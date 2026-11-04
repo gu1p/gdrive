@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use super::download_directory;
+use super::{download_directory, PartialFiles};
 use crate::{
     common::drive_file::MIME_TYPE_DRIVE_FOLDER,
     files::download::{errors, Config, Destination, ExistingFileAction},
@@ -350,8 +350,15 @@ async fn a_failed_file_stops_the_download_and_removes_the_temporary_files() {
     );
 }
 
+/// Waits until `path` exists.
+async fn appears(path: &Path) {
+    while !path.exists() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 #[tokio::test]
-async fn ctrl_c_cancels_the_running_downloads_and_removes_their_temporary_files() {
+async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
     let files = vec![
         FakeFile::blob("s1", "s1.bin", "root", "0123456789"),
         FakeFile::blob("s2", "s2.bin", "root", "abcdefghij"),
@@ -363,12 +370,24 @@ async fn ctrl_c_cancels_the_running_downloads_and_removes_their_temporary_files(
     };
     let server = FakeDrive::start(files, behavior).await;
     let destination = tempfile::tempdir().unwrap();
-    // A stale temporary file of s1 from an earlier run, which is not this run's to remove.
     let root = destination.path().join("Root");
     std::fs::create_dir(&root).unwrap();
+    // Temporary names that are not this run's: s1's first name is taken, so its download takes
+    // the second; s2's first name is free, but its third is taken (a gap).
     std::fs::write(root.join(".gdrive-s1.part"), "stale").unwrap();
+    std::fs::write(root.join(".gdrive-s2-2.part"), "other process").unwrap();
 
-    let cancel = tokio::time::sleep(Duration::from_millis(300));
+    // Once both downloads write their temporary files, another gdrive takes the next names,
+    // and then Ctrl-C comes.
+    let cancel = {
+        let root = root.clone();
+        async move {
+            appears(&root.join(".gdrive-s1-1.part")).await;
+            appears(&root.join(".gdrive-s2.part")).await;
+            std::fs::write(root.join(".gdrive-s1-2.part"), "concurrent").unwrap();
+            std::fs::write(root.join(".gdrive-s2-1.part"), "concurrent").unwrap();
+        }
+    };
     let downloaded = download(&server, &config(destination.path(), 3, false), cancel).await;
 
     assert_eq!(
@@ -379,11 +398,54 @@ async fn ctrl_c_cancels_the_running_downloads_and_removes_their_temporary_files(
         downloaded.err.lines()[0],
         "Interrupted: cancelling the transfers in progress"
     );
-    assert_eq!(entries(&root), [".gdrive-s1.part", "done.bin"]);
+    assert_eq!(
+        entries(&root),
+        [
+            ".gdrive-s1-2.part",
+            ".gdrive-s1.part",
+            ".gdrive-s2-1.part",
+            ".gdrive-s2-2.part",
+            "done.bin"
+        ]
+    );
     assert_eq!(
         std::fs::read_to_string(root.join(".gdrive-s1.part")).unwrap(),
         "stale"
     );
+    assert_eq!(
+        std::fs::read_to_string(root.join(".gdrive-s2-2.part")).unwrap(),
+        "other process"
+    );
+}
+
+#[tokio::test]
+async fn the_cleanup_removes_the_files_it_created_and_no_other_file_of_these_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("x.bin");
+    let partial = PartialFiles::new(target.clone(), "X");
+    std::fs::write(
+        dir.path().join(".gdrive-X-2.part"),
+        "left by another process",
+    )
+    .unwrap();
+
+    // The first free name, as `save_to_file` takes it; then the content starts over.
+    let (first, file) = super::super::create_temp_file(&target, "X").await.unwrap();
+    drop(partial.track(file));
+    let (second, file) = super::super::create_temp_file(&target, "X").await.unwrap();
+    drop(partial.track(file));
+    assert_eq!(
+        (first.file_name().unwrap(), second.file_name().unwrap()),
+        (".gdrive-X.part".as_ref(), ".gdrive-X-1.part".as_ref())
+    );
+    // The first was replaced by another file of the same name since.
+    std::fs::remove_file(&first).unwrap();
+    std::fs::write(&first, "someone else's").unwrap();
+
+    partial.remove().await;
+
+    assert_eq!(entries(dir.path()), [".gdrive-X-2.part", ".gdrive-X.part"]);
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "someone else's");
 }
 
 #[tokio::test]

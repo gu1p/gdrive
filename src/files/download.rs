@@ -234,7 +234,7 @@ pub(crate) async fn save_to_file(
 }
 
 /// [`save_to_file`] writing through `writer(temporary file)`; tests use it to inject write
-/// errors.
+/// errors, the recursive download to note which temporary files it created.
 async fn save_through<W>(
     download: ResumableDownload<'_>,
     first: Next,

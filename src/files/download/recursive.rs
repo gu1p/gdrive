@@ -13,7 +13,8 @@
 //! Each file goes through the same steps as before the scheduler: the `--overwrite` check, the
 //! md5 check that skips an identical local file, the media request with Range resume, and
 //! `save_to_file`, which writes a temporary file and renames it once size and md5 match. A job
-//! that is aborted (a failure elsewhere, Ctrl-C) removes the temporary file it left.
+//! that is aborted (a failure elsewhere, Ctrl-C) removes the temporary files it created, and only
+//! those.
 
 #[cfg(test)]
 mod tests;
@@ -22,7 +23,7 @@ use std::{
     collections::VecDeque,
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, OnceLock, PoisonError},
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use futures::{stream, Stream, StreamExt};
@@ -31,7 +32,7 @@ use tokio::fs;
 use super::{
     err_if_local_file_exists, errors, file_content, local_file_is_identical, remove_temp_file,
     resume::{Identity, ResumableDownload, Revision},
-    save_to_file, Config, ExistingFileAction, MAX_TEMP_FILE_ATTEMPTS,
+    save_through, Config, ExistingFileAction, MAX_TEMP_FILE_ATTEMPTS,
 };
 use crate::{
     common::{
@@ -291,13 +292,15 @@ impl Files {
             .printer
             .out(format!("Downloading file '{}'", file.path.display()))
             .await;
-        partial.mark().await;
-        save_to_file(download, first, &abs_file_path, &file.id)
-            .await
-            .map_err(|source| E::SaveBodyToFile {
-                path: abs_file_path.clone(),
-                source,
-            })?;
+        // `save_to_file`, with every temporary file it creates noted for the cleanup.
+        save_through(download, first, &abs_file_path, &file.id, |file| {
+            partial.track(file)
+        })
+        .await
+        .map_err(|source| E::SaveBodyToFile {
+            path: abs_file_path.clone(),
+            source,
+        })?;
         context.progress.bytes(file.size);
 
         Ok(Outcome::Transferred { bytes: file.size })
@@ -307,11 +310,14 @@ impl Files {
 /// The temporary files of one download, for when its task is aborted: `save_to_file` removes
 /// its temporary file whenever it fails, but an aborted task runs no code.
 ///
-/// `save_to_file` takes the first free name of `.gdrive-<id>.part`, `.gdrive-<id>-1.part`, ...
-/// and, when the content starts over, the next free one. Before it runs, [`Self::mark`] notes
-/// the first free name; after an abort, [`Self::remove`] removes the temporary files of this id
-/// from that name on. Names taken before (a stale file of an earlier run, a concurrent gdrive)
-/// stay.
+/// `save_to_file` names a temporary file `.gdrive-<id>.part`, `.gdrive-<id>-1.part`, ..., the
+/// first that is free, and another one when the content starts over. Other files with these
+/// names (a stale one of an earlier run, one of a concurrent gdrive) are not this download's, so
+/// the names alone do not say what to remove. [`Self::track`] notes the identity of every
+/// temporary file as it is created (device and inode on Unix, the creation time on Windows), and
+/// [`Self::remove`] removes only the temporary names that are still one of those files. Where
+/// no identity is available, nothing is removed: a leftover temporary file is better than a
+/// removed file of someone else.
 #[derive(Clone)]
 struct PartialFiles(Arc<PartialState>);
 
@@ -319,8 +325,8 @@ struct PartialState {
     /// The final path of the download.
     path: PathBuf,
     file_id: String,
-    /// The first temporary name that was free before `save_to_file` ran.
-    first: OnceLock<u32>,
+    /// The temporary files this download created.
+    created: Mutex<Vec<FileIdentity>>,
 }
 
 impl PartialFiles {
@@ -328,7 +334,7 @@ impl PartialFiles {
         PartialFiles(Arc::new(PartialState {
             path,
             file_id: file_id.to_owned(),
-            first: OnceLock::new(),
+            created: Mutex::new(Vec::new()),
         }))
     }
 
@@ -337,27 +343,84 @@ impl PartialFiles {
         local_name::safe_join(dir, &local_name::temp_file_name(&self.0.file_id, attempt))
     }
 
-    async fn mark(&self) {
-        for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
-            if fs::symlink_metadata(self.temp_path(attempt)).await.is_err() {
-                let _ = self.0.first.set(attempt);
-                return;
-            }
-        }
+    fn created(&self) -> std::sync::MutexGuard<'_, Vec<FileIdentity>> {
+        self.0
+            .created
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
-    async fn remove(&self) {
-        let Some(&first) = self.0.first.get() else {
-            return;
+    /// Notes the identity of a temporary file `save_to_file` just created, and hands the file
+    /// back to it unchanged.
+    fn track(&self, file: fs::File) -> fs::File {
+        // Nothing has run on the new file yet, so it converts without waiting.
+        let file = match file.try_into_std() {
+            Ok(file) => file,
+            Err(file) => return file,
         };
-        for attempt in first..MAX_TEMP_FILE_ATTEMPTS {
+        if let Some(identity) = file.metadata().ok().as_ref().and_then(FileIdentity::of) {
+            self.created().push(identity);
+        }
+        fs::File::from_std(file)
+    }
+
+    /// Removes the temporary files this download created that are still there.
+    async fn remove(&self) {
+        let mut created = self.created().clone();
+        for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
+            if created.is_empty() {
+                break;
+            }
             let path = self.temp_path(attempt);
-            if fs::symlink_metadata(&path)
-                .await
-                .is_ok_and(|metadata| metadata.is_file())
-            {
+            let Ok(metadata) = fs::symlink_metadata(&path).await else {
+                continue;
+            };
+            let identity = metadata
+                .is_file()
+                .then(|| FileIdentity::of(&metadata))
+                .flatten();
+            if let Some(found) = created.iter().position(|ours| Some(*ours) == identity) {
+                created.swap_remove(found);
                 remove_temp_file(&path).await;
             }
         }
+    }
+}
+
+/// What tells one file from another while both exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    /// Unix: the device and the inode. Windows: the creation time, in 100 ns units.
+    id: (u64, u64),
+}
+
+impl FileIdentity {
+    #[cfg(unix)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the same signature as on platforms without file identities"
+    )]
+    fn of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        Some(FileIdentity {
+            id: (metadata.dev(), metadata.ino()),
+        })
+    }
+
+    #[cfg(windows)]
+    #[allow(
+        clippy::unnecessary_wraps,
+        reason = "the same signature as on platforms without file identities"
+    )]
+    fn of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+        use std::os::windows::fs::MetadataExt;
+        Some(FileIdentity {
+            id: (metadata.creation_time(), 0),
+        })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn of(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
+        None
     }
 }
