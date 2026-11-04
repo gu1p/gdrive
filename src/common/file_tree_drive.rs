@@ -595,16 +595,27 @@ mod tests {
         }
     }
 
-    /// The relative paths of every file in the tree, sorted.
-    fn file_paths(tree: &FileTreeDrive) -> Vec<String> {
+    /// The relative paths of every file in the tree as path components, sorted. Components, not
+    /// strings: the separator is `\` on Windows.
+    fn file_paths(tree: &FileTreeDrive) -> Vec<Vec<String>> {
         let mut paths = tree
             .folders()
             .iter()
             .flat_map(|folder| folder.files())
-            .map(|file| file.relative_path().display().to_string())
+            .map(|file| {
+                file.relative_path()
+                    .components()
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         paths.sort();
         paths
+    }
+
+    /// The components of a `/`-separated expected path.
+    fn components(path: &str) -> Vec<String> {
+        path.split('/').map(String::from).collect()
     }
 
     async fn tree_from(
@@ -662,6 +673,7 @@ mod tests {
                 "Root/c/file.txt",
                 "Root/file.txt",
             ]
+            .map(components)
         );
         assert!(server.max_in_flight() <= WalkOptions::DEFAULT_LISTING_JOBS);
         // The listing before the walk sent one request per folder: 8. Batched, each level is
@@ -702,10 +714,14 @@ mod tests {
             3,
             "documents and shortcuts are skipped: {paths:?}"
         );
-        assert_eq!(paths[0], "Root/.._escape/a_b");
-        assert_eq!(paths[1], "Root/report.pdf");
-        assert!(paths[2].starts_with("Root/report~"), "{}", paths[2]);
-        assert_eq!(&paths[2][paths[2].len() - 4..], ".pdf");
+        assert_eq!(paths[0], components("Root/.._escape/a_b"));
+        assert_eq!(paths[1], components("Root/report.pdf"));
+        let [root, suffixed] = paths[2].as_slice() else {
+            panic!("{:?} is not a child of the root", paths[2]);
+        };
+        assert_eq!(root, "Root");
+        assert!(suffixed.starts_with("report~"), "{suffixed}");
+        assert_eq!(&suffixed[suffixed.len() - 4..], ".pdf");
         let plain = tree
             .root
             .files()
