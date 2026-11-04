@@ -446,6 +446,8 @@ fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
 #[derive(Debug, Default)]
 struct Existing {
     by_name: HashMap<String, Vec<DestFile>>,
+    /// The ids of all of them.
+    ids: HashSet<String>,
 }
 
 #[derive(Debug)]
@@ -473,10 +475,12 @@ enum Match {
 impl Existing {
     fn of(files: Vec<File>) -> Self {
         let mut by_name = HashMap::<String, Vec<DestFile>>::new();
+        let mut ids = HashSet::new();
         for file in files {
             let (Some(id), Some(name)) = (file.id, file.name) else {
                 continue;
             };
+            ids.insert(id.clone());
             by_name.entry(name).or_default().push(DestFile {
                 id,
                 mime_type: file.mime_type.unwrap_or_default(),
@@ -484,12 +488,12 @@ impl Existing {
                 md5: file.md5_checksum,
             });
         }
-        Existing { by_name }
+        Existing { by_name, ids }
     }
 
     /// Whether the folder holds the file or folder `id` itself: one that both accounts see.
     fn contains(&self, id: &str) -> bool {
-        self.by_name.values().flatten().any(|file| file.id == id)
+        self.ids.contains(id)
     }
 
     /// The first folder named `name`.
