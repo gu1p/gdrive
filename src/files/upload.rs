@@ -1,4 +1,4 @@
-mod recursive;
+pub(crate) mod recursive;
 
 use std::{
     error,

@@ -14,8 +14,9 @@ enum Source<'a> {
     Drive {
         hub: &'a Hub,
     },
-    /// Local sequential ids, for tests that must not reach Drive.
-    #[cfg(test)]
+    /// Local sequential ids that are never sent to Drive: for a local tree that is only
+    /// compared with Drive (the inventory of `files sync`), and for tests that must not reach
+    /// Drive.
     Sequential(u64),
 }
 
@@ -28,7 +29,8 @@ impl<'a> IdGen<'a> {
         }
     }
 
-    #[cfg(test)]
+    /// Ids `id-1`, `id-2`, ... made locally, without a request: for a tree whose items are
+    /// never created on Drive under them.
     #[must_use]
     pub(crate) fn sequential() -> IdGen<'static> {
         IdGen {
@@ -50,7 +52,6 @@ impl<'a> IdGen<'a> {
                 let id = self.ids.pop().ok_or(NextError::OutOfIds)?;
                 Ok(id)
             }
-            #[cfg(test)]
             Source::Sequential(next) => {
                 *next += 1;
                 Ok(format!("id-{next}"))

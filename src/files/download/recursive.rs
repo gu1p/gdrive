@@ -95,6 +95,7 @@ pub(super) async fn download_directory(
         existing_file_action: config.existing_file_action,
         acknowledge_abuse: config.acknowledge_abuse,
         exports: ExportCounts::default(),
+        planned: false,
     });
     let source = Source {
         walk: Some(walk),
@@ -288,13 +289,17 @@ impl Source {
 }
 
 /// What every file job of a recursive download shares.
-struct Files {
+pub(crate) struct Files {
     hub: Hub,
     /// The canonical destination.
     root_path: PathBuf,
     existing_file_action: ExistingFileAction,
     acknowledge_abuse: bool,
     exports: ExportCounts,
+    /// The jobs of a plan (`files sync`): the plan compared the local file already and prints
+    /// what each job does, so a job neither checks for an identical local file nor announces
+    /// itself.
+    planned: bool,
 }
 
 /// How the export jobs ended so far, for the last line of the download.
@@ -331,6 +336,25 @@ struct ExportTotals {
 }
 
 impl Files {
+    /// The downloads and exports of a plan into the canonical directory `root_path`: see the
+    /// `planned` field.
+    #[must_use]
+    pub(crate) fn for_plan(
+        hub: Hub,
+        root_path: PathBuf,
+        existing_file_action: ExistingFileAction,
+        acknowledge_abuse: bool,
+    ) -> Files {
+        Files {
+            hub,
+            root_path,
+            existing_file_action,
+            acknowledge_abuse,
+            exports: ExportCounts::default(),
+            planned: true,
+        }
+    }
+
     fn job(self: &Arc<Self>, file: PlannedFile) -> Job {
         let files = Arc::clone(self);
         let label = local_name::tree_path(&file.path);
@@ -344,7 +368,8 @@ impl Files {
         .on_cancel(move || async move { cleanup.remove().await })
     }
 
-    async fn download(
+    /// Downloads `file` below the destination, noting its temporary files in `partial`.
+    pub(crate) async fn download(
         &self,
         file: PlannedFile,
         partial: &PartialFiles,
@@ -369,7 +394,7 @@ impl Files {
 
         let abs_file_path = self.root_path.join(&file.path);
         err_if_local_file_exists(&abs_file_path, self.existing_file_action).await?;
-        if local_file_is_identical(&abs_file_path, file.md5.as_ref()).await {
+        if !self.planned && local_file_is_identical(&abs_file_path, file.md5.as_ref()).await {
             return Ok(Outcome::Unchanged);
         }
 
@@ -391,10 +416,12 @@ impl Files {
             .await
             .map_err(|err| E::DownloadFile(Box::new(err)))?;
 
-        context
-            .printer
-            .out(format!("Downloading file '{}'", file.path.display()))
-            .await;
+        if !self.planned {
+            context
+                .printer
+                .out(format!("Downloading file '{}'", file.path.display()))
+                .await;
+        }
         // `save_to_file`, with every temporary file it creates noted for the cleanup.
         save_through(download, first, &abs_file_path, &file.id, |file| {
             partial.track(file)
@@ -422,7 +449,8 @@ impl Files {
         .on_cancel(move || async move { cleanup.remove().await })
     }
 
-    async fn export(
+    /// Exports `export` below the destination, noting its temporary files in `partial`.
+    pub(crate) async fn export(
         &self,
         export: PlannedExport,
         partial: &PartialFiles,
@@ -469,14 +497,16 @@ impl Files {
             }
         })?;
 
-        context
-            .printer
-            .out(format!(
-                "Exporting {} '{}'",
-                export.doc_type,
-                export.path.display()
-            ))
-            .await;
+        if !self.planned {
+            context
+                .printer
+                .out(format!(
+                    "Exporting {} '{}'",
+                    export.doc_type,
+                    export.path.display()
+                ))
+                .await;
+        }
         save_through(download, first, &abs_file_path, &export.id, |file| {
             partial.track(file)
         })
@@ -533,7 +563,7 @@ impl Files {
 /// available (same-file knows Unix and Windows), nothing is removed: a leftover temporary file is
 /// better than a removed file of someone else.
 #[derive(Clone)]
-struct PartialFiles(Arc<PartialState>);
+pub(crate) struct PartialFiles(Arc<PartialState>);
 
 struct PartialState {
     /// The final path of the download.
@@ -544,7 +574,8 @@ struct PartialState {
 }
 
 impl PartialFiles {
-    fn new(path: PathBuf, file_id: &str) -> Self {
+    /// The temporary files of the download of `file_id` to the absolute `path`.
+    pub(crate) fn new(path: PathBuf, file_id: &str) -> Self {
         PartialFiles(Arc::new(PartialState {
             path,
             file_id: file_id.to_owned(),
@@ -583,7 +614,7 @@ impl PartialFiles {
 
     /// Removes the temporary files this download created that are still there, and lets go of
     /// the handles.
-    async fn remove(&self) {
+    pub(crate) async fn remove(&self) {
         let mut created = mem::take(&mut *self.created());
         for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
             if created.is_empty() {

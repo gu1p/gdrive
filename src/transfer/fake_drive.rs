@@ -17,6 +17,12 @@
 //! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
 //! last). Like Drive, a create fails with 404 when a parent does not exist yet.
 //!
+//! For syncs it answers multipart `files.update` of a stored file's content (a `PATCH` to the
+//! upload path, [`FakeDrive::updates`]), metadata `files.update` (a `PATCH` of JSON, such as
+//! `{"trashed": true}`, [`FakeDrive::patches`]) and records `files.delete`
+//! ([`FakeDrive::deletes`]). The stored files do not change: a listing after an update still
+//! returns what the test started the fake with.
+//!
 //! A test that checks how many requests were in flight at once does not rely on delays: the
 //! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
 //! listing until a download has started, so the overlap happens however slow the machine is.
@@ -265,6 +271,10 @@ pub(crate) struct Behavior {
     pub(crate) upload_delay: Duration,
     /// Creates of files with these names fail with 400.
     pub(crate) upload_rejected: HashSet<String>,
+    /// Content updates of these file ids fail with 400.
+    pub(crate) update_rejected: HashSet<String>,
+    /// Metadata updates (a trash, a rename) of these file ids fail with 403.
+    pub(crate) patch_rejected: HashSet<String>,
     /// How long every chunk of a resumable session takes before its reply.
     pub(crate) chunk_delay: Duration,
     /// The chunk of the file with this name that starts at this offset fails with 503 once,
@@ -392,6 +402,12 @@ struct State {
     last_list: Mutex<Option<Instant>>,
     /// Successful creates, in reply order.
     created: Mutex<Vec<Created>>,
+    /// Successful content updates: the file id and the new content.
+    updates: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Metadata updates: the file id and the JSON body, also the rejected ones.
+    patches: Mutex<Vec<(String, Value)>>,
+    /// The ids of `files.delete` requests.
+    deletes: Mutex<Vec<String>>,
     /// Orders the arrivals and replies of creates.
     create_events: AtomicUsize,
     uploads_in_flight: AtomicUsize,
@@ -443,6 +459,9 @@ impl FakeDrive {
             first_media: Mutex::new(None),
             last_list: Mutex::new(None),
             created: Mutex::new(Vec::new()),
+            updates: Mutex::new(Vec::new()),
+            patches: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
             create_events: AtomicUsize::new(0),
             uploads_in_flight: AtomicUsize::new(0),
             uploads_max_in_flight: AtomicUsize::new(0),
@@ -515,6 +534,27 @@ impl FakeDrive {
     /// The successful creates, in reply order.
     pub(crate) fn created(&self) -> Vec<Created> {
         self.state.created.lock().expect("created lock").clone()
+    }
+
+    /// The successful content updates (`files.update` with media): file id and new content.
+    pub(crate) fn updates(&self) -> Vec<(String, Vec<u8>)> {
+        self.state.updates.lock().expect("updates lock").clone()
+    }
+
+    /// The metadata updates (`files.update` without media), rejected ones included: file id and
+    /// JSON body.
+    pub(crate) fn patches(&self) -> Vec<(String, Value)> {
+        self.state.patches.lock().expect("patches lock").clone()
+    }
+
+    /// The file ids of `files.delete` requests.
+    pub(crate) fn deletes(&self) -> Vec<String> {
+        self.state.deletes.lock().expect("deletes lock").clone()
+    }
+
+    /// How many ids `files.generateIds` handed out.
+    pub(crate) fn generated_ids(&self) -> usize {
+        self.state.generated.load(Ordering::SeqCst)
     }
 
     /// The chunk and status requests of resumable sessions, in arrival order.
@@ -594,6 +634,9 @@ async fn handle(
         } else {
             create(&state, request).await
         });
+    }
+    if matches!(*request.method(), Method::PATCH | Method::DELETE) {
+        return Ok(modify(&state, &path, request).await);
     }
     if request.method() == Method::PUT {
         if let Some(session) = path
@@ -764,6 +807,105 @@ fn finish_create(
         "md5Checksum": format!("{:x}", md5::compute(&created.content)),
     });
     state.created.lock().expect("created lock").push(created);
+    json_response(StatusCode::OK, &reply)
+}
+
+/// A `PATCH` (`files.update` of the content or of the metadata) or a `DELETE` of a file.
+async fn modify(state: &State, path: &str, request: hyper::Request<Incoming>) -> FakeResponse {
+    let id_after = |prefix: &str| {
+        path.strip_prefix(prefix)
+            .and_then(|id| id.strip_prefix('/'))
+            .map(String::from)
+    };
+    match (
+        request.method().clone(),
+        id_after(UPLOAD_PATH),
+        id_after(LIST_PATH),
+    ) {
+        (Method::PATCH, Some(id), _) => update(state, &id, request).await,
+        (Method::PATCH, None, Some(id)) => patch(state, &id, request).await,
+        (Method::DELETE, None, Some(id)) => {
+            state.deletes.lock().expect("deletes lock").push(id);
+            hyper::Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()).boxed())
+                .expect("valid response")
+        }
+        _ => error(StatusCode::NOT_FOUND, "unexpected request"),
+    }
+}
+
+/// A multipart `files.update` of a stored file: its new content. Resumable updates are not
+/// supported (the tests' files are small).
+async fn update(state: &State, id: &str, request: hyper::Request<Incoming>) -> FakeResponse {
+    let multipart_upload = request.uri().query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "uploadType" && value == "multipart")
+    });
+    if !multipart_upload {
+        return error(StatusCode::BAD_REQUEST, "only multipart updates");
+    }
+    let boundary = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("boundary="))
+        .map(|(_, boundary)| boundary.trim_matches('"').to_owned());
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let Some((_, content)) = boundary.and_then(|b| multipart(&body.to_bytes(), &b)) else {
+        return error(StatusCode::BAD_REQUEST, "not a multipart upload");
+    };
+    let Some(file) = state.files.iter().find(|file| file.id == id) else {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
+    };
+    if state.behavior.update_rejected.contains(id) {
+        return error(StatusCode::BAD_REQUEST, "Invalid upload.");
+    }
+    let reply = json!({
+        "kind": "drive#file",
+        "id": id,
+        "name": file.name,
+        "mimeType": file.mime_type,
+        "parents": file.parents,
+        "size": content.len().to_string(),
+        "md5Checksum": format!("{:x}", md5::compute(&content)),
+    });
+    state
+        .updates
+        .lock()
+        .expect("updates lock")
+        .push((id.to_owned(), content));
+    json_response(StatusCode::OK, &reply)
+}
+
+/// A metadata `files.update` (`PATCH` of JSON) of a stored file.
+async fn patch(state: &State, id: &str, request: hyper::Request<Incoming>) -> FakeResponse {
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let metadata = serde_json::from_slice::<Value>(&body.to_bytes()).unwrap_or(Value::Null);
+    state
+        .patches
+        .lock()
+        .expect("patches lock")
+        .push((id.to_owned(), metadata.clone()));
+    let Some(file) = state.files.iter().find(|file| file.id == id) else {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
+    };
+    if state.behavior.patch_rejected.contains(id) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "The user does not have sufficient permissions for this file.",
+        );
+    }
+    let mut reply = file.to_json(true);
+    if let (Some(reply), Some(changes)) = (reply.as_object_mut(), metadata.as_object()) {
+        for (key, value) in changes {
+            reply.insert(key.clone(), value.clone());
+        }
+    }
     json_response(StatusCode::OK, &reply)
 }
 

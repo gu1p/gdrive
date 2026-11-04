@@ -3,7 +3,7 @@ pub(crate) mod errors;
 mod media_tests;
 #[cfg(test)]
 pub(crate) use media_tests::assert_content;
-mod recursive;
+pub(crate) mod recursive;
 pub(crate) mod resume;
 
 use std::path::{Path, PathBuf};

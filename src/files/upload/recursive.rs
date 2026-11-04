@@ -21,7 +21,7 @@ mod tests;
 
 use std::{
     future::Future,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -156,16 +156,8 @@ impl Uploads {
                 ))
                 .await;
         }
-        let mkdir = mkdir::Config {
-            id: Some(id.clone()),
-            name: folder.info.name.clone(),
-            parents,
-            print_only_id: false,
-        };
-        let created = match mkdir::create_directory(&self.hub, &mkdir).await {
-            Ok(created) => created.id.ok_or(Error::DriveFolderMissingId),
-            Err(err) => Err(Error::Mkdir(Box::new(err))),
-        };
+        let name = folder.info.name.clone();
+        let created = create_folder(&self.hub, Some(id.clone()), name, parents).await;
         let folder_id = match created {
             Ok(folder_id) => folder_id,
             Err(source) => return failed(path, source).into(),
@@ -245,11 +237,8 @@ impl Uploads {
         Outcome::Transferred { bytes }
     }
 
-    /// The one call that sends a file of a recursive upload to Drive, under its pre-generated
-    /// id, into the folder `parents`: gdrive's uploader, which opens the file once the job has
-    /// its slot (so at most `--jobs` files are open), measures it then, and reports the bytes
-    /// Drive confirmed to `progress` after every chunk. Returns the size of the uploaded
-    /// content.
+    /// Sends a file of a recursive upload to Drive, under its pre-generated id, into the
+    /// folder `parents` ([`send_file`]).
     async fn send(
         &self,
         file: &file_tree::File,
@@ -264,21 +253,56 @@ impl Uploads {
             convert_to: None,
             new_file_id: Some(file.drive_id.clone()),
         };
-        // The uploader tells the bytes Drive holds so far; progress takes what is new.
-        let confirmed = AtomicU64::new(0);
-        let report = |held: u64| {
-            let before = confirmed.fetch_max(held, Ordering::SeqCst);
-            progress.bytes(held.saturating_sub(before));
-        };
-        let uploaded = upload_path(&self.hub, &file.path, &target, &self.options, Some(&report))
-            .await
-            .map_err(|err| Error::Transfer(Box::new(err)))?;
-        let size = uploaded
-            .size
-            .and_then(|size| u64::try_from(size).ok())
-            .unwrap_or_else(|| confirmed.load(Ordering::SeqCst));
-        Ok(size)
+        send_file(&self.hub, &file.path, &target, &self.options, progress).await
     }
+}
+
+/// Creates the folder `name` in `parents` (none: the top folder of My Drive), under its
+/// pre-generated `id` if it has one, and returns the id Drive gave it.
+pub(crate) async fn create_folder(
+    hub: &Hub,
+    id: Option<String>,
+    name: String,
+    parents: Option<Vec<String>>,
+) -> Result<String, Error> {
+    let mkdir = mkdir::Config {
+        id,
+        name,
+        parents,
+        print_only_id: false,
+    };
+    match mkdir::create_directory(hub, &mkdir).await {
+        Ok(created) => created.id.ok_or(Error::DriveFolderMissingId),
+        Err(err) => Err(Error::Mkdir(Box::new(err))),
+    }
+}
+
+/// The one call that sends a file of a transfer job to Drive (a new file or, with
+/// `target.existing_file_id`, a new revision of one): gdrive's uploader, which opens the file
+/// once the job has its slot (so at most `--jobs` files are open), measures it then, and
+/// reports the bytes Drive confirmed to `progress` after every chunk. Returns the size of the
+/// uploaded content.
+pub(crate) async fn send_file(
+    hub: &Hub,
+    path: &Path,
+    target: &UploadTarget,
+    options: &UploadOptions,
+    progress: &JobProgress,
+) -> Result<u64, Error> {
+    // The uploader tells the bytes Drive holds so far; progress takes what is new.
+    let confirmed = AtomicU64::new(0);
+    let report = |held: u64| {
+        let before = confirmed.fetch_max(held, Ordering::SeqCst);
+        progress.bytes(held.saturating_sub(before));
+    };
+    let uploaded = upload_path(hub, path, target, options, Some(&report))
+        .await
+        .map_err(|err| Error::Transfer(Box::new(err)))?;
+    let size = uploaded
+        .size
+        .and_then(|size| u64::try_from(size).ok())
+        .unwrap_or_else(|| confirmed.load(Ordering::SeqCst));
+    Ok(size)
 }
 
 fn failed(path: PathBuf, source: Error) -> Outcome {
