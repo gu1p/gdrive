@@ -1,0 +1,262 @@
+# Release: builds gdrive for every supported platform and publishes the
+# archives plus a SHA256SUMS file as a GitHub release.
+#
+# - Pushing a tag vX.Y.Z publishes the release vX.Y.Z. The tag must match the
+#   version in Cargo.toml.
+# - Running the workflow by hand (Actions > Release > Run workflow) is a dry
+#   run: it builds, checks and packages every target and keeps the archives
+#   and SHA256SUMS as workflow artifacts, but creates no release and uploads
+#   nothing to one.
+#
+# The release is created only after every target has built, in one step, so a
+# failed target never leaves a release with missing assets. See
+# docs/releasing.md.
+#
+# Actions are pinned to full commit SHAs (the comment names the release) so a
+# moved tag cannot change what builds the binaries; Dependabot keeps the pins
+# current.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Two runs for the same ref never overlap, and a release is never cancelled
+# half-way.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check tag against Cargo.toml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Compare tag and package version
+        if: github.event_name == 'push'
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match version $version in Cargo.toml; bump the version and tag v$version."
+            exit 1
+          fi
+          echo "Releasing gdrive $version"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: check-version
+    strategy:
+      # Let the other targets finish so a dry run reports every broken one.
+      fail-fast: false
+      matrix:
+        include:
+          # Linux binaries link musl statically, so one file runs on any
+          # distribution regardless of its glibc version (and on musl-based ones
+          # such as Alpine). TLS is rustls, so there is no OpenSSL to link.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            asset: gdrive_linux-x64
+          # Built natively on GitHub's arm64 runner (free for public
+          # repositories) instead of cross-compiled from x86_64: no cross linker,
+          # sysroot or Docker image to maintain, and the same steps as x64.
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            asset: gdrive_linux-arm64
+          # macos-latest is an arm64 machine. Upstream built its macOS asset
+          # there and named it x64 although it held an arm64 binary. Here each
+          # asset name matches its architecture (checked below), and the Intel
+          # binary is cross-compiled on the same runner with Apple's toolchain,
+          # which supports both architectures.
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            asset: gdrive_macos-arm64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            asset: gdrive_macos-x64
+          # The static CRT links the Visual C++ runtime into gdrive.exe, so it
+          # runs on machines without the VC++ Redistributable (upstream #128).
+          # Set here rather than in a committed .cargo/config.toml so local
+          # builds keep the default.
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            asset: gdrive_windows-x64
+            rustflags: -C target-feature=+crt-static
+    runs-on: ${{ matrix.os }}
+    env:
+      # build.rs embeds the commit as the `Commit:` line of `gdrive version`.
+      # It asks `git rev-parse HEAD` first and falls back to this variable
+      # when git is unavailable; the check step below asserts the result.
+      GDRIVE_GIT_HASH: ${{ github.sha }}
+    # No Swatinem/rust-cache here on purpose: release binaries are built from
+    # a clean state, so nothing restored from another workflow's cache can end
+    # up in a published binary. It costs a few minutes per release.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      # musl-gcc compiles ring's C and assembly parts for the musl target.
+      - name: Install musl tools
+        if: contains(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools
+      # Used for its build and packaging only (cargo build --release --locked
+      # --target, then tar.gz on Unix or zip on Windows with the binary at the
+      # archive root, as upstream's archives had it). It never uploads: the
+      # publish job creates the release once every target is built.
+      - name: Build and package
+        id: package
+        uses: taiki-e/upload-rust-binary-action@f0d45ae91ee7b8ee928de7a9d04d893a08bcbec6 # v1.30.2
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+        with:
+          bin: gdrive
+          target: ${{ matrix.target }}
+          archive: ${{ matrix.asset }}
+          # Plain cargo on every runner. Left unset, the action switches to
+          # cross (Docker) whenever the target differs from the host triple,
+          # which includes the musl targets.
+          build-tool: cargo
+          locked: true
+          tar: unix
+          zip: windows
+          dry-run: true
+          dry-run-intended: true
+      # Refuse to ship a binary of the wrong architecture or one that needs
+      # libraries the user may not have (the two defects upstream shipped), or
+      # one that does not know its commit (upstream printed "Commit: unknown").
+      - name: Check the binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          EXPECTED_COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/gdrive"
+          case "$TARGET" in
+            *-linux-musl)
+              # No program interpreter means no dynamic loader and no shared
+              # libraries: the binary is static.
+              headers=$(readelf --program-headers "$bin")
+              if grep -q INTERP <<<"$headers"; then
+                echo "::error::$bin is dynamically linked"
+                exit 1
+              fi
+              ;;
+            *-apple-darwin)
+              expected=${TARGET%%-*}
+              [ "$expected" = aarch64 ] && expected=arm64
+              archs=$(lipo -archs "$bin")
+              echo "$bin: $archs"
+              if [ "$archs" != "$expected" ]; then
+                echo "::error::$bin is $archs, expected $expected"
+                exit 1
+              fi
+              ;;
+            *-windows-msvc)
+              bin="$bin.exe"
+              # With the static CRT, gdrive.exe imports no VC++ runtime DLL.
+              if grep -qai 'vcruntime140\.dll' "$bin"; then
+                echo "::error::$bin depends on the VC++ runtime DLLs"
+                exit 1
+              fi
+              ;;
+          esac
+          # The x86_64 macOS binary cannot run on the arm64 runner, so for it
+          # the embedded commit string is searched instead.
+          if [ "$TARGET" = x86_64-apple-darwin ]; then
+            if ! grep -qaF "$EXPECTED_COMMIT" "$bin"; then
+              echo "::error::$bin does not embed commit $EXPECTED_COMMIT"
+              exit 1
+            fi
+          else
+            out=$("$bin" version | tr -d '\r')
+            echo "$out"
+            if ! grep -qFx "Commit: $EXPECTED_COMMIT" <<<"$out"; then
+              echo "::error::gdrive version does not print Commit: $EXPECTED_COMMIT"
+              exit 1
+            fi
+          fi
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ steps.package.outputs.tar || steps.package.outputs.zip }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the release and upload its assets
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: gdrive_*
+          merge-multiple: true
+          path: dist
+      - name: Check asset names and write SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # Asset names are a public interface: install scripts download
+          # .../releases/latest/download/<name>. The linux-x64, macos-x64 and
+          # windows-x64 names are upstream's; never rename them.
+          mapfile -t expected <<'NAMES'
+          gdrive_linux-arm64.tar.gz
+          gdrive_linux-x64.tar.gz
+          gdrive_macos-arm64.tar.gz
+          gdrive_macos-x64.tar.gz
+          gdrive_windows-x64.zip
+          NAMES
+          want=$(printf '%s\n' "${expected[@]}" | LC_ALL=C sort)
+          have=$(find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort)
+          if [ "$have" != "$want" ]; then
+            echo "::error::Unexpected release assets"
+            diff <(echo "$want") <(echo "$have") || true
+            exit 1
+          fi
+          sha256sum "${expected[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - name: Keep SHA256SUMS of the dry run
+        if: github.event_name != 'push'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 7
+      # gh creates the release as a draft, uploads every asset, then publishes
+      # it, so users never see a release with only part of its assets. Tags
+      # with a pre-release suffix (v4.0.0-alpha.1) become pre-releases, which
+      # releases/latest skips.
+      - name: Create GitHub release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          case "$TAG" in
+            *-*) prerelease=(--prerelease) ;;
+          esac
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes "${prerelease[@]}" dist/*
