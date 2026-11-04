@@ -343,6 +343,10 @@ enum FileCommand {
         /// Path of file to upload
         file_path: Option<PathBuf>,
 
+        /// Name of the file on Drive [default: the name of the local file, a random name for stdin]
+        #[arg(long, value_name = "NAME", conflicts_with = "recursive", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: Option<String>,
+
         /// Force mime type [default: auto-detect]
         #[arg(long, value_name = "MIME_TYPE")]
         mime: Option<Mime>,
@@ -391,6 +395,10 @@ enum FileCommand {
 
         /// Path of file to upload
         file_path: Option<PathBuf>,
+
+        /// New name of the file [default: the name of the local file; with stdin the file keeps its name]
+        #[arg(long, value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: Option<String>,
 
         /// Force mime type [default: auto-detect]
         #[arg(long, value_name = "MIME_TYPE")]
@@ -496,6 +504,14 @@ enum FileCommand {
         /// Print only id of file
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
+
+        /// Set chunk size in MB, must be a power of two.
+        #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
+        chunk_size: ChunkSize,
+
+        /// Upload files of at most this many MB in a single request; larger files are uploaded in chunks and can be resumed. 0 uploads every non-empty file in chunks
+        #[arg(long, value_name = "MB", default_value_t = MultipartThreshold::default())]
+        multipart_threshold: MultipartThreshold,
     },
 
     /// Export google document to file
@@ -828,6 +844,7 @@ async fn handle_files_command(
 
         FileCommand::Upload {
             file_path,
+            name,
             mime,
             parent,
             recursive,
@@ -841,6 +858,7 @@ async fn handle_files_command(
         } => {
             files::upload(files::upload::Config {
                 file_path,
+                name,
                 mime_type: mime,
                 parents: parent,
                 chunk_size,
@@ -857,6 +875,7 @@ async fn handle_files_command(
         FileCommand::Update {
             file_id,
             file_path,
+            name,
             mime,
             chunk_size,
             multipart_threshold,
@@ -866,6 +885,7 @@ async fn handle_files_command(
             files::update(files::update::Config {
                 file_id,
                 file_path,
+                name,
                 mime_type: mime,
                 chunk_size,
                 multipart_threshold,
@@ -939,11 +959,15 @@ async fn handle_files_command(
             file_path,
             parent,
             print_only_id,
+            chunk_size,
+            multipart_threshold,
         } => {
             files::import(files::import::Config {
                 file_path,
                 parents: parent,
                 print_only_id,
+                chunk_size,
+                multipart_threshold,
             })
             .await?;
         }
@@ -1632,6 +1656,92 @@ mod flag_tests {
                 let extension = extension.to_string();
                 assert!(listed.contains(extension.as_str()), "{extension}: {help}");
             }
+        }
+    }
+
+    #[test]
+    fn import_takes_the_chunk_size_and_threshold_of_upload() {
+        let FileCommand::Import {
+            chunk_size,
+            multipart_threshold,
+            ..
+        } = parse(&[
+            "files",
+            "import",
+            "a.md",
+            "--chunk-size",
+            "1",
+            "--multipart-threshold",
+            "0",
+        ])
+        else {
+            panic!("expected import");
+        };
+        assert_eq!(chunk_size.in_bytes(), 1 << 20);
+        assert_eq!(multipart_threshold.in_bytes(), 0);
+
+        // The same defaults as upload.
+        let FileCommand::Import {
+            chunk_size,
+            multipart_threshold,
+            ..
+        } = parse(&["files", "import", "a.md"])
+        else {
+            panic!("expected import");
+        };
+        let FileCommand::Upload {
+            chunk_size: upload_chunk_size,
+            multipart_threshold: upload_multipart_threshold,
+            ..
+        } = parse(&["files", "upload", "a.md"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(chunk_size.in_bytes(), upload_chunk_size.in_bytes());
+        assert_eq!(multipart_threshold, upload_multipart_threshold);
+
+        // And the same parsing: what upload rejects, import rejects.
+        for (flag, value) in [
+            ("--chunk-size", "3"),
+            ("--chunk-size", "0"),
+            ("--multipart-threshold", "-1"),
+            ("--multipart-threshold", "many"),
+        ] {
+            for command in ["upload", "import"] {
+                let result = Cli::try_parse_from(["gdrive", "files", command, "a.md", flag, value]);
+                assert!(result.is_err(), "files {command} {flag} {value}");
+            }
+        }
+    }
+
+    #[test]
+    fn upload_and_update_take_a_name() {
+        let FileCommand::Upload { name, .. } = parse(&["files", "upload", "--name", "a b.txt"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(name.as_deref(), Some("a b.txt"));
+        let FileCommand::Upload { name, .. } = parse(&["files", "upload", "local.txt"]) else {
+            panic!("expected upload");
+        };
+        assert_eq!(name, None);
+
+        let FileCommand::Update { file_id, name, .. } =
+            parse(&["files", "update", "id", "--name", "report"])
+        else {
+            panic!("expected update");
+        };
+        assert_eq!((file_id.as_str(), name.as_deref()), ("id", Some("report")));
+
+        for args in [
+            &["files", "upload", "dir", "--recursive", "--name", "x"][..],
+            &["files", "upload", "--name", ""],
+            &["files", "update", "id", "--name", ""],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
+                "{args:?} should be rejected"
+            );
         }
     }
 }

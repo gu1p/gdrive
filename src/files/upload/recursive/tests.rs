@@ -54,6 +54,7 @@ fn config(path: &Path, jobs: usize, continue_on_error: bool) -> UploadDirectoryC
     UploadDirectoryConfig {
         file_path: path.to_path_buf(),
         common: CommonConfig {
+            name: None,
             mime_type: None,
             parents: None,
             upload_directories: true,

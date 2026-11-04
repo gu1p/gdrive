@@ -258,7 +258,7 @@ impl Uploads {
     ) -> Result<u64, Error> {
         let target = UploadTarget {
             parents,
-            name: file.name.clone(),
+            name: Some(file.name.clone()),
             mime: Some(file.mime_type.clone()),
             existing_file_id: None,
             convert_to: None,

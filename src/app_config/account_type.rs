@@ -29,7 +29,7 @@ const SERVICE_ACCOUNT_KEY_NAME: &str = "service_account.json";
 /// The directory under the config root where [`AppConfig::install`] prepares an account before it
 /// moves it into place. It has no `account.json` of its own, so it is never listed as an account,
 /// and no account may have its name.
-const STAGING_DIR_NAME: &str = ".staging";
+pub(crate) const STAGING_DIR_NAME: &str = ".staging";
 
 /// How an account gets its access tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
