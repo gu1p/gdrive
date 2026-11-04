@@ -308,11 +308,26 @@ pub(crate) enum LoadSecret {
         path: PathBuf,
         source: io::Error,
     },
-    /// Holds the path, not the content: the file contains the OAuth client secret.
+    /// Holds only where and what kind of error, not the `serde_json` error: the file contains the
+    /// OAuth client secret, and `serde_json` quotes input in its messages ("invalid type: string
+    /// \"...\"").
     Deserialize {
         path: PathBuf,
-        source: serde_json::Error,
+        category: serde_json::error::Category,
+        line: usize,
+        column: usize,
     },
+}
+
+impl LoadSecret {
+    pub(crate) fn deserialize(path: PathBuf, error: &serde_json::Error) -> Self {
+        LoadSecret::Deserialize {
+            path,
+            category: error.classify(),
+            line: error.line(),
+            column: error.column(),
+        }
+    }
 }
 
 impl Display for LoadSecret {
@@ -321,8 +336,25 @@ impl Display for LoadSecret {
             LoadSecret::Read { path, source: _ } => {
                 write!(f, "unable to read the content of file '{}'", path.display())
             }
-            LoadSecret::Deserialize { path, source: _ } => {
-                write!(f, "unable to parse the secret in '{}'", path.display())
+            LoadSecret::Deserialize {
+                path,
+                category,
+                line,
+                column,
+            } => {
+                let problem = match category {
+                    serde_json::error::Category::Io => "read error",
+                    serde_json::error::Category::Syntax => "invalid JSON",
+                    serde_json::error::Category::Data => {
+                        "not a client id and secret (a value has the wrong type)"
+                    }
+                    serde_json::error::Category::Eof => "unexpected end of file",
+                };
+                write!(
+                    f,
+                    "unable to parse the secret in '{}': {problem} at line {line} column {column}",
+                    path.display()
+                )
             }
         }
     }
@@ -332,7 +364,7 @@ impl Error for LoadSecret {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LoadSecret::Read { source, .. } => Some(source),
-            LoadSecret::Deserialize { source, .. } => Some(source),
+            LoadSecret::Deserialize { .. } => None,
         }
     }
 }

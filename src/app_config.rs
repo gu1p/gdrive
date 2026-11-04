@@ -174,10 +174,7 @@ impl AppConfig {
         };
         match serde_json::from_str(&content) {
             Ok(secret) => Ok(secret),
-            Err(source) => Err(errors::LoadSecret::Deserialize {
-                path: path.to_path_buf(),
-                source,
-            }),
+            Err(error) => Err(errors::LoadSecret::deserialize(path.to_path_buf(), &error)),
         }
     }
 
@@ -293,4 +290,57 @@ pub(crate) fn set_file_permissions(path: &Path) -> Result<(), io::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "GOCSPX-not-a-real-secret";
+
+    fn load_secret_from(content: &str) -> Result<Secret, errors::LoadSecret> {
+        let base_path = tempfile::tempdir().unwrap();
+        let config = AppConfig::new(base_path.path().to_path_buf(), Account::new("account"));
+        fs::create_dir_all(config.account_base_path()).unwrap();
+        fs::write(config.secret_path(), content).unwrap();
+        config.load_secret()
+    }
+
+    #[test]
+    fn load_secret_reads_client_id_and_secret() {
+        let secret = load_secret_from(&format!(
+            r#"{{"client_id": "id", "client_secret": "{SECRET}"}}"#
+        ))
+        .unwrap();
+
+        assert_eq!(secret.client_id, "id");
+        assert_eq!(secret.client_secret, SECRET);
+    }
+
+    #[test]
+    fn malformed_secret_file_errors_do_not_print_the_secret() {
+        let contents = [
+            // serde_json quotes the string: invalid type: string "...", expected struct Secret
+            format!(r#""{SECRET}""#),
+            // ... and the number: invalid type: integer `...`, expected a string
+            r#"{"client_id": "id", "client_secret": 4815162342}"#.to_owned(),
+            format!(r#"{{"client_id": "id", "client_secret": "{SECRET}""#),
+            format!(r#"{{"client_id": "id", "client_secret": "{SECRET}"}} trailing"#),
+        ];
+
+        for content in contents {
+            let err = crate::common::hub_helper::GetHubError::LoadSecret(
+                load_secret_from(&content).unwrap_err(),
+            );
+            let message = crate::error_message(&err);
+
+            assert!(
+                message.contains("unable to parse the secret in '"),
+                "{message}"
+            );
+            assert!(message.contains(" at line 1 column "), "{message}");
+            assert!(!message.contains(SECRET), "{message}");
+            assert!(!message.contains("4815162342"), "{message}");
+        }
+    }
 }
