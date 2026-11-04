@@ -26,6 +26,11 @@ use crate::auth::store::{self, TokenFile};
 
 const SERVICE_ACCOUNT_KEY_NAME: &str = "service_account.json";
 
+/// The directory under the config root where [`AppConfig::install`] prepares an account before it
+/// moves it into place. It has no `account.json` of its own, so it is never listed as an account,
+/// and no account may have its name.
+const STAGING_DIR_NAME: &str = ".staging";
+
 /// How an account gets its access tokens.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -50,13 +55,14 @@ pub(super) fn is_account_dir(path: &Path) -> bool {
 }
 
 /// Whether `name` can be the name of an account: it becomes a directory under the config root,
-/// so it must be one plain path component.
+/// so it must be one plain path component, and not the name of gdrive's staging directory.
 pub(crate) fn is_valid_account_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     ) && !name.contains(['/', '\\'])
+        && !name.eq_ignore_ascii_case(STAGING_DIR_NAME)
 }
 
 impl AppConfig {
@@ -105,79 +111,197 @@ impl AppConfig {
     /// Stores this account as `account_type`, which must not be [`AccountType::User`], with
     /// the content of its key file, if it has one, and its first tokens, if there are any.
     ///
-    /// An existing account of another type than [`AccountType::User`] is replaced: its cached
-    /// tokens are removed, because they may have been issued for another key or subject. Every
-    /// file is written atomically and with mode 0600 on Unix; `account.json` comes after the key,
-    /// so an interrupted run never leaves an account without its key.
+    /// An existing account of another type than [`AccountType::User`] is replaced as a whole,
+    /// cached tokens included, because they were issued for another key or subject.
+    ///
+    /// The new account is written into a new directory under the staging directory first (files
+    /// with mode 0600, the directory 0700 on Unix), and moved into place only when all of it is
+    /// written; an earlier account is moved aside just before and removed after. When anything
+    /// fails, the earlier account stays as it was. Only a crash between the two renames leaves no
+    /// account under the name; the earlier one is then in the staging directory.
     pub(crate) async fn install(
         &self,
         account_type: &AccountType,
         key: Option<&[u8]>,
         tokens: Option<&TokenFile>,
     ) -> Result<(), InstallAccount> {
+        self.install_failing_at(account_type, key, tokens, None)
+            .await
+    }
+
+    /// [`AppConfig::install`], with an injected failure at `fail_at` for tests; `None` outside
+    /// tests.
+    async fn install_failing_at(
+        &self,
+        account_type: &AccountType,
+        key: Option<&[u8]>,
+        tokens: Option<&TokenFile>,
+        fail_at: Option<InstallStep>,
+    ) -> Result<(), InstallAccount> {
         use InstallAccount as E;
 
         debug_assert_ne!(account_type, &AccountType::User);
         self.check_replaceable()?;
 
-        let dir = self.account_base_path();
-        create_private_dir(dir)
+        let staging_root = self.base_path.join(STAGING_DIR_NAME);
+        create_private_dir(&staging_root, true)
             .await
             .map_err(|source| E::CreateDir {
-                path: dir.to_path_buf(),
+                path: staging_root.clone(),
+                source,
+            })?;
+        let name = random_name().map_err(|source| E::CreateDir {
+            path: staging_root.clone(),
+            source,
+        })?;
+        let staging = staging_root.join(format!("{name}.new"));
+        create_private_dir(&staging, false)
+            .await
+            .map_err(|source| E::CreateDir {
+                path: staging.clone(),
                 source,
             })?;
 
-        let tokens_path = self.tokens_path();
-        remove_if_exists(tokens_path).await?;
+        let result = async {
+            if let Some(key) = key {
+                write_staged(
+                    &staging,
+                    SERVICE_ACCOUNT_KEY_NAME,
+                    key,
+                    fail_at,
+                    InstallStep::WriteKey,
+                )
+                .await?;
+            }
+            let content = serde_json::to_vec_pretty(account_type).map_err(E::Serialize)?;
+            write_staged(
+                &staging,
+                ACCOUNT_CONFIG_NAME,
+                &content,
+                fail_at,
+                InstallStep::WriteType,
+            )
+            .await?;
+            if let Some(tokens) = tokens {
+                let content = tokens.to_json().map_err(E::Serialize)?;
+                write_staged(
+                    &staging,
+                    TOKENS_CONFIG_NAME,
+                    content.as_bytes(),
+                    fail_at,
+                    InstallStep::WriteTokens,
+                )
+                .await?;
+            }
+            let aside = staging_root.join(format!("{name}.old"));
+            self.move_into_place(&staging, &aside, fail_at).await
+        }
+        .await;
 
-        let key_path = self.service_account_key_path();
-        match key {
-            Some(key) => store::write_private_file(&key_path, key)
-                .await
-                .map_err(|source| E::Write {
-                    path: key_path.clone(),
-                    source,
-                })?,
-            None => remove_if_exists(&key_path).await?,
+        if result.is_err() {
+            let _ = tokio::fs::remove_dir_all(&staging).await;
+        }
+        result
+    }
+
+    /// Replaces the account directory with `staging`, moving an existing one to `aside` first
+    /// and removing it after.
+    async fn move_into_place(
+        &self,
+        staging: &Path,
+        aside: &Path,
+        fail_at: Option<InstallStep>,
+    ) -> Result<(), InstallAccount> {
+        let dir = self.account_base_path();
+        let move_error = |source| InstallAccount::Move {
+            path: dir.to_path_buf(),
+            source,
+        };
+
+        let had_account = match inject(fail_at, InstallStep::MoveOldAside).and(std::fs::exists(dir))
+        {
+            Ok(false) => false,
+            Ok(true) => {
+                tokio::fs::rename(dir, aside).await.map_err(move_error)?;
+                true
+            }
+            Err(source) => return Err(move_error(source)),
+        };
+
+        let moved_in = match inject(fail_at, InstallStep::MoveNewIn) {
+            Ok(()) => tokio::fs::rename(staging, dir).await,
+            Err(error) => Err(error),
+        };
+        if let Err(source) = moved_in {
+            if had_account {
+                // Put the earlier account back.
+                let _ = tokio::fs::rename(aside, dir).await;
+            }
+            return Err(move_error(source));
         }
 
-        let type_path = self.account_type_path();
-        let content = serde_json::to_vec_pretty(account_type).map_err(E::Serialize)?;
-        store::write_private_file(&type_path, &content)
-            .await
-            .map_err(|source| E::Write {
-                path: type_path.clone(),
-                source,
-            })?;
-
-        if let Some(tokens) = tokens {
-            tokens.save(tokens_path).await.map_err(|source| E::Write {
-                path: tokens_path.to_path_buf(),
-                source,
-            })?;
+        if had_account {
+            if let Err(error) = tokio::fs::remove_dir_all(aside).await {
+                eprintln!(
+                    "Warning: unable to remove the replaced account in '{}': {error}",
+                    aside.display()
+                );
+            }
         }
         Ok(())
     }
 }
 
-async fn create_private_dir(path: &Path) -> io::Result<()> {
+/// The steps of [`AppConfig::install`] that can fail, for failure-injection tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallStep {
+    WriteKey,
+    WriteType,
+    WriteTokens,
+    MoveOldAside,
+    MoveNewIn,
+}
+
+/// The injected failure of a test at `step`.
+fn inject(fail_at: Option<InstallStep>, step: InstallStep) -> io::Result<()> {
+    if fail_at == Some(step) {
+        return Err(io::Error::other(format!("injected failure at {step:?}")));
+    }
+    Ok(())
+}
+
+async fn write_staged(
+    staging: &Path,
+    name: &str,
+    content: &[u8],
+    fail_at: Option<InstallStep>,
+    step: InstallStep,
+) -> Result<(), InstallAccount> {
+    let path = staging.join(name);
+    let written = match inject(fail_at, step) {
+        Ok(()) => store::write_private_file(&path, content).await,
+        Err(error) => Err(error),
+    };
+    written.map_err(|source| InstallAccount::Write { path, source })
+}
+
+/// A random name for a staging directory.
+fn random_name() -> io::Result<String> {
+    use ring::rand::{SecureRandom, SystemRandom};
+
+    let mut bytes = [0; 8];
+    SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| io::Error::other("unable to get random bytes from the system"))?;
+    Ok(format!("{:016x}", u64::from_le_bytes(bytes)))
+}
+
+async fn create_private_dir(path: &Path, recursive: bool) -> io::Result<()> {
     let mut builder = tokio::fs::DirBuilder::new();
-    builder.recursive(true);
+    builder.recursive(recursive);
     #[cfg(unix)]
     builder.mode(0o700);
     builder.create(path).await
-}
-
-async fn remove_if_exists(path: &Path) -> Result<(), InstallAccount> {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => Ok(()),
-        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(source) => Err(InstallAccount::Remove {
-            path: path.to_path_buf(),
-            source,
-        }),
-    }
 }
 
 #[derive(Debug)]
@@ -220,7 +344,7 @@ pub(crate) enum InstallAccount {
     UserAccountExists(String),
     CreateDir { path: PathBuf, source: io::Error },
     Write { path: PathBuf, source: io::Error },
-    Remove { path: PathBuf, source: io::Error },
+    Move { path: PathBuf, source: io::Error },
     Serialize(serde_json::Error),
 }
 
@@ -240,8 +364,8 @@ impl Display for InstallAccount {
             InstallAccount::Write { path, .. } => {
                 write!(f, "unable to write '{}'", path.display())
             }
-            InstallAccount::Remove { path, .. } => {
-                write!(f, "unable to remove '{}'", path.display())
+            InstallAccount::Move { path, .. } => {
+                write!(f, "unable to move the new account to '{}'", path.display())
             }
             InstallAccount::Serialize(_) => f.write_str("unable to serialize the account type"),
         }
@@ -255,7 +379,7 @@ impl Error for InstallAccount {
             InstallAccount::UserAccountExists(_) => None,
             InstallAccount::CreateDir { source, .. }
             | InstallAccount::Write { source, .. }
-            | InstallAccount::Remove { source, .. } => Some(source),
+            | InstallAccount::Move { source, .. } => Some(source),
             InstallAccount::Serialize(source) => Some(source),
         }
     }
@@ -437,6 +561,149 @@ mod tests {
             list_accounts_in(dir.path().to_path_buf()).unwrap(),
             ["robot"]
         );
+    }
+
+    /// The files of `dir` and their content; empty when it does not exist.
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return std::collections::BTreeMap::new();
+        };
+        entries
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn staging_leftovers(base: &Path) -> Vec<String> {
+        snapshot(&base.join(STAGING_DIR_NAME)).into_keys().collect()
+    }
+
+    const ALL_STEPS: [InstallStep; 5] = [
+        InstallStep::WriteKey,
+        InstallStep::WriteType,
+        InstallStep::WriteTokens,
+        InstallStep::MoveOldAside,
+        InstallStep::MoveNewIn,
+    ];
+
+    fn new_tokens() -> TokenFile {
+        TokenFile::from_json(br#"[{"scopes":["https://www.googleapis.com/auth/drive"],"token":{"access_token":"new","refresh_token":null,"expires_at":null,"id_token":null}}]"#).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_replacement_leaves_the_earlier_account_as_it_was() {
+        let bob = AccountType::ServiceAccount {
+            subject: Some(String::from("bob@example.com")),
+        };
+        for step in ALL_STEPS {
+            let dir = tempfile::tempdir().unwrap();
+            let config = account(dir.path(), "robot");
+            let alice = AccountType::ServiceAccount {
+                subject: Some(String::from("alice@example.com")),
+            };
+            config
+                .install(&alice, Some(b"alice-key"), None)
+                .await
+                .unwrap();
+            fs::write(config.tokens_path(), "[]").unwrap();
+            let before = snapshot(config.account_base_path());
+
+            let error = config
+                .install_failing_at(&bob, Some(b"bob-key"), Some(&new_tokens()), Some(step))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("unable to"), "{step:?}: {error}");
+
+            assert_eq!(snapshot(config.account_base_path()), before, "{step:?}");
+            assert_eq!(config.account_type().unwrap(), alice, "{step:?}");
+            assert_eq!(
+                staging_leftovers(dir.path()),
+                Vec::<String>::new(),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_install_leaves_no_account() {
+        for step in ALL_STEPS {
+            let dir = tempfile::tempdir().unwrap();
+            let config = account(dir.path(), "robot");
+
+            config
+                .install_failing_at(
+                    &AccountType::ServiceAccount { subject: None },
+                    Some(b"key"),
+                    Some(&new_tokens()),
+                    Some(step),
+                )
+                .await
+                .unwrap_err();
+
+            assert!(!config.account_base_path().exists(), "{step:?}");
+            assert_eq!(
+                list_accounts_in(dir.path().to_path_buf()).unwrap(),
+                Vec::<String>::new()
+            );
+            assert_eq!(
+                staging_leftovers(dir.path()),
+                Vec::<String>::new(),
+                "{step:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replacement_swaps_in_the_complete_new_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = account(dir.path(), "robot");
+        config
+            .install(
+                &AccountType::ServiceAccount { subject: None },
+                Some(b"old"),
+                None,
+            )
+            .await
+            .unwrap();
+        fs::write(config.account_base_path().join("stale.tmp"), "x").unwrap();
+
+        let new_type = AccountType::ServiceAccount {
+            subject: Some(String::from("bob@example.com")),
+        };
+        config
+            .install(&new_type, Some(b"new"), Some(&new_tokens()))
+            .await
+            .unwrap();
+
+        let files = snapshot(config.account_base_path());
+        assert_eq!(
+            files.keys().collect::<Vec<_>>(),
+            ["account.json", "service_account.json", "tokens.json"]
+        );
+        assert_eq!(files["service_account.json"], b"new");
+        assert_eq!(config.account_type().unwrap(), new_type);
+        assert_eq!(staging_leftovers(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_staging_directory_is_no_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join(STAGING_DIR_NAME).join("0123.new");
+        fs::create_dir_all(&staged).unwrap();
+        fs::write(staged.join("account.json"), r#"{"type":"service_account"}"#).unwrap();
+        fs::write(staged.join("tokens.json"), "[]").unwrap();
+
+        assert_eq!(
+            list_accounts_in(dir.path().to_path_buf()).unwrap(),
+            Vec::<String>::new()
+        );
+        assert!(!is_valid_account_name(".staging"));
+        assert!(!is_valid_account_name(".STAGING"));
     }
 
     #[tokio::test]
