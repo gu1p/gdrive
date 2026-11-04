@@ -167,11 +167,12 @@ pub(crate) const PAGE_SIZE: i32 = 1000;
 /// The most folders OR-ed into one `files.list` query. About 2.5 KB of `q` with Drive ids.
 pub(crate) const MAX_PARENTS_PER_QUERY: usize = 50;
 
-/// The `fields` mask of every list request: what the recursive download and the scheduler read
-/// (`parents` routes the results of a batched query, `driveId` tells shared-drive items apart,
-/// `resourceKey` opens link-shared folders and files).
+/// The `fields` mask of every list request: what the recursive download, the scheduler and a
+/// migration read (`parents` routes the results of a batched query, `driveId` tells shared-drive
+/// items apart, `resourceKey` opens link-shared folders and files, `createdTime` is what a
+/// migrated file gets as its own).
 pub(crate) const FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,\
-    md5Checksum,modifiedTime,parents,driveId,trashed,resourceKey,\
+    md5Checksum,modifiedTime,createdTime,parents,driveId,trashed,resourceKey,\
     shortcutDetails(targetId,targetMimeType,targetResourceKey))";
 
 /// The header that names the resource keys of link-shared items a request reads: comma-separated

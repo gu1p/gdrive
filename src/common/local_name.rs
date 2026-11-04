@@ -474,7 +474,7 @@ fn collision_key(name: &str, rules: Rules) -> String {
 }
 
 /// `name` with control characters escaped, safe to print to a terminal.
-fn printable(name: &str) -> Cow<'_, str> {
+pub(crate) fn printable(name: &str) -> Cow<'_, str> {
     if name.chars().any(char::is_control) {
         Cow::Owned(
             name.chars()

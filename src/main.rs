@@ -412,6 +412,68 @@ enum FileCommand {
         progress: ProgressArgs,
     },
 
+    /// Migrate files and folders to another account
+    ///
+    /// Copies the given files and folders of the source account (--from, the current account by
+    /// default) into the account --to, folders with everything in them. The content streams through this
+    /// machine without being written to disk. Running the command again skips what is already
+    /// there, so an interrupted migration is finished by running it again. Google Docs, Sheets
+    /// and Slides are exported and converted back (up to 10 MB each); shortcuts, Drawings, Forms
+    /// and the other Google types are skipped; sharing and comments are not migrated. Use
+    /// --dry-run first. See docs/migrate.md.
+    Migrate {
+        /// Id of a file or folder of the source account. Several ids are migrated in one run
+        #[arg(required = true, value_name = "FILE_ID")]
+        file_id: Vec<String>,
+
+        /// The account to migrate to, as `gdrive account list` prints it
+        #[arg(long, value_name = "ACCOUNT")]
+        to: String,
+
+        /// The account to migrate from, as `gdrive account list` prints it [default: the current account]
+        #[arg(long, value_name = "ACCOUNT")]
+        from: Option<String>,
+
+        /// Id of a folder of the destination account to migrate into [default: the top of My Drive]
+        #[arg(long, value_name = "FOLDER_ID")]
+        into: Option<String>,
+
+        /// Migrate up to N files at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// When a file or folder fails, go on with the others instead of stopping. The command still exits with an error
+        #[arg(long)]
+        continue_on_error: bool,
+
+        /// Print what would be done, one line per item, and change nothing: the destination is only read
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Move each source file to the trash of the source account once it is in the destination, and each source folder once everything in it is. Nothing is deleted for good
+        #[arg(long)]
+        trash_source: bool,
+
+        /// Set chunk size in MB, must be a power of two.
+        #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
+        chunk_size: ChunkSize,
+
+        /// Upload files of at most this many MB in a single request; larger files are uploaded in chunks and can be resumed. 0 uploads every non-empty file in chunks
+        #[arg(long, value_name = "MB", default_value_t = MultipartThreshold::default())]
+        multipart_threshold: MultipartThreshold,
+
+        /// Print errors occuring during chunk upload
+        #[arg(long, value_name = "", default_value_t = false)]
+        print_chunk_errors: bool,
+
+        /// Print details about each chunk
+        #[arg(long, value_name = "", default_value_t = false)]
+        print_chunk_info: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
+    },
+
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
     Update {
         /// File id of the file you want ot update
@@ -1075,6 +1137,38 @@ async fn handle_files_command(
 
         FileCommand::Sync { command } => {
             files::sync(sync_config(command)).await?;
+        }
+
+        FileCommand::Migrate {
+            file_id,
+            to,
+            from,
+            into,
+            jobs,
+            continue_on_error,
+            dry_run,
+            trash_source,
+            chunk_size,
+            multipart_threshold,
+            print_chunk_errors,
+            print_chunk_info,
+            progress,
+        } => {
+            files::migrate(files::migrate::Config {
+                file_ids: file_id,
+                from,
+                to,
+                into,
+                dry_run,
+                trash_source,
+                chunk_size,
+                multipart_threshold,
+                print_chunk_errors,
+                print_chunk_info,
+                transfer: Options::new(jobs, continue_on_error),
+                progress: progress.mode(),
+            })
+            .await?;
         }
 
         FileCommand::Update {
@@ -2001,6 +2095,109 @@ mod flag_tests {
                 let result = Cli::try_parse_from(["gdrive", "files", command, "a.md", flag, value]);
                 assert!(result.is_err(), "files {command} {flag} {value}");
             }
+        }
+    }
+
+    #[test]
+    fn migrate_takes_ids_accounts_and_the_transfer_flags() {
+        let FileCommand::Migrate {
+            file_id,
+            to,
+            from,
+            into,
+            jobs,
+            continue_on_error,
+            dry_run,
+            trash_source,
+            chunk_size,
+            multipart_threshold,
+            print_chunk_errors,
+            print_chunk_info,
+            progress,
+        } = parse(&[
+            "files",
+            "migrate",
+            "a",
+            "b",
+            "--to",
+            "new@example.com",
+            "--from",
+            "old@example.com",
+            "--into",
+            "folder",
+            "--jobs",
+            "8",
+            "--continue-on-error",
+            "--dry-run",
+            "--trash-source",
+            "--chunk-size",
+            "1",
+            "--multipart-threshold",
+            "0",
+            "--print-chunk-errors",
+            "--print-chunk-info",
+            "--progress",
+            "--no-progress",
+        ])
+        else {
+            panic!("expected migrate");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+        assert_eq!(to, "new@example.com");
+        assert_eq!(from.as_deref(), Some("old@example.com"));
+        assert_eq!(into.as_deref(), Some("folder"));
+        assert_eq!(jobs.get(), 8);
+        assert!(continue_on_error && dry_run && trash_source);
+        assert_eq!(chunk_size.in_bytes(), 1 << 20);
+        assert_eq!(multipart_threshold.in_bytes(), 0);
+        assert!(print_chunk_errors && print_chunk_info);
+        assert_eq!((progress.progress, progress.no_progress), (false, true));
+    }
+
+    #[test]
+    fn migrate_defaults_to_the_current_account_and_my_drive() {
+        let FileCommand::Migrate {
+            from,
+            into,
+            jobs,
+            continue_on_error,
+            dry_run,
+            trash_source,
+            chunk_size,
+            multipart_threshold,
+            progress,
+            ..
+        } = parse(&["files", "migrate", "id", "--to", "new@example.com"])
+        else {
+            panic!("expected migrate");
+        };
+        assert_eq!((from, into), (None, None));
+        assert_eq!(jobs.get(), 4);
+        assert!(!continue_on_error && !dry_run && !trash_source);
+        assert_eq!((progress.progress, progress.no_progress), (false, false));
+        // The same defaults as upload.
+        let FileCommand::Upload {
+            chunk_size: upload_chunk_size,
+            multipart_threshold: upload_multipart_threshold,
+            ..
+        } = parse(&["files", "upload", "a.md"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(chunk_size.in_bytes(), upload_chunk_size.in_bytes());
+        assert_eq!(multipart_threshold, upload_multipart_threshold);
+
+        for args in [
+            &["files", "migrate", "id"][..],
+            &["files", "migrate", "--to", "new@example.com"],
+            &["files", "migrate", "id", "--to"],
+            &["files", "migrate", "id", "--to", "x", "--jobs", "0"],
+            &["files", "migrate", "id", "--to", "x", "--chunk-size", "3"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
+                "{args:?} should be rejected"
+            );
         }
     }
 

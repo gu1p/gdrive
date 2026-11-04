@@ -10,13 +10,6 @@
 #[cfg(test)]
 pub(crate) mod fake_drive;
 pub(crate) mod progress;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the engine of `files migrate`, whose command is on branch migrate-cmd"
-    )
-)]
 pub(crate) mod relay;
 pub(crate) mod scheduler;
 pub(crate) mod upload;

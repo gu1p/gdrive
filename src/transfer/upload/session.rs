@@ -127,14 +127,7 @@ impl SourceIdentity {
     /// The identity of the Drive file `file_id` of `size` bytes, read as `account`. Without an
     /// md5 nor a version, nothing tells whether it changed, and its session is not continued.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
-        )
-    )]
-    pub(crate) fn remote(
+        pub(crate) fn remote(
         account: &str,
         file_id: &str,
         size: u64,

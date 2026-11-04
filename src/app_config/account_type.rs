@@ -84,6 +84,12 @@ impl AppConfig {
             .then(|| AppConfig::new(base_path, Account::new(account_name)))
     }
 
+    /// Whether this account exists: its directory is one that `gdrive account list` lists.
+    #[must_use]
+    pub(crate) fn exists(&self) -> bool {
+        is_account_dir(self.account_base_path())
+    }
+
     /// The type of this account, from its `account.json`; [`AccountType::User`] without one.
     pub(crate) fn account_type(&self) -> Result<AccountType, LoadAccountType> {
         let path = self.account_type_path();

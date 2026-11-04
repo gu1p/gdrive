@@ -706,14 +706,7 @@ impl<'a> Upload<'a> {
 
     /// The file gets `times` (see [`FileTimes`]).
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
-        )
-    )]
-    pub(crate) fn with_times(mut self, times: FileTimes) -> Self {
+        pub(crate) fn with_times(mut self, times: FileTimes) -> Self {
         self.times = times;
         self
     }
@@ -724,14 +717,7 @@ impl<'a> Upload<'a> {
     /// way (the relay compares Drive's md5 with the source's `md5Checksum`). An upload in one
     /// run is checked as always.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
-        )
-    )]
-    pub(crate) fn trust_continued_content(mut self) -> Self {
+        pub(crate) fn trust_continued_content(mut self) -> Self {
         self.trust_continued = true;
         self
     }
