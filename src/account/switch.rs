@@ -15,7 +15,7 @@ pub(crate) fn switch(config: &Config) -> Result<(), Error> {
     let accounts = app_config::list_accounts().map_err(Error::ListAccounts)?;
 
     if accounts.contains(&config.account_name).not() {
-        return Err(Error::AccountNotFound);
+        return Err(Error::AccountNotFound(config.account_name.clone()));
     }
 
     let app_cfg = AppConfig::init_account(&config.account_name).map_err(Error::InitAccount)?;
@@ -28,7 +28,7 @@ pub(crate) fn switch(config: &Config) -> Result<(), Error> {
 #[derive(Debug)]
 pub(crate) enum Error {
     ListAccounts(app_config::errors::ListAccounts),
-    AccountNotFound,
+    AccountNotFound(String),
     InitAccount(app_config::errors::InitAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
 }
@@ -37,7 +37,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Error::ListAccounts(source) => Some(source),
-            Error::AccountNotFound => None,
+            Error::AccountNotFound(_) => None,
             Error::InitAccount(source) => Some(source),
             Error::SwitchAccount(source) => Some(source),
         }
@@ -48,7 +48,7 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Error::ListAccounts(_) => "unable to list accounts",
-            Error::AccountNotFound => "account not found",
+            Error::AccountNotFound(name) => return write!(f, "account '{name}' not found"),
             Error::InitAccount(_) => "unable to initialize the account",
             Error::SwitchAccount(_) => "unable to switch to the account",
         };

@@ -10,11 +10,11 @@ use crate::{app_config, hub};
 pub(crate) async fn add() -> Result<(), Box<Error>> {
     println!("To add an account you need a Google Client ID and Client Secret.");
     println!(
-        "Instructions for how to create credentials can be found here:\
+        "Instructions for how to create credentials can be found here: \
         https://github.com/glotlabs/gdrive/blob/main/docs/create_google_api_credentials.md"
     );
     println!(
-        "Note that if you are using gdrive on a remote server you should read this first:\
+        "Note that if you are using gdrive on a remote server you should read this first: \
         https://github.com/glotlabs/gdrive#using-gdrive-on-a-remote-server"
     );
     println!();
@@ -59,7 +59,7 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
         app_cfg.base_path.display()
     );
     println!(
-        "Keep them safe! If someone gets access to them, they will also be able to access your\
+        "Keep them safe! If someone gets access to them, they will also be able to access your \
         Google Drive."
     );
 

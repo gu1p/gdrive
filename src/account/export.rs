@@ -22,7 +22,7 @@ pub(crate) fn export(config: &Config) -> Result<(), Error> {
     let Config { account_name } = config;
     let accounts = app_config::list_accounts().map_err(Error::ListAccounts)?;
     if accounts.contains(account_name).not() {
-        return Err(Error::AccountNotFound);
+        return Err(Error::AccountNotFound(account_name.clone()));
     }
 
     let app_cfg = AppConfig::init_account(account_name).map_err(Error::InitAccount)?;
@@ -48,7 +48,7 @@ pub(crate) fn export(config: &Config) -> Result<(), Error> {
 pub(crate) enum Error {
     ListAccounts(app_config::errors::ListAccounts),
     InitAccount(app_config::errors::InitAccount),
-    AccountNotFound,
+    AccountNotFound(String),
     CreateArchive(account_archive::errors::Create),
 }
 
@@ -57,7 +57,7 @@ impl error::Error for Error {
         match self {
             Error::ListAccounts(error) => Some(error),
             Error::InitAccount(error) => Some(error),
-            Error::AccountNotFound => None,
+            Error::AccountNotFound(_) => None,
             Error::CreateArchive(error) => Some(error),
         }
     }
@@ -68,7 +68,7 @@ impl Display for Error {
         match self {
             Error::ListAccounts(_) => f.write_str("unable to list accounts from config"),
             Error::InitAccount(_) => f.write_str("unable to initialize account in config"),
-            Error::AccountNotFound => f.write_str("account not found"),
+            Error::AccountNotFound(name) => write!(f, "account '{name}' not found"),
             Error::CreateArchive(_) => f.write_str("unable to create account archive"),
         }
     }

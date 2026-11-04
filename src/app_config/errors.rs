@@ -205,7 +205,11 @@ impl Display for LoadAccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LoadAccountConfig::DefaultBasePath(_) => f.write_str("unable to get default base path"),
-            LoadAccountConfig::AccountConfigMissing => f.write_str("account config is missing"),
+            LoadAccountConfig::AccountConfigMissing => f.write_str(
+                "no account has been selected\n\
+                 Use `gdrive account list` to show all accounts.\n\
+                 Use `gdrive account switch` to select an account.",
+            ),
             LoadAccountConfig::ReadAccountConfig { path, source: _ } => {
                 write!(f, "cannot read config from path '{}'", path.display())
             }
