@@ -27,6 +27,12 @@ use crate::common::json_error::RedactedJsonError;
 pub(crate) struct TokenEntry {
     pub(crate) scopes: Vec<String>,
     pub(crate) token: TokenInfo,
+    /// The credential a service account token was issued for (see
+    /// `auth::service::credential_id`), so that a token of a replaced key or subject is never
+    /// taken for the new one. Absent for the tokens of OAuth user accounts, which keeps their
+    /// layout that of gdrive 3.x.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) credential: Option<String>,
 }
 
 /// The content of `tokens.json`.
@@ -54,11 +60,19 @@ impl TokenFile {
         serde_json::to_string(self)
     }
 
-    /// The best token for `scopes`: among the entries whose scopes include all of `scopes`, an
-    /// unexpired one if there is any, and the one that expires last.
+    /// The best token of an OAuth user account for `scopes`: [`TokenFile::get_for`] without a
+    /// credential.
     pub(crate) fn get(&self, scopes: &[&str]) -> Option<&TokenInfo> {
+        self.get_for(None, scopes)
+    }
+
+    /// The best token of `credential` for `scopes`: among its entries whose scopes include all
+    /// of `scopes`, an unexpired one if there is any, and the one that expires last. Entries of
+    /// other credentials do not count.
+    pub(crate) fn get_for(&self, credential: Option<&str>, scopes: &[&str]) -> Option<&TokenInfo> {
         self.entries
             .iter()
+            .filter(|entry| entry.credential.as_deref() == credential)
             .filter(|entry| covers(&entry.scopes, scopes))
             .max_by_key(|entry| (!entry.token.is_expired(), entry.token.expires_at))
             .map(|entry| &entry.token)
@@ -69,23 +83,41 @@ impl TokenFile {
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.entries
             .iter()
+            .filter(|entry| entry.credential.is_none())
             .filter(|entry| entry.token.refresh_token.is_some())
             .max_by_key(|entry| entry.token.expires_at)
             .and_then(|entry| entry.token.refresh_token.as_deref())
     }
 
-    /// Stores `token` for exactly `scopes`, replacing the entry for the same scope set.
-    ///
-    /// A token without a refresh token keeps the refresh token that is already stored, first
-    /// the one of the replaced entry, otherwise [`TokenFile::refresh_token`]: token responses to
-    /// a refresh request normally carry no refresh token, and the stored one stays valid.
-    pub(crate) fn set(&mut self, scopes: &[&str], mut token: TokenInfo) {
-        let index = self
-            .entries
-            .iter()
-            .position(|entry| same_scopes(&entry.scopes, scopes));
+    /// [`TokenFile::set_for`] for an OAuth user account.
+    #[cfg(test)]
+    pub(crate) fn set(&mut self, scopes: &[&str], token: TokenInfo) {
+        self.set_for(None, scopes, token);
+    }
 
-        if token.refresh_token.is_none() {
+    /// Stores `token` of `credential` for exactly `scopes`, replacing the entry for the same
+    /// credential and scope set.
+    ///
+    /// For an OAuth user account (no credential), a token without a refresh token keeps the
+    /// refresh token that is already stored, first the one of the replaced entry, otherwise
+    /// [`TokenFile::refresh_token`]: token responses to a refresh request normally carry no
+    /// refresh token, and the stored one stays valid.
+    ///
+    /// Entries of other credentials are left alone while they are valid (a process that still
+    /// has an earlier key of the account may use them) and dropped once they expired.
+    pub(crate) fn set_for(
+        &mut self,
+        credential: Option<&str>,
+        scopes: &[&str],
+        mut token: TokenInfo,
+    ) {
+        self.entries
+            .retain(|entry| entry.credential.as_deref() == credential || !entry.token.is_expired());
+        let index = self.entries.iter().position(|entry| {
+            entry.credential.as_deref() == credential && same_scopes(&entry.scopes, scopes)
+        });
+
+        if token.refresh_token.is_none() && credential.is_none() {
             token.refresh_token = index
                 .and_then(|index| self.entries[index].token.refresh_token.clone())
                 .or_else(|| self.refresh_token().map(str::to_owned));
@@ -96,6 +128,7 @@ impl TokenFile {
             None => self.entries.push(TokenEntry {
                 scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
                 token,
+                credential: credential.map(str::to_owned),
             }),
         }
     }
@@ -121,6 +154,7 @@ impl TokenFile {
             entries: vec![TokenEntry {
                 scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
                 token,
+                credential: None,
             }],
         }
     }
@@ -153,6 +187,13 @@ impl TokenFile {
         let json = self.to_json().map_err(io::Error::other)?;
         replace_file(path, json.as_bytes(), write_and_sync).await
     }
+}
+
+/// Replaces `path` atomically with `content`, like [`TokenFile::save`]: the file is created with
+/// mode 0600 on Unix from the start, never made private after the fact. For other files that hold
+/// credentials, such as a service account key.
+pub(crate) async fn write_private_file(path: &Path, content: &[u8]) -> io::Result<()> {
+    replace_file(path, content, write_and_sync).await
 }
 
 /// Replaces `path` with `content`. `write` fills a new temporary file next to `path`, which is
@@ -259,14 +300,29 @@ pub(crate) struct TokenStore {
     /// The refresh token the authenticator refreshes with; stored with refreshed tokens that
     /// come without one.
     refresh_token: Option<String>,
+    /// The credential of a service account whose tokens these are; see [`TokenEntry`].
+    credential: Option<String>,
 }
 
 impl TokenStore {
+    /// The tokens of an OAuth user account.
     pub(crate) fn new(path: PathBuf, file: TokenFile, refresh_token: Option<String>) -> Self {
         TokenStore {
             path,
             file: Mutex::new(file),
             refresh_token,
+            credential: None,
+        }
+    }
+
+    /// The tokens of the service account credential `credential`: only its entries are read,
+    /// and its tokens are stored with it.
+    pub(crate) fn for_credential(path: PathBuf, file: TokenFile, credential: String) -> Self {
+        TokenStore {
+            path,
+            file: Mutex::new(file),
+            refresh_token: None,
+            credential: Some(credential),
         }
     }
 }
@@ -274,6 +330,13 @@ impl TokenStore {
 #[async_trait::async_trait]
 impl TokenStorage for TokenStore {
     async fn set(&self, scopes: &[&str], mut token: TokenInfo) -> Result<(), TokenStorageError> {
+        // yup-oauth2 also hands over the "token" of an answer without one (`{}` with a 503): it
+        // must not replace a working token. Nor is a service account token without an expiry
+        // cached: it would never be renewed.
+        let no_access_token = token.access_token.as_deref().is_none_or(str::is_empty);
+        if no_access_token || (self.credential.is_some() && token.expires_at.is_none()) {
+            return Ok(());
+        }
         if token.refresh_token.is_none() {
             token.refresh_token.clone_from(&self.refresh_token);
         }
@@ -284,12 +347,16 @@ impl TokenStorage for TokenStore {
         if let Ok(Some(on_disk)) = TokenFile::load(&self.path).await {
             *file = on_disk;
         }
-        file.set(scopes, token);
+        file.set_for(self.credential.as_deref(), scopes, token);
         file.save(&self.path).await.map_err(TokenStorageError::Io)
     }
 
     async fn get(&self, scopes: &[&str]) -> Option<TokenInfo> {
-        self.file.lock().await.get(scopes).cloned()
+        self.file
+            .lock()
+            .await
+            .get_for(self.credential.as_deref(), scopes)
+            .cloned()
     }
 }
 
@@ -355,6 +422,7 @@ mod tests {
                 .map(|(scopes, token)| TokenEntry {
                     scopes: scopes.iter().map(|&s| s.to_owned()).collect(),
                     token: token.clone(),
+                    credential: None,
                 })
                 .collect(),
         }
@@ -408,6 +476,68 @@ mod tests {
 
         let without = self::file(&[(&DRIVE_SCOPES, token("a", None, Duration::hours(1)))]);
         assert_eq!(without.refresh_token(), None);
+    }
+
+    #[test]
+    fn tokens_of_other_credentials_are_never_read() {
+        let mut file = TokenFile::default();
+        file.set_for(
+            Some("alice"),
+            &[DRIVE],
+            token("a", None, Duration::hours(1)),
+        );
+        file.set_for(Some("bob"), &[DRIVE], token("b", None, Duration::hours(1)));
+
+        let access = |file: &TokenFile, credential| {
+            file.get_for(credential, &[DRIVE])
+                .and_then(|token| token.access_token.clone())
+        };
+        assert_eq!(access(&file, Some("alice")).as_deref(), Some("a"));
+        assert_eq!(access(&file, Some("bob")).as_deref(), Some("b"));
+        assert_eq!(access(&file, Some("carol")), None);
+        // Nor by a user account, which has no credential.
+        assert_eq!(access(&file, None), None);
+        assert_eq!(file.refresh_token(), None);
+
+        // Replacing alice's token leaves bob's alone.
+        file.set_for(
+            Some("alice"),
+            &[DRIVE],
+            token("a2", None, Duration::hours(1)),
+        );
+        assert_eq!(access(&file, Some("alice")).as_deref(), Some("a2"));
+        assert_eq!(access(&file, Some("bob")).as_deref(), Some("b"));
+        assert_eq!(file.entries().len(), 2);
+    }
+
+    #[test]
+    fn expired_tokens_of_other_credentials_are_dropped_on_write() {
+        let mut file = TokenFile::default();
+        file.set_for(
+            Some("old-key"),
+            &[DRIVE],
+            token("old", None, Duration::hours(-1)),
+        );
+        file.set_for(
+            Some("other"),
+            &[DRIVE],
+            token("valid", None, Duration::hours(1)),
+        );
+
+        file.set_for(
+            Some("new-key"),
+            &[DRIVE],
+            token("new", None, Duration::hours(1)),
+        );
+
+        let credentials: Vec<_> = file
+            .entries()
+            .iter()
+            .map(|entry| entry.credential.as_deref())
+            .collect();
+        assert_eq!(credentials, [Some("other"), Some("new-key")]);
+        let json = file.to_json().unwrap();
+        assert!(json.contains(r#""credential":"new-key""#), "{json}");
     }
 
     #[test]
@@ -756,6 +886,41 @@ mod tests {
         let access = auth.token(&[METADATA]).await.unwrap();
         assert_eq!(access.token(), Some("from-gdrive"));
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_never_caches_a_token_without_access_token_or_a_service_token_without_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(1)))]);
+        loaded.save(&path).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let user = TokenStore::new(path.clone(), loaded.clone(), Some(String::from("r1")));
+        for access_token in [None, Some(String::new())] {
+            let empty = TokenInfo {
+                access_token,
+                ..token("", None, Duration::hours(1))
+            };
+            user.set(&DRIVE_SCOPES, empty).await.unwrap();
+        }
+
+        let service = TokenStore::for_credential(path.clone(), loaded, String::from("robot"));
+        let no_expiry = TokenInfo {
+            expires_at: None,
+            ..token("forever", None, Duration::hours(1))
+        };
+        service.set(&DRIVE_SCOPES, no_expiry).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert_eq!(
+            user.get(&DRIVE_SCOPES)
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("old")
+        );
     }
 
     #[tokio::test]

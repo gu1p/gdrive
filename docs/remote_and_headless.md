@@ -25,7 +25,8 @@ gdrive on the server keeps waiting.
 | [C. Manual login](#c-manual-login-account-add---manual) | Any browser, on any device | 4.0.0 and later |
 | [Curl the redirect](#curl-the-redirect-gdrive-3x) | A second shell on the server | 3.x |
 
-For scheduled jobs, read [D. Unattended use](#d-unattended-use-cron-systemd-ci) as well.
+For scheduled jobs, read [D. Unattended use](#d-unattended-use-cron-systemd-ci) as well. Behind a
+corporate or national firewall, read [E. Behind a proxy](#e-behind-a-proxy).
 
 ## A. Export an account and import it on the server
 
@@ -238,4 +239,50 @@ A cron entry that mails you when the job fails:
 
 ### Service accounts
 
-Service accounts are not supported yet. They are planned (see the [roadmap](triage/README.md), milestone 3).
+From gdrive 4.0.0, a job can use a service account or Application Default Credentials instead of a
+person's login: `gdrive account add --service-account KEY_JSON` or `gdrive account add --adc`. Nothing
+expires after seven days and nothing needs `account reauth`. A service account has no Drive storage of
+its own, so it uploads into shared drives or acts for a Workspace user. See
+[Service accounts and Application Default Credentials](service_accounts.md).
+
+## E. Behind a proxy
+
+Available from gdrive 4.0.0. gdrive reads the proxy from the environment, as curl does:
+
+| Variable | Used for |
+|---|---|
+| `HTTPS_PROXY` | `https://` addresses: every request to Google |
+| `HTTP_PROXY` | `http://` addresses |
+| `ALL_PROXY` | Both, when the variable for the scheme is not set |
+| `NO_PROXY` | Hosts reached directly: names (`example.com` also covers its subdomains), IP addresses, ranges (`10.0.0.0/8`), or `*` for all, separated by commas |
+
+The lowercase names (`https_proxy`, ...) work too; when both are set, the uppercase one wins.
+
+The proxy is a URL:
+
+| Value | Proxy |
+|---|---|
+| `http://proxy.example.com:3128` | HTTP proxy; gdrive opens a `CONNECT` tunnel. Without a scheme, `proxy.example.com:3128` means the same. |
+| `http://user:password@proxy.example.com:3128` | The same with basic authentication. Write special characters of the password percent-encoded, `@` as `%40`. |
+| `https://proxy.example.com:443` | HTTP proxy reached over TLS |
+| `socks5://proxy.example.com:1080` | SOCKS5 proxy; gdrive resolves host names itself. The port defaults to 1080. |
+| `socks5h://proxy.example.com:1080` | SOCKS5 proxy that resolves host names, for networks where DNS does not work |
+
+```sh
+export HTTPS_PROXY=http://proxy.example.com:3128
+gdrive account add --manual
+gdrive files list
+```
+
+Set the variable for every command, also in cron jobs and systemd units (`Environment=HTTPS_PROXY=...`):
+the login, token refreshes and Drive requests all go through the proxy.
+
+Notes:
+
+- TLS to Google runs end to end through the tunnel, so the proxy sees host names, not content. A proxy
+  that inspects TLS needs its CA certificate in the system's trust store.
+- Any other scheme, such as `socks4://`, is an error, and so is a value that is not a URL. gdrive never
+  prints the proxy URL, which can contain a password; errors name only the variable.
+- The metadata server of Google Cloud (`metadata.google.internal`) is always reached directly.
+- The proxy settings of Windows and macOS are not read, and there is no `--proxy` option. Set the
+  variable.
