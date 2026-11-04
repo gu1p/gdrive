@@ -298,6 +298,8 @@ pub(crate) enum Error {
     Incomplete(scheduler::Incomplete),
     /// stdout or stderr of a recursive upload could not be written.
     WriteOutput(scheduler::OutputError),
+    /// An entry of the local folder of a recursive upload cannot be read.
+    ReadLocal(file_tree::errors::Folder),
 }
 
 impl error::Error for Error {
@@ -313,6 +315,7 @@ impl error::Error for Error {
             Error::RecursiveItem { source, .. } => Some(source),
             Error::Incomplete(source) => Some(source),
             Error::WriteOutput(source) => Some(source),
+            Error::ReadLocal(source) => Some(source),
         }
     }
 }
@@ -346,6 +349,7 @@ impl Display for Error {
             Error::WriteOutput(_) => {
                 f.write_str("unable to write the output of the recursive upload")
             }
+            Error::ReadLocal(_) => f.write_str("unable to read it from the local disk"),
         }
     }
 }

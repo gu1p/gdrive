@@ -376,3 +376,97 @@ async fn ids_that_cannot_be_printed_fail_the_upload() {
     assert!(server.created().len() < 10, "{:?}", server.created());
     assert!(err.text().contains("Summary: "));
 }
+
+/// [`local_tree`] with a broken symlink and, where permissions apply, a directory that cannot
+/// be read. Returns whether the directory is unreadable.
+#[cfg(unix)]
+fn with_unreadable_entries(root: &Path) -> bool {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    symlink("missing", root.join("2024").join("dangling.jpg")).unwrap();
+    let locked = root.join("locked");
+    std::fs::create_dir(&locked).unwrap();
+    std::fs::write(locked.join("hidden.txt"), "h").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    std::fs::read_dir(&locked).is_err()
+}
+
+#[cfg(unix)]
+fn unlock(root: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(root.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_unreadable_local_entry_stops_the_upload_before_anything_is_created() {
+    let (_dir, root) = local_tree();
+    with_unreadable_entries(&root);
+    let server = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let uploaded = upload(&server, config(&root, 2, false)).await;
+    unlock(&root);
+
+    let error = uploaded.error();
+    assert!(
+        error.starts_with("Error: the recursive upload is incomplete: 1 f"),
+        "{error}"
+    );
+    assert!(error.contains("--continue-on-error"), "{error}");
+    assert_eq!(server.created().len(), 0, "nothing was created");
+    let err = uploaded.err.lines();
+    assert!(
+        err[0].starts_with("Error: unable to upload '")
+            && err[0].contains("': unable to read it from the local disk: "),
+        "{err:?}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn continue_on_error_uploads_everything_that_can_be_read() {
+    let (_dir, root) = local_tree();
+    let locked = with_unreadable_entries(&root);
+    let server = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let uploaded = upload(&server, config(&root, 2, true)).await;
+    unlock(&root);
+
+    let created = created_paths(&server.created());
+    let readable = if locked { 10 } else { 12 };
+    assert_eq!(
+        created.len(),
+        readable,
+        "every readable folder and file: {created:?}"
+    );
+    let err = uploaded.err.lines();
+    let link = shown("photos/2024/dangling.jpg");
+    assert!(
+        err.iter().any(|line| line.starts_with(&format!(
+            "Error: unable to upload '{link}': unable to read it from the local disk: symbolic \
+            link '"
+        ))),
+        "{err:?}"
+    );
+    if locked {
+        assert_eq!(
+            uploaded.error(),
+            "Error: the recursive upload is incomplete: 1 file and 1 folder failed"
+        );
+        assert!(err.iter().any(|line| line.starts_with(&format!(
+            "Error: unable to upload '{}': unable to read it from the local disk: unable to \
+            read directory content",
+            shown("photos/locked")
+        ))));
+        assert_eq!(
+            err.last().unwrap(),
+            &format!(
+                "Summary: 6 transferred ({TREE_SIZE} B), 0 unchanged, 0 skipped, 1 failed, 0 \
+                cancelled; 1 folder failed"
+            )
+        );
+    } else {
+        assert!(uploaded.error().ends_with("1 file failed"));
+    }
+}

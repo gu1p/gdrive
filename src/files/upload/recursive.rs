@@ -10,6 +10,11 @@
 //!
 //! A folder that cannot be created fails, and everything below it counts as cancelled. A file
 //! is opened only when its job starts, so the open files are bounded by `--jobs` as well.
+//!
+//! Local entries that cannot be read (a broken symlink, a file or directory without permission)
+//! are failed items too, before the top folder's job: by default the first one stops the upload
+//! before anything is created, as before; with `--continue-on-error` every one is reported and
+//! the rest is uploaded.
 
 #[cfg(test)]
 mod tests;
@@ -69,9 +74,20 @@ pub(super) async fn upload_directory(
         delegate_config: delegate_config.clone(),
         print_only_id,
     });
+    let unreadable = tree.unreadable.into_iter().map(|entry| {
+        let kind = if entry.is_dir {
+            JobKind::Metadata
+        } else {
+            JobKind::Media
+        };
+        let label = entry.relative_path.display().to_string();
+        let error = Error::ReadLocal(entry.error);
+        Job::done(kind, label, failed(entry.relative_path, error))
+    });
     let root = uploads.folder_job(tree.root, common.parents);
+    let jobs = unreadable.chain([root]).collect::<Vec<_>>();
     let report = Scheduler::new(common.transfer, printer.clone())
-        .run(stream::iter([root]), cancel)
+        .run(stream::iter(jobs), cancel)
         .await;
 
     let result = report.check().map_err(Error::Incomplete);

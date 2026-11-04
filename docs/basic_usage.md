@@ -236,6 +236,9 @@ gdrive files upload --recursive ~/photos --jobs 2 --continue-on-error
   (or `upload`). With `--continue-on-error`, gdrive goes on with everything that does not depend on the
   failure and reports every failure at the end. A folder that cannot be listed (download) or created
   (upload) takes everything in it along. Either way the command exits with status 1 when anything failed.
+- A local file or folder that a recursive upload cannot read (a broken symbolic link, no permission) is
+  such a failure too. By default the upload stops before it creates anything on Drive; with
+  `--continue-on-error` everything else is uploaded.
 - Drive sometimes answers a listing with `incompleteSearch`: the result may miss files. gdrive prints a
   `Warning:` line and the download exits with status 1 at the end, unless `--continue-on-error`.
 - Ctrl-C cancels the running transfers, removes their temporary files and exits with status 1. Files that
