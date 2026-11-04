@@ -25,6 +25,18 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
+use crate::app_config::AppConfig;
+
+/// The directory of the records, under the account directory.
+pub(crate) const UPLOADS_DIR: &str = "uploads";
+
+/// The directory of the records of the current account, if there is one.
+#[must_use]
+pub(crate) fn account_session_dir() -> Option<PathBuf> {
+    let config = AppConfig::load_current_account().ok()?;
+    Some(config.account_base_path().join(UPLOADS_DIR))
+}
+
 /// Google expires an upload session a week after it started.
 pub(crate) const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 

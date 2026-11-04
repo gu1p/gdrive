@@ -132,8 +132,8 @@ pub(crate) struct UploadOptions {
     /// Print a line before each chunk is sent (`--print-chunk-info`).
     pub(crate) print_chunk_info: bool,
     /// Where the sessions of resumable uploads are recorded, so that a later run continues an
-    /// interrupted one (`uploads/` in the account directory). `None`: an interrupted upload
-    /// starts over.
+    /// interrupted one (`uploads/` of the account, [`session::account_session_dir`]). `None`:
+    /// an interrupted upload starts over.
     pub(crate) session_dir: Option<PathBuf>,
 }
 
