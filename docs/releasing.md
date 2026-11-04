@@ -90,7 +90,18 @@ curl -fLO https://github.com/gu1p/gdrive/releases/download/v4.0.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
 ```
 
-macOS: the same downloads, then `shasum -a 256 --check --ignore-missing SHA256SUMS`.
+macOS (Apple silicon; on an Intel Mac use `gdrive_macos-x64.tar.gz` instead):
+
+```sh
+curl -fLO https://github.com/gu1p/gdrive/releases/download/v4.0.0/gdrive_macos-arm64.tar.gz
+curl -fLO https://github.com/gu1p/gdrive/releases/download/v4.0.0/SHA256SUMS
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar -xzf gdrive_macos-arm64.tar.gz
+./gdrive version
+```
+
+If the archive came from a web browser rather than `curl`, macOS quarantines the binary and refuses to run it;
+clear the flag first with `xattr -d com.apple.quarantine ./gdrive`.
 
 Windows (PowerShell), compare the two values:
 
