@@ -129,6 +129,9 @@ Notes:
 - Paste the address within a few minutes. The code in it is short-lived and works only once.
 - The address contains a one-time code for your account. Do not paste it anywhere else.
 - `--manual` works with `--port N`. The port only changes the address you copy.
+- `--no-browser` is an alias of `--manual`.
+- If the address you paste belongs to another login attempt (its `state` does not match), gdrive asks
+  again instead of failing.
 
 ### `--port N`
 
@@ -141,6 +144,10 @@ gdrive account add --port 9085
 ```
 
 Desktop app clients accept any loopback port, so you do not change anything in the Google Cloud console.
+
+`--port 0` picks any free port. In browser mode gdrive waits at most 10 minutes for the redirect, and
+if the port is already taken it stops with an error naming the port instead of waiting; use another
+port or `--manual`.
 
 ### Curl the redirect (gdrive 3.x)
 
@@ -171,7 +178,9 @@ was still taken (upstream [#147](https://github.com/glotlabs/gdrive/issues/147))
 
 From gdrive 4.0.0, only `gdrive account add` and `gdrive account reauth` start a login. Every other
 command fails fast instead: it prints an error that starts with `Error:`, tells you to run
-`gdrive account reauth`, and exits with a non-zero status. Nothing waits on port 8085.
+`gdrive account reauth`, and exits with a non-zero status. Nothing waits on port 8085. A token refresh
+that gets no answer within 60 seconds fails the same way. A stored access token that is still valid
+keeps working until it expires even when no refresh token is stored.
 
 ### Sign in again with `account reauth`
 
@@ -185,7 +194,8 @@ gdrive account reauth
 It runs the Google sign-in again for an existing account and keeps the account's settings. If Google does
 not send a new refresh token, gdrive keeps the stored one instead of overwriting it with nothing (upstream
 [#150](https://github.com/glotlabs/gdrive/issues/150)). On a server without a browser, add `--manual`. It
-takes `--port` too. Run `gdrive account reauth --help` for the full list of options.
+takes `--port` too. Sign in with the same Google account: if the address differs, or Google does not
+report one, nothing is changed. Run `gdrive account reauth --help` for the full list of options.
 
 ### Keep the token valid
 
