@@ -1,0 +1,36 @@
+# Weekly dependency updates.
+#
+# Cargo minor and patch bumps arrive as one grouped pull request; major bumps
+# come one per pull request because they can need code changes. The CI
+# workflow's MSRV job catches an update that needs a newer Rust than
+# Cargo.toml's rust-version.
+#
+# The workflows pin actions to commit SHAs with the release in a comment;
+# Dependabot updates both.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Vendored under vendor/ with gdrive's resumable-upload fixes and
+      # applied through [patch.crates-io]; it is updated by hand, together
+      # with google-drive3, and the fixes re-applied.
+      - dependency-name: google-apis-common
+      # A major google-drive3 bump could require google-apis-common 9.x, which
+      # would silently bypass the vendored 8.0.0 patch; update both by hand.
+      - dependency-name: google-drive3
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: build
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci

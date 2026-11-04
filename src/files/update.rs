@@ -1,7 +1,7 @@
 use std::{
     error,
     fmt::{Display, Formatter},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
@@ -32,6 +32,10 @@ pub(crate) struct Config {
 }
 
 pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
+    if let Some(file_path) = &config.file_path {
+        err_if_not_regular_file(file_path)?;
+    }
+
     let hub = get_hub().await.map_err(Error::Hub)?;
 
     let delegate_config = UploadDelegateConfig {
@@ -90,6 +94,19 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
     files::info::print_file_info(&file, &DisplayConfig::default());
 
     Ok(())
+}
+
+/// The upload reads the path as a seekable byte stream: a directory makes the upload library
+/// panic (#18) and a FIFO would block, so only regular files (or symlinks to them) are accepted.
+fn err_if_not_regular_file(path: &Path) -> Result<(), Box<Error>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(Box::new(Error::IsDirectory(path.to_path_buf()))),
+        Ok(metadata) if !metadata.is_file() => {
+            Err(Box::new(Error::NotRegularFile(path.to_path_buf())))
+        }
+        // A missing or unreadable path is reported when the file is opened.
+        _ => Ok(()),
+    }
 }
 
 #[expect(
@@ -167,6 +184,8 @@ pub(crate) async fn update_metadata(
 #[derive(Debug)]
 pub(crate) enum Error {
     Hub(GetHubError),
+    IsDirectory(PathBuf),
+    NotRegularFile(PathBuf),
     FileInfo {
         path: PathBuf,
         source: file_info::FromFileError,
@@ -180,6 +199,16 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::Hub(_) => f.write_str("unable to get drive hub"),
+            Error::IsDirectory(path) => write!(
+                f,
+                "'{}' is a directory, only a regular file can be updated",
+                path.display()
+            ),
+            Error::NotRegularFile(path) => write!(
+                f,
+                "'{}' is not a regular file, only a regular file can be updated",
+                path.display()
+            ),
             Error::FileInfo { path, source: _ } => {
                 write!(f, "unable to get file info for '{}'", path.display())
             }
@@ -196,6 +225,7 @@ impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
             Error::Hub(source) => Some(source),
+            Error::IsDirectory(_) | Error::NotRegularFile(_) => None,
             Error::FileInfo { source, .. } => Some(source),
             Error::OpenFile(_, source) => Some(source),
             Error::GetFile(source) | Error::Update(source) => Some(source),
@@ -225,5 +255,61 @@ impl PatchFile {
             ..self.file
         };
         self
+    }
+
+    #[must_use]
+    pub(crate) fn with_trashed(mut self, trashed: bool) -> Self {
+        self.file = google_drive3::api::File {
+            trashed: Some(trashed),
+            ..self.file
+        };
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{err_if_not_regular_file, Error};
+
+    #[test]
+    fn directory_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = err_if_not_regular_file(dir.path()).unwrap_err();
+        assert!(matches!(*err, Error::IsDirectory(ref path) if path == dir.path()));
+        assert!(err.to_string().contains("is a directory"));
+    }
+
+    #[test]
+    fn regular_file_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"a").unwrap();
+        assert!(err_if_not_regular_file(&file).is_ok());
+    }
+
+    #[test]
+    fn missing_file_is_left_to_open() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(err_if_not_regular_file(&dir.path().join("missing")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn special_file_and_symlinks_are_checked() {
+        use std::os::unix::{fs::symlink, net::UnixListener};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("socket");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let err = err_if_not_regular_file(&socket).unwrap_err();
+        assert!(matches!(*err, Error::NotRegularFile(_)));
+
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"a").unwrap();
+        symlink(&file, dir.path().join("file-link")).unwrap();
+        symlink(dir.path(), dir.path().join("dir-link")).unwrap();
+        assert!(err_if_not_regular_file(&dir.path().join("file-link")).is_ok());
+        let err = err_if_not_regular_file(&dir.path().join("dir-link")).unwrap_err();
+        assert!(matches!(*err, Error::IsDirectory(_)));
     }
 }

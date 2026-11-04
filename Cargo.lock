@@ -182,6 +182,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.5.67"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1248e420506b523e97ebd7b610656114abadbe73b04279a86768a12ce1860837"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.5.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -518,9 +527,12 @@ name = "gdrive"
 version = "4.0.0-alpha.1"
 dependencies = [
  "async-recursion",
+ "async-trait",
+ "base64",
  "bytes",
  "chrono",
  "clap",
+ "clap_complete",
  "error-trace",
  "exponential-backoff",
  "futures",
@@ -537,13 +549,18 @@ dependencies = [
  "mime_guess",
  "mktemp",
  "pin-project-lite",
+ "ring",
  "rustc_version_runtime",
  "serde",
  "serde_json",
  "tabwriter",
  "tar",
  "tempfile",
+ "time",
  "tokio",
+ "tower-service",
+ "unicode-normalization",
+ "url",
  "yup-oauth2",
 ]
 
@@ -1653,6 +1670,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinyvec"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
+
+[[package]]
 name = "tokio"
 version = "1.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1750,6 +1773,15 @@ name = "unicode-ident"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "84a22b9f218b40614adcb3f4ff08b703773ad44fa9423e4e0d346d5db86e4ebc"
+
+[[package]]
+name = "unicode-normalization"
+version = "0.1.26"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75cd3fb03d5288b3ba9a1ee103ac7e9cbb59f0b03d64f8ddfcc04dd42758a85d"
+dependencies = [
+ "tinyvec",
+]
 
 [[package]]
 name = "unicode-width"

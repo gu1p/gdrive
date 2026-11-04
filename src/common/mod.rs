@@ -10,8 +10,14 @@ pub(crate) mod file_tree_like;
 pub(crate) mod hub_helper;
 pub(crate) mod human_size;
 pub(crate) mod id_gen;
+pub(crate) mod local_name;
 pub(crate) mod md5_writer;
+#[cfg(test)]
+pub(crate) mod mock_server;
+pub(crate) mod paginate;
 pub(crate) mod permission;
+#[cfg(test)]
+pub(crate) mod stub_server;
 pub(crate) mod table;
 
 pub(crate) use file_tree_like::{FileLike, FileTreeLike, FolderInfoLike, FolderLike};
