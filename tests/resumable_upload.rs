@@ -65,7 +65,7 @@ mod human_size;
 mod retry;
 
 use delegate::{ChunkSize, UploadDelegate, UploadDelegateConfig};
-use retry::{Jitter, RetryPolicy, Throttle};
+use retry::{RetryPolicy, Throttle};
 
 const FILE_ID: &str = "mock-file-id";
 const SESSION_PATH: &str = "/upload-session";
@@ -398,7 +398,7 @@ fn delegate_config() -> UploadDelegateConfig {
             base_delay: Duration::from_millis(5),
             multiplier: 2,
             max_delay: Duration::from_millis(20),
-            jitter: Jitter::Full,
+            full_jitter: true,
         },
         print_chunk_errors: true,
         print_chunk_info: true,

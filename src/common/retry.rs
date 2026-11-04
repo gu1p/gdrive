@@ -3,9 +3,10 @@
 //! shares it once Google reports a rate limit.
 //!
 //! - The classifiers ([`classify_status`], [`classify_drive_error`], [`classify_transport`],
-//!   [`classify_body_error`], [`classify_io`]) turn one failed attempt into a [`Decision`]:
-//!   [`Decision::Retry`] with the delay the server asked for (`Retry-After`, zero without one),
-//!   or [`Decision::Stop`] with the reason.
+//!   [`classify_body_error`]) turn one failed attempt into a [`Decision`]: [`Decision::Retry`]
+//!   with the delay the server asked for (`Retry-After`, zero without one), or
+//!   [`Decision::Stop`] with the reason. Local I/O errors (reading the source, writing the
+//!   destination) are never retried: callers return them without asking the policy.
 //! - [`RetryPolicy`] is the budget and the backoff. [`RetryState`] applies it to one operation:
 //!   it turns a classifier's `Retry` into the delay to actually wait (backoff with jitter, at
 //!   least the `Retry-After`, at least the shared throttle), or into a `Stop` once the budget is
@@ -58,16 +59,6 @@ const QUOTA_REASONS: [&str; 6] = [
     "teamDriveFileLimitExceeded",
 ];
 
-/// How the backoff delay is randomized.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Jitter {
-    /// Exactly the backoff delay.
-    None,
-    /// A uniformly random delay between zero and the backoff delay ("full jitter"), so that
-    /// workers that failed together do not retry together.
-    Full,
-}
-
 /// The retry budget and backoff of one operation: one metadata call, one upload, one download.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RetryPolicy {
@@ -82,7 +73,9 @@ pub(crate) struct RetryPolicy {
     pub(crate) multiplier: u32,
     /// The backoff never grows past this.
     pub(crate) max_delay: Duration,
-    pub(crate) jitter: Jitter,
+    /// Wait a uniformly random delay between zero and the backoff ("full jitter"), so that
+    /// workers that failed together do not retry together. Without it, exactly the backoff.
+    pub(crate) full_jitter: bool,
 }
 
 impl Default for RetryPolicy {
@@ -94,13 +87,14 @@ impl Default for RetryPolicy {
             base_delay: Duration::from_secs(1),
             multiplier: 2,
             max_delay: Duration::from_secs(64),
-            jitter: Jitter::Full,
+            full_jitter: true,
         }
     }
 }
 
 impl RetryPolicy {
     /// One attempt, no retries.
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn no_retries() -> Self {
         RetryPolicy {
@@ -119,7 +113,7 @@ impl RetryPolicy {
             base_delay: Duration::from_millis(2),
             multiplier: 2,
             max_delay: Duration::from_millis(10),
-            jitter: Jitter::Full,
+            full_jitter: true,
         }
     }
 
@@ -137,12 +131,11 @@ impl RetryPolicy {
     /// The delay before retry number `retry`, jittered with `rng`.
     pub(crate) fn backoff(&self, retry: u32, rng: &mut fastrand::Rng) -> Duration {
         let ceiling = self.backoff_ceiling(retry);
-        match self.jitter {
-            Jitter::None => ceiling,
-            Jitter::Full => {
-                let nanos = u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX);
-                Duration::from_nanos(rng.u64(0..=nanos))
-            }
+        if self.full_jitter {
+            let nanos = u64::try_from(ceiling.as_nanos()).unwrap_or(u64::MAX);
+            Duration::from_nanos(rng.u64(0..=nanos))
+        } else {
+            ceiling
         }
     }
 }
@@ -629,12 +622,6 @@ pub(crate) fn classify_body_error(error: &hyper::Error) -> Decision {
     }
 }
 
-/// A local I/O error (reading the source file, writing the destination): never retried.
-#[must_use]
-pub(crate) fn classify_io(_error: &io::Error) -> Decision {
-    stop(StopReason::Local)
-}
-
 /// Status and headers of a failed reply, which google-drive3's `Error::BadRequest` drops.
 #[derive(Debug, Clone)]
 pub(crate) struct FailedReply {
@@ -785,9 +772,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        classify_body_error, classify_drive_error, classify_io, classify_status, parse_retry_after,
-        retry_after, Decision, FailedReply, Jitter, RetryPolicy, RetryReason, RetryState,
-        StopReason, Throttle, MAX_RETRY_AFTER,
+        classify_body_error, classify_drive_error, classify_status, parse_retry_after, retry_after,
+        Decision, FailedReply, RetryPolicy, RetryReason, RetryState, StopReason, Throttle,
+        MAX_RETRY_AFTER,
     };
 
     fn google_error(code: u16, reason: &str) -> serde_json::Value {
@@ -992,8 +979,11 @@ mod tests {
 
     #[test]
     fn local_and_decode_errors_stop() {
-        let io = std::io::Error::other("disk full");
-        assert_eq!(stop_reason(classify_io(&io)), StopReason::Local);
+        let io = google_drive3::Error::Io(std::io::Error::other("disk full"));
+        assert_eq!(
+            stop_reason(classify_drive_error(&io, None)),
+            StopReason::Local
+        );
 
         let decode = serde_json::from_str::<serde_json::Value>("").unwrap_err();
         let error = google_drive3::Error::JsonDecodeError(String::new(), decode);
@@ -1071,7 +1061,7 @@ mod tests {
 
     fn no_jitter() -> RetryPolicy {
         RetryPolicy {
-            jitter: Jitter::None,
+            full_jitter: false,
             ..RetryPolicy::default()
         }
     }

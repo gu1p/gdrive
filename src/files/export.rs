@@ -5,16 +5,22 @@ use std::{
     path::PathBuf,
 };
 
-use google_apis_common::Body;
 use mime::Mime;
 
 use crate::{
     common::{
         drive_file::{DocType, FileExtension},
         hub_helper::{get_hub, GetHubError},
+        media_client::{MediaClient, MediaError},
         parse_md5_digest,
     },
-    files,
+    files::{
+        self,
+        download::{
+            resume::{MediaSource, ResumableDownload},
+            Expected,
+        },
+    },
     hub::Hub,
 };
 
@@ -33,12 +39,15 @@ pub(crate) enum ExistingFileAction {
 
 pub(crate) async fn export(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
+    export_with_hub(&hub, config).await
+}
 
+async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
     if config.file_path.exists() && config.existing_file_action == ExistingFileAction::Abort {
         return Err(Error::FileExists(config.file_path));
     }
 
-    let file = files::info::get_file(&hub, &config.file_id)
+    let file = files::info::get_file(hub, &config.file_id)
         .await
         .map_err(|err| Error::GetFile(Box::new(err)))?;
 
@@ -56,9 +65,14 @@ pub(crate) async fn export(config: Config) -> Result<(), Error> {
 
     let mime_type = extension.get_export_mime();
 
-    let body = export_file(&hub, &config.file_id, mime_type)
+    let label = format!("export of '{}'", file.name.as_deref().unwrap_or_default());
+    let source = export_content(hub, &config.file_id, mime_type, label)
+        .map_err(|err| Error::ExportFile(Box::new(err)))?;
+    let mut download = ResumableDownload::new(source, hub.retrier().state(), None);
+    let first = download
+        .next()
         .await
-        .map_err(Error::ExportFile)?;
+        .map_err(|err| Error::ExportFile(Box::new(err)))?;
 
     println!(
         "Exporting {} '{}' to {}",
@@ -67,12 +81,16 @@ pub(crate) async fn export(config: Config) -> Result<(), Error> {
         config.file_path.display()
     );
 
-    let md5_checksum = file.md5_checksum.as_deref().and_then(parse_md5_digest);
-    files::download::save_body_to_file(
-        body,
+    let expected = Expected {
+        md5: file.md5_checksum.as_deref().and_then(parse_md5_digest),
+        size: None,
+    };
+    files::download::save_to_file(
+        download,
+        first,
         &config.file_path,
         &config.file_id,
-        md5_checksum.as_ref(),
+        expected,
     )
     .await
     .map_err(Error::SaveFile)?;
@@ -82,19 +100,20 @@ pub(crate) async fn export(config: Config) -> Result<(), Error> {
     Ok(())
 }
 
-async fn export_file(
-    hub: &Hub,
+/// The export of a Workspace document as `mime_type` (`files.export`). Exports ignore `Range`:
+/// a download that breaks off starts over, through the same path as file downloads.
+fn export_content<'a>(
+    hub: &'a Hub,
     file_id: &str,
     mime_type: &Mime,
-) -> Result<Body, Box<google_drive3::Error>> {
-    let response = hub
-        .files()
-        .export(file_id, mime_type.as_ref())
-        .add_scope(google_drive3::api::Scope::Full)
-        .doit()
-        .await?;
-
-    Ok(response.into_body())
+    label: String,
+) -> Result<MediaSource<'a>, MediaError> {
+    let client = MediaClient::new(hub);
+    let url = client.drive_url(
+        &["files", file_id, "export"],
+        &[("mimeType", mime_type.as_ref())],
+    )?;
+    Ok(MediaSource::Drive { client, url, label })
 }
 
 #[derive(Debug)]
@@ -102,7 +121,7 @@ pub(crate) enum Error {
     Hub(GetHubError),
     FileExists(PathBuf),
     GetFile(Box<google_drive3::Error>),
-    ExportFile(Box<google_drive3::Error>),
+    ExportFile(Box<MediaError>),
     MissingDriveMime,
     UnsupportedDriveMime(String),
     UnsupportedExportExtension(DocType),
@@ -160,7 +179,59 @@ impl error::Error for Error {
             | Error::MissingDriveMime
             | Error::UnsupportedDriveMime(_)
             | Error::UnsupportedExportExtension(_) => None,
-            Error::GetFile(source) | Error::ExportFile(source) => Some(source),
+            Error::GetFile(source) => Some(source),
+            Error::ExportFile(source) => Some(source),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{export_with_hub, Config, ExistingFileAction};
+    use crate::common::{
+        drive_file::MIME_TYPE_DRIVE_DOCUMENT,
+        mock_server::{MockServer, Response},
+    };
+
+    #[tokio::test]
+    async fn a_broken_export_starts_over_through_the_download_path() {
+        let content = "exported document text\n".repeat(2000);
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({"id": "doc", "name": "Notes", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+            ),
+            Response::raw(200, &content).cut_after(5000),
+            // Exports ignore Range and send everything again.
+            Response::raw(200, &content),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+
+        export_with_hub(
+            &server.hub(),
+            Config {
+                file_id: String::from("doc"),
+                file_path: path.clone(),
+                existing_file_action: ExistingFileAction::Abort,
+            },
+        )
+        .await
+        .unwrap();
+
+        crate::files::download::assert_content(&path, &content);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+        for export in &requests[1..] {
+            assert_eq!(export.path, "/drive/v3/files/doc/export");
+            assert_eq!(export.query_param("mimeType"), Some("text%2Fplain"));
+        }
+        assert_eq!(requests[1].header("range"), None);
+        assert_eq!(requests[2].header("range"), Some("bytes=5000-"));
+        let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1, "no temporary file is left");
     }
 }

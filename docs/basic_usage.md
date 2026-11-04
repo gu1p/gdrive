@@ -139,6 +139,16 @@ gdrive files download <SHORTCUT_ID> --follow-shortcuts      # download the targe
 Google Docs, Sheets and Slides have no binary content. Use [`files export`](#google-docs-sheets-and-slides)
 for them.
 
+A download that breaks off (a dropped connection, an HTTP/2 `GOAWAY`) continues where it stopped, with a
+`Warning:` line on stderr. The file is checked against its MD5 checksum, or its size when Drive has no
+checksum, before it gets its final name; until then it is a hidden `.gdrive-<id>.part` file next to it,
+removed again if the download fails. Resuming works within one run of gdrive, not across runs.
+
+All commands retry rate limits (`429`, `403 rateLimitExceeded`), timeouts and server errors (`500`, `502`,
+`503`, `504`) with growing, randomized waits, and honor `Retry-After`. They give up after 10 attempts or 10
+minutes without progress. Errors that waiting does not fix, such as `404`, permission or quota errors, end
+the command at once.
+
 ## Download a folder
 
 ```sh

@@ -11,8 +11,13 @@ use crate::common::retry::{Retrier, RetryPolicy, Throttle};
 /// that every request made through it shares.
 pub(crate) struct Hub {
     drive: DriveHub<HttpsConnector<HttpConnector>>,
+    /// The Drive API base URL the hub was set up with (google-drive3 has no getter for it).
+    drive_base_url: String,
     retrier: Retrier,
 }
+
+/// google-drive3's default base URL.
+const DRIVE_BASE_URL: &str = "https://www.googleapis.com/drive/v3/";
 
 impl Deref for Hub {
     type Target = DriveHub<HttpsConnector<HttpConnector>>;
@@ -40,15 +45,27 @@ impl Hub {
 
         Ok(Hub::from_drive_hub(
             google_drive3::DriveHub::new(http_client, auth),
+            DRIVE_BASE_URL.to_owned(),
             RetryPolicy::default(),
         ))
     }
 
-    fn from_drive_hub(drive: DriveHub<HttpsConnector<HttpConnector>>, policy: RetryPolicy) -> Hub {
+    fn from_drive_hub(
+        drive: DriveHub<HttpsConnector<HttpConnector>>,
+        drive_base_url: String,
+        policy: RetryPolicy,
+    ) -> Hub {
         Hub {
             drive,
+            drive_base_url,
             retrier: Retrier::new(policy, Throttle::new()),
         }
+    }
+
+    /// The Drive API base URL, ending in `/`: `https://www.googleapis.com/drive/v3/` outside
+    /// tests.
+    pub(crate) fn drive_base_url(&self) -> &str {
+        &self.drive_base_url
     }
 
     /// The retry policy and the throttle shared by every request of this hub.
@@ -71,8 +88,8 @@ impl Hub {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(create_connector()?);
         let mut hub = google_drive3::DriveHub::new(http_client, google_apis_common::NoToken);
-        hub.base_url(base_url);
-        Ok(Hub::from_drive_hub(hub, RetryPolicy::for_tests()))
+        hub.base_url(base_url.clone());
+        Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
     }
 }
 
@@ -87,8 +104,9 @@ impl Hub {
 
         // Not a credential: google-drive3 refuses resumable uploads without some token.
         let mut hub = DriveHub::new(http_client, String::from("mock-token"));
+        let base_url = format!("{root_url}drive/v3/");
         hub.root_url(root_url.to_owned());
-        hub.base_url(format!("{root_url}drive/v3/"));
-        Ok(Hub::from_drive_hub(hub, RetryPolicy::for_tests()))
+        hub.base_url(base_url.clone());
+        Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
     }
 }

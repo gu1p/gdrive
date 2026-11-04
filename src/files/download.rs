@@ -1,14 +1,14 @@
 pub(crate) mod errors;
 #[cfg(test)]
 mod media_tests;
+#[cfg(test)]
+pub(crate) use media_tests::assert_content;
+pub(crate) mod resume;
 
 use std::path::{Path, PathBuf};
 
 use async_recursion::async_recursion;
 use error_trace::ErrorTrace;
-use futures::stream::StreamExt;
-use google_apis_common::Body;
-use http_body_util::BodyExt;
 use md5::Digest;
 use tokio::{
     fs::{self, File},
@@ -23,11 +23,13 @@ use crate::{
         human_size::human_size,
         local_name::{self, NameChange, UnusableName},
         md5_writer::Md5Writer,
+        media_client::{MediaClient, MediaError},
         parse_md5_digest, FileTreeLike, FolderLike,
     },
     files,
     hub::Hub,
 };
+use resume::{copy_body, BodyError, MediaSource, Next, ResumableDownload};
 
 pub(crate) struct Config {
     pub(crate) file_id: String,
@@ -133,12 +135,21 @@ async fn download_regular(
 ) -> Result<(), errors::Download> {
     use errors::Download as E;
 
-    let body = download_file(hub, &config.file_id, config.acknowledge_abuse)
+    let size = file.size.and_then(|size| u64::try_from(size).ok());
+    let label = format!(
+        "download of '{}'",
+        file.name.as_deref().unwrap_or(&config.file_id)
+    );
+    let source = file_content(hub, &config.file_id, config.acknowledge_abuse, label)
+        .map_err(|err| E::DownloadFile(Box::new(err)))?;
+    let mut download = ResumableDownload::new(source, hub.retrier().state(), size);
+    let first = download
+        .next()
         .await
-        .map_err(E::DownloadFile)?;
+        .map_err(|err| E::DownloadFile(Box::new(err)))?;
 
     if config.destination == Destination::Stdout {
-        save_body_to_stdout(body).await?;
+        save_to_stdout(download, first).await?;
     } else {
         let file_name = local_file_name(file, config)?;
         warn_if_renamed(file, config, &file_name);
@@ -146,10 +157,12 @@ async fn download_regular(
             local_name::safe_join(&config.canonical_destination_root()?, &file_name);
 
         println!("Downloading {file_name}");
-        let md5_checksum = file.md5_checksum.as_deref().and_then(parse_md5_digest);
+        let expected = Expected {
+            md5: file.md5_checksum.as_deref().and_then(parse_md5_digest),
+            size,
+        };
         let file_id = file.id.as_deref().unwrap_or(&config.file_id);
-        if let Err(source) =
-            save_body_to_file(body, &abs_file_path, file_id, md5_checksum.as_ref()).await
+        if let Err(source) = save_to_file(download, first, &abs_file_path, file_id, expected).await
         {
             return Err(E::SaveBodyToFile {
                 path: abs_file_path,
@@ -203,13 +216,23 @@ async fn download_directory(
                 continue;
             }
 
-            let body = download_file(hub, &file.drive_id, config.acknowledge_abuse)
+            let label = format!("download of '{}'", file_path.display());
+            let source = file_content(hub, &file.drive_id, config.acknowledge_abuse, label)
+                .map_err(|err| E::DownloadFile(Box::new(err)))?;
+            let mut download =
+                ResumableDownload::new(source, hub.retrier().state(), Some(file.size));
+            let first = download
+                .next()
                 .await
-                .map_err(E::DownloadFile)?;
+                .map_err(|err| E::DownloadFile(Box::new(err)))?;
 
             println!("Downloading file '{}'", file_path.display());
+            let expected = Expected {
+                md5: file.md5,
+                size: Some(file.size),
+            };
             if let Err(source) =
-                save_body_to_file(body, &abs_file_path, &file.drive_id, file.md5.as_ref()).await
+                save_to_file(download, first, &abs_file_path, &file.drive_id, expected).await
             {
                 return Err(E::SaveBodyToFile {
                     path: abs_file_path,
@@ -229,62 +252,107 @@ async fn download_directory(
     Ok(())
 }
 
-async fn download_file(
-    hub: &Hub,
+/// The content of a Drive file: `files.get?alt=media`, which supports `Range` requests.
+/// `label` names the download in warnings.
+fn file_content<'a>(
+    hub: &'a Hub,
     file_id: &str,
     acknowledge_abuse: bool,
-) -> Result<Body, Box<google_drive3::Error>> {
-    let (response, _) = hub
-        .files()
-        .get(file_id)
-        .supports_all_drives(true)
-        .acknowledge_abuse(acknowledge_abuse)
-        .param("alt", "media")
-        .add_scope(google_drive3::api::Scope::Full)
-        .doit()
-        .await?;
+    label: String,
+) -> Result<MediaSource<'a>, MediaError> {
+    let client = MediaClient::new(hub);
+    let acknowledge_abuse = if acknowledge_abuse { "true" } else { "false" };
+    let url = client.drive_url(
+        &["files", file_id],
+        &[
+            ("alt", "media"),
+            ("supportsAllDrives", "true"),
+            ("acknowledgeAbuse", acknowledge_abuse),
+        ],
+    )?;
+    Ok(MediaSource::Drive { client, url, label })
+}
 
-    Ok(response.into_body())
+/// What a finished download is checked against.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct Expected {
+    /// Drive's `md5Checksum`; Workspace documents and exports have none.
+    pub(crate) md5: Option<Digest>,
+    /// Drive's `size`. Without it, the size the server announced is checked.
+    pub(crate) size: Option<u64>,
 }
 
 /// How many temporary file names [`create_temp_file`] tries before it gives up.
 const MAX_TEMP_FILE_ATTEMPTS: u32 = 100;
 
-/// Saves `body` to `file_path` through a temporary file named after the Drive file id.
+/// Saves a download to `file_path` through a temporary file named after the Drive file id.
+/// `first` is what [`ResumableDownload::next`] returned first.
 ///
 /// The temporary file is created next to `file_path` with `create_new`, so it is never shared
 /// with another download, removed if anything fails, and renamed to `file_path` only after the
-/// whole body is written and its md5 matches.
+/// whole content is written and its size and md5 match. A body that breaks off is resumed (see
+/// [`resume`]); when the server sends the content from the start again, it goes to a new
+/// temporary file and the old one is removed.
 // TODO: move to common
-pub(crate) async fn save_body_to_file(
-    body: Body,
+pub(crate) async fn save_to_file(
+    download: ResumableDownload<'_>,
+    first: Next,
     file_path: &Path,
     file_id: &str,
-    expected_md5: Option<&Digest>,
+    expected: Expected,
 ) -> Result<(), errors::SaveBodyToFile> {
-    save_body_through(body, file_path, file_id, expected_md5, |file| file).await
+    save_through(download, first, file_path, file_id, expected, |file| file).await
 }
 
-/// [`save_body_to_file`] writing through `writer(temporary file)`; tests use it to inject write
+/// [`save_to_file`] writing through `writer(temporary file)`; tests use it to inject write
 /// errors.
-async fn save_body_through<W>(
-    body: Body,
+async fn save_through<W>(
+    download: ResumableDownload<'_>,
+    first: Next,
     file_path: &Path,
     file_id: &str,
-    expected_md5: Option<&Digest>,
-    writer: impl FnOnce(File) -> W,
+    expected: Expected,
+    mut writer: impl FnMut(File) -> W,
 ) -> Result<(), errors::SaveBodyToFile>
 where
     W: AsyncWrite + Unpin,
 {
     let (tmp_file_path, file) = create_temp_file(file_path, file_id).await?;
+    let part = TempFile::new(tmp_file_path, writer(file));
+    write_temp_file(download, first, part, file_path, file_id, expected, writer).await
+}
 
-    let result = write_temp_file(body, writer(file), &tmp_file_path, file_path, expected_md5).await;
-    if result.is_err() {
-        remove_temp_file(&tmp_file_path).await;
+/// The temporary file a download is written to.
+struct TempFile<W> {
+    path: PathBuf,
+    writer: Md5Writer<W>,
+}
+
+impl<W: AsyncWrite + Unpin> TempFile<W> {
+    fn new(path: PathBuf, writer: W) -> Self {
+        TempFile {
+            path,
+            writer: Md5Writer::new(writer),
+        }
     }
 
-    result
+    /// Replaces the temporary file with a new, empty one, for content that starts over.
+    async fn restart(
+        &mut self,
+        file_path: &Path,
+        file_id: &str,
+        writer: &mut impl FnMut(File) -> W,
+    ) -> Result<(), errors::SaveBodyToFile> {
+        let (path, file) = create_temp_file(file_path, file_id).await?;
+        let old = std::mem::replace(self, TempFile::new(path, writer(file)));
+        let TempFile {
+            path: old_path,
+            writer: old_writer,
+        } = old;
+        drop(old_writer);
+        remove_temp_file(&old_path).await;
+        Ok(())
+    }
 }
 
 /// Creates the temporary file for `file_path`. It refuses a `file_path` that has the name of a
@@ -360,47 +428,131 @@ async fn remove_temp_file(path: &Path) {
     }
 }
 
-/// Streams `body` into the temporary file, flushes and closes it, checks the md5 and renames the
-/// file to `file_path`.
+/// Writes the download into `part`, flushes and closes it, checks size and md5 and renames the
+/// file to `file_path`. On failure the temporary file is removed.
 ///
 /// The flush comes before the digest is taken: `tokio::fs::File` reports the error of a write only
 /// on the next write or flush, so without it a failure on the last chunk (a full disk, for
 /// example) would be lost and the incomplete file renamed as if it were complete.
 async fn write_temp_file<W>(
-    body: Body,
-    file: W,
-    tmp_file_path: &Path,
+    mut download: ResumableDownload<'_>,
+    first: Next,
+    mut part: TempFile<W>,
     file_path: &Path,
-    expected_md5: Option<&Digest>,
+    file_id: &str,
+    expected: Expected,
+    mut writer: impl FnMut(File) -> W,
 ) -> Result<(), errors::SaveBodyToFile>
 where
     W: AsyncWrite + Unpin,
 {
     use errors::SaveBodyToFile as E;
 
-    // Wrap file in writer that calculates md5
-    let mut writer = Md5Writer::new(file);
+    let written = async {
+        receive(
+            &mut download,
+            first,
+            &mut part,
+            file_path,
+            file_id,
+            &mut writer,
+        )
+        .await?;
+        part.writer.flush().await.map_err(E::Flush)
+    }
+    .await;
 
-    let mut body = body.into_stream();
+    let TempFile {
+        path: tmp_file_path,
+        writer: md5_writer,
+    } = part;
+    let result = match written {
+        Ok(()) => {
+            // Taking the digest closes the file, before it is renamed
+            let md5_digest = md5_writer.md5();
+            check_and_rename(&tmp_file_path, file_path, &expected, &download, md5_digest).await
+        }
+        Err(err) => Err(err),
+    };
 
-    // Read chunks from stream and write to file
-    while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(E::ReadChunk)?;
-        if let Some(data) = chunk.data_ref() {
-            writer.write_all(data).await.map_err(E::WriteChunk)?;
+    if result.is_err() {
+        remove_temp_file(&tmp_file_path).await;
+    }
+    result
+}
+
+/// Streams the download into `part` until it is complete, resuming broken bodies.
+async fn receive<W>(
+    download: &mut ResumableDownload<'_>,
+    first: Next,
+    part: &mut TempFile<W>,
+    file_path: &Path,
+    file_id: &str,
+    writer: &mut impl FnMut(File) -> W,
+) -> Result<(), errors::SaveBodyToFile>
+where
+    W: AsyncWrite + Unpin,
+{
+    use errors::SaveBodyToFile as E;
+
+    let mut next = first;
+    loop {
+        let body = match next {
+            Next::Complete => return Ok(()),
+            Next::Body { body, restart } => {
+                if restart {
+                    part.restart(file_path, file_id, writer).await?;
+                }
+                body
+            }
+        };
+
+        match copy_body(body, &mut part.writer, download).await {
+            Ok(()) => {
+                if download
+                    .ended()
+                    .await
+                    .map_err(|err| E::Request(Box::new(err)))?
+                {
+                    return Ok(());
+                }
+            }
+            Err(BodyError::Read(err)) => download.interrupted(err).await.map_err(E::ReadChunk)?,
+            Err(BodyError::Write(err)) => return Err(E::WriteChunk(err)),
+        }
+
+        next = download
+            .next()
+            .await
+            .map_err(|err| E::Request(Box::new(err)))?;
+    }
+}
+
+async fn check_and_rename(
+    tmp_file_path: &Path,
+    file_path: &Path,
+    expected: &Expected,
+    download: &ResumableDownload<'_>,
+    md5_digest: Digest,
+) -> Result<(), errors::SaveBodyToFile> {
+    use errors::SaveBodyToFile as E;
+
+    // The byte count, also when there is no md5 to check (exports, Workspace files)
+    let received = download.received();
+    if let Some(size) = expected.size.or(download.total()) {
+        if size != received {
+            return Err(E::SizeMismatch {
+                expected: size,
+                actual: received,
+            });
         }
     }
 
-    writer.flush().await.map_err(E::Flush)?;
-
-    // Taking the digest closes the file, before it is renamed
-    let md5_digest = writer.md5();
-
     // Check md5
-    if let Some(expected_md5) = expected_md5 {
-        if *expected_md5 != md5_digest {
+    if let Some(expected_md5) = expected.md5 {
+        if expected_md5 != md5_digest {
             return Err(E::Md5Mismatch {
-                expected: *expected_md5,
+                expected: expected_md5,
                 actual: md5_digest,
             });
         }
@@ -412,27 +564,55 @@ where
         .map_err(E::RenameFile)
 }
 
+/// Writes a download to stdout. A body that breaks off is resumed, but content that the server
+/// sends from the start again cannot be taken back from stdout, so that is an error.
 // TODO: move to common
-async fn save_body_to_stdout(body: Body) -> Result<(), errors::SaveBodyToStdout> {
-    let mut stdout = io::stdout();
-    let mut body = body.into_stream();
+async fn save_to_stdout(
+    mut download: ResumableDownload<'_>,
+    first: Next,
+) -> Result<(), errors::SaveBodyToStdout> {
+    use errors::SaveBodyToStdout as E;
 
-    // Read chunks from stream and write to stdout
-    while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(errors::SaveBodyToStdout::ReadChunk)?;
-        if let Some(data) = chunk.data_ref() {
-            stdout
-                .write_all(data)
-                .await
-                .map_err(errors::SaveBodyToStdout::WriteChunk)?;
+    let mut stdout = io::stdout();
+    let mut next = first;
+    loop {
+        let body = match next {
+            Next::Complete => break,
+            Next::Body { restart: true, .. } => return Err(E::CannotRestart),
+            Next::Body { body, .. } => body,
+        };
+
+        match copy_body(body, &mut stdout, &mut download).await {
+            Ok(()) => {
+                if download
+                    .ended()
+                    .await
+                    .map_err(|err| E::Request(Box::new(err)))?
+                {
+                    break;
+                }
+            }
+            Err(BodyError::Read(err)) => download.interrupted(err).await.map_err(E::ReadChunk)?,
+            Err(BodyError::Write(err)) => return Err(E::WriteChunk(err)),
         }
+
+        next = download
+            .next()
+            .await
+            .map_err(|err| E::Request(Box::new(err)))?;
     }
 
     // Like a file, stdout reports the error of the last write only on flush
-    stdout
-        .flush()
-        .await
-        .map_err(errors::SaveBodyToStdout::WriteChunk)?;
+    stdout.flush().await.map_err(E::WriteChunk)?;
+
+    if let Some(size) = download.total() {
+        if size != download.received() {
+            return Err(E::SizeMismatch {
+                expected: size,
+                actual: download.received(),
+            });
+        }
+    }
 
     Ok(())
 }
@@ -561,15 +741,60 @@ mod tests {
     use bytes::Bytes;
     use google_apis_common::Body;
     use http_body_util::{BodyExt, Full};
+    use md5::Digest;
+    use tokio::{fs::File, io::AsyncWrite};
 
     use super::{
-        create_temp_file, err_if_file_exists, err_if_local_file_exists, errors, save_body_through,
-        save_body_to_file, write_temp_file, Config, Destination, ExistingFileAction,
+        create_temp_file, err_if_file_exists, err_if_local_file_exists, errors, save_through,
+        write_temp_file, Config, Destination, ExistingFileAction, Expected, MediaSource,
+        ResumableDownload, TempFile,
     };
     use crate::common::{
         drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT},
         local_name,
+        retry::{RetryPolicy, RetryState},
     };
+
+    /// A download of `body` that cannot be resumed.
+    fn one_shot(body: Body) -> ResumableDownload<'static> {
+        ResumableDownload::new(
+            MediaSource::Body(Some(body)),
+            RetryState::new(RetryPolicy::no_retries(), None),
+            None,
+        )
+    }
+
+    /// Saves `body` like a download that cannot be resumed, through `writer(temporary file)`.
+    async fn save_body_through<W>(
+        body: Body,
+        file_path: &Path,
+        file_id: &str,
+        expected_md5: Option<&Digest>,
+        writer: impl FnMut(File) -> W,
+    ) -> Result<(), errors::SaveBodyToFile>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut download = one_shot(body);
+        let first = download
+            .next()
+            .await
+            .map_err(|err| errors::SaveBodyToFile::Request(Box::new(err)))?;
+        let expected = Expected {
+            md5: expected_md5.copied(),
+            size: None,
+        };
+        save_through(download, first, file_path, file_id, expected, writer).await
+    }
+
+    async fn save_body_to_file(
+        body: Body,
+        file_path: &Path,
+        file_id: &str,
+        expected_md5: Option<&Digest>,
+    ) -> Result<(), errors::SaveBodyToFile> {
+        save_body_through(body, file_path, file_id, expected_md5, |file| file).await
+    }
 
     fn is_refusal(result: &Result<(), errors::SaveBodyToFile>) -> bool {
         matches!(
@@ -864,9 +1089,18 @@ mod tests {
 
         // B finishes with its own bytes in its own destination.
         let b_md5 = md5::compute(b"B bytes");
-        write_temp_file(body(b"B bytes"), b_file, &b_tmp, &b_target, Some(&b_md5))
-            .await
-            .unwrap();
+        let mut download = one_shot(body(b"B bytes"));
+        let first = download.next().await.unwrap();
+        let expected = Expected {
+            md5: Some(b_md5),
+            size: None,
+        };
+        let part = TempFile::new(b_tmp.clone(), b_file);
+        write_temp_file(download, first, part, &b_target, "idB", expected, |file| {
+            file
+        })
+        .await
+        .unwrap();
 
         assert_eq!(std::fs::read(&a_target).unwrap(), b"A bytes");
         assert_eq!(std::fs::read(&b_target).unwrap(), b"B bytes");
@@ -1016,7 +1250,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("a.bin");
 
-        let result = save_body_through(body(b"new"), &target, "id-a", None, |_file| full).await;
+        let mut full = Some(full);
+        let result = save_body_through(body(b"new"), &target, "id-a", None, |_file| {
+            full.take().expect("a single temporary file")
+        })
+        .await;
 
         assert!(
             matches!(result, Err(errors::SaveBodyToFile::Flush(_))),
