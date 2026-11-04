@@ -84,6 +84,17 @@ per destination folder):
 A Google Docs file has no checksum; it is already there when the destination has a file of its name and the
 same Google type. Folders never conflict with files: a folder `a.txt` next to a file `a.txt` is fine.
 
+If Drive answers the listing of a destination folder with `incompleteSearch`, a file of the same name might be
+missing from it and would be created a second time. That folder fails instead, with everything in it
+(`Drive did not list the destination folder completely`); run the command again later.
+
+**The same file on both sides.** When both accounts can see the same folder, for example a folder of the
+source that is shared with the destination account and added to its My Drive, the destination folder may
+hold the source item itself. gdrive compares Drive ids: such an item fails with `the source and the
+destination are the same folder; nothing to do` (or `file`), nothing is copied and it never goes to the
+trash. An `--into` folder that is one of the folders to migrate, or inside one, is refused before anything
+starts.
+
 ### The output
 
 stdout gets one line per item, the action and the path from the name of the `FILE_ID` on:
@@ -108,10 +119,13 @@ trash photos/2024/beach.jpg
 | `already-there PATH` | the destination has the same file; nothing to do |
 | `skip PATH: REASON` | the item cannot be migrated (see below) |
 | `trash PATH`, `trash PATH/` | with `--trash-source`: the source file or folder went to the trash |
+| `keep PATH: REASON`, `keep PATH/: REASON` | with `--trash-source`: the source file or folder was to go to the trash, but stays (see below) |
 
 The lines come in the order the items start, which is not the order of the folder when several files are
-copied at once. Errors go to stderr when they happen, as `Error: unable to migrate 'PATH': ...`. At the
-end, stderr gets the list of skipped items and a summary:
+copied at once. Control characters in names (a newline, a carriage return, an escape sequence) are printed
+escaped, as `\n`, `\r` or `\u{1b}`, here and in error messages; the files keep their names. Errors go to
+stderr when they happen, as `Error: unable to migrate 'PATH': ...`. At the end, stderr gets the list of
+skipped items and a summary:
 
 ```text
 Skipped 1 unsupported item, which cannot be migrated:
@@ -120,7 +134,7 @@ Summary: 2 migrated (4.2 MB, 1 Google Workspace file converted), 1 already there
 ```
 
 Folders that failed are added as `; 1 folder failed`, `--trash-source` adds `; N moved to the trash in the
-source`, and an interrupted run ends with `; interrupted`. The line is for people; scripts should use the
+source` (and `, N kept there`), and an interrupted run ends with `; interrupted`. The line is for people; scripts should use the
 exit status.
 
 **Exit status:** 0 when every item was migrated, already there, or skipped as unsupported. 1 when an item
@@ -142,6 +156,7 @@ still exits with 1. A source folder that cannot be listed fails with everything 
 | Google Docs, Sheets, Slides | exported (to docx, xlsx, pptx) and converted back to a Google file in the destination |
 | Google Docs files larger than 10 MB as an export | **fail**: Drive exports at most 10 MB per file. Copy them by hand, or with Google Takeout |
 | Shortcuts | skipped: a shortcut has no content. Migrate its target instead |
+| Drawings | skipped: Drive exports them only as images or PDF, and converts nothing back to a Drawing |
 | Forms, Sites, My Maps, Apps Script and other Google types without an export | skipped |
 | Files in the source's trash | left out |
 
@@ -186,6 +201,17 @@ With `--trash-source`, gdrive moves what it migrated to the trash of the **sourc
   was skipped, a Google Docs file that was already there and so was not compared, a listing that was
   incomplete) stays, and so do the folders around it.
 
+Right before an item goes to the trash, gdrive looks at it again in the source:
+
+- a file is fetched again; if its size, MD5 checksum or modification time differ from what was migrated or
+  matched (it changed during the run), it stays: `keep PATH: it changed in the source during the migration`.
+  The destination's copy is then older than the source; rename or remove it and run the command again;
+- a folder is listed again; if it holds anything that is not in the trash yet (a file added during the
+  run), or Drive cannot list it completely, it stays: `keep PATH/: it has files that were not migrated`.
+  Running the command again migrates the new files and then moves the folder.
+
+A kept item is not a failure: the exit status stays 0.
+
 Nothing is ever deleted for good. Restore with `gdrive files untrash <FILE_ID>` (as the source account) or
 from the trash in Drive, which keeps items for 30 days. A file that went to the trash on its own stays there
 when you restore its folder; restore it too.
@@ -203,6 +229,15 @@ Dry run, nothing was changed. Summary: 4 to migrate (12 MB, 1 Google Workspace f
 
 A conflict fails the dry run as it would fail the real run; with `--continue-on-error` the dry run lists
 all of them.
+
+What a dry run cannot tell, because it reads no content and writes nothing:
+
+- **a Google Docs, Sheets or Slides file whose export is larger than 10 MB**: only the export itself tells,
+  and the real run fails that item;
+- errors of reading or uploading: a file Google flagged as malware or spam, missing permission to download
+  a file, the destination's storage quota, a checksum that does not match;
+- source files that change during the real run (see `--trash-source` above), and changes to the destination
+  between the dry run and the real run.
 
 ## Options
 
