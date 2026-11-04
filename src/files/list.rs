@@ -95,6 +95,7 @@ pub(crate) async fn list_files(
 ) -> Result<Vec<google_drive3::api::File>, Error> {
     let mut collected_files: Vec<google_drive3::api::File> = vec![];
     let mut next_page_token: Option<String> = None;
+    let q = config.query.q();
 
     loop {
         let max_files = config.max_files - collected_files.len();
@@ -106,9 +107,16 @@ pub(crate) async fn list_files(
             req = req.page_token(&token);
         }
 
+        if !q.is_empty() {
+            req = req.q(&q);
+        }
+
+        if let Some(drive_id) = config.query.drive_id() {
+            req = req.corpora("drive").drive_id(drive_id);
+        }
+
         let (_, file_list) = req
             .page_size(page_size.try_into().unwrap_or(i32::MAX))
-            .q(&config.query.to_string())
             .order_by(&config.order_by.to_string())
             .add_scope(google_drive3::api::Scope::Full)
             .supports_all_drives(true)
@@ -136,52 +144,74 @@ pub(crate) async fn list_files(
     Ok(collected_files)
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) enum ListQuery {
-    #[default]
-    RootNotTrashed,
-    FilesOnDrive {
-        drive_id: String,
-    },
-    FilesInFolder {
-        folder_id: String,
-    },
-    Custom(String),
-    None,
+/// What `files list` searches: the `q` expression and, for `--drive`, the shared drive to search in.
+///
+/// Composition rules:
+/// - no `--query`: the non-trashed files directly in `--parent`, else at the top level of `--drive`,
+///   else in My Drive's root (the 3.9 defaults);
+/// - `--query` alone: the query as given;
+/// - `--query` with `--parent`: `'<parent>' in parents and (<query>)`;
+/// - `--drive` searches the shared drive (`corpora=drive`, `driveId`) with the query above, so
+///   `--drive` with `--query` searches the whole drive rather than only its top level.
+///
+/// An empty `--query` adds no condition. The user query is passed through unchanged; only the ids
+/// are quoted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ListQuery {
+    /// `--query`; `None` selects the default listed above.
+    pub(crate) query: Option<String>,
+    /// `--parent`: only list direct children of this folder.
+    pub(crate) parent: Option<String>,
+    /// `--drive`: search this shared drive.
+    pub(crate) drive: Option<String>,
 }
 
-impl From<String> for ListQuery {
-    fn from(value: String) -> Self {
-        if value.is_empty() {
-            Self::None
-        } else {
-            Self::Custom(value)
+impl ListQuery {
+    /// The non-trashed files directly in a folder.
+    #[must_use]
+    pub(crate) fn files_in_folder(folder_id: String) -> Self {
+        Self {
+            parent: Some(folder_id),
+            ..Self::default()
         }
+    }
+
+    /// The `q` parameter of `files.list`. Empty means no filter.
+    #[must_use]
+    pub(crate) fn q(&self) -> String {
+        match (&self.query, &self.parent, &self.drive) {
+            (None, None, None) => String::from("'root' in parents and trashed = false"),
+            (None, Some(folder_id), _) | (None, None, Some(folder_id)) => {
+                format!("{} in parents and trashed = false", quote(folder_id))
+            }
+            (Some(query), Some(parent), _) if query.trim().is_empty() => {
+                format!("{} in parents", quote(parent))
+            }
+            (Some(query), Some(parent), _) => format!("{} in parents and ({query})", quote(parent)),
+            (Some(query), None, _) => query.clone(),
+        }
+    }
+
+    /// The shared drive to search (`corpora=drive` and `driveId`), if any.
+    #[must_use]
+    pub(crate) fn drive_id(&self) -> Option<&str> {
+        self.drive.as_deref()
     }
 }
 
-impl Display for ListQuery {
-    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        match self {
-            ListQuery::RootNotTrashed => {
-                write!(f, "'root' in parents and trashed = false")
-            }
-
-            ListQuery::FilesOnDrive { drive_id } => {
-                write!(f, "'{drive_id}' in parents and trashed = false")
-            }
-
-            ListQuery::FilesInFolder { folder_id } => {
-                write!(f, "'{folder_id}' in parents and trashed = false")
-            }
-
-            ListQuery::Custom(query) => {
-                write!(f, "{query}")
-            }
-
-            ListQuery::None => Ok(()),
+/// Quotes a value as a string literal of the Drive query language: `'` and `\` are escaped
+/// with a backslash.
+fn quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for c in value.chars() {
+        if matches!(c, '\'' | '\\') {
+            quoted.push('\\');
         }
+        quoted.push(c);
     }
+    quoted.push('\'');
+    quoted
 }
 
 #[derive(Debug, Clone, Default)]
@@ -308,7 +338,123 @@ fn truncate_middle(s: &str, max_length: usize) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_middle;
+    use super::{quote, truncate_middle, ListQuery};
+
+    fn list_query(query: Option<&str>, parent: Option<&str>, drive: Option<&str>) -> ListQuery {
+        ListQuery {
+            query: query.map(String::from),
+            parent: parent.map(String::from),
+            drive: drive.map(String::from),
+        }
+    }
+
+    #[test]
+    fn query_defaults_without_user_query() {
+        let cases = [
+            (None, None, "'root' in parents and trashed = false", None),
+            (Some("P"), None, "'P' in parents and trashed = false", None),
+            (
+                None,
+                Some("D"),
+                "'D' in parents and trashed = false",
+                Some("D"),
+            ),
+            (
+                Some("P"),
+                Some("D"),
+                "'P' in parents and trashed = false",
+                Some("D"),
+            ),
+        ];
+
+        for (parent, drive, expected_q, expected_drive) in cases {
+            let query = list_query(None, parent, drive);
+            assert_eq!(query.q(), expected_q, "parent {parent:?}, drive {drive:?}");
+            assert_eq!(query.drive_id(), expected_drive);
+        }
+    }
+
+    #[test]
+    fn query_composes_with_parent_and_drive() {
+        let user = "name contains 'report'";
+        let cases = [
+            (None, None, "name contains 'report'", None),
+            (
+                Some("P"),
+                None,
+                "'P' in parents and (name contains 'report')",
+                None,
+            ),
+            (None, Some("D"), "name contains 'report'", Some("D")),
+            (
+                Some("P"),
+                Some("D"),
+                "'P' in parents and (name contains 'report')",
+                Some("D"),
+            ),
+        ];
+
+        for (parent, drive, expected_q, expected_drive) in cases {
+            let query = list_query(Some(user), parent, drive);
+            assert_eq!(query.q(), expected_q, "parent {parent:?}, drive {drive:?}");
+            assert_eq!(query.drive_id(), expected_drive);
+        }
+    }
+
+    #[test]
+    fn query_with_drive_does_not_add_root_default() {
+        let query = list_query(Some("trashed = false"), None, Some("D"));
+        assert_eq!(query.q(), "trashed = false");
+        assert!(!query.q().contains("'root'"));
+    }
+
+    #[test]
+    fn query_parenthesizes_user_query() {
+        let query = list_query(Some("name = 'a' or name = 'b'"), Some("P"), None);
+        assert_eq!(query.q(), "'P' in parents and (name = 'a' or name = 'b')");
+    }
+
+    #[test]
+    fn query_keeps_quotes_in_user_query() {
+        let user = r"name = 'O\'Brien' and fullText contains '\'quoted\''";
+        assert_eq!(list_query(Some(user), None, None).q(), user);
+        assert_eq!(
+            list_query(Some(user), Some("P"), Some("D")).q(),
+            format!("'P' in parents and ({user})")
+        );
+    }
+
+    #[test]
+    fn empty_query_adds_no_condition() {
+        for user in ["", "  "] {
+            assert_eq!(list_query(Some(user), None, None).q().trim(), "");
+            assert_eq!(
+                list_query(Some(user), Some("P"), None).q(),
+                "'P' in parents"
+            );
+            let on_drive = list_query(Some(user), None, Some("D"));
+            assert_eq!(on_drive.q().trim(), "");
+            assert_eq!(on_drive.drive_id(), Some("D"));
+        }
+    }
+
+    #[test]
+    fn ids_are_quoted_and_escaped() {
+        assert_eq!(quote("abc-_123"), "'abc-_123'");
+        assert_eq!(quote(r"it's"), r"'it\'s'");
+        assert_eq!(quote(r"a\b"), r"'a\\b'");
+        assert_eq!(
+            list_query(Some("starred"), Some("x'y"), None).q(),
+            r"'x\'y' in parents and (starred)"
+        );
+    }
+
+    #[test]
+    fn files_in_folder_lists_non_trashed_children() {
+        let query = ListQuery::files_in_folder(String::from("F"));
+        assert_eq!(query.q(), "'F' in parents and trashed = false");
+        assert_eq!(query.drive_id(), None);
+    }
 
     #[test]
     fn truncate_middle_ascii() {

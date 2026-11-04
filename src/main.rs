@@ -124,19 +124,30 @@ enum FileCommand {
         #[arg(long, default_value_t = 30)]
         max: usize,
 
-        /// Query. See <https://developers.google.com/drive/search-parameters>
-        #[arg(long, default_value_t = ListQuery::default())]
-        query: ListQuery,
+        /// Query. See <https://developers.google.com/workspace/drive/api/guides/search-files> [default: "'root' in parents and trashed = false"]
+        ///
+        /// With --parent, lists only the files in that folder that match:
+        /// `'<DIRECTORY_ID>' in parents and (<QUERY>)`. With --drive, searches the whole shared
+        /// drive instead of its top level. An empty query adds no condition.
+        #[arg(long)]
+        query: Option<String>,
 
-        /// Order by. See <https://developers.google.com/drive/api/v3/reference/files/list>
+        /// Order by. See <https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list>
         #[arg(long, default_value_t = ListSortOrder::default())]
         order_by: ListSortOrder,
 
         /// List files in a specific folder
+        ///
+        /// Without --query, lists the files in the folder that are not trashed. With --query,
+        /// lists the files in the folder that match the query.
         #[arg(long, value_name = "DIRECTORY_ID")]
         parent: Option<String>,
 
         /// List files on a shared drive
+        ///
+        /// Without --query, lists the files that are not trashed at the top level of the drive,
+        /// or in the --parent folder. With --query, searches the whole drive, or only the
+        /// --parent folder.
         #[arg(long, value_name = "DRIVE_ID")]
         drive: Option<String>,
 
@@ -507,12 +518,12 @@ async fn handle_files_command(
             full_name,
             field_separator,
         } => {
-            let parent_query = parent.map(|folder_id| ListQuery::FilesInFolder { folder_id });
-            let drive_query = drive.map(|drive_id| ListQuery::FilesOnDrive { drive_id });
-            let q = parent_query.or(drive_query).unwrap_or(query);
-
             files::list(files::list::Config {
-                query: q,
+                query: ListQuery {
+                    query,
+                    parent,
+                    drive,
+                },
                 order_by,
                 max_files: max,
                 skip_header,
@@ -710,4 +721,56 @@ async fn handle_account_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{Cli, Command, FileCommand};
+    use crate::files::list::ListQuery;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    fn parse_files_list(args: &[&str]) -> ListQuery {
+        let cli = Cli::try_parse_from(["gdrive", "files", "list"].iter().chain(args))
+            .expect("arguments should parse");
+        let Command::Files {
+            command:
+                FileCommand::List {
+                    query,
+                    parent,
+                    drive,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected files list");
+        };
+        ListQuery {
+            query,
+            parent,
+            drive,
+        }
+    }
+
+    #[test]
+    fn files_list_keeps_default_query_without_flags() {
+        let query = parse_files_list(&[]);
+        assert_eq!(query.q(), "'root' in parents and trashed = false");
+        assert_eq!(query.drive_id(), None);
+    }
+
+    #[test]
+    fn files_list_query_is_not_dropped_by_parent_or_drive() {
+        let query = parse_files_list(&["--query", "name = 'a'", "--parent", "P"]);
+        assert_eq!(query.q(), "'P' in parents and (name = 'a')");
+
+        let query = parse_files_list(&["--drive", "D", "--query", "name = 'a'"]);
+        assert_eq!(query.q(), "name = 'a'");
+        assert_eq!(query.drive_id(), Some("D"));
+    }
 }
