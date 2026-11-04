@@ -39,9 +39,6 @@ use tokio::time::Instant;
 const UNAUTHORIZED_HINT: &str =
     "; run 'gdrive account reauth' to authorize the current account again";
 
-/// A longer `Retry-After` is cut down to this.
-pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
-
 /// 403 reasons that mean "slow down", which Google documents as retryable with backoff.
 const RATE_LIMIT_REASONS: [&str; 3] = [
     "rateLimitExceeded",
@@ -330,8 +327,10 @@ impl RetryState {
     /// Counts a failed attempt and decides what follows: a classifier's `Stop` stays; its
     /// `Retry` becomes the delay to wait (the jittered backoff, at least the server's
     /// `Retry-After`, at least what the shared throttle still holds back), or a
-    /// [`StopReason::GaveUp`] once the attempts or the elapsed time are used up. A rate limit is
-    /// signaled to the throttle, so that every request sharing it waits as well.
+    /// [`StopReason::GaveUp`] once the attempts are used up or that delay would end past the
+    /// elapsed budget. The server's `Retry-After` is never shortened: a wait longer than the
+    /// budget left is a stop, not an early retry. A rate limit that is waited for is signaled to
+    /// the throttle, so that every request sharing it waits as well.
     pub(crate) fn next(&mut self, decision: Decision) -> Decision {
         let Decision::Retry {
             after: requested,
@@ -363,14 +362,18 @@ impl RetryState {
             .backoff(self.failures, &mut self.rng)
             .max(requested);
         if let Some(throttle) = &self.throttle {
-            if reason.is_rate_limit() {
-                throttle.signal(after);
-            }
             after = after.max(throttle.remaining());
         }
 
         if elapsed.saturating_add(after) > self.policy.max_elapsed {
             return give_up(self.failures, reason);
+        }
+
+        // Only a wait that happens holds back the others: a stop must not leave a long hold.
+        if let Some(throttle) = &self.throttle {
+            if reason.is_rate_limit() {
+                throttle.signal(after);
+            }
         }
 
         Decision::Retry { after, reason }
@@ -392,10 +395,10 @@ impl Throttle {
     }
 
     /// Holds back every request for at least `delay` from now. An earlier hold that ends later
-    /// is kept.
+    /// is kept. Callers signal the delay they wait themselves, which the retry budget bounds.
     pub(crate) fn signal(&self, delay: Duration) {
         let now = Instant::now();
-        let until = now.checked_add(delay.min(MAX_RETRY_AFTER)).unwrap_or(now);
+        let until = now.checked_add(delay).unwrap_or(now);
         let mut next_request = lock(&self.next_request);
         if next_request.is_none_or(|current| current < until) {
             *next_request = Some(until);
@@ -449,7 +452,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `Retry-After` of a reply, capped at [`MAX_RETRY_AFTER`].
+/// `Retry-After` of a reply.
 #[must_use]
 pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?;
@@ -457,8 +460,8 @@ pub(crate) fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 }
 
 /// A `Retry-After` value, delay seconds (`120`) or an HTTP date
-/// (`Wed, 21 Oct 2015 07:28:00 GMT`, a date in the past meaning now), capped at
-/// [`MAX_RETRY_AFTER`].
+/// (`Wed, 21 Oct 2015 07:28:00 GMT`, a date in the past meaning now). It is not capped: a wait
+/// longer than the retry budget left makes [`RetryState::next`] stop.
 #[must_use]
 pub(crate) fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
     let value = value.trim();
@@ -468,7 +471,7 @@ pub(crate) fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration
         let date = httpdate::parse_http_date(value).ok()?;
         date.duration_since(now).unwrap_or_default()
     };
-    Some(delay.min(MAX_RETRY_AFTER))
+    Some(delay)
 }
 
 /// The `reason`s of a Google JSON error body: `error.errors[].reason`, and
@@ -774,7 +777,6 @@ mod tests {
     use super::{
         classify_body_error, classify_drive_error, classify_status, parse_retry_after, retry_after,
         Decision, FailedReply, RetryPolicy, RetryReason, RetryState, StopReason, Throttle,
-        MAX_RETRY_AFTER,
     };
 
     fn google_error(code: u16, reason: &str) -> serde_json::Value {
@@ -934,14 +936,76 @@ mod tests {
     }
 
     #[test]
-    fn retry_after_is_capped_at_five_minutes() {
+    fn long_retry_after_values_are_kept() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_445_412_480);
-        assert_eq!(parse_retry_after("86400", now), Some(MAX_RETRY_AFTER));
+        assert_eq!(
+            parse_retry_after("86400", now),
+            Some(Duration::from_secs(86400))
+        );
         assert_eq!(
             parse_retry_after("Thu, 22 Oct 2015 07:28:00 GMT", now),
-            Some(MAX_RETRY_AFTER)
+            Some(Duration::from_secs(86400))
         );
-        assert_eq!(MAX_RETRY_AFTER, Duration::from_secs(300));
+    }
+
+    fn requested(after: Duration) -> Decision {
+        Decision::Retry {
+            after,
+            reason: RetryReason::RateLimited {
+                status: StatusCode::TOO_MANY_REQUESTS,
+                reason: None,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_within_the_budget_is_honored_in_full() {
+        // Seven minutes: more than the five minutes gdrive used to cut it to.
+        let throttle = Throttle::new();
+        let mut state = RetryState::new(no_jitter(), Some(throttle.clone()));
+        assert_eq!(
+            state.next(requested(Duration::from_secs(7 * 60))),
+            Decision::Retry {
+                after: Duration::from_secs(7 * 60),
+                reason: RetryReason::RateLimited {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    reason: None,
+                },
+            }
+        );
+        assert!(throttle.remaining() > Duration::from_secs(6 * 60));
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_beyond_the_budget_stops_without_holding_anyone_back() {
+        let throttle = Throttle::new();
+        let mut state = RetryState::new(no_jitter(), Some(throttle.clone()));
+        // Twenty minutes, the budget is ten.
+        assert!(matches!(
+            stop_reason(state.next(requested(Duration::from_secs(20 * 60)))),
+            StopReason::GaveUp { attempts: 1, .. }
+        ));
+        assert_eq!(throttle.remaining(), Duration::ZERO);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_retry_after_beyond_the_budget_left_stops() {
+        let mut state = RetryState::new(no_jitter(), None);
+        let Decision::Retry { after, .. } = state.next(requested(Duration::from_secs(8 * 60)))
+        else {
+            panic!("eight minutes fit the ten-minute budget");
+        };
+        tokio::time::sleep(after).await;
+        // Two minutes are left: three is a stop, one is a retry.
+        let mut probe = state.clone();
+        assert!(matches!(
+            stop_reason(probe.next(requested(Duration::from_secs(3 * 60)))),
+            StopReason::GaveUp { attempts: 2, .. }
+        ));
+        assert!(matches!(
+            state.next(requested(Duration::from_secs(60))),
+            Decision::Retry { after, .. } if after == Duration::from_secs(60)
+        ));
     }
 
     #[test]
