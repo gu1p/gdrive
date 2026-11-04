@@ -714,3 +714,46 @@ async fn a_file_deleted_before_the_resume_is_a_clean_error() {
     );
     assert_eq!(dir_entries(dir.path()), Vec::<String>::new());
 }
+
+#[tokio::test]
+async fn a_file_flagged_as_abusive_ends_with_the_acknowledge_abuse_hint() {
+    let server = MockServer::start(vec![
+        Response::json(
+            200,
+            &json!({"id": "file-id", "name": "a.exe", "mimeType": "application/octet-stream"}),
+        ),
+        Response::json(
+            403,
+            &json!({"error": {
+                "code": 403,
+                "message": "This file has been identified as malware or spam and cannot be \
+                            downloaded.",
+                "errors": [{
+                    "domain": "global",
+                    "reason": "cannotDownloadAbusiveFile",
+                    "message": "This file has been identified as malware or spam and cannot \
+                                be downloaded.",
+                }],
+            }}),
+        ),
+    ])
+    .await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let config = Config {
+        acknowledge_abuse: false,
+        ..config("file-id", destination.path())
+    };
+    let error = download_with_hub(&server.hub(), config).await.unwrap_err();
+
+    let message = crate::error_message(&error);
+    assert!(
+        message.starts_with("Error: unable to download file from drive: Drive answered 403"),
+        "{message}"
+    );
+    assert!(
+        message.ends_with("; rerun with --acknowledge-abuse if you own the file"),
+        "{message}"
+    );
+    assert_eq!(dir_entries(destination.path()), Vec::<String>::new());
+}
