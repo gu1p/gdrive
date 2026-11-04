@@ -384,11 +384,15 @@ async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
     std::fs::write(root.join(".gdrive-s1.part"), "stale").unwrap();
     std::fs::write(root.join(".gdrive-s2-2.part"), "other process").unwrap();
 
-    // Once both downloads write their temporary files, another gdrive takes the next names,
-    // and then Ctrl-C comes.
+    // Once done.bin is complete and both other downloads write their temporary files, another
+    // gdrive takes the next names, and then Ctrl-C comes. done.bin is waited for, and its job
+    // given a moment to return after the rename: under load it may finish after the others
+    // started writing.
     let cancel = {
         let root = root.clone();
         async move {
+            appears(&root.join("done.bin")).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             appears(&root.join(".gdrive-s1-1.part")).await;
             appears(&root.join(".gdrive-s2.part")).await;
             std::fs::write(root.join(".gdrive-s1-2.part"), "concurrent").unwrap();
