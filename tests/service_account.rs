@@ -352,8 +352,12 @@ async fn token_requests_go_through_the_proxy_and_bad_proxies_are_clean_errors() 
         assert_eq!(listed.status.code(), Some(1), "{var}={value}");
         let message = stderr(&listed);
         assert!(message.starts_with("Error: "), "{message}");
+        // Windows environment variable names are case-insensitive, so the message may
+        // name the upper-case variant of a lower-case variable.
         assert!(
-            message.contains(&format!("the proxy in {var} ")),
+            message
+                .to_ascii_lowercase()
+                .contains(&format!("the proxy in {} ", var.to_ascii_lowercase())),
             "{message}"
         );
         assert!(!message.contains("panicked"), "{message}");
