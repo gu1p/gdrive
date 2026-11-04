@@ -1137,3 +1137,53 @@ async fn an_edit_in_the_same_second_as_the_last_export_is_exported_again() {
         "Summary: 1 transferred (24 B), 0 unchanged, 0 skipped, 0 failed, 0 cancelled"
     );
 }
+
+#[tokio::test]
+async fn a_rerun_with_overwrite_through_the_command_skips_the_unchanged_export() {
+    let files = vec![
+        // The root folder, for the command's `files.get`.
+        FakeFile::folder("root", "Root", "none"),
+        FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, "doc!")
+            .modified("2024-05-06T07:08:09.123Z"),
+        FakeFile::blob("x", "x.txt", "root", "x"),
+    ];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let hub = server.hub();
+    let destination = tempfile::tempdir().unwrap();
+    let run = |existing_file_action| Config {
+        existing_file_action,
+        ..exporting(destination.path(), "default", false)
+    };
+
+    super::super::download_with_hub(&hub, run(ExistingFileAction::Abort))
+        .await
+        .unwrap();
+    assert_eq!(server.exports().len(), 1);
+
+    // Into an existing destination, only --overwrite gets past the existing top folder.
+    let error = super::super::download_with_hub(&hub, run(ExistingFileAction::Abort))
+        .await
+        .unwrap_err();
+    assert!(
+        crate::error_message(&error).ends_with("already exists, use --overwrite to overwrite it"),
+        "{error}"
+    );
+
+    super::super::download_with_hub(&hub, run(ExistingFileAction::Overwrite))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.exports().len(),
+        1,
+        "the unchanged export is not requested"
+    );
+    assert_eq!(
+        server.media(),
+        ["x"],
+        "the identical file is not downloaded either"
+    );
+    assert_eq!(
+        std::fs::read_to_string(local(destination.path(), "Root/report.docx")).unwrap(),
+        "doc!"
+    );
+}
