@@ -117,7 +117,7 @@ SSH tunnel, `gdrive account add --manual` (4.0.0), and unattended use in cron jo
 gdrive account      add, list, current, switch, remove, export, import
                     reauth, add --service-account, add --adc (4.0.0)
 gdrive files        list, info, download, upload, update, delete, mkdir, rename,
-                    move, copy, import, export
+                    move, copy, import, export, sync up, sync down (4.0.0)
 gdrive drives       list
 gdrive permissions  share, list, revoke
 gdrive about        information about gdrive
@@ -125,6 +125,9 @@ gdrive version      version information
 ```
 
 Run `gdrive <command> --help` for the options, for example `gdrive files list --help`.
+
+- One-way sync of a local directory and a Drive folder, with `--dry-run` and a `--delete` that only
+  moves things to a trash: [Sync a folder one way](docs/sync.md).
 
 - Service accounts and Application Default Credentials, for CI and servers:
   [Service accounts](docs/service_accounts.md).
@@ -198,11 +201,15 @@ Also in 4.0.0:
 - `files download --recursive --export default` exports Google Docs, Sheets, Slides and Drawings (to
   docx, xlsx, pptx and png, or a format per type such as `--export md,sheets=ods`) instead of skipping
   them, and does not export an unchanged document again.
+- `files sync up` and `files sync down` sync a local directory and a Drive folder one way: new and changed
+  files only, changed Drive files updated in place, `--dry-run`, and `--delete` that runs only after a
+  complete listing and a transfer without failures and moves extras to the Drive trash or
+  `.gdrive-trash/` ([docs/sync.md](docs/sync.md)).
 
 Planned, not done yet:
 
 - Faster transfers: resumable uploads that survive a restart, progress output,
-  skip and sync modes, download resume.
+  download resume.
 - Shell completions; a Windows build without the Visual C++ runtime.
 - Trash and untrash, real TSV and JSON output, listing all shared drives, Markdown export and import,
   short options.
