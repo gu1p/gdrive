@@ -9,6 +9,10 @@
 //! the fields its `fields` mask names, so a test can check what a metadata request asks for;
 //! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
 //! the other requests.
+//!
+//! For recursive uploads it answers `files.generateIds` and multipart `files.create` (the
+//! uploads of files and the creation of folders, [`Created`]). Like Drive, a create fails with
+//! 404 when a parent does not exist yet.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,6 +36,8 @@ use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 
 const LIST_PATH: &str = "/drive/v3/files";
+const GENERATE_IDS_PATH: &str = "/drive/v3/files/generateIds";
+const UPLOAD_PATH: &str = "/upload/drive/v3/files";
 
 /// A file stored by the fake.
 #[derive(Debug, Clone, Default)]
@@ -209,6 +215,24 @@ pub(crate) struct Behavior {
     /// Media downloads of these file ids send half of the content and then nothing more, like
     /// a transfer that is still running.
     pub(crate) media_stalled: HashSet<String>,
+    /// How long the create of a file (not a folder) takes before its reply.
+    pub(crate) upload_delay: Duration,
+    /// Creates of files with these names fail with 400.
+    pub(crate) upload_rejected: HashSet<String>,
+}
+
+/// A `files.create` the fake answered.
+#[derive(Debug, Clone)]
+pub(crate) struct Created {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) mime_type: String,
+    pub(crate) parents: Vec<String>,
+    pub(crate) content: Vec<u8>,
+    /// The position of the request's arrival among all arrivals and replies of creates.
+    pub(crate) arrived: usize,
+    /// The position of its reply.
+    pub(crate) answered: usize,
 }
 
 /// A list request as the fake saw it, with percent-decoded parameters.
@@ -248,6 +272,14 @@ struct State {
     first_media: Mutex<Option<Instant>>,
     /// When the last list reply was sent.
     last_list: Mutex<Option<Instant>>,
+    /// Successful creates, in reply order.
+    created: Mutex<Vec<Created>>,
+    /// Orders the arrivals and replies of creates.
+    create_events: AtomicUsize,
+    uploads_in_flight: AtomicUsize,
+    uploads_max_in_flight: AtomicUsize,
+    /// Ids handed out by `files.generateIds`.
+    generated: AtomicUsize,
 }
 
 pub(crate) struct FakeDrive {
@@ -275,6 +307,11 @@ impl FakeDrive {
             media_max_in_flight: AtomicUsize::new(0),
             first_media: Mutex::new(None),
             last_list: Mutex::new(None),
+            created: Mutex::new(Vec::new()),
+            create_events: AtomicUsize::new(0),
+            uploads_in_flight: AtomicUsize::new(0),
+            uploads_max_in_flight: AtomicUsize::new(0),
+            generated: AtomicUsize::new(0),
         });
 
         let server_state = Arc::clone(&state);
@@ -324,6 +361,16 @@ impl FakeDrive {
     /// The most media downloads that were being answered at the same time.
     pub(crate) fn media_max_in_flight(&self) -> usize {
         self.state.media_max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The successful creates, in reply order.
+    pub(crate) fn created(&self) -> Vec<Created> {
+        self.state.created.lock().expect("created lock").clone()
+    }
+
+    /// The most file uploads (creates of non-folders) that were being answered at once.
+    pub(crate) fn uploads_max_in_flight(&self) -> usize {
+        self.state.uploads_max_in_flight.load(Ordering::SeqCst)
     }
 
     /// When the first media download arrived and when the last list reply was sent.
@@ -378,11 +425,18 @@ async fn handle(
         })
         .unwrap_or_default();
 
-    let path = request.uri().path();
+    let path = request.uri().path().to_owned();
+    if request.method() == Method::POST && path == UPLOAD_PATH {
+        return Ok(create(&state, request).await);
+    }
     if request.method() != Method::GET {
         return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
     }
+    if path == GENERATE_IDS_PATH {
+        return Ok(generate_ids(&state, &params));
+    }
     if let Some(id) = path
+        .as_str()
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
@@ -424,6 +478,127 @@ async fn handle(
     let response = list(&state, &list_request, &q);
     *state.last_list.lock().expect("last list lock") = Some(Instant::now());
     Ok(response)
+}
+
+/// `files.generateIds`: `count` ids that no other call returned.
+fn generate_ids(state: &State, params: &[(String, String)]) -> FakeResponse {
+    let count = params
+        .iter()
+        .find(|(key, _)| key == "count")
+        .and_then(|(_, count)| count.parse::<usize>().ok())
+        .unwrap_or(10);
+    let first = state.generated.fetch_add(count, Ordering::SeqCst);
+    let ids = (first..first + count)
+        .map(|n| format!("gen-{n}"))
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        &json!({"kind": "drive#generatedIds", "space": "drive", "ids": ids}),
+    )
+}
+
+/// A multipart `files.create`: the metadata part and the content part.
+async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeResponse {
+    let arrived = state.create_events.fetch_add(1, Ordering::SeqCst);
+    let boundary = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("boundary="))
+        .map(|(_, boundary)| boundary.trim_matches('"').to_owned());
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let Some((metadata, content)) = boundary.and_then(|b| multipart(&body.to_bytes(), &b)) else {
+        return error(StatusCode::BAD_REQUEST, "not a multipart upload");
+    };
+    let text = |key: &str| metadata[key].as_str().unwrap_or_default().to_owned();
+    let mime_type = text("mimeType");
+    let is_folder = mime_type == MIME_TYPE_DRIVE_FOLDER;
+    let parents = metadata["parents"]
+        .as_array()
+        .map(|parents| {
+            parents
+                .iter()
+                .filter_map(|parent| parent.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    let _upload =
+        (!is_folder).then(|| InFlight::new(&state.uploads_in_flight, &state.uploads_max_in_flight));
+    if !is_folder {
+        tokio::time::sleep(state.behavior.upload_delay).await;
+    }
+
+    let name = text("name");
+    if state.behavior.upload_rejected.contains(&name) {
+        return error(StatusCode::BAD_REQUEST, "Invalid upload.");
+    }
+    let missing_parent = {
+        let created = state.created.lock().expect("created lock");
+        parents.iter().find(|parent| {
+            parent.as_str() != "root"
+                && !created.iter().any(|folder| {
+                    &folder.id == *parent && folder.mime_type == MIME_TYPE_DRIVE_FOLDER
+                })
+                && !state.files.iter().any(|file| &file.id == *parent)
+        })
+    };
+    if let Some(parent) = missing_parent {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {parent}."));
+    }
+
+    let created = Created {
+        id: text("id"),
+        name,
+        mime_type,
+        parents,
+        content,
+        arrived,
+        answered: state.create_events.fetch_add(1, Ordering::SeqCst),
+    };
+    let reply = json!({
+        "kind": "drive#file",
+        "id": created.id,
+        "name": created.name,
+        "mimeType": created.mime_type,
+        "parents": created.parents,
+        "size": created.content.len().to_string(),
+    });
+    state.created.lock().expect("created lock").push(created);
+    json_response(StatusCode::OK, &reply)
+}
+
+/// The JSON metadata and the content of a `multipart/related` body with two parts.
+fn multipart(body: &[u8], boundary: &str) -> Option<(Value, Vec<u8>)> {
+    let delimiter = format!("--{boundary}");
+    let mut parts = split(body, delimiter.as_bytes()).into_iter().skip(1);
+    let mut part = || -> Option<Vec<u8>> {
+        let part = parts.next()?;
+        let part = part.strip_prefix(b"\r\n")?;
+        let start = part.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+        let content = &part[start..];
+        Some(content.strip_suffix(b"\r\n").unwrap_or(content).to_vec())
+    };
+    let metadata = serde_json::from_slice(&part()?).ok()?;
+    let content = part()?;
+    Some((metadata, content))
+}
+
+/// `haystack` split at every `delimiter`.
+fn split<'a>(haystack: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    let mut pieces = Vec::new();
+    let mut rest = haystack;
+    while let Some(at) = rest
+        .windows(delimiter.len())
+        .position(|window| window == delimiter)
+    {
+        pieces.push(&rest[..at]);
+        rest = &rest[at + delimiter.len()..];
+    }
+    pieces.push(rest);
+    pieces
 }
 
 /// `files.get?alt=media`: the content of a blob.

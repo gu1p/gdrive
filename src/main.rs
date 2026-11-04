@@ -367,6 +367,14 @@ enum FileCommand {
         /// Print only id of file/folder
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
+
+        /// With --recursive: upload up to N files at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// With --recursive: when a file or folder fails, go on with the others instead of stopping. The command still exits with an error
+        #[arg(long)]
+        continue_on_error: bool,
     },
 
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
@@ -801,6 +809,8 @@ async fn handle_files_command(
             print_chunk_errors,
             print_chunk_info,
             print_only_id,
+            jobs,
+            continue_on_error,
         } => {
             files::upload(files::upload::Config {
                 file_path,
@@ -811,6 +821,7 @@ async fn handle_files_command(
                 print_chunk_info,
                 upload_directories: recursive,
                 print_only_id,
+                transfer: Options::new(jobs, continue_on_error),
             })
             .await?;
         }
@@ -1203,6 +1214,30 @@ mod tests {
             download(&["-r", "--jobs", "8", "--continue-on-error"]),
             (8, true)
         );
+
+        let cli = Cli::try_parse_from([
+            "gdrive",
+            "files",
+            "upload",
+            "dir",
+            "-r",
+            "--jobs",
+            "2",
+            "--continue-on-error",
+        ])
+        .expect("valid flags");
+        let Command::Files {
+            command:
+                FileCommand::Upload {
+                    jobs,
+                    continue_on_error,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected files upload");
+        };
+        assert_eq!((jobs.get(), continue_on_error), (2, true));
     }
 
     #[test]

@@ -1,3 +1,5 @@
+mod recursive;
+
 use std::{
     error,
     fmt::{Display, Formatter},
@@ -13,15 +15,13 @@ use crate::{
         delegate::{ChunkSize, UploadDelegate, UploadDelegateConfig},
         file_helper,
         file_info::{self, FileInfo},
-        file_tree::{self, FileTree},
+        file_tree,
         hub_helper::{get_hub, GetHubError},
-        human_size::human_size,
-        id_gen::IdGen,
         retry::RetryPolicy,
-        FileTreeLike, FolderLike,
     },
-    files::{self, info::DisplayConfig, mkdir, FileResult},
+    files::{self, info::DisplayConfig, FileResult},
     hub::Hub,
+    transfer::scheduler::{self, Printer},
 };
 
 #[expect(
@@ -37,6 +37,9 @@ pub(crate) struct Config {
     pub(crate) print_chunk_info: bool,
     pub(crate) upload_directories: bool,
     pub(crate) print_only_id: bool,
+    /// How many files a recursive upload transfers at once, and whether it goes on after a
+    /// failure.
+    pub(crate) transfer: scheduler::Options,
 }
 
 impl Config {
@@ -50,6 +53,7 @@ impl Config {
             print_chunk_info,
             upload_directories,
             print_only_id,
+            transfer,
         } = self;
         (
             CommonConfig {
@@ -57,6 +61,7 @@ impl Config {
                 parents,
                 upload_directories,
                 print_only_id,
+                transfer,
             },
             file_path,
             UploadDelegateConfig {
@@ -145,6 +150,7 @@ struct CommonConfig {
     parents: Option<Vec<String>>,
     upload_directories: bool,
     print_only_id: bool,
+    transfer: scheduler::Options,
 }
 
 #[derive(Debug)]
@@ -208,110 +214,15 @@ struct UploadDirectoryConfig {
     common: CommonConfig,
 }
 
+/// Uploads the local folder and everything in it: folders are created parent first with
+/// pre-generated ids, files are uploaded `common.transfer.jobs` at a time (see [`recursive`]).
 async fn upload_directory(
     hub: &Hub,
     config: UploadDirectoryConfig,
     delegate_config: &UploadDelegateConfig,
 ) -> Result<(), Error> {
-    let mut ids = IdGen::new(hub);
-    let tree = FileTree::from_path(&config.file_path, &mut ids)
-        .await
-        .map_err(Error::CreateFileTree)?;
-
-    let tree_info = tree.info();
-
-    if !config.common.print_only_id {
-        println!(
-            "Found {} files in {} directories with a total size of {}",
-            tree_info.file_count,
-            tree_info.folder_count,
-            human_size(tree_info.total_file_size),
-        );
-    }
-
-    for folder in &tree.folders() {
-        let folder_parents = folder
-            .info
-            .parent
-            .as_ref()
-            .map(|p| vec![p.drive_id.clone()])
-            .or_else(|| config.common.parents.clone());
-
-        if !config.common.print_only_id {
-            println!(
-                "Creating directory '{}' with id: {}",
-                folder.relative_path().display(),
-                folder.info.drive_id
-            );
-        }
-
-        let drive_folder = mkdir::create_directory(
-            hub,
-            &mkdir::Config {
-                id: Some(folder.info.drive_id.clone()),
-                name: folder.info.name.clone(),
-                parents: folder_parents,
-                print_only_id: false,
-            },
-        )
-        .await
-        .map_err(|err| Error::Mkdir(Box::new(err)))?;
-
-        if config.common.print_only_id {
-            println!(
-                "{}: {}",
-                folder.relative_path().display(),
-                folder.info.drive_id
-            );
-        }
-
-        let folder_id = drive_folder.id.ok_or(Error::DriveFolderMissingId)?;
-        let parents = Some(vec![folder_id.clone()]);
-
-        for file in folder.files() {
-            let os_file = match fs::File::open(&file.path) {
-                Ok(os_file) => os_file,
-                Err(err) => {
-                    return Err(Error::OpenFile(file.path.clone(), err));
-                }
-            };
-
-            let file_info = file.info(parents.clone());
-
-            if !config.common.print_only_id {
-                println!(
-                    "Uploading file '{}' with id: {}",
-                    file.relative_path().display(),
-                    file.drive_id
-                );
-            }
-
-            upload_file(
-                hub,
-                os_file,
-                Some(file.drive_id.clone()),
-                file_info,
-                delegate_config,
-            )
-            .await
-            .map_err(|err| Error::Upload(Box::new(err)))?;
-
-            if config.common.print_only_id {
-                println!("{}: {}", file.relative_path().display(), file.drive_id);
-            }
-        }
-    }
-
-    if !config.common.print_only_id {
-        println!(
-            "Uploaded {} files in {} directories with a total size of {}",
-            tree_info.file_count,
-            tree_info.folder_count,
-            human_size(tree_info.total_file_size),
-        );
-    }
-
-    Ok(())
+    let printer = Printer::stdio();
+    recursive::upload_directory(hub, config, delegate_config, &printer, scheduler::ctrl_c()).await
 }
 
 #[expect(
@@ -378,6 +289,13 @@ pub(crate) enum Error {
     DriveFolderMissingId,
     CreateFileTree(file_tree::errors::FileTree),
     Mkdir(Box<google_drive3::Error>),
+    /// A file or folder of a recursive upload failed; `path` starts with the uploaded folder.
+    RecursiveItem {
+        path: PathBuf,
+        source: Box<Error>,
+    },
+    /// Files or folders of a recursive upload failed, or it was interrupted.
+    Incomplete(scheduler::Incomplete),
 }
 
 impl error::Error for Error {
@@ -390,6 +308,8 @@ impl error::Error for Error {
             Error::Upload(source) | Error::Mkdir(source) => Some(source),
             Error::IsDirectory(_) | Error::DriveFolderMissingId => None,
             Error::CreateFileTree(file_tree) => Some(file_tree),
+            Error::RecursiveItem { source, .. } => Some(source),
+            Error::Incomplete(source) => Some(source),
         }
     }
 }
@@ -416,6 +336,10 @@ impl Display for Error {
             }
             Error::CreateFileTree(_) => f.write_str("unable to create file tree"),
             Error::Mkdir(_) => f.write_str("unable to create directory"),
+            Error::RecursiveItem { path, source: _ } => {
+                write!(f, "unable to upload '{}'", path.display())
+            }
+            Error::Incomplete(_) => f.write_str("the recursive upload is incomplete"),
         }
     }
 }

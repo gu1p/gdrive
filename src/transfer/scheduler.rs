@@ -220,13 +220,6 @@ impl Job {
     }
 
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the recursive upload uses it from the next commit on"
-        )
-    )]
     pub(crate) fn with_subtree(mut self, subtree: Subtree) -> Job {
         self.subtree = subtree;
         self
