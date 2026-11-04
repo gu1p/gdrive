@@ -48,8 +48,12 @@ const HEADER: [&str; 5] = ["Id", "Name", "Type", "Size", "Created"];
 
 pub(crate) async fn list(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
+    list_to(&hub, &config, io::stdout()).await
+}
+
+async fn list_to(hub: &Hub, config: &Config, writer: impl Write) -> Result<(), Error> {
     let files = list_files(
-        &hub,
+        hub,
         ListFilesConfig {
             query: &config.query,
             order_by: &config.order_by,
@@ -58,7 +62,7 @@ pub(crate) async fn list(config: Config) -> Result<(), Error> {
     )
     .await?;
 
-    write_files(io::stdout(), &files, &config.output).map_err(Error::WriteOutput)
+    write_files(writer, &files, &config.output).map_err(Error::WriteOutput)
 }
 
 fn write_files(
@@ -423,11 +427,143 @@ mod tests {
 
     use chrono::{TimeZone, Utc};
 
-    use super::{quote, truncate_middle, write_files, ListQuery, Output};
+    use super::{
+        list_files, list_to, quote, truncate_middle, write_files, Config, ListFilesConfig,
+        ListQuery, ListSortOrder, Output,
+    };
     use crate::{
-        common::drive_file::{MIME_TYPE_DRIVE_DOCUMENT, MIME_TYPE_DRIVE_FOLDER},
+        common::{
+            drive_file::{MIME_TYPE_DRIVE_DOCUMENT, MIME_TYPE_DRIVE_FOLDER},
+            stub_server::{Request, StubServer, TIMEOUT},
+        },
         files::info::{format_date_time, DisplayBytes, DisplayConfig},
     };
+
+    /// A `files.list` response with files `f<first>..f<last>` and an optional next page token.
+    fn file_page(range: std::ops::Range<usize>, next_page_token: Option<&str>) -> String {
+        let files: Vec<_> = range
+            .map(|i| serde_json::json!({ "id": format!("f{i}"), "name": format!("file {i}") }))
+            .collect();
+        let mut page = serde_json::json!({ "files": files });
+        if let Some(token) = next_page_token {
+            page["nextPageToken"] = token.into();
+        }
+        page.to_string()
+    }
+
+    /// Lists files against a stub serving `pages`; returns the file ids and the requests.
+    async fn list_from_stub(
+        query: ListQuery,
+        max_files: usize,
+        pages: Vec<String>,
+    ) -> (Vec<String>, Vec<Request>) {
+        let server = StubServer::start(pages).await.expect("start stub server");
+        let hub = server.hub().expect("create hub");
+        let config = ListFilesConfig {
+            query: &query,
+            order_by: &ListSortOrder::default(),
+            max_files,
+        };
+
+        let files = tokio::time::timeout(TIMEOUT, list_files(&hub, config))
+            .await
+            .expect("listing should finish")
+            .expect("listing should succeed");
+
+        let ids = files.into_iter().filter_map(|file| file.id).collect();
+        (ids, server.requests().await)
+    }
+
+    /// `files list --max 2500`: regression test for the 1000 cap that upstream PR #104 removed.
+    #[tokio::test]
+    async fn max_above_1000_pages_through_results() {
+        let pages = vec![
+            file_page(0..1000, Some("t1")),
+            file_page(1000..2000, Some("t2")),
+            file_page(2000..2500, Some("t3")),
+        ];
+        let server = StubServer::start(pages).await.expect("start stub server");
+        let hub = server.hub().expect("create hub");
+        let config = Config {
+            query: ListQuery::default(),
+            order_by: ListSortOrder::default(),
+            max_files: 2500,
+            output: Output::Tsv { skip_header: true },
+        };
+
+        let mut out = Vec::new();
+        tokio::time::timeout(TIMEOUT, list_to(&hub, &config, &mut out))
+            .await
+            .expect("listing should finish")
+            .expect("listing should succeed");
+
+        let out = String::from_utf8(out).expect("utf-8");
+        assert_eq!(out.lines().count(), 2500);
+        assert!(out.lines().last().expect("rows").starts_with("f2499\t"));
+
+        let requests = server.requests().await;
+        let page_params: Vec<_> = requests
+            .iter()
+            .map(|r| (r.param("pageSize"), r.param("pageToken")))
+            .collect();
+        assert_eq!(
+            page_params,
+            [
+                (Some("1000"), None),
+                (Some("1000"), Some("t1")),
+                (Some("500"), Some("t2")),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stops_when_no_next_page_token() {
+        let pages = vec![file_page(0..1000, Some("t1")), file_page(1000..1200, None)];
+
+        let (ids, requests) = list_from_stub(ListQuery::default(), 5000, pages).await;
+
+        assert_eq!(ids.len(), 1200);
+        assert_eq!(requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn request_parameters_follow_the_query() {
+        let cases = [
+            (
+                list_query(None, None, None),
+                Some("'root' in parents and trashed = false"),
+                None,
+            ),
+            (
+                list_query(Some("name contains 'x'"), Some("P"), None),
+                Some("'P' in parents and (name contains 'x')"),
+                None,
+            ),
+            (
+                list_query(Some("name contains 'x'"), None, Some("D")),
+                Some("name contains 'x'"),
+                Some("D"),
+            ),
+            (list_query(Some(""), None, Some("D")), None, Some("D")),
+        ];
+
+        for (query, expected_q, expected_drive) in cases {
+            let (_, requests) =
+                list_from_stub(query.clone(), 30, vec![file_page(0..1, None)]).await;
+            let request = &requests[0];
+
+            assert_eq!(request.path, "/drive/v3/files", "{query:?}");
+            assert_eq!(request.param("q"), expected_q, "{query:?}");
+            assert_eq!(request.param("driveId"), expected_drive, "{query:?}");
+            assert_eq!(
+                request.param("corpora"),
+                expected_drive.map(|_| "drive"),
+                "{query:?}"
+            );
+            assert_eq!(request.param("supportsAllDrives"), Some("true"));
+            assert_eq!(request.param("includeItemsFromAllDrives"), Some("true"));
+        }
+    }
 
     const LONG_NAME: &str = "a name that is much longer than forty-one characters.pdf";
 
