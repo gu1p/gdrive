@@ -1,7 +1,10 @@
 //! Protocol tests for the media requests of `files download`: parameters, and resuming a
 //! download that breaks off (`resume.rs`).
 
-use std::path::Path;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+};
 
 use http_body_util::BodyExt;
 use serde_json::json;
@@ -11,10 +14,13 @@ use super::{
     resume::{Identity, Revision},
     save_to_file, Config, Destination, ExistingFileAction, Expected, Next, ResumableDownload,
 };
-use crate::common::{
-    drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT},
-    mock_server::{MockServer, Response},
-    retry::RetryPolicy,
+use crate::{
+    common::{
+        drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT},
+        mock_server::{MockServer, Response},
+        retry::RetryPolicy,
+    },
+    transfer::progress::{JobId, JobProgress, ProgressEvent, ProgressSink},
 };
 
 async fn media_request(acknowledge_abuse: bool) -> crate::common::mock_server::Request {
@@ -64,6 +70,7 @@ fn config(file_id: &str, destination: &std::path::Path) -> Config {
         destination: Destination::Path(destination.to_owned()),
         acknowledge_abuse: true,
         transfer: crate::transfer::scheduler::Options::default(),
+        progress: crate::transfer::progress::Mode::Never,
         export: None,
     }
 }
@@ -169,15 +176,65 @@ async fn download(
     size: Option<u64>,
     md5: Option<md5::Digest>,
 ) -> Result<(), super::errors::SaveBodyToFile> {
+    download_reporting(server, dir, size, md5, None).await
+}
+
+/// [`download`], reporting the bytes to `progress`.
+async fn download_reporting(
+    server: &MockServer,
+    dir: &Path,
+    size: Option<u64>,
+    md5: Option<md5::Digest>,
+    progress: Option<JobProgress>,
+) -> Result<(), super::errors::SaveBodyToFile> {
     let hub = server.hub();
     let source = file_content(&hub, "file-id", false, String::from("test download")).unwrap();
     let mut download =
         ResumableDownload::new(source, hub.retrier().state(), Expected { md5, size });
+    if let Some(progress) = progress {
+        download = download.with_progress(progress);
+    }
     let first = download
         .next()
         .await
         .map_err(|err| super::errors::SaveBodyToFile::Request(Box::new(err)))?;
     save_to_file(download, first, &dir.join("out.bin"), "file-id").await
+}
+
+/// The bytes a download reports, each with whether its destination was there already.
+struct Written {
+    destination: PathBuf,
+    reports: Mutex<Vec<(u64, bool)>>,
+}
+
+impl ProgressSink for Written {
+    fn event(&self, event: &ProgressEvent<'_>) {
+        if let ProgressEvent::Bytes { bytes, .. } = event {
+            let renamed = self.destination.exists();
+            self.reports.lock().unwrap().push((*bytes, renamed));
+        }
+    }
+}
+
+/// Downloads like [`download`] and returns the bytes it reported.
+async fn reported(server: &MockServer, dir: &Path, content: &str) -> Vec<(u64, bool)> {
+    let written = Arc::new(Written {
+        destination: dir.join("out.bin"),
+        reports: Mutex::new(Vec::new()),
+    });
+    let progress = JobProgress::new(JobId(0), Arc::clone(&written) as Arc<dyn ProgressSink>);
+    download_reporting(
+        server,
+        dir,
+        Some(content.len() as u64),
+        Some(md5::compute(content)),
+        Some(progress),
+    )
+    .await
+    .unwrap();
+    assert_content(&dir.join("out.bin"), content);
+    let reports = written.reports.lock().unwrap().clone();
+    reports
 }
 
 /// The file holds exactly `expected`; on failure, says where it differs instead of printing it.
@@ -239,6 +296,49 @@ async fn a_cut_body_is_resumed_with_a_range_request() {
     assert_eq!(ranges(&server), [None, Some(format!("bytes={cut}-"))]);
     assert_content(&dir.path().join("out.bin"), &content);
     assert_eq!(dir_entries(dir.path()), ["out.bin"]);
+}
+
+#[tokio::test]
+async fn the_bytes_are_reported_as_they_are_written() {
+    let content = content();
+    let cut = 20_000;
+    let total = content.len();
+    let server = MockServer::start(vec![
+        Response::raw(200, &content).cut_after(cut),
+        Response::raw(206, &content[cut..]).with_header(
+            "Content-Range",
+            &format!("bytes {cut}-{}/{total}", total - 1),
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let reports = reported(&server, dir.path(), &content).await;
+
+    let bytes = reports.iter().map(|(bytes, _)| bytes).sum::<u64>();
+    assert_eq!(bytes, total as u64, "every byte, once");
+    assert!(reports.len() >= 2, "{reports:?}");
+    assert!(
+        reports.iter().all(|(_, renamed)| !renamed),
+        "while the file is written, not when it is complete: {reports:?}"
+    );
+}
+
+#[tokio::test]
+async fn bytes_written_again_after_a_restart_are_not_reported_again() {
+    let content = content();
+    let server = MockServer::start(vec![
+        Response::raw(200, &content).cut_after(30_000),
+        // The server ignores the Range header and sends everything again.
+        Response::raw(200, &content),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let reports = reported(&server, dir.path(), &content).await;
+
+    let bytes = reports.iter().map(|(bytes, _)| bytes).sum::<u64>();
+    assert_eq!(bytes, content.len() as u64);
 }
 
 #[tokio::test]

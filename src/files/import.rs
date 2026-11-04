@@ -15,9 +15,12 @@ use crate::{
         hub_helper::{get_hub, GetHubError},
     },
     files::{self, info::DisplayConfig},
-    transfer::upload::{
-        session::{account_session_dir, account_session_identity},
-        upload_path, UploadError, UploadOptions, UploadTarget,
+    transfer::{
+        progress::{self, ConfirmedTotal, ProgressDisplay},
+        upload::{
+            session::{account_session_dir, account_session_identity},
+            upload_path, UploadError, UploadOptions, UploadTarget,
+        },
     },
 };
 
@@ -28,6 +31,8 @@ pub(crate) struct Config {
     pub(crate) print_only_id: bool,
     pub(crate) chunk_size: ChunkSize,
     pub(crate) multipart_threshold: MultipartThreshold,
+    /// Whether the import shows its progress on stderr.
+    pub(crate) progress: progress::Mode,
 }
 
 impl Config {
@@ -90,9 +95,12 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
         println!("Importing {} as a {}", config.file_path.display(), doc_type);
     }
 
-    let file = upload_path(&hub, &config.file_path, &target, &options, None)
-        .await
-        .map_err(|err| Error::UploadFile(Box::new(err)))?;
+    let (display, progress) = ProgressDisplay::single(config.progress, false, Some(file_info.size));
+    let confirmed = ConfirmedTotal::new(progress);
+    let report = |held| confirmed.held(held);
+    let uploaded = upload_path(&hub, &config.file_path, &target, &options, Some(&report)).await;
+    display.finish();
+    let file = uploaded.map_err(|err| Error::UploadFile(Box::new(err)))?;
 
     if config.print_only_id {
         print!("{}", file.id.unwrap_or_default());
@@ -205,6 +213,7 @@ mod tests {
             print_only_id: false,
             chunk_size: chunk_size.parse().unwrap(),
             multipart_threshold: multipart_threshold.parse().unwrap(),
+            progress: crate::transfer::progress::Mode::Never,
         }
     }
 

@@ -2,10 +2,11 @@
 //! downloads concurrently.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::{self, Future},
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -21,9 +22,10 @@ use crate::{
     },
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
+        progress::{JobId, Mode, NoProgress, ProgressDisplay, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
-            Options,
+            Options, Printer,
         },
     },
 };
@@ -38,6 +40,7 @@ fn config(destination: &Path, jobs: usize, continue_on_error: bool) -> Config {
         acknowledge_abuse: false,
         transfer: Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error),
         export: None,
+        progress: Mode::Never,
     }
 }
 
@@ -70,9 +73,26 @@ async fn download(
     config: &Config,
     cancel: impl Future<Output = ()> + Send,
 ) -> Downloaded {
+    download_reporting(server, config, Arc::new(NoProgress), cancel).await
+}
+
+/// [`download`], reporting to `progress`.
+async fn download_reporting(
+    server: &FakeDrive,
+    config: &Config,
+    progress: Arc<dyn ProgressSink>,
+    cancel: impl Future<Output = ()> + Send,
+) -> Downloaded {
     let output = output();
     let hub = server.hub();
-    let run = download_directory(&hub, root_folder(), config, &output.printer, cancel);
+    let run = download_directory(
+        &hub,
+        root_folder(),
+        config,
+        &output.printer,
+        ProgressDisplay::reporting_to(progress),
+        cancel,
+    );
     let result = tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the download should end");
@@ -1237,4 +1257,131 @@ async fn a_rerun_with_overwrite_through_the_command_skips_the_unchanged_export()
         std::fs::read_to_string(local(destination.path(), "Root/report.docx")).unwrap(),
         "doc!"
     );
+}
+
+/// The bytes reported for each file and export of a recursive download, by label, and whether
+/// the file was in place already when they were.
+struct Written {
+    destination: PathBuf,
+    labels: Mutex<HashMap<JobId, String>>,
+    reports: Mutex<BTreeMap<String, Vec<(u64, bool)>>>,
+}
+
+impl ProgressSink for Written {
+    fn event(&self, event: &ProgressEvent<'_>) {
+        match event {
+            ProgressEvent::Queued { job, label, .. } => {
+                self.labels
+                    .lock()
+                    .unwrap()
+                    .insert(*job, (*label).to_owned());
+            }
+            ProgressEvent::Bytes { job, bytes } => {
+                let label = self.labels.lock().unwrap()[job].clone();
+                let renamed = self.destination.join(&label).exists();
+                let mut reports = self.reports.lock().unwrap();
+                reports.entry(label).or_default().push((*bytes, renamed));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn downloaded_and_exported_bytes_are_reported_as_they_are_written() {
+    let big = "0123456789".repeat(30_000);
+    let files = vec![
+        FakeFile::blob("big", "big.bin", "root", &big),
+        FakeFile::blob("small", "small.txt", "root", "small"),
+        FakeFile::blob("same", "same.txt", "root", "same"),
+        FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, "doc!"),
+    ];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+    let root = destination.path().join("Root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("same.txt"), "same").unwrap();
+    let config = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..exporting(destination.path(), "default", false)
+    };
+    let written = Arc::new(Written {
+        destination: destination.path().to_path_buf(),
+        labels: Mutex::default(),
+        reports: Mutex::default(),
+    });
+
+    let downloaded = download_reporting(
+        &server,
+        &config,
+        Arc::clone(&written) as Arc<dyn ProgressSink>,
+        future::pending(),
+    )
+    .await;
+
+    downloaded.result.unwrap();
+    let reports = written.reports.lock().unwrap();
+    let totals = reports
+        .iter()
+        .map(|(label, reports)| {
+            let bytes = reports.iter().map(|(bytes, _)| bytes).sum::<u64>();
+            (label.clone(), bytes)
+        })
+        .collect::<Vec<_>>();
+    // Exports are labeled with the platform's separator.
+    let mut expected = vec![
+        (String::from("Root/big.bin"), big.len() as u64),
+        (shown("Root/report.docx"), 4),
+        (String::from("Root/small.txt"), 5),
+    ];
+    expected.sort();
+    assert_eq!(totals, expected, "an unchanged file transfers nothing");
+    for (label, reports) in reports.iter() {
+        assert!(
+            reports.iter().all(|(_, renamed)| !renamed),
+            "{label}: reported while it was written: {reports:?}"
+        );
+    }
+}
+
+/// Where the plain line of a display and the lines of the run go to one stream: the line was
+/// drawn and erased before the summary, and nothing is drawn after it.
+fn assert_progress_gone_before_the_summary(written: &str) {
+    let drawn = written.find(" files, ").expect("the progress is drawn");
+    let erased = written
+        .rfind(&format!("\r{}\r", " ".repeat(80)))
+        .expect("the progress is erased");
+    let summary = written.find("Summary: ").expect("a summary");
+    assert!(drawn < erased && erased < summary, "{written:?}");
+    assert!(!written[summary..].contains('\r'), "{written:?}");
+}
+
+#[tokio::test]
+async fn the_progress_is_gone_before_the_summary() {
+    let files = vec![
+        FakeFile::blob("a", "a.txt", "root", "a"),
+        FakeFile::blob("b", "b.txt", "root", "b"),
+    ];
+    // Long enough for the display to draw.
+    let behavior = Behavior {
+        media_delay: Duration::from_millis(500),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(files, behavior).await;
+    let destination = tempfile::tempdir().unwrap();
+    let written = Captured::default();
+    let printer = Printer::to(written.clone(), written.clone());
+
+    download_directory(
+        &server.hub(),
+        root_folder(),
+        &config(destination.path(), 2, false),
+        &printer,
+        ProgressDisplay::plain_on(written.clone()),
+        future::pending(),
+    )
+    .await
+    .unwrap();
+
+    assert_progress_gone_before_the_summary(&written.text());
 }

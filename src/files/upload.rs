@@ -22,6 +22,7 @@ use crate::{
     files::{self, info::DisplayConfig},
     hub::Hub,
     transfer::{
+        progress::{self, ConfirmedTotal, ProgressDisplay},
         scheduler::{self, Printer},
         upload::{
             session::{account_session_dir, account_session_identity},
@@ -50,6 +51,8 @@ pub(crate) struct Config {
     /// How many files a recursive upload transfers at once, and whether it goes on after a
     /// failure.
     pub(crate) transfer: scheduler::Options,
+    /// Whether the upload shows its progress on stderr.
+    pub(crate) progress: progress::Mode,
 }
 
 impl Config {
@@ -68,6 +71,7 @@ impl Config {
             upload_directories,
             print_only_id,
             transfer,
+            progress,
         } = self;
         let options = UploadOptions {
             chunk_size: chunk_size.in_bytes(),
@@ -86,6 +90,7 @@ impl Config {
                 upload_directories,
                 print_only_id,
                 transfer,
+                progress,
             },
             file_path,
             options,
@@ -163,6 +168,7 @@ struct CommonConfig {
     upload_directories: bool,
     print_only_id: bool,
     transfer: scheduler::Options,
+    progress: progress::Mode,
 }
 
 #[derive(Debug)]
@@ -222,9 +228,20 @@ async fn upload_regular(
         println!("Uploading {}", config.file_path.as_path().display());
     }
 
-    let file = upload_path(hub, config.file_path.as_path(), &target, &options, None)
-        .await
-        .map_err(|err| Error::Transfer(Box::new(err)))?;
+    let (display, progress) =
+        ProgressDisplay::single(config.common.progress, false, Some(file_info.size));
+    let confirmed = ConfirmedTotal::new(progress);
+    let report = |held| confirmed.held(held);
+    let uploaded = upload_path(
+        hub,
+        config.file_path.as_path(),
+        &target,
+        &options,
+        Some(&report),
+    )
+    .await;
+    display.finish();
+    let file = uploaded.map_err(|err| Error::Transfer(Box::new(err)))?;
 
     if config.common.print_only_id {
         print!("{}", file.id.unwrap_or_default());
@@ -251,7 +268,8 @@ async fn upload_directory(
     options: &UploadOptions,
 ) -> Result<(), Error> {
     let printer = Printer::stdio();
-    recursive::upload_directory(hub, config, options, &printer, scheduler::ctrl_c()).await
+    let display = ProgressDisplay::recursive(config.common.progress, config.common.transfer.jobs);
+    recursive::upload_directory(hub, config, options, &printer, display, scheduler::ctrl_c()).await
 }
 
 #[derive(Debug)]
@@ -371,6 +389,7 @@ mod tests {
             upload_directories: false,
             print_only_id: true,
             transfer: scheduler::Options::default(),
+            progress: crate::transfer::progress::Mode::Never,
         }
     }
 
@@ -499,6 +518,7 @@ mod tests {
             upload_directories: true,
             print_only_id: false,
             transfer: scheduler::Options::default(),
+            progress: crate::transfer::progress::Mode::Never,
         }
         .split();
 

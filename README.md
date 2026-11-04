@@ -198,11 +198,14 @@ Also in 4.0.0:
 - `files download --recursive --export default` exports Google Docs, Sheets, Slides and Drawings (to
   docx, xlsx, pptx and png, or a format per type such as `--export md,sheets=ods`) instead of skipping
   them, and does not export an unchanged document again.
+- Progress on stderr for downloads, uploads, updates, imports and exports: a bar with the rate and the
+  time left, and for recursive transfers a line for the run and one per file. On by default on a
+  terminal; `--progress`, `--no-progress` and `GDRIVE_PROGRESS` change that. See
+  [Progress output](docs/basic_usage.md#progress-output).
 
 Planned, not done yet:
 
-- Faster transfers: resumable uploads that survive a restart, progress output,
-  skip and sync modes, download resume.
+- Faster transfers: resumable uploads that survive a restart, skip and sync modes, download resume.
 - Shell completions; a Windows build without the Visual C++ runtime.
 - Trash and untrash, real TSV and JSON output, listing all shared drives, Markdown export and import,
   short options.

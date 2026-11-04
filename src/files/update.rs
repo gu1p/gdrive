@@ -20,9 +20,12 @@ use crate::{
         FileResult,
     },
     hub::Hub,
-    transfer::upload::{
-        session::{account_session_dir, account_session_identity},
-        upload_path, UploadError, UploadOptions, UploadTarget,
+    transfer::{
+        progress::{self, ConfirmedTotal, ProgressDisplay},
+        upload::{
+            session::{account_session_dir, account_session_identity},
+            upload_path, UploadError, UploadOptions, UploadTarget,
+        },
     },
 };
 
@@ -37,6 +40,8 @@ pub(crate) struct Config {
     pub(crate) multipart_threshold: MultipartThreshold,
     pub(crate) print_chunk_errors: bool,
     pub(crate) print_chunk_info: bool,
+    /// Whether the update shows its progress on stderr.
+    pub(crate) progress: progress::Mode,
 }
 
 pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
@@ -127,9 +132,12 @@ async fn update_content(
         content_path.display()
     );
 
-    upload_path(hub, content_path, &target, options, None)
-        .await
-        .map_err(|err| Box::new(Error::Update(Box::new(err))))
+    let (display, progress) = ProgressDisplay::single(config.progress, false, Some(file_info.size));
+    let confirmed = ConfirmedTotal::new(progress);
+    let report = |held| confirmed.held(held);
+    let uploaded = upload_path(hub, content_path, &target, options, Some(&report)).await;
+    display.finish();
+    uploaded.map_err(|err| Box::new(Error::Update(Box::new(err))))
 }
 
 /// The upload reads the path as a seekable byte stream: a directory made the upload library
@@ -302,6 +310,7 @@ mod tests {
             multipart_threshold: "5".parse().unwrap(),
             print_chunk_errors: false,
             print_chunk_info: false,
+            progress: crate::transfer::progress::Mode::Never,
         };
         let file = std::fs::File::open(content_path).unwrap();
 

@@ -30,6 +30,7 @@ use crate::{
         },
     },
     hub::Hub,
+    transfer::progress::{self, ProgressDisplay},
 };
 
 #[derive(Clone, Debug)]
@@ -37,6 +38,8 @@ pub(crate) struct Config {
     pub(crate) file_id: String,
     pub(crate) file_path: PathBuf,
     pub(crate) existing_file_action: ExistingFileAction,
+    /// Whether the export shows its progress on stderr.
+    pub(crate) progress: progress::Mode,
     /// The format (`--format`); `None` takes it from the extension of `file_path`.
     pub(crate) format: Option<FileExtension>,
 }
@@ -109,9 +112,12 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
         config.file_path.display()
     );
 
-    files::download::save_to_file(download, first, &config.file_path, &config.file_id)
-        .await
-        .map_err(Error::SaveFile)?;
+    let (display, progress) = ProgressDisplay::single(config.progress, false, download.total());
+    let download = download.with_progress(progress);
+    let saved =
+        files::download::save_to_file(download, first, &config.file_path, &config.file_id).await;
+    display.finish();
+    saved.map_err(Error::SaveFile)?;
     if let Some(modified_time) = file.modified_time {
         if let Err(err) = set_modified_time(&config.file_path, modified_time).await {
             eprintln!(
@@ -315,7 +321,7 @@ impl error::Error for Error {
 mod tests {
     use serde_json::json;
 
-    use super::{export_with_hub, Config, ExistingFileAction};
+    use super::{export_with_hub, progress, Config, ExistingFileAction};
     use crate::common::{
         drive_file::{FileExtension, MIME_TYPE_DRIVE_DOCUMENT},
         mock_server::{MockServer, Response},
@@ -344,6 +350,7 @@ mod tests {
                 file_path: path.clone(),
                 existing_file_action: ExistingFileAction::Abort,
                 format: None,
+                progress: progress::Mode::Never,
             },
         )
         .await
@@ -387,6 +394,7 @@ mod tests {
                 file_path: dir.path().join("big.pdf"),
                 existing_file_action: ExistingFileAction::Abort,
                 format: None,
+                progress: progress::Mode::Never,
             },
         )
         .await
@@ -421,6 +429,7 @@ mod tests {
                 file_path: path.clone(),
                 existing_file_action: ExistingFileAction::Abort,
                 format: Some(FileExtension::Md),
+                progress: progress::Mode::Never,
             },
         )
         .await
@@ -447,6 +456,7 @@ mod tests {
                 file_path: dir.path().join("notes.pdf"),
                 existing_file_action: ExistingFileAction::Abort,
                 format: Some(FileExtension::Xlsx),
+                progress: progress::Mode::Never,
             },
         )
         .await
@@ -491,6 +501,7 @@ mod tests {
                 file_path: path.clone(),
                 existing_file_action: ExistingFileAction::Abort,
                 format: None,
+                progress: progress::Mode::Never,
             },
         )
         .await
@@ -532,6 +543,7 @@ mod tests {
                 file_path: path.clone(),
                 existing_file_action: ExistingFileAction::Overwrite,
                 format: None,
+                progress: progress::Mode::Never,
             },
         )
         .await

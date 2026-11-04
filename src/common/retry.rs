@@ -33,6 +33,9 @@ use hyper::{
 };
 use tokio::time::Instant;
 
+// Warnings go above the progress bars.
+use crate::transfer::progress::eprintln;
+
 /// What to do about a 401, in the style of the auth errors.
 const UNAUTHORIZED_HINT: &str =
     "; run 'gdrive account reauth' to authorize the current account again";
