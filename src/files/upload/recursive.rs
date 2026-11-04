@@ -30,8 +30,9 @@ use crate::{
     },
     files::mkdir,
     hub::Hub,
-    transfer::scheduler::{
-        Job, JobContext, JobKind, JobOutput, Outcome, Printer, Scheduler, Subtree,
+    transfer::{
+        progress::JobProgress,
+        scheduler::{Job, JobContext, JobKind, JobOutput, Outcome, Printer, Scheduler, Subtree},
     },
 };
 
@@ -212,7 +213,7 @@ impl Uploads {
                 ))
                 .await;
         }
-        if let Err(source) = self.upload_file(os_file, &file, parents).await {
+        if let Err(source) = self.send(os_file, &file, parents, &context.progress).await {
             return failed(path, source);
         }
         if self.print_only_id {
@@ -221,18 +222,21 @@ impl Uploads {
                 .out(format!("{}: {}", path.display(), file.drive_id))
                 .await;
         }
-        context.progress.bytes(file.size);
 
         Outcome::Transferred { bytes: file.size }
     }
 
     /// The one call that sends a file of a recursive upload to Drive, under its pre-generated
-    /// id, into the folder `parents`.
-    async fn upload_file(
+    /// id, into the folder `parents`, and reports the bytes Drive confirmed to `progress`.
+    ///
+    /// The gdrive-owned uploader (milestone 2, item 1) replaces the `upload_file` call here
+    /// with its own, which reports confirmed bytes per chunk instead of once at the end.
+    async fn send(
         &self,
         os_file: fs::File,
         file: &file_tree::File,
         parents: Vec<String>,
+        progress: &JobProgress,
     ) -> Result<(), Error> {
         upload_file(
             &self.hub,
@@ -243,6 +247,7 @@ impl Uploads {
         )
         .await
         .map_err(|err| Error::Upload(Box::new(err)))?;
+        progress.bytes(file.size);
         Ok(())
     }
 }
