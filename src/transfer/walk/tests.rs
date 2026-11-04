@@ -295,6 +295,53 @@ async fn folders_end_after_the_last_page_of_their_query() {
 }
 
 #[tokio::test]
+async fn ids_repeated_across_pages_are_emitted_once() {
+    let mut files = Vec::new();
+    for parent in ["root", "a", "b"] {
+        for n in 0..3 {
+            files.push(FakeFile::blob(
+                &format!("{parent}{n}"),
+                &format!("{n}.txt"),
+                parent,
+                "x",
+            ));
+        }
+    }
+    // Inserted after the root's files so that it is the repeated one on its second page.
+    files.insert(2, FakeFile::folder("a", "a", "root"));
+    files.push(FakeFile::folder("b", "b", "root"));
+    let behavior = Behavior {
+        page_size: Some(2),
+        repeat_across_pages: true,
+        ..Behavior::default()
+    };
+    for max_parents_per_query in [1, MAX_PARENTS_PER_QUERY] {
+        let options = WalkOptions {
+            max_parents_per_query,
+            ..options()
+        };
+        let walked = walk_all(files.clone(), behavior.clone(), options).await;
+
+        assert_eq!(
+            walked.paths(),
+            [
+                "0.txt", "1.txt", "2.txt", "a", "a/0.txt", "a/1.txt", "a/2.txt", "b", "b/0.txt",
+                "b/1.txt", "b/2.txt"
+            ],
+            "with max_parents_per_query = {max_parents_per_query}"
+        );
+        let listings_of_a = walked
+            .server
+            .requests()
+            .iter()
+            .filter(|request| request.parents.contains(&String::from("a")))
+            .filter(|request| request.param("pageToken").is_none())
+            .count();
+        assert_eq!(listings_of_a, 1, "`a` is queued once");
+    }
+}
+
+#[tokio::test]
 async fn batched_query_routes_children_to_their_parents() {
     let mut files = vec![
         FakeFile::folder("a", "a", "root"),

@@ -161,6 +161,9 @@ pub(crate) struct Behavior {
     pub(crate) omit_parents: bool,
     /// Return trashed files even when the query excludes them.
     pub(crate) ignore_trashed_filter: bool,
+    /// Start every page after the first with the last file of the previous page, as Drive may
+    /// when the folder changes during the listing.
+    pub(crate) repeat_across_pages: bool,
 }
 
 /// A list request as the fake saw it, with percent-decoded parameters.
@@ -343,9 +346,14 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
         .and_then(|size| size.parse::<usize>().ok())
         .unwrap_or(100);
     let page_size = behavior.page_size.unwrap_or(requested).min(requested);
-    let end = (offset + page_size).min(matching.len());
+    let start = if behavior.repeat_across_pages {
+        offset.saturating_sub(1)
+    } else {
+        offset
+    };
+    let end = (start + page_size).min(matching.len());
     let files = matching
-        .get(offset..end)
+        .get(start..end)
         .unwrap_or_default()
         .iter()
         .map(|file| file.to_json(!behavior.omit_parents))

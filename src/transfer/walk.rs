@@ -55,15 +55,16 @@
 //! - Backpressure: items reach the consumer only through the bounded channel. While the producer
 //!   waits for room it starts no request, so it runs ahead of the consumer by at most `buffer`
 //!   items plus the pages already in flight. Beyond that it holds the queue of discovered,
-//!   not yet listed folders (one small record per folder) and, for a batch of several folders,
-//!   the ids it emitted so far.
+//!   not yet listed folders (one small record per folder) and, for every batch in flight, the
+//!   ids it emitted so far.
 //! - Order: the entry of a folder (with [`Children::Listed`]) is sent before any item about its
 //!   children: their entries, its [`IncompleteSearch`], [`WalkItem::FolderDone`] or
 //!   [`FolderError`]. Every listed folder location, the root included, ends with exactly one
 //!   `FolderDone` or `FolderError`, and nothing names it afterwards. Across folders the order
 //!   is the completion order of concurrent requests; within a folder it is Drive's order.
-//! - A file is emitted at most once per folder location, also when a batch is split and its
-//!   folders are listed again. A `FolderError` may follow some entries of that folder when a
+//! - A file id is emitted at most once per folder location, also when Drive repeats it on a
+//!   later page or when a batch is split and its folders are listed again; so a subfolder is
+//!   queued once per location. A `FolderError` may follow some entries of that folder when a
 //!   later page failed.
 //! - Trashed files are never emitted: `trashed = false` is in every query and a trashed result
 //!   is dropped anyway. `incompleteSearch` is never dropped: it becomes an
@@ -375,7 +376,7 @@ impl Walk {
                 id: id.clone(),
                 parent: None,
             }),
-            skip: HashSet::new(),
+            emitted: HashSet::new(),
             alone: false,
         };
 
@@ -468,8 +469,8 @@ struct PendingFolder {
     corpus: Corpus,
     /// This folder's id and its ancestors' ids.
     ancestors: Arc<Ancestors>,
-    /// Ids already emitted under this folder by a batch that was split.
-    skip: HashSet<String>,
+    /// Ids already emitted under this folder, by a batch that was split.
+    emitted: HashSet<String>,
     /// List this folder with a query of its own: the batch it was in failed or could not be
     /// routed.
     alone: bool,
@@ -479,20 +480,19 @@ struct PendingFolder {
 #[derive(Debug)]
 struct Batch {
     folders: Vec<PendingFolder>,
-    /// Per folder: the ids emitted under it so far, kept for batches of several folders so that
-    /// a split does not emit them again.
+    /// Per folder: the ids emitted under it so far, by this batch and by the batch it was split
+    /// from, so that an id repeated on a later page or after a split is not emitted again.
     emitted: Vec<HashSet<String>>,
     q: String,
 }
 
 impl Batch {
-    fn new(folders: Vec<PendingFolder>) -> Self {
+    fn new(mut folders: Vec<PendingFolder>) -> Self {
         let q = parents_query(folders.iter().map(|folder| folder.folder.id.as_str()));
-        let emitted = if folders.len() > 1 {
-            folders.iter().map(|_| HashSet::new()).collect()
-        } else {
-            Vec::new()
-        };
+        let emitted = folders
+            .iter_mut()
+            .map(|folder| std::mem::take(&mut folder.emitted))
+            .collect();
         Self {
             folders,
             emitted,
@@ -507,19 +507,14 @@ impl Batch {
             .map_or(&Corpus::User, |folder| &folder.corpus)
     }
 
-    /// Whether `file` is new under folder `index`: not emitted by an earlier, split batch. Records
-    /// it as emitted.
+    /// Whether `file` is new under folder `index`: not emitted before, on an earlier page (Drive
+    /// can repeat an id across pages when the folder changes during the listing) or by the batch
+    /// this one was split from. Records it as emitted. A file without an id is always new.
     fn newly_emitted(&mut self, index: usize, file: &File) -> bool {
-        let Some(id) = &file.id else {
-            return true;
-        };
-        if self.folders[index].skip.contains(id) {
-            return false;
+        match (&file.id, self.emitted.get_mut(index)) {
+            (Some(id), Some(emitted)) => emitted.insert(id.clone()),
+            (None, _) | (_, None) => true,
         }
-        if let Some(emitted) = self.emitted.get_mut(index) {
-            emitted.insert(id.clone());
-        }
-        true
     }
 
     /// The folders of this batch a listed file belongs to. With one folder that is the folder;
@@ -734,12 +729,9 @@ impl Producer {
         let Batch {
             folders, emitted, ..
         } = batch;
-        let emitted = emitted
-            .into_iter()
-            .chain(std::iter::repeat_with(HashSet::new));
         let folders = folders.into_iter().zip(emitted).collect::<Vec<_>>();
         for (mut folder, emitted) in folders.into_iter().rev() {
-            folder.skip.extend(emitted);
+            folder.emitted = emitted;
             folder.alone = true;
             self.pending.push_front(folder);
         }
@@ -833,7 +825,7 @@ impl Producer {
                 id: id.to_owned(),
                 parent: Some(Arc::clone(&parent.ancestors)),
             }),
-            skip: HashSet::new(),
+            emitted: HashSet::new(),
             alone: false,
         });
         key
