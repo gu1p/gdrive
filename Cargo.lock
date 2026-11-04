@@ -567,8 +567,6 @@ dependencies = [
 [[package]]
 name = "google-apis-common"
 version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "020dd415ee200770d835d01674084400a4d11e6c108ae941f660e8264f49d4ca"
 dependencies = [
  "base64",
  "chrono",

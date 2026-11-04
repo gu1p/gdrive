@@ -42,3 +42,9 @@ dead_code_pub_in_binary = "warn"
 pedantic = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
+
+# google-apis-common 8.0.0 lost the resumable-upload retry fixes that gdrive 3.9.1 shipped with
+# (a retried chunk is skipped, a lost final reply is reported as an error). The vendored copy is
+# 8.0.0 plus the patches described in vendor/google-apis-common/GDRIVE-PATCHES.md.
+[patch.crates-io]
+google-apis-common = { path = "vendor/google-apis-common" }
