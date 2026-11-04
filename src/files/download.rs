@@ -530,6 +530,46 @@ mod tests {
             .boxed()
     }
 
+    /// A response body that yields `partial` and then fails: an in-process server promises more
+    /// bytes than it sends and closes the connection.
+    async fn truncated_body(partial: &'static [u8]) -> Body {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = socket.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                partial.len() + 100
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(partial).await.unwrap();
+            socket.flush().await.unwrap();
+            // Let the client read the bytes before the connection drops.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        });
+
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build_http::<http_body_util::Empty<Bytes>>();
+        let response = client
+            .get(format!("http://{addr}/").parse().unwrap())
+            .await
+            .unwrap();
+        response.into_body().boxed()
+    }
+
     fn dir_entries(dir: &Path) -> Vec<String> {
         let mut names = std::fs::read_dir(dir)
             .unwrap()
@@ -815,5 +855,55 @@ mod tests {
         assert!(is_refusal(&result), "{result:?}");
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
         assert!(!dir.path().join("a.bin").exists());
+    }
+
+    #[tokio::test]
+    async fn truncated_body_yields_bytes_then_fails() {
+        let mut body = truncated_body(b"partial bytes").await;
+        let mut received = Vec::new();
+        loop {
+            match body.frame().await {
+                Some(Ok(frame)) => received.extend_from_slice(frame.data_ref().unwrap()),
+                Some(Err(_)) => break,
+                None => panic!("body ended without an error"),
+            }
+        }
+        assert_eq!(received, b"partial bytes");
+    }
+
+    #[tokio::test]
+    async fn stream_failure_after_bytes_removes_temp_file_and_keeps_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.bin");
+        std::fs::write(&target, b"old").unwrap();
+
+        let body = truncated_body(b"partial bytes").await;
+        let result = save_body_to_file(body, &target, "id-a", None).await;
+
+        assert!(
+            matches!(result, Err(errors::SaveBodyToFile::ReadChunk(_))),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(dir_entries(dir.path()), ["a.bin"]);
+    }
+
+    #[tokio::test]
+    async fn rename_failure_removes_temp_file_and_keeps_target() {
+        let dir = tempfile::tempdir().unwrap();
+        // A non-empty directory where the file should go: the final rename fails.
+        let target = dir.path().join("a.bin");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("keep.txt"), b"keep").unwrap();
+
+        let result = save_body_to_file(body(b"new"), &target, "id-a", None).await;
+
+        assert!(
+            matches!(result, Err(errors::SaveBodyToFile::RenameFile(_))),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
+        assert_eq!(dir_entries(dir.path()), ["a.bin"]);
+        assert_eq!(dir_entries(&target), ["keep.txt"]);
     }
 }
