@@ -10,7 +10,7 @@ use yup_oauth2::storage::TokenInfo;
 use crate::{
     app_config,
     auth::{self, login, store::TokenFile},
-    common::retry::retry_api,
+    common::retry::retry_read,
     hub,
 };
 
@@ -88,7 +88,7 @@ pub(super) fn token_hub(token: &TokenInfo) -> io::Result<hub::Hub> {
 pub(super) async fn authorized_email(
     hub: &hub::Hub,
 ) -> Result<Option<String>, Box<google_drive3::Error>> {
-    let (_, about) = retry_api(hub.retrier(), "about.get", |mut delegate| async move {
+    let (_, about) = retry_read(hub.retrier(), "about.get", |mut delegate| async move {
         hub.about()
             .get()
             .param("fields", "user")

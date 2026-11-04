@@ -4,7 +4,7 @@ use crate::{
     common::{
         hub_helper::{get_hub, GetHubError},
         paginate::{self, Page, PageRequest},
-        retry::retry_api,
+        retry::retry_read,
         table::{self, Table},
     },
     hub::Hub,
@@ -67,7 +67,7 @@ async fn list_drives(
 ) -> Result<Vec<google_drive3::api::Drive>, Box<google_drive3::Error>> {
     paginate::collect_pages(max_drives, MAX_PAGE_SIZE, async |page: PageRequest| {
         let page = &page;
-        let (_, drive_list) = retry_api(hub.retrier(), "drives.list", |mut delegate| async move {
+        let (_, drive_list) = retry_read(hub.retrier(), "drives.list", |mut delegate| async move {
             let mut req = hub
                 .drives()
                 .list()

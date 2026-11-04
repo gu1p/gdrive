@@ -7,7 +7,7 @@ use std::{
 use crate::{
     common::{
         hub_helper::{get_hub, GetHubError},
-        retry::retry_api,
+        retry::retry_read,
         table::{self, Table},
     },
     files,
@@ -75,7 +75,7 @@ pub(crate) async fn list_permissions(
     hub: &Hub,
     file_id: &str,
 ) -> Result<Vec<google_drive3::api::Permission>, Box<google_drive3::Error>> {
-    let (_, permission_list) = retry_api(
+    let (_, permission_list) = retry_read(
         hub.retrier(),
         "permissions.list",
         |mut delegate| async move {

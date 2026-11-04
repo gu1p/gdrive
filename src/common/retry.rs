@@ -12,8 +12,9 @@
 //!   least the `Retry-After`, at least the shared throttle), or into a `Stop` once the budget is
 //!   used up. Progress ([`RetryState::progress`]) starts a new budget.
 //! - [`Throttle`] is shared by every request of a hub, and later of every scheduler worker.
-//! - [`retry_api`] runs a google-drive3 metadata call under all of the above. The upload
-//!   delegate (`delegate.rs`) and the media client (`media_client.rs`) use the parts directly.
+//! - [`retry_read`] (reads) and [`retry_api`] (mutations) run a google-drive3 metadata call
+//!   under all of the above. The upload delegate (`delegate.rs`) and the media client
+//!   (`media_client.rs`) use the parts directly.
 //!
 //! Google's guidance: <https://developers.google.com/workspace/drive/api/guides/handle-errors>.
 //!
@@ -663,7 +664,40 @@ pub(crate) fn classify_drive_error(
     }
 }
 
-/// The google-drive3 delegate of [`retry_api`]. It never retries by itself (google-drive3's
+/// Whether a call may be sent again after a success reply whose body was lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Replay {
+    /// A read (get, list): sending it again changes nothing on Drive.
+    Safe,
+    /// A mutation (create, copy, update, delete): the lost reply may belong to a change that
+    /// happened, and repeating it can make a duplicate or fail on the changed state.
+    Unsafe,
+}
+
+/// [`classify_drive_error`] for a call that may (`Replay::Safe`) or may not be repeated after a
+/// success reply whose body broke off. google-drive3 decodes such a body as empty (a cut body is
+/// read as nothing), so a JSON error at the end of the input means the body was cut; malformed
+/// JSON is still not retried.
+#[must_use]
+pub(crate) fn classify_drive_error_for(
+    error: &google_drive3::Error,
+    failed_reply: Option<&FailedReply>,
+    replay: Replay,
+) -> Decision {
+    match error {
+        google_drive3::Error::JsonDecodeError(_, decode_error)
+            if replay == Replay::Safe && decode_error.is_eof() =>
+        {
+            Decision::Retry {
+                after: Duration::ZERO,
+                reason: RetryReason::BodyRead,
+            }
+        }
+        _ => classify_drive_error(error, failed_reply),
+    }
+}
+
+/// The google-drive3 delegate of [`retry_api`] and [`retry_read`]. It never retries by itself (google-drive3's
 /// own loop would bypass the budget and the throttle); it keeps the status and headers of a
 /// failed reply for [`classify_drive_error`].
 #[derive(Debug, Clone, Default)]
@@ -704,8 +738,10 @@ impl Display for AccessTokenRejected {
 
 impl Error for AccessTokenRejected {}
 
-/// Runs a google-drive3 call, and repeats it per the policy of `retrier` while it fails with a
-/// retryable error ([`classify_drive_error`]).
+/// Runs a google-drive3 call that changes Drive (create, copy, update, delete), and repeats it
+/// per the policy of `retrier` while it fails with a retryable error ([`classify_drive_error`]).
+/// A success reply whose body is lost is not repeated (see [`Replay::Unsafe`]); reads use
+/// [`retry_read`].
 ///
 /// `attempt` builds and sends the call; it gets the [`ApiDelegate`] of the attempt, which it must
 /// set with `.delegate(&mut delegate)` so that the `Retry-After` and status of a failed reply are
@@ -721,6 +757,42 @@ impl Error for AccessTokenRejected {}
 pub(crate) async fn retry_api<T, F, Fut>(
     retrier: &Retrier,
     call: &str,
+    attempt: F,
+) -> google_drive3::Result<T>
+where
+    F: FnMut(ApiDelegate) -> Fut,
+    Fut: Future<Output = google_drive3::Result<T>>,
+{
+    run_api(retrier, call, Replay::Unsafe, attempt).await
+}
+
+/// [`retry_api`] for a read (`files.get`, `files.list`, `drives.list`, `permissions.list`,
+/// `about.get`, ...), which is also repeated when its success reply broke off before the end of
+/// its JSON body ([`Replay::Safe`]).
+#[expect(
+    clippy::result_large_err,
+    reason = "the error of the wrapped call, unchanged; callers box it where they keep it"
+)]
+pub(crate) async fn retry_read<T, F, Fut>(
+    retrier: &Retrier,
+    call: &str,
+    attempt: F,
+) -> google_drive3::Result<T>
+where
+    F: FnMut(ApiDelegate) -> Fut,
+    Fut: Future<Output = google_drive3::Result<T>>,
+{
+    run_api(retrier, call, Replay::Safe, attempt).await
+}
+
+#[expect(
+    clippy::result_large_err,
+    reason = "the error of the wrapped call, unchanged; callers box it where they keep it"
+)]
+async fn run_api<T, F, Fut>(
+    retrier: &Retrier,
+    call: &str,
+    replay: Replay,
     mut attempt: F,
 ) -> google_drive3::Result<T>
 where
@@ -739,7 +811,8 @@ where
         };
         let failed_reply = lock(&failed_reply).take();
 
-        match state.next(classify_drive_error(&error, failed_reply.as_ref())) {
+        let decision = classify_drive_error_for(&error, failed_reply.as_ref(), replay);
+        match state.next(decision) {
             Decision::Retry { after, reason } => {
                 eprintln!(
                     "Warning: {call} failed ({reason}), retrying in {} (attempt {} of {})",
@@ -775,8 +848,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        classify_body_error, classify_drive_error, classify_status, parse_retry_after, retry_after,
-        Decision, FailedReply, RetryPolicy, RetryReason, RetryState, StopReason, Throttle,
+        classify_body_error, classify_drive_error, classify_drive_error_for, classify_status,
+        parse_retry_after, retry_after, Decision, FailedReply, Replay, RetryPolicy, RetryReason,
+        RetryState, StopReason, Throttle,
     };
 
     fn google_error(code: u16, reason: &str) -> serde_json::Value {
@@ -1039,6 +1113,40 @@ mod tests {
         );
         let error = google_drive3::Error::BadRequest(google_error(503, "backendError"));
         assert!(is_retry(&classify_drive_error(&error, None)));
+    }
+
+    #[test]
+    fn a_cut_success_body_is_retried_only_for_reads() {
+        let cut = serde_json::from_str::<serde_json::Value>("").unwrap_err();
+        let error = google_drive3::Error::JsonDecodeError(String::new(), cut);
+        assert_eq!(
+            classify_drive_error_for(&error, None, Replay::Safe),
+            Decision::Retry {
+                after: Duration::ZERO,
+                reason: RetryReason::BodyRead,
+            }
+        );
+        assert_eq!(
+            stop_reason(classify_drive_error_for(&error, None, Replay::Unsafe)),
+            StopReason::InvalidReply
+        );
+
+        let half =
+            serde_json::from_str::<serde_json::Value>(r#"{"files": [{"id": "a"#).unwrap_err();
+        let error = google_drive3::Error::JsonDecodeError(String::from("..."), half);
+        assert!(is_retry(&classify_drive_error_for(
+            &error,
+            None,
+            Replay::Safe
+        )));
+
+        // Malformed, not cut: decoding it again would fail again.
+        let malformed = serde_json::from_str::<serde_json::Value>("{]").unwrap_err();
+        let error = google_drive3::Error::JsonDecodeError(String::from("{]"), malformed);
+        assert_eq!(
+            stop_reason(classify_drive_error_for(&error, None, Replay::Safe)),
+            StopReason::InvalidReply
+        );
     }
 
     #[test]

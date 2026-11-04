@@ -9,6 +9,7 @@ use crate::{
     files::{
         self,
         list::{ListFilesConfig, ListQuery, ListSortOrder},
+        mkdir,
     },
 };
 
@@ -238,4 +239,52 @@ async fn a_persistent_503_gives_up_after_the_budget() {
         usize::try_from(attempts).unwrap(),
         "exactly max_attempts attempts"
     );
+}
+
+#[tokio::test]
+async fn a_listing_whose_reply_broke_off_is_repeated() {
+    let page = json!({"files": [{"id": "a", "name": "name of a"}, {"id": "b", "name": "b"}]});
+    let server = MockServer::start(vec![
+        Response::json(200, &page).cut_after(20),
+        Response::json(200, &page),
+    ])
+    .await;
+
+    let ids = list(&server)
+        .await
+        .expect("a read is repeated after a cut reply");
+
+    assert_eq!(ids, ["a", "b"]);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(signature(&requests[0]), signature(&requests[1]));
+}
+
+#[tokio::test]
+async fn a_create_whose_reply_broke_off_is_not_repeated() {
+    // The folder may exist: creating it again would make a second one.
+    let folder =
+        json!({"id": "new-folder", "name": "f", "mimeType": "application/vnd.google-apps.folder"});
+    let server = MockServer::start(vec![
+        Response::json(200, &folder).cut_after(10),
+        Response::json(200, &folder),
+    ])
+    .await;
+
+    let result = mkdir::create_directory(
+        &server.hub(),
+        &mkdir::Config {
+            id: None,
+            name: String::from("f"),
+            parents: None,
+            print_only_id: false,
+        },
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(google_drive3::Error::JsonDecodeError(..))),
+        "{result:?}"
+    );
+    assert_eq!(server.requests().len(), 1, "a mutation is not repeated");
 }

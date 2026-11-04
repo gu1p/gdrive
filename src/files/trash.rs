@@ -11,7 +11,7 @@ use crate::{
         drive_file,
         file_tree_drive::errors::FileIdentifier,
         hub_helper::{get_hub, GetHubError},
-        retry::retry_api,
+        retry::retry_read,
     },
     files::{
         self,
@@ -75,7 +75,7 @@ async fn trash_file(
     action: Action,
     trash_directories: bool,
 ) -> Result<(), Error> {
-    let (_, file) = retry_api(hub.retrier(), "files.get", |mut delegate| async move {
+    let (_, file) = retry_read(hub.retrier(), "files.get", |mut delegate| async move {
         hub.files()
             .get(file_id)
             .param("fields", FILE_FIELDS)

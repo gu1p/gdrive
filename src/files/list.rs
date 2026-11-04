@@ -14,7 +14,7 @@ use crate::{
     common::{
         drive_file,
         hub_helper::{get_hub, GetHubError},
-        retry::retry_api,
+        retry::retry_read,
         table::{self, Table},
     },
     files::{self, info::DisplayConfig},
@@ -191,7 +191,7 @@ pub(crate) async fn list_files(
         let page_token = page_token.as_deref();
 
         // Each page is its own operation with its own retry budget.
-        let (_, file_list) = retry_api(hub.retrier(), "files.list", |mut delegate| async move {
+        let (_, file_list) = retry_read(hub.retrier(), "files.list", |mut delegate| async move {
             let mut req = hub.files().list();
 
             if let Some(token) = page_token {
