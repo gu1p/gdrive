@@ -10,7 +10,9 @@
 //! comes once, when no further job will be queued from the source (the walk ended): from then on
 //! the totals are final, apart from follow-up jobs (an upload's folder releasing its children).
 //! A run whose totals are known before its jobs are (a local tree, walked first) says so with
-//! [`ProgressEvent::Planned`], before the first job.
+//! [`ProgressEvent::Planned`], before the first job; the part of them below a job that failed or
+//! was cancelled, and which will never be queued, is taken back with
+//! [`ProgressEvent::SubtreeCancelled`].
 //!
 //! [`render`] draws the events on stderr; [`terminal`] decides whether it does (`--progress`,
 //! `--no-progress`, `GDRIVE_PROGRESS`, a terminal on stderr) and keeps other output above the
@@ -74,6 +76,9 @@ pub(crate) enum ProgressEvent<'a> {
     },
     /// The source of jobs is exhausted.
     SourceDone,
+    /// A job ended failed or cancelled and takes its subtree with it: `files` files of `bytes`
+    /// bytes below it will never be queued. Follows the job's [`ProgressEvent::Finished`].
+    SubtreeCancelled { files: u64, bytes: u64 },
 }
 
 /// Receives the [`ProgressEvent`]s of a run. Called from the scheduler's task and from the jobs'

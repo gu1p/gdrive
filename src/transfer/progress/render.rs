@@ -297,6 +297,13 @@ impl State {
                 job, kind, outcome, ..
             } => self.finish(job, kind, outcome, now),
             ProgressEvent::SourceDone => self.discovering = false,
+            // Planned files below a folder that failed: they will never come.
+            ProgressEvent::SubtreeCancelled { files, bytes, .. } => {
+                if let Some(planned) = &mut self.planned {
+                    planned.files = planned.files.saturating_sub(files);
+                    planned.bytes = planned.bytes.saturating_sub(bytes);
+                }
+            }
         }
     }
 

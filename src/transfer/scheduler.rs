@@ -184,6 +184,8 @@ impl fmt::Debug for JobOutput {
 pub(crate) struct Subtree {
     pub(crate) files: u64,
     pub(crate) folders: u64,
+    /// The sizes of the files, which leave the progress's planned total with them.
+    pub(crate) bytes: u64,
 }
 
 /// What a running job gets from the scheduler.
@@ -887,7 +889,7 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
         }
         self.report.record(kind, &outcome);
         if outcome.ends_subtree() {
-            self.report.cancel_subtree(subtree);
+            self.cancel_subtree(subtree);
         }
         if matches!(outcome, Outcome::Failed { .. }) && !self.options.continue_on_error {
             self.report.stopped = true;
@@ -923,6 +925,17 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
             outcome: &Outcome::Cancelled,
         });
         self.report.record(kind, &Outcome::Cancelled);
+        self.cancel_subtree(subtree);
+    }
+
+    /// Counts `subtree`, below a job that ended without releasing it, as cancelled.
+    fn cancel_subtree(&mut self, subtree: Subtree) {
+        if subtree.files > 0 {
+            self.progress.event(&ProgressEvent::SubtreeCancelled {
+                files: subtree.files,
+                bytes: subtree.bytes,
+            });
+        }
         self.report.cancel_subtree(subtree);
     }
 

@@ -6,7 +6,7 @@ use std::{
     future,
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -16,10 +16,10 @@ use crate::{
     files::upload::{CommonConfig, Error, UploadDirectoryConfig},
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
-        progress::{Mode, NoProgress},
+        progress::{Mode, NoProgress, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
-            Options, Printer,
+            JobKind, Options, Printer,
         },
         upload::UploadOptions,
     },
@@ -114,8 +114,28 @@ async fn upload_with(
     printer: &Printer,
     cancel: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), Error> {
+    upload_reporting(
+        server,
+        config,
+        options,
+        printer,
+        Arc::new(NoProgress),
+        cancel,
+    )
+    .await
+}
+
+/// [`upload_with`], reporting to `progress`.
+async fn upload_reporting(
+    server: &FakeDrive,
+    config: UploadDirectoryConfig,
+    options: &UploadOptions,
+    printer: &Printer,
+    progress: Arc<dyn ProgressSink>,
+    cancel: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), Error> {
     let hub = server.hub();
-    let run = upload_directory(&hub, config, options, printer, Arc::new(NoProgress), cancel);
+    let run = upload_directory(&hub, config, options, printer, progress, cancel);
     tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the upload should end")
@@ -329,6 +349,37 @@ async fn continue_on_error_uploads_the_other_files_and_still_fails() {
     );
 }
 
+/// The totals a run planned, the bytes it confirmed, and what failed folders took along.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Totals {
+    planned: (u64, u64),
+    finished: u64,
+    confirmed: u64,
+    cancelled: (u64, u64),
+}
+
+#[derive(Default)]
+struct Recorder(Mutex<Totals>);
+
+impl ProgressSink for Recorder {
+    fn event(&self, event: &ProgressEvent<'_>) {
+        let mut totals = self.0.lock().unwrap();
+        match *event {
+            ProgressEvent::Planned { files, bytes } => totals.planned = (files, bytes),
+            ProgressEvent::Bytes { bytes, .. } => totals.confirmed += bytes,
+            ProgressEvent::Finished {
+                kind: JobKind::Media,
+                ..
+            } => totals.finished += 1,
+            ProgressEvent::SubtreeCancelled { files, bytes } => {
+                totals.cancelled.0 += files;
+                totals.cancelled.1 += bytes;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
     let (_dir, root) = local_tree();
@@ -337,8 +388,23 @@ async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
+    let output = output();
+    let recorder = Arc::new(Recorder::default());
 
-    let uploaded = upload(&server, config(&root, 2, true)).await;
+    let result = upload_reporting(
+        &server,
+        config(&root, 2, true),
+        &UploadOptions::default(),
+        &output.printer,
+        Arc::clone(&recorder) as Arc<dyn ProgressSink>,
+        future::pending(),
+    )
+    .await;
+    let uploaded = Uploaded {
+        result,
+        out: output.out,
+        err: output.err,
+    };
 
     assert_eq!(
         uploaded.error(),
@@ -363,6 +429,17 @@ async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
         err.last().unwrap(),
         "Summary: 3 transferred (7 B), 0 unchanged, 0 skipped, 0 failed, 3 cancelled; \
         1 folder failed"
+    );
+    // The progress's totals: the three files of 2024 leave them with their folder, so the
+    // run ends at what it planned.
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        Totals {
+            planned: (6, TREE_SIZE as u64),
+            finished: 3,
+            confirmed: 7,
+            cancelled: (3, 13),
+        }
     );
 }
 

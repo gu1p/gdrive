@@ -287,14 +287,17 @@ fn failed(path: PathBuf, source: Error) -> Outcome {
     })
 }
 
-/// The files and folders below `folder`.
+/// The files and folders below `folder`, and the sizes of the files.
 fn subtree(folder: &file_tree::Folder) -> Subtree {
     let mut subtree = Subtree::default();
     let mut folders = vec![folder];
     while let Some(folder) = folders.pop() {
         for child in &folder.children {
             match child {
-                Node::File(_) => subtree.files += 1,
+                Node::File(file) => {
+                    subtree.files += 1;
+                    subtree.bytes += file.size;
+                }
                 Node::Folder(folder) => {
                     subtree.folders += 1;
                     folders.push(folder);

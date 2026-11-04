@@ -271,6 +271,38 @@ fn planned_totals_are_known_before_the_jobs() {
 }
 
 #[test]
+fn files_below_a_failed_folder_leave_the_planned_totals() {
+    let mut feed = Feed::new(Layout::Run { files: 2 });
+    feed.event(
+        0,
+        &ProgressEvent::Planned {
+            files: 6,
+            bytes: 20,
+        },
+    );
+    feed.event(0, &ProgressEvent::SourceDone);
+    feed.queued(1, "photos/a.txt", Some(4));
+    feed.started(0, 1);
+    feed.bytes(1_000, 1, 4);
+    feed.finished(1_000, 1, JobKind::Media, &Outcome::Transferred { bytes: 4 });
+    feed.finished(1_000, 2, JobKind::Metadata, &failure());
+    feed.event(
+        1_000,
+        &ProgressEvent::SubtreeCancelled {
+            files: 3,
+            bytes: 13,
+        },
+    );
+
+    let view = feed.view(1_000);
+    assert_eq!((view.files_done, view.files_total), (1, Some(3)));
+    assert_eq!((view.bytes_done, view.bytes_total), (4, Some(7)));
+    assert_eq!(view.failed, 1);
+    // 3 bytes left at 4 B/s.
+    assert_eq!(view.eta, Some(Duration::from_secs(1)));
+}
+
+#[test]
 fn file_lines_are_the_running_files_in_queue_order_up_to_the_jobs() {
     let mut feed = Feed::new(Layout::Run { files: 2 });
     for job in 0..4 {
