@@ -192,10 +192,13 @@ Also in 4.0.0:
   and Application Default Credentials (`gdrive account add --adc`).
 - Proxy support through `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, including SOCKS5.
 - Release archives for Linux x86_64 and ARM64, macOS ARM64 and Intel, and Windows, with `SHA256SUMS`.
+- Recursive download and upload transfer 4 files at a time (`--jobs N`). A recursive download starts
+  while it still lists the folder. `--continue-on-error` finishes the other files after a failure; every
+  failure is reported and makes the command exit non-zero, and a summary line goes to stderr.
 
 Planned, not done yet:
 
-- Faster transfers: several files at a time, resumable uploads that survive a restart, progress output,
+- Faster transfers: resumable uploads that survive a restart, progress output,
   skip and sync modes, export of Google Docs during recursive download, download resume.
 - Shell completions; a Windows build without the Visual C++ runtime.
 - Trash and untrash, real TSV and JSON output, listing all shared drives, Markdown export and import,

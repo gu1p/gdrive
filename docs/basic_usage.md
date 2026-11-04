@@ -169,13 +169,16 @@ My Drive, use the `root` alias. It creates a folder named `My Drive`:
 gdrive files download --recursive root --destination ~/backup
 ```
 
+gdrive downloads 4 files at a time (`--jobs`) and starts while it is still listing the folder. See
+[Recursive transfers](#recursive-transfers) for `--jobs`, `--continue-on-error`, the output and the summary
+line.
+
 Things to know:
 
-- **Google Docs, Sheets and Slides are skipped.** Recursive download currently leaves out all
-  Google-native files without a message. Export them one by one with `files export`. Exporting them during
-  recursive download is planned.
-- gdrive reads the whole folder tree before it downloads the first file, so a large folder can be silent
-  for a while. Then it downloads one file at a time.
+- **Google Docs, Sheets and Slides are skipped.** Recursive download leaves out all Google-native files
+  and says how many at the end, for example ``3 Google Docs files skipped; use `gdrive files export` to
+  download them``. Export them one by one with `files export`. Exporting them during recursive download is
+  planned. Shortcuts are skipped and counted the same way: a recursive download does not follow them.
 - **There is no `--skip`.** gdrive 2's `--skip` kept every local file that already existed. gdrive 3 has
   no exact equivalent yet. Without `--overwrite`, a recursive download stops when the local folder already
   exists. A real skip-existing mode is planned (roadmap milestone 2, item 6).
@@ -202,6 +205,60 @@ gdrive files upload --recursive ~/photos               # a local folder and ever
 - `--chunk-size <MB>` sets the upload chunk size (a power of two). Larger chunks use more memory.
 - `--print-chunk-errors` and `--print-chunk-info` show retries and progress per chunk. They help when
   uploads from a cloud server are slow because of many `429`, `502` or `503` responses.
+- `--recursive` uploads 4 files at a time (`--jobs`); every Drive folder is created before anything goes
+  into it. See [Recursive transfers](#recursive-transfers).
+
+## Recursive transfers
+
+`files download --recursive` and `files upload --recursive` transfer several files at a time:
+
+```sh
+gdrive files download --recursive <FOLDER_ID> --jobs 8
+gdrive files upload --recursive ~/photos --jobs 2 --continue-on-error
+```
+
+- `--jobs N` sets how many files are transferred at once, from 1 to 64; the default is 4. Folder listings
+  and folder creations run besides, 2 at a time. `--jobs 1` transfers one file after the other, as gdrive
+  3.9 did. More jobs help most with many small files; with a few large files the connection is the limit.
+  All jobs share one rate-limit backoff: when Drive answers `429` or `403 rateLimitExceeded`, all of them
+  wait.
+- A recursive download starts while it is still listing the folder: the files of a folder are downloaded
+  once that folder is listed, and each local folder is created before the files in it. A recursive upload
+  lists the local folder first and creates every Drive folder before it uploads anything into it.
+- The lines of files that are transferred at the same time never mix, but they come in the order the
+  transfers start and end, not in the order of the folder. A recursive download prints `Found N files in M
+  directories ...` once the listing is complete, no longer before the first download. `Downloaded ...` and
+  `Uploaded ...` come only when every file succeeded. With `--print-only-id`, the `<path>: <id>` line of a
+  folder or file comes once it exists on Drive, a folder's line before the lines of what is in it.
+- **Errors.** By default the first failed file or folder stops the command: no further transfer starts,
+  the running ones are cancelled and their temporary `.gdrive-<id>.part` files removed. The error of every
+  failed file or folder is printed to stderr when it happens, as `Error: unable to download '<path>': ...`
+  (or `upload`). With `--continue-on-error`, gdrive goes on with everything that does not depend on the
+  failure and reports every failure at the end. A folder that cannot be listed (download) or created
+  (upload) takes everything in it along. Either way the command exits with status 1 when anything failed.
+- Drive sometimes answers a listing with `incompleteSearch`: the result may miss files. gdrive prints a
+  `Warning:` line and the download exits with status 1 at the end, unless `--continue-on-error`.
+- Ctrl-C cancels the running transfers, removes their temporary files and exits with status 1. Files that
+  were complete stay.
+
+At the end, a recursive transfer prints one summary line to stderr:
+
+```text
+Summary: 12 transferred (3.4 MB), 2 unchanged, 3 skipped, 1 failed, 4 cancelled
+```
+
+The counts are files:
+
+| Count | Meaning |
+|---|---|
+| transferred | Downloaded or uploaded. The size in parentheses is their total. |
+| unchanged | Not downloaded: with `--overwrite`, the local file has the same MD5 checksum as the Drive file. |
+| skipped | Not transferable: Google Docs, Sheets and Slides (use `files export`) and shortcuts. |
+| failed | The file failed; its error is printed above. |
+| cancelled | Not done because the command stopped (a failure without `--continue-on-error`, Ctrl-C) or because the folder it is in failed. |
+
+Folders that failed are added at the end, as in `...; 1 folder failed`, and an interrupted command ends the
+line with `; interrupted`. The line is meant for people; scripts should use the exit status.
 
 ## Update a file
 
