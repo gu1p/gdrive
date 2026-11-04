@@ -18,7 +18,7 @@ use futures::{future::BoxFuture, stream::FuturesUnordered, Stream, StreamExt};
 use google_drive3::api::{File, FileList, Scope};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::{common::drive_file, hub::Hub};
+use crate::{common::drive_file, files::list::ListQuery, hub::Hub};
 
 /// The largest page `files.list` returns.
 pub(crate) const PAGE_SIZE: i32 = 1000;
@@ -418,20 +418,22 @@ impl Batch {
     }
 }
 
-/// The `q` of a batch: `('a' in parents or 'b' in parents) and trashed = false`.
+/// The `q` of a batch: `('a' in parents or 'b' in parents) and trashed = false`. One folder is
+/// listed with the query of `files list --parent`: `'a' in parents and trashed = false`.
 fn parents_query<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    let ids = ids.collect::<Vec<_>>();
+    if let [id] = ids.as_slice() {
+        return ListQuery::files_in_folder((*id).to_owned()).q();
+    }
     let parents = ids
+        .iter()
         .map(|id| format!("{} in parents", quote(id)))
         .collect::<Vec<_>>();
-    if let [parent] = parents.as_slice() {
-        format!("{parent} and trashed = false")
-    } else {
-        format!("({}) and trashed = false", parents.join(" or "))
-    }
+    format!("({}) and trashed = false", parents.join(" or "))
 }
 
 /// Quotes a value as a string literal of the Drive query language: `'` and `\` are escaped
-/// with a backslash.
+/// with a backslash, as `files::list` does for `--parent`.
 fn quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');

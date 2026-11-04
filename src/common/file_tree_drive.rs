@@ -1,8 +1,8 @@
 pub(crate) mod errors;
 
-use std::{iter, ops::Not, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, iter, ops::Not, path::PathBuf, sync::Arc};
 
-use async_recursion::async_recursion;
+use futures::StreamExt;
 
 use super::{file_tree_like, parse_md5_digest, FileLike, FileTreeLike, FolderInfoLike, FolderLike};
 use crate::{
@@ -11,8 +11,9 @@ use crate::{
         file_tree_drive::errors::FileIdentifier,
         local_name::{self, NameChange, NameEntry, UnusableName},
     },
-    files::list::{self, ListQuery, ListSortOrder},
+    files::list,
     hub::Hub,
+    transfer::walk::{Children, FolderKey, Walk, WalkItem, WalkOptions, WalkRoot},
 };
 
 #[derive(Debug, Clone)]
@@ -21,11 +22,14 @@ pub(crate) struct FileTreeDrive {
 }
 
 impl FileTreeDrive {
+    /// Lists the subtree of the folder `file` and builds the tree. The listing is the
+    /// [`transfer::walk`](crate::transfer::walk) with its default options: breadth-first, two
+    /// list requests at a time, up to 50 folders per query.
     pub(crate) async fn from_file(
         hub: &Hub,
         file: google_drive3::api::File,
     ) -> Result<FileTreeDrive, errors::FileTreeDrive> {
-        let root = Folder::from_file(hub, file, None, None)
+        let root = Folder::from_file(hub, file)
             .await
             .map_err(errors::FileTreeDrive)?;
         Ok(FileTreeDrive { root })
@@ -57,15 +61,14 @@ pub(crate) struct FolderInfo {
     pub(crate) parent: Option<Arc<Self>>,
 }
 
+/// The children of every listed folder, in listing order, with whether the walk listed them.
+type Listing = HashMap<FolderKey, Vec<(google_drive3::api::File, Children)>>;
+
 impl Folder {
-    /// Builds the folder and its subtree. `local_name` is the name assigned by the parent folder;
-    /// the root (`None`) maps its own name.
-    #[async_recursion]
+    /// Lists the subtree of the folder `file` and builds the folder from the listing.
     async fn from_file(
         hub: &Hub,
         file: google_drive3::api::File,
-        parent: Option<&'async_recursion Arc<FolderInfo>>,
-        local_name: Option<String>,
     ) -> Result<Folder, errors::Folder> {
         if drive_file::is_directory(&file).not() {
             return Err(errors::Folder::NotDirectory);
@@ -73,59 +76,118 @@ impl Folder {
 
         let name = file.name.ok_or(errors::Folder::MissingFileName)?;
         let file_id = file.id.ok_or(errors::Folder::MissingFileId)?;
+        let local_name = root_local_name(&name, &file_id)?;
 
-        let local_name = match local_name {
-            Some(local_name) => local_name,
-            None => root_local_name(&name, &file_id)?,
+        let root = WalkRoot {
+            id: file_id,
+            name: name.clone(),
+            drive_id: file.drive_id,
         };
+        let mut listing = list_subtree(hub, root).await?;
+
+        let info = Arc::new(FolderInfo {
+            name,
+            local_name,
+            parent: None,
+        });
+        Folder::from_listing(info, FolderKey::ROOT, &mut listing)
+    }
+
+    /// Builds the folder listed under `key` and its subtree, taking their children out of
+    /// `listing`.
+    fn from_listing(
+        info: Arc<FolderInfo>,
+        key: FolderKey,
+        listing: &mut Listing,
+    ) -> Result<Folder, errors::Folder> {
+        // Skip documents and shortcuts
+        let (files, children): (Vec<_>, Vec<_>) = listing
+            .remove(&key)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(file, _)| drive_file::is_directory(file) || drive_file::is_binary(file))
+            .unzip();
+        let local_names = children_local_names(&files, &info)?;
 
         let mut folder = Folder {
-            info: Arc::new(FolderInfo {
-                name,
-                local_name,
-                parent: parent.map(Arc::clone),
-            }),
-            children: Vec::new(),
+            info,
+            children: Vec::with_capacity(files.len()),
         };
 
-        let files = list::list_files(
-            hub,
-            list::ListFilesConfig {
-                query: &ListQuery::files_in_folder(file_id),
-                order_by: &ListSortOrder::default(),
-                max_files: usize::MAX,
-            },
-        )
-        .await
-        .map_err(errors::Folder::ListFiles)?;
-
-        // Skip documents
-        let files = files
-            .into_iter()
-            .filter(|file| drive_file::is_directory(file) || drive_file::is_binary(file))
-            .collect::<Vec<_>>();
-        let local_names = children_local_names(&files, &folder.info)?;
-
-        let mut children = Vec::new();
-
-        for (file, local_name) in files.into_iter().zip(local_names) {
-            if drive_file::is_directory(&file) {
-                let folder =
-                    Folder::from_file(hub, file, Some(&folder.info), Some(local_name)).await?;
-                let node = Node::Folder(folder);
-                children.push(node);
+        for ((file, children), local_name) in files.into_iter().zip(children).zip(local_names) {
+            let node = if drive_file::is_directory(&file) {
+                Node::Folder(Folder::subfolder(
+                    file,
+                    children,
+                    &folder.info,
+                    local_name,
+                    listing,
+                )?)
             } else {
-                let f = File::from_file(file, &folder, local_name)
+                let file = File::from_file(file, &folder, local_name)
                     .map_err(|(source, identifier)| errors::Folder::File { identifier, source })?;
-                let node = Node::File(f);
-                children.push(node);
-            }
+                Node::File(file)
+            };
+            folder.children.push(node);
         }
-
-        folder.children = children;
 
         Ok(folder)
     }
+
+    /// Builds a child folder. Its name and id were checked by [`children_local_names`].
+    fn subfolder(
+        file: google_drive3::api::File,
+        children: Children,
+        parent: &Arc<FolderInfo>,
+        local_name: String,
+        listing: &mut Listing,
+    ) -> Result<Folder, errors::Folder> {
+        let key = match children {
+            Children::Listed(key) => key,
+            Children::None => return Err(errors::Folder::MissingFileId),
+            Children::Cycle => return Err(errors::Folder::Cycle(FileIdentifier::from(file))),
+        };
+        let name = file.name.ok_or(errors::Folder::MissingFileName)?;
+
+        let info = Arc::new(FolderInfo {
+            name,
+            local_name,
+            parent: Some(Arc::clone(parent)),
+        });
+        Folder::from_listing(info, key, listing)
+    }
+}
+
+/// Runs the walk to its end and groups the entries by the folder that listed them. The first
+/// folder that cannot be listed ends the listing with its error, as before the walk existed.
+async fn list_subtree(hub: &Hub, root: WalkRoot) -> Result<Listing, errors::Folder> {
+    let mut walk = Walk::start(Arc::new(hub.clone()), root, WalkOptions::default());
+    let mut listing = Listing::new();
+
+    while let Some(item) = walk.next().await {
+        match item {
+            WalkItem::Entry(entry) => listing
+                .entry(entry.parent)
+                .or_default()
+                .push((*entry.file, entry.children)),
+            WalkItem::FolderError(error) => {
+                return Err(errors::Folder::ListFiles(list::Error::ListFiles(
+                    error.error,
+                )));
+            }
+            WalkItem::IncompleteSearch(incomplete) => {
+                for folder in &incomplete.folders {
+                    eprintln!(
+                        "Warning: Drive did not search everything while listing '{}', some \
+                        files may be missing",
+                        folder.display_path()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(listing)
 }
 
 fn root_local_name(name: &str, file_id: &str) -> Result<String, errors::Folder> {
@@ -313,8 +375,17 @@ mod tests {
         sync::Arc,
     };
 
-    use super::{children_local_names, errors, File, FolderInfo};
-    use crate::common::{drive_file::MIME_TYPE_DRIVE_FOLDER, local_name::InvalidName};
+    use super::{children_local_names, errors, File, FileTreeDrive, FolderInfo};
+    use crate::{
+        common::{
+            drive_file::MIME_TYPE_DRIVE_FOLDER, local_name::InvalidName, FileTreeLike, FolderLike,
+        },
+        files::list,
+        transfer::{
+            fake_drive::{Behavior, FakeDrive, FakeFile},
+            walk::WalkOptions,
+        },
+    };
 
     fn folder_info(name: &str, parent: Option<&Arc<FolderInfo>>) -> Arc<FolderInfo> {
         Arc::new(FolderInfo {
@@ -421,5 +492,187 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    fn root_folder() -> google_drive3::api::File {
+        google_drive3::api::File {
+            id: Some(String::from("root")),
+            name: Some(String::from("Root")),
+            mime_type: Some(MIME_TYPE_DRIVE_FOLDER.to_string()),
+            ..google_drive3::api::File::default()
+        }
+    }
+
+    /// The relative paths of every file in the tree, sorted.
+    fn file_paths(tree: &FileTreeDrive) -> Vec<String> {
+        let mut paths = tree
+            .folders()
+            .iter()
+            .flat_map(|folder| folder.files())
+            .map(|file| file.relative_path().display().to_string())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    async fn tree_from(
+        files: Vec<FakeFile>,
+        behavior: Behavior,
+    ) -> (FakeDrive, Result<FileTreeDrive, errors::FileTreeDrive>) {
+        let server = FakeDrive::start(files, behavior).await;
+        let tree = FileTreeDrive::from_file(&server.hub(), root_folder()).await;
+        (server, tree)
+    }
+
+    #[tokio::test]
+    async fn three_levels_of_8_folders_take_3_batched_requests() {
+        let folders = [
+            ("a", "root"),
+            ("b", "root"),
+            ("c", "root"),
+            ("a1", "a"),
+            ("a2", "a"),
+            ("b1", "b"),
+            ("c1", "c"),
+        ];
+        let mut files = folders
+            .iter()
+            .map(|(id, parent)| FakeFile::folder(id, id, parent))
+            .collect::<Vec<_>>();
+        for folder in ["root", "a", "b", "c", "a1", "a2", "b1", "c1"] {
+            files.push(FakeFile::blob(
+                &format!("{folder}-file"),
+                "file.txt",
+                folder,
+                folder,
+            ));
+        }
+        // Slow enough that requests would overlap if the walk sent more than it may.
+        let behavior = Behavior {
+            delay: std::time::Duration::from_millis(20),
+            ..Behavior::default()
+        };
+
+        let (server, tree) = tree_from(files, behavior).await;
+        let tree = tree.unwrap();
+
+        let info = tree.info();
+        assert_eq!((info.folder_count, info.file_count), (8, 8));
+        assert_eq!(
+            file_paths(&tree),
+            [
+                "Root/a/a1/file.txt",
+                "Root/a/a2/file.txt",
+                "Root/a/file.txt",
+                "Root/b/b1/file.txt",
+                "Root/b/file.txt",
+                "Root/c/c1/file.txt",
+                "Root/c/file.txt",
+                "Root/file.txt",
+            ]
+        );
+        assert!(server.max_in_flight() <= WalkOptions::DEFAULT_LISTING_JOBS);
+        // The listing before the walk sent one request per folder: 8. Batched, each level is
+        // one query: the root, then a, b and c, then a1, a2, b1 and c1.
+        let parents = server
+            .requests()
+            .into_iter()
+            .map(|request| request.parents)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parents,
+            [
+                vec!["root"],
+                vec!["a", "b", "c"],
+                vec!["a1", "a2", "b1", "c1"]
+            ]
+        );
+        assert!(parents.len() < 8);
+    }
+
+    #[tokio::test]
+    async fn listed_children_get_safe_unique_names() {
+        let files = vec![
+            FakeFile::blob("id-b", "report.pdf", "root", "b"),
+            FakeFile::blob("id-a", "report.pdf", "root", "a"),
+            FakeFile::folder("id-c", "../escape", "root"),
+            FakeFile::blob("id-d", "a/b", "id-c", "d"),
+            FakeFile::document("id-e", "notes", "root"),
+            FakeFile::shortcut("id-f", "link", "root", "id-a", "application/pdf"),
+        ];
+
+        let (_server, tree) = tree_from(files, Behavior::default()).await;
+        let tree = tree.unwrap();
+
+        let paths = file_paths(&tree);
+        assert_eq!(
+            paths.len(),
+            3,
+            "documents and shortcuts are skipped: {paths:?}"
+        );
+        assert_eq!(paths[0], "Root/.._escape/a_b");
+        assert_eq!(paths[1], "Root/report.pdf");
+        assert!(paths[2].starts_with("Root/report~"), "{}", paths[2]);
+        assert_eq!(&paths[2][paths[2].len() - 4..], ".pdf");
+        let plain = tree
+            .root
+            .files()
+            .into_iter()
+            .find(|file| file.local_name == "report.pdf")
+            .unwrap();
+        assert_eq!(plain.drive_id, "id-a");
+        assert_eq!(plain.size, 1);
+        assert_eq!(plain.md5, Some(md5::compute("a")));
+    }
+
+    #[tokio::test]
+    async fn unreadable_subfolder_fails_the_tree() {
+        let files = vec![
+            FakeFile::folder("a", "a", "root"),
+            FakeFile::folder("b", "b", "root"),
+        ];
+        let behavior = Behavior {
+            unreadable: std::collections::HashSet::from([String::from("b")]),
+            ..Behavior::default()
+        };
+
+        let (_server, tree) = tree_from(files, behavior).await;
+
+        assert!(matches!(
+            tree.unwrap_err(),
+            errors::FileTreeDrive(errors::Folder::ListFiles(list::Error::ListFiles(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn folder_listed_inside_itself_is_an_error() {
+        let files = vec![
+            FakeFile::folder("a", "a", "root"),
+            FakeFile::folder("a", "a", "a"),
+        ];
+
+        let (_server, tree) = tree_from(files, Behavior::default()).await;
+
+        assert!(matches!(
+            tree.unwrap_err(),
+            errors::FileTreeDrive(errors::Folder::Cycle(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn root_that_is_not_a_folder_is_rejected_without_listing() {
+        let server = FakeDrive::start(Vec::new(), Behavior::default()).await;
+        let file = google_drive3::api::File {
+            mime_type: Some(String::from("text/plain")),
+            ..root_folder()
+        };
+
+        let tree = FileTreeDrive::from_file(&server.hub(), file).await;
+
+        assert!(matches!(
+            tree.unwrap_err(),
+            errors::FileTreeDrive(errors::Folder::NotDirectory)
+        ));
+        assert_eq!(server.request_count(), 0);
     }
 }

@@ -88,6 +88,8 @@ pub(crate) enum Folder {
         source: File,
     },
     UnusableName(UnusableName),
+    /// The folder contains one of its ancestors (only a broken listing can say so).
+    Cycle(FileIdentifier),
 }
 
 impl Display for Folder {
@@ -104,6 +106,9 @@ impl Display for Folder {
                 write!(f, "unable to process file{}", identifier.display())
             }
             Folder::UnusableName(_) => f.write_str("unable to map a drive name to a local name"),
+            Folder::Cycle(identifier) => {
+                write!(f, "folder{} is its own ancestor", identifier.display())
+            }
         }
     }
 }
@@ -111,7 +116,10 @@ impl Display for Folder {
 impl Error for Folder {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Folder::MissingFileName | Folder::NotDirectory | Folder::MissingFileId => None,
+            Folder::MissingFileName
+            | Folder::NotDirectory
+            | Folder::MissingFileId
+            | Folder::Cycle(_) => None,
             Folder::ListFiles(error) => Some(error),
             Folder::File { source, .. } => Some(source),
             Folder::UnusableName(source) => Some(source),
