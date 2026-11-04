@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::store::TokenFile;
+
 const SYSTEM_CONFIG_DIR_NAME: &str = ".config";
 const BASE_PATH_DIR_NAME: &str = "gdrive3";
 const ACCOUNT_CONFIG_NAME: &str = "account.json";
@@ -25,16 +27,19 @@ pub(crate) struct AppConfig {
     tokens_path: OnceLock<PathBuf>,
 }
 
-pub(crate) fn add_account(
+pub(crate) async fn add_account(
     account_name: &str,
     secret: &Secret,
-    tokens_path: &Path,
+    tokens: &TokenFile,
 ) -> Result<AppConfig, errors::AddAccount> {
     let config = AppConfig::init_account(account_name).map_err(errors::AddAccount::InitAccount)?;
     config
         .save_secret(secret)
         .map_err(errors::AddAccount::SaveSecret)?;
-    fs::copy(tokens_path, config.tokens_path()).map_err(errors::AddAccount::CopyTokens)?;
+    tokens
+        .save(config.tokens_path())
+        .await
+        .map_err(errors::AddAccount::SaveTokens)?;
     Ok(config)
 }
 
@@ -109,6 +114,50 @@ impl AppConfig {
         Ok(AppConfig::new(base_path, account))
     }
 
+    /// The account `account_name` and its stored client credentials (secret.json). Unlike
+    /// [`list_accounts`], this does not need tokens.json, so an account whose tokens are missing
+    /// can still be authorized again.
+    pub(crate) fn load_account_with_secret(
+        account_name: &str,
+    ) -> Result<(AppConfig, Secret), errors::LoadAccountWithSecret> {
+        let base_path = AppConfig::default_base_path()
+            .map_err(errors::LoadAccountWithSecret::DefaultBasePath)?;
+        AppConfig::load_account_with_secret_in(base_path, account_name)
+    }
+
+    pub(crate) fn load_account_with_secret_in(
+        base_path: PathBuf,
+        account_name: &str,
+    ) -> Result<(AppConfig, Secret), errors::LoadAccountWithSecret> {
+        use errors::LoadAccountWithSecret as E;
+
+        // The name becomes a directory under the config root: one plain path component only.
+        let mut components = Path::new(account_name).components();
+        let single_component = matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if !single_component || account_name.contains(['/', '\\']) {
+            return Err(E::InvalidName(account_name.to_owned()));
+        }
+
+        let config = AppConfig::new(base_path, Account::new(account_name));
+        let secret = match config.load_secret() {
+            Ok(secret) => secret,
+            Err(errors::LoadSecret::Read { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Err(E::NotFound(account_name.to_owned()));
+            }
+            Err(error) => return Err(E::LoadSecret(error)),
+        };
+        if secret.client_id.trim().is_empty() || secret.client_secret.trim().is_empty() {
+            return Err(E::IncompleteSecret(account_name.to_owned()));
+        }
+
+        Ok((config, secret))
+    }
+
     pub(crate) fn init_account(account_name: &str) -> Result<AppConfig, errors::InitAccount> {
         let base_path = AppConfig::default_base_path()?;
         let account = Account::new(account_name);
@@ -174,8 +223,21 @@ impl AppConfig {
         };
         match serde_json::from_str(&content) {
             Ok(secret) => Ok(secret),
-            Err(source) => Err(errors::LoadSecret::Deserialize { content, source }),
+            Err(source) => Err(errors::LoadSecret::Deserialize {
+                path: path.to_path_buf(),
+                source,
+            }),
         }
+    }
+
+    /// The stored tokens of this account, if there are any and they were issued to the OAuth
+    /// client `client_id`. A refresh token of another client is of no use.
+    pub(crate) async fn tokens_of_client(&self, client_id: &str) -> Option<TokenFile> {
+        let secret = self.load_secret().ok()?;
+        if secret.client_id != client_id {
+            return None;
+        }
+        TokenFile::load(self.tokens_path()).await.ok().flatten()
     }
 
     fn load_account_config() -> Result<AccountConfig, errors::LoadAccountConfig> {
@@ -290,4 +352,93 @@ pub(crate) fn set_file_permissions(path: &Path) -> Result<(), io::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKENS: &str = r#"[{"scopes":["https://www.googleapis.com/auth/drive"],"token":{"access_token":"a","refresh_token":"r","expires_at":null,"id_token":null}}]"#;
+
+    #[tokio::test]
+    async fn tokens_of_client_requires_the_same_client_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig::new(dir.path().to_path_buf(), Account::new("me@example.com"));
+        assert!(config.tokens_of_client("id").await.is_none());
+
+        config.create_account_dir().unwrap();
+        config
+            .save_secret(&Secret {
+                client_id: String::from("id"),
+                client_secret: String::from("secret"),
+            })
+            .unwrap();
+        fs::write(config.tokens_path(), TOKENS).unwrap();
+
+        let tokens = config.tokens_of_client("id").await.unwrap();
+        assert_eq!(tokens.refresh_token(), Some("r"));
+        assert!(config.tokens_of_client("other-id").await.is_none());
+    }
+
+    #[test]
+    fn account_with_secret_does_not_need_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let config = AppConfig::new(base.clone(), Account::new("me@example.com"));
+        config.create_account_dir().unwrap();
+        config
+            .save_secret(&Secret {
+                client_id: String::from("id"),
+                client_secret: String::from("secret"),
+            })
+            .unwrap();
+        // No tokens.json: list_accounts skips this account.
+        assert!(!config.tokens_path().exists());
+
+        let (loaded, secret) =
+            AppConfig::load_account_with_secret_in(base.clone(), "me@example.com").unwrap();
+        assert_eq!(loaded.tokens_path(), config.tokens_path());
+        assert_eq!(secret.client_id, "id");
+    }
+
+    #[test]
+    fn account_with_secret_rejects_unknown_accounts_bad_names_and_empty_credentials() {
+        use errors::LoadAccountWithSecret as E;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+
+        let error = AppConfig::load_account_with_secret_in(base.clone(), "nobody").unwrap_err();
+        assert!(matches!(&error, E::NotFound(name) if name == "nobody"));
+        assert!(error.to_string().contains("gdrive account list"));
+
+        for name in ["", ".", "..", "../me", "a/b", "a\\b", "/abs"] {
+            let error = AppConfig::load_account_with_secret_in(base.clone(), name).unwrap_err();
+            assert!(matches!(error, E::InvalidName(_)), "{name:?}: {error:?}");
+        }
+
+        let config = AppConfig::new(base.clone(), Account::new("empty"));
+        config.create_account_dir().unwrap();
+        fs::write(
+            config.secret_path(),
+            r#"{"client_id":"","client_secret":"s"}"#,
+        )
+        .unwrap();
+        let error = AppConfig::load_account_with_secret_in(base.clone(), "empty").unwrap_err();
+        assert!(matches!(error, E::IncompleteSecret(_)), "{error:?}");
+    }
+
+    #[test]
+    fn invalid_secret_json_is_reported_without_its_content() {
+        use error_trace::ErrorTrace;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig::new(dir.path().to_path_buf(), Account::new("me"));
+        config.create_account_dir().unwrap();
+        fs::write(config.secret_path(), r#"{"client_secret":"s3cr3t"}"#).unwrap();
+
+        let error = config.load_secret().unwrap_err();
+        assert!(matches!(error, errors::LoadSecret::Deserialize { .. }));
+        assert!(!error.trace().to_string().contains("s3cr3t"));
+    }
 }

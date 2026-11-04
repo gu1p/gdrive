@@ -103,7 +103,7 @@ impl Error for SaveSecret {
 pub(crate) enum AddAccount {
     InitAccount(InitAccount),
     SaveSecret(SaveSecret),
-    CopyTokens(io::Error),
+    SaveTokens(io::Error),
 }
 
 impl Display for AddAccount {
@@ -111,7 +111,7 @@ impl Display for AddAccount {
         let s = match self {
             AddAccount::InitAccount(_) => "unable to initialize account",
             AddAccount::SaveSecret(_) => "unable to save secret",
-            AddAccount::CopyTokens(_) => "unable to save tokens to file",
+            AddAccount::SaveTokens(_) => "unable to save tokens to file",
         };
         f.write_str(s)
     }
@@ -122,7 +122,7 @@ impl Error for AddAccount {
         match self {
             AddAccount::InitAccount(source) => Some(source),
             AddAccount::SaveSecret(source) => Some(source),
-            AddAccount::CopyTokens(source) => Some(source),
+            AddAccount::SaveTokens(source) => Some(source),
         }
     }
 }
@@ -304,8 +304,9 @@ pub(crate) enum LoadSecret {
         path: PathBuf,
         source: io::Error,
     },
+    /// secret.json is not valid. Holds the path, never the content: it has the client secret.
     Deserialize {
-        content: String,
+        path: PathBuf,
         source: serde_json::Error,
     },
 }
@@ -316,8 +317,12 @@ impl Display for LoadSecret {
             LoadSecret::Read { path, source: _ } => {
                 write!(f, "unable to read the content of file '{}'", path.display())
             }
-            LoadSecret::Deserialize { content, source: _ } => {
-                write!(f, "unable to serialize the content '{content}'")
+            LoadSecret::Deserialize { path, source: _ } => {
+                write!(
+                    f,
+                    "'{}' is not a valid client credentials file",
+                    path.display()
+                )
             }
         }
     }
@@ -328,6 +333,53 @@ impl Error for LoadSecret {
         match self {
             LoadSecret::Read { source, .. } => Some(source),
             LoadSecret::Deserialize { source, .. } => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum LoadAccountWithSecret {
+    InvalidName(String),
+    DefaultBasePath(DefaultBasePath),
+    NotFound(String),
+    LoadSecret(LoadSecret),
+    IncompleteSecret(String),
+}
+
+impl Display for LoadAccountWithSecret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LoadAccountWithSecret::InvalidName(name) => {
+                write!(f, "'{name}' is not a valid account name")
+            }
+            LoadAccountWithSecret::DefaultBasePath(_) => {
+                f.write_str("unable to get default base path")
+            }
+            LoadAccountWithSecret::NotFound(name) => write!(
+                f,
+                "account '{name}' not found; run 'gdrive account list' to see the accounts, or \
+                 'gdrive account add' to add one"
+            ),
+            LoadAccountWithSecret::LoadSecret(_) => {
+                f.write_str("unable to load the client credentials of the account")
+            }
+            LoadAccountWithSecret::IncompleteSecret(name) => write!(
+                f,
+                "the stored client credentials of account '{name}' are incomplete; add the \
+                 account again with 'gdrive account add'"
+            ),
+        }
+    }
+}
+
+impl Error for LoadAccountWithSecret {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            LoadAccountWithSecret::DefaultBasePath(source) => Some(source),
+            LoadAccountWithSecret::LoadSecret(source) => Some(source),
+            LoadAccountWithSecret::InvalidName(_)
+            | LoadAccountWithSecret::NotFound(_)
+            | LoadAccountWithSecret::IncompleteSecret(_) => None,
         }
     }
 }
