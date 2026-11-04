@@ -44,25 +44,24 @@ pub(crate) async fn info(config: Config) -> Result<(), Box<Error>> {
     Ok(())
 }
 
-/// What `files info` prints: the fields of [`print_file_info`], then whether the file is in the
-/// trash.
+/// What `files info` prints: the fields of [`print_file_info`], then, for a file in the trash
+/// only, a `Trashed` line. The output for a file that is not in the trash is that of gdrive 3.x.
 fn info_text(file: &google_drive3::api::File, display_config: &DisplayConfig) -> String {
     let mut text = file_info_text(file, display_config);
     push_field(
         &mut text,
         "Trashed",
-        file.trashed
-            .map(|trashed| trashed_status(trashed, file.explicitly_trashed)),
+        (file.trashed == Some(true)).then(|| trashed_status(file.explicitly_trashed)),
     );
     text
 }
 
 /// `explicitly`: the file itself was trashed, not (only) a folder it is in.
-fn trashed_status(trashed: bool, explicitly: Option<bool>) -> &'static str {
-    match (trashed, explicitly) {
-        (false, _) => "no",
-        (true, Some(true)) => "yes (explicitly)",
-        (true, _) => "yes",
+fn trashed_status(explicitly: Option<bool>) -> &'static str {
+    if explicitly == Some(true) {
+        "yes (explicitly)"
+    } else {
+        "yes"
     }
 }
 
@@ -308,10 +307,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trashed_status_says_whether_the_file_itself_was_trashed() {
-        let (text, ..) = info_of(&json!({"id": "file-id", "trashed": false})).await;
-        assert_eq!(text, "Id: file-id\nTrashed: no\n");
+    async fn a_file_that_is_not_in_the_trash_prints_as_before() {
+        let file = json!({
+            "id": "file-id",
+            "name": "a.txt",
+            "mimeType": "text/plain",
+            "shared": true,
+            "parents": ["parent-a"],
+            "trashed": false,
+            "explicitlyTrashed": false,
+        });
+        let (text, other_commands, _) = info_of(&file).await;
+        assert_eq!(
+            text,
+            "Id: file-id\n\
+             Name: a.txt\n\
+             Mime: text/plain\n\
+             Shared: True\n\
+             Parents: parent-a\n"
+        );
+        assert_eq!(text, other_commands);
 
+        // Drive did not say.
+        let (text, ..) = info_of(&json!({"id": "file-id"})).await;
+        assert_eq!(text, "Id: file-id\n");
+    }
+
+    #[tokio::test]
+    async fn trashed_status_says_whether_the_file_itself_was_trashed() {
         // Trashed with a folder it is in.
         let (text, ..) = info_of(&json!({
             "id": "file-id",
@@ -321,8 +344,7 @@ mod tests {
         .await;
         assert_eq!(text, "Id: file-id\nTrashed: yes\n");
 
-        // Drive did not say.
-        let (text, ..) = info_of(&json!({"id": "file-id"})).await;
-        assert_eq!(text, "Id: file-id\n");
+        let (text, ..) = info_of(&json!({"id": "file-id", "trashed": true})).await;
+        assert_eq!(text, "Id: file-id\nTrashed: yes\n");
     }
 }
