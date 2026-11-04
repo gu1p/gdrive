@@ -14,12 +14,16 @@ clap = { version = "4.5.41", features = ["derive"] }
 clap_complete = "4.5.67"
 error-trace = { version = "4.0.0", default-features = false }
 exponential-backoff = "2.1.1"
+# Full jitter for the retry backoff; already in the tree through tempfile.
+fastrand = "2.1.0"
 futures = "0.3.25"
 google-apis-common = { version = "8.0.0", default-features = false }
 google-drive3 = "7.0.0"
 home = "0.5.4"
 human_bytes = { version = "0.4.3", default-features = false }
 http-body-util = "0.1.5"
+# Retry-After as an HTTP date; already in the tree through hyper.
+httpdate = "1.0.2"
 hyper = "1.5.2"
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1"] }
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
@@ -45,6 +49,8 @@ yup-oauth2 = { version = "12.1.2", default-features = false }
 # The mock Google upload server in tests/ needs hyper's server side.
 hyper = { version = "1.5.2", features = ["server", "http1"] }
 tower-service = "0.3"
+# Paused clock for the retry and throttle tests.
+tokio = { version = "1.23.0", features = ["test-util"] }
 
 [lints.rust]
 unreachable_pub = "warn"

@@ -17,6 +17,11 @@ pub(crate) mod md5_writer;
 pub(crate) mod mock_server;
 pub(crate) mod paginate;
 pub(crate) mod permission;
+#[expect(
+    dead_code,
+    reason = "wired into the upload delegate, the metadata calls and downloads by the next commits"
+)]
+pub(crate) mod retry;
 #[cfg(test)]
 pub(crate) mod stub_server;
 pub(crate) mod table;
