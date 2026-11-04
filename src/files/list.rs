@@ -575,6 +575,43 @@ mod tests {
         );
     }
 
+    /// Every page of a --drive listing keeps the drive scope and the composed query, not just
+    /// the first one.
+    #[tokio::test]
+    async fn drive_with_query_scopes_every_page() {
+        let cases = [
+            (
+                list_query(Some("name contains 'x'"), None, Some("D")),
+                "trashed = false and (name contains 'x')",
+            ),
+            (
+                list_query(Some("name contains 'x'"), Some("P"), Some("D")),
+                "'P' in parents and trashed = false and (name contains 'x')",
+            ),
+        ];
+
+        for (query, expected_q) in cases {
+            let pages = vec![
+                file_page(0..1000, Some("t1")),
+                file_page(1000..2000, Some("t2")),
+                file_page(2000..2100, None),
+            ];
+
+            let (ids, requests) = list_from_stub(query.clone(), usize::MAX, pages).await;
+
+            assert_eq!(ids.len(), 2100, "{query:?}");
+            let tokens: Vec<_> = requests.iter().map(|r| r.param("pageToken")).collect();
+            assert_eq!(tokens, [None, Some("t1"), Some("t2")], "{query:?}");
+            for request in &requests {
+                assert_eq!(request.param("corpora"), Some("drive"), "{query:?}");
+                assert_eq!(request.param("driveId"), Some("D"), "{query:?}");
+                assert_eq!(request.param("q"), Some(expected_q), "{query:?}");
+                assert_eq!(request.param("includeItemsFromAllDrives"), Some("true"));
+                assert_eq!(request.param("supportsAllDrives"), Some("true"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn stops_when_no_next_page_token() {
         let pages = vec![file_page(0..1000, Some("t1")), file_page(1000..1200, None)];
