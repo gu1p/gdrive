@@ -74,7 +74,7 @@ async fn copy_file(
     delegate_config: &UploadDelegateConfig,
     config: &CopyConfig,
 ) -> FileResult {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     let file = google_drive3::api::File {
         parents: Some(vec![config.to_folder_id.clone()]),

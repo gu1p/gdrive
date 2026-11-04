@@ -66,7 +66,7 @@ pub(crate) async fn create_directory(
         ..google_drive3::api::File::default()
     };
 
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     let req = hub
         .files()

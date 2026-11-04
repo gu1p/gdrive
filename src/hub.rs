@@ -5,13 +5,20 @@ use google_drive3::DriveHub;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 
-pub(crate) struct Hub(DriveHub<HttpsConnector<HttpConnector>>);
+use crate::common::retry::{Retrier, RetryPolicy, Throttle};
+
+/// The Drive API client of a command: google-drive3's hub, and the retry policy and throttle
+/// that every request made through it shares.
+pub(crate) struct Hub {
+    drive: DriveHub<HttpsConnector<HttpConnector>>,
+    retrier: Retrier,
+}
 
 impl Deref for Hub {
     type Target = DriveHub<HttpsConnector<HttpConnector>>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.drive
     }
 }
 
@@ -31,7 +38,22 @@ impl Hub {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(create_connector()?);
 
-        Ok(Hub(google_drive3::DriveHub::new(http_client, auth)))
+        Ok(Hub::from_drive_hub(
+            google_drive3::DriveHub::new(http_client, auth),
+            RetryPolicy::default(),
+        ))
+    }
+
+    fn from_drive_hub(drive: DriveHub<HttpsConnector<HttpConnector>>, policy: RetryPolicy) -> Hub {
+        Hub {
+            drive,
+            retrier: Retrier::new(policy, Throttle::new()),
+        }
+    }
+
+    /// The retry policy and the throttle shared by every request of this hub.
+    pub(crate) fn retrier(&self) -> &Retrier {
+        &self.retrier
     }
 }
 
@@ -50,7 +72,7 @@ impl Hub {
                 .build(create_connector()?);
         let mut hub = google_drive3::DriveHub::new(http_client, google_apis_common::NoToken);
         hub.base_url(base_url);
-        Ok(Hub(hub))
+        Ok(Hub::from_drive_hub(hub, RetryPolicy::for_tests()))
     }
 }
 
@@ -67,6 +89,6 @@ impl Hub {
         let mut hub = DriveHub::new(http_client, String::from("mock-token"));
         hub.root_url(root_url.to_owned());
         hub.base_url(format!("{root_url}drive/v3/"));
-        Ok(Hub(hub))
+        Ok(Hub::from_drive_hub(hub, RetryPolicy::for_tests()))
     }
 }

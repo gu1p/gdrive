@@ -77,7 +77,7 @@ pub(crate) async fn list_permissions(
     delegate_config: &UploadDelegateConfig,
     file_id: &str,
 ) -> Result<Vec<google_drive3::api::Permission>, Box<google_drive3::Error>> {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     let (_, permission_list) = hub
         .permissions()

@@ -77,7 +77,7 @@ async fn change_parent(
     delegate_config: &UploadDelegateConfig,
     ids: ChangeParentIds<'_>,
 ) -> FileResult {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     let empty_file = google_drive3::api::File::default();
 

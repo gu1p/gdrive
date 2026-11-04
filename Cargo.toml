@@ -13,7 +13,6 @@ chrono = { version = "0.4.41", default-features = false }
 clap = { version = "4.5.41", features = ["derive"] }
 clap_complete = "4.5.67"
 error-trace = { version = "4.0.0", default-features = false }
-exponential-backoff = "2.1.1"
 # Full jitter for the retry backoff; already in the tree through tempfile.
 fastrand = "2.1.0"
 futures = "0.3.25"

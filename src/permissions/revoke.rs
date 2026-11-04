@@ -55,7 +55,7 @@ async fn delete_permission(
     file_id: &str,
     permission_id: &str,
 ) -> Result<(), Box<google_drive3::Error>> {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     hub.permissions()
         .delete(file_id, permission_id)

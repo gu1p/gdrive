@@ -72,7 +72,7 @@ async fn list_drives(
     max_drives: usize,
 ) -> Result<Vec<google_drive3::api::Drive>, Box<google_drive3::Error>> {
     paginate::collect_pages(max_drives, MAX_PAGE_SIZE, async |page: PageRequest| {
-        let mut delegate = UploadDelegate::new(delegate_config);
+        let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
         let mut req = hub
             .drives()

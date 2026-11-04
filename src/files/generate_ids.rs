@@ -8,7 +8,7 @@ pub(crate) async fn generate_ids(
     count: i32,
     delegate_config: &UploadDelegateConfig,
 ) -> Result<Vec<String>, Box<google_drive3::Error>> {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     let (_, ids) = hub
         .files()

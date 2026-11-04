@@ -9,9 +9,9 @@
 //! that `upload_file` builds (`param("fields", ..)`, `add_scope(Full)`, `delegate(..)`,
 //! `supports_all_drives(true)`, `upload_resumable(..)`) on a `DriveHub` whose root URL is the mock
 //! server. That covers google-drive3's session initiation and final JSON decoding, the vendored
-//! google-apis-common resumable loop, and gdrive's retry decisions. Only the backoff timings are
-//! shorter than the ones `upload.rs` uses, so that the unpatched crate fails within a second
-//! instead of retrying for hours.
+//! google-apis-common resumable loop, and gdrive's retry decisions (the retry policy of
+//! `src/common/retry.rs`). Only the backoff timings are shorter than the ones `upload.rs` uses,
+//! so that the unpatched crate fails within a second instead of retrying for minutes.
 //!
 //! The mock follows <https://developers.google.com/workspace/drive/api/guides/manage-uploads>:
 //! - a chunk is accepted only at the next uncommitted offset; anything else gets the 503 that
@@ -28,7 +28,7 @@ use std::{
     io::{self, Cursor},
     net::SocketAddr,
     sync::{Arc, Mutex, MutexGuard},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -57,8 +57,15 @@ use tokio::net::TcpListener;
 mod delegate;
 #[path = "../src/common/human_size.rs"]
 mod human_size;
+#[allow(
+    dead_code,
+    reason = "only the parts of the retry policy that the upload delegate uses are used here"
+)]
+#[path = "../src/common/retry.rs"]
+mod retry;
 
-use delegate::{BackoffConfig, ChunkSize, UploadDelegate, UploadDelegateConfig};
+use delegate::{ChunkSize, UploadDelegate, UploadDelegateConfig};
+use retry::{Jitter, RetryPolicy, Throttle};
 
 const FILE_ID: &str = "mock-file-id";
 const SESSION_PATH: &str = "/upload-session";
@@ -85,6 +92,9 @@ struct Faults {
     /// Answer every chunk that starts at this offset with a 308 that repeats the current Range,
     /// committing nothing (unlike the faults above, this one never goes away).
     stall_at: Option<u64>,
+    /// Answer the chunk that starts at the given offset with a 429 rateLimitExceeded and
+    /// `Retry-After: <seconds>`, committing none of it.
+    rate_limit_chunk_at: Option<(u64, u64)>,
 }
 
 #[derive(Default)]
@@ -97,6 +107,9 @@ struct MockState {
     session_methods: Vec<Method>,
     stalled_chunks: u32,
     log: Vec<String>,
+    /// When each chunk or status request arrived, with its first byte (`None` for a status
+    /// request) and the status it was answered with.
+    session_requests: Vec<(Instant, Option<u64>, StatusCode)>,
 }
 
 impl MockState {
@@ -150,6 +163,22 @@ impl MockState {
         if self.faults.stall_at == Some(first) {
             self.stalled_chunks += 1;
             return self.resume_incomplete();
+        }
+        if let Some((at, seconds)) = self.faults.rate_limit_chunk_at {
+            if at == first {
+                self.faults.rate_limit_chunk_at = None;
+                let body = serde_json::json!({"error": {
+                    "code": 429,
+                    "message": "Rate Limit Exceeded",
+                    "errors": [{"domain": "usageLimits", "reason": "rateLimitExceeded"}],
+                }});
+                return Response::builder()
+                    .status(StatusCode::TOO_MANY_REQUESTS)
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Retry-After", seconds.to_string())
+                    .body(full(body.to_string()))
+                    .expect("valid 429 reply");
+            }
         }
         if self.faults.fail_chunk_at == Some(first) {
             self.faults.fail_chunk_at = None;
@@ -306,7 +335,16 @@ impl MockServer {
                 .expect("valid session initiation reply")
         } else if path == SESSION_PATH {
             state.session_methods.push(method.clone());
-            state.session_request(content_range.as_deref(), &body)
+            let response = state.session_request(content_range.as_deref(), &body);
+            let first = content_range
+                .as_deref()
+                .and_then(|value| value.strip_prefix("bytes "))
+                .and_then(|value| value.split_once('-'))
+                .and_then(|(first, _)| first.parse().ok());
+            state
+                .session_requests
+                .push((Instant::now(), first, response.status()));
+            response
         } else {
             text(StatusCode::NOT_FOUND, "unknown path")
         };
@@ -354,10 +392,13 @@ fn tail(log: &[String]) -> String {
 fn delegate_config() -> UploadDelegateConfig {
     UploadDelegateConfig {
         chunk_size: ChunkSize::Approx1,
-        backoff_config: BackoffConfig {
-            max_retries: 5,
-            min_sleep: Duration::from_millis(5),
-            max_sleep: Duration::from_millis(20),
+        retry_policy: RetryPolicy {
+            max_attempts: 6,
+            max_elapsed: Duration::from_secs(30),
+            base_delay: Duration::from_millis(5),
+            multiplier: 2,
+            max_delay: Duration::from_millis(20),
+            jitter: Jitter::Full,
         },
         print_chunk_errors: true,
         print_chunk_info: true,
@@ -372,9 +413,17 @@ fn test_data() -> Vec<u8> {
 
 /// The `files.create` call of `upload_file` in src/files/upload.rs, through gdrive's delegate.
 async fn upload(server: &MockServer, data: &[u8]) -> UploadResult {
+    upload_with_throttle(server, data, &Throttle::new()).await
+}
+
+async fn upload_with_throttle(
+    server: &MockServer,
+    data: &[u8],
+    throttle: &Throttle,
+) -> UploadResult {
     let hub = server.hub();
     let config = delegate_config();
-    let mut delegate = UploadDelegate::new(&config);
+    let mut delegate = UploadDelegate::new(&config, throttle);
     let dst_file = google_drive3::api::File {
         name: Some(String::from("data.bin")),
         mime_type: Some(String::from("application/octet-stream")),
@@ -449,7 +498,7 @@ async fn repeated_308_without_progress_fails_within_the_retry_budget() {
         server.log()
     );
     let state = server.state();
-    let max_attempts = delegate_config().backoff_config.max_retries + 1;
+    let max_attempts = delegate_config().retry_policy.max_attempts;
     assert!(
         (2..=max_attempts).contains(&state.stalled_chunks),
         "the stalled chunk must be resent with backoff, at most {max_attempts} times, was sent {} \
@@ -505,4 +554,61 @@ async fn partially_committed_chunk_resumes_at_the_range_reported_by_308() {
     let result = upload(&server, &data).await;
 
     assert_uploaded_once(&server, &data, result);
+}
+
+#[tokio::test]
+async fn rate_limited_chunk_waits_for_retry_after_and_holds_back_the_throttle() {
+    let data = test_data();
+    let server = MockServer::start(Faults {
+        rate_limit_chunk_at: Some((MIB, 1)),
+        ..Faults::default()
+    })
+    .await;
+    let throttle = Throttle::new();
+    let other_worker = throttle.clone();
+
+    // Another worker sharing the throttle looks at it once the client has seen the 429.
+    let held_back = async {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            let remaining = other_worker.remaining();
+            if !remaining.is_zero() {
+                return remaining;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Duration::ZERO
+    };
+    let (result, held_back) =
+        tokio::join!(upload_with_throttle(&server, &data, &throttle), held_back);
+
+    assert_uploaded_once(&server, &data, result);
+    assert!(
+        held_back > Duration::from_millis(500),
+        "a rate limit must hold back every request sharing the throttle, held back {held_back:?}"
+    );
+    let state = server.state();
+    let requests = &state.session_requests;
+    let limited = requests
+        .iter()
+        .position(|(_, _, status)| *status == StatusCode::TOO_MANY_REQUESTS)
+        .unwrap_or_else(|| panic!("the chunk must be rate limited once\n{}", tail(&state.log)));
+    let (limited_at, first, _) = requests[limited];
+    let (resent_at, resent_first, _) = requests
+        .get(limited + 1)
+        .copied()
+        .unwrap_or_else(|| panic!("the chunk must be resent\n{}", tail(&state.log)));
+    assert_eq!(first, Some(MIB));
+    assert_eq!(resent_first, Some(MIB), "the same chunk is resent");
+    let waited = resent_at - limited_at;
+    // The policy's own backoff is at most 20 ms here: only Retry-After explains a second.
+    assert!(
+        waited >= Duration::from_millis(950),
+        "Retry-After: 1 must be honored, the chunk was resent after {waited:?}"
+    );
+    assert!(
+        waited < Duration::from_secs(10),
+        "waited far longer than asked: {waited:?}"
+    );
+    assert_eq!(throttle.remaining(), Duration::ZERO, "the hold is over");
 }

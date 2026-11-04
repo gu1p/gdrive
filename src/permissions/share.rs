@@ -78,7 +78,7 @@ async fn create_permission(
     delegate_config: &UploadDelegateConfig,
     config: Config,
 ) -> Result<google_drive3::api::Permission, google_drive3::Error> {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
 
     let requires_ownership_transfer = config.requires_ownership_transfer();
     let new_permission = google_drive3::api::Permission {

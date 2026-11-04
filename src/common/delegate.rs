@@ -1,39 +1,55 @@
 use std::{
     fmt::{self, Display},
     str::FromStr,
-    time::Duration,
 };
 
 use error_trace::ErrorTrace;
 use hyper::{self, http};
 
 // `super::` rather than `crate::common::`, so that tests/resumable_upload.rs can compile this
-// module next to human_size.rs.
-use super::human_size::human_size;
+// module next to human_size.rs and retry.rs.
+use super::{
+    human_size::human_size,
+    retry::{
+        classify_status, classify_transport, Decision, RetryPolicy, RetryReason, RetryState,
+        Throttle,
+    },
+};
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UploadDelegateConfig {
     pub(crate) chunk_size: ChunkSize,
-    pub(crate) backoff_config: BackoffConfig,
+    /// The budget of one upload; a chunk the server accepts starts a new one.
+    pub(crate) retry_policy: RetryPolicy,
     pub(crate) print_chunk_errors: bool,
     pub(crate) print_chunk_info: bool,
 }
 
+/// The google-drive3 delegate of an upload: chunk size, chunk messages, and the retry decisions
+/// of the vendored resumable-upload helper and of google-drive3's request loop, made by the
+/// retry policy (`retry.rs`).
+///
+/// The helper's retry contract (vendor/google-apis-common/GDRIVE-PATCHES.md): after
+/// `Retry::After` a failed chunk is resent from its first byte, a transport error resends the
+/// same chunk, and a 308 that took none of the chunk is handed to `http_failure` like a failure.
 pub(crate) struct UploadDelegate<'a> {
     config: &'a UploadDelegateConfig,
-    backoff: Backoff,
+    retry: RetryState,
     resumable_upload_url: Option<String>,
     previous_chunk: Option<google_apis_common::ContentRange>,
 }
 
 impl<'a> UploadDelegate<'a> {
+    /// A delegate whose rate limits hold back, and which waits for, every request that shares
+    /// `throttle` (the hub's).
+    ///
+    /// The delegate cannot wait before a chunk by itself (google-drive3 calls it synchronously):
+    /// callers wait for the throttle before they start the upload, and retries wait for it.
     #[must_use]
-    pub(crate) fn new(config: &'a UploadDelegateConfig) -> Self {
-        let backoff = Backoff::new(&config.backoff_config);
-
+    pub(crate) fn new(config: &'a UploadDelegateConfig, throttle: &Throttle) -> Self {
         UploadDelegate {
             config,
-            backoff,
+            retry: RetryState::new(config.retry_policy, Some(throttle.clone())),
             resumable_upload_url: None,
             previous_chunk: None,
         }
@@ -65,6 +81,28 @@ impl<'a> UploadDelegate<'a> {
             }
         }
     }
+
+    /// A chunk that starts past the previous one means the server took bytes: progress.
+    fn note_progress(&mut self, chunk: &google_apis_common::ContentRange) {
+        let previous_first = self
+            .previous_chunk
+            .as_ref()
+            .and_then(|previous| previous.range.as_ref())
+            .map(|range| range.first);
+        let first = chunk.range.as_ref().map(|range| range.first);
+        if let (Some(previous_first), Some(first)) = (previous_first, first) {
+            if first > previous_first {
+                self.retry.progress();
+            }
+        }
+    }
+}
+
+fn to_retry(decision: &Decision) -> google_apis_common::Retry {
+    match decision {
+        Decision::Retry { after, .. } => google_apis_common::Retry::After(*after),
+        Decision::Stop { .. } => google_apis_common::Retry::Abort,
+    }
 }
 
 impl google_apis_common::Delegate for UploadDelegate<'_> {
@@ -73,6 +111,7 @@ impl google_apis_common::Delegate for UploadDelegate<'_> {
     }
 
     fn cancel_chunk_upload(&mut self, chunk: &google_apis_common::ContentRange) -> bool {
+        self.note_progress(chunk);
         self.print_chunk_info(chunk);
         self.previous_chunk = Some(chunk.clone());
 
@@ -91,78 +130,36 @@ impl google_apis_common::Delegate for UploadDelegate<'_> {
         if self.config.print_chunk_errors {
             eprintln!("Warning: Failed attempt to upload chunk: {}", err.trace());
         }
-        self.backoff.retry()
+        to_retry(&self.retry.next(classify_transport(err)))
     }
 
     fn http_failure(
         &mut self,
         res: &google_apis_common::Response,
-        _err: Option<&serde_json::Value>,
+        err: Option<&serde_json::Value>,
     ) -> google_apis_common::Retry {
         let status = res.status();
 
-        if should_retry(status) {
-            if self.config.print_chunk_errors {
-                eprintln!(
-                    "Warning: Failed attempt to upload chunk. Status code: {}, body: {:?}",
-                    status,
-                    res.body()
-                );
+        // A 308 Resume Incomplete reaches the delegate only when a chunk made no progress (see
+        // vendor/google-apis-common/GDRIVE-PATCHES.md): resend it like a 5xx, within the budget.
+        let classified = if status == http::StatusCode::PERMANENT_REDIRECT {
+            Decision::Retry {
+                after: std::time::Duration::ZERO,
+                reason: RetryReason::NoProgress,
             }
-            self.backoff.retry()
         } else {
-            google_apis_common::Retry::Abort
+            classify_status(status, Some(res.headers()), err)
+        };
+        let decision = self.retry.next(classified);
+
+        if self.config.print_chunk_errors && matches!(decision, Decision::Retry { .. }) {
+            eprintln!(
+                "Warning: Failed attempt to upload chunk. Status code: {}, body: {:?}",
+                status,
+                res.body()
+            );
         }
-    }
-}
-
-fn should_retry(status: http::StatusCode) -> bool {
-    // A 308 Resume Incomplete reaches the delegate only when a chunk made no progress (see
-    // vendor/google-apis-common/GDRIVE-PATCHES.md): resend it like a 5xx, within the budget.
-    status.is_server_error()
-        || status == http::StatusCode::TOO_MANY_REQUESTS
-        || status == http::StatusCode::PERMANENT_REDIRECT
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct BackoffConfig {
-    pub(crate) max_retries: u32,
-    pub(crate) min_sleep: Duration,
-    pub(crate) max_sleep: Duration,
-}
-
-impl Default for BackoffConfig {
-    fn default() -> Self {
-        BackoffConfig {
-            max_retries: 100,
-            min_sleep: Duration::from_secs(1),
-            max_sleep: Duration::from_secs(60),
-        }
-    }
-}
-
-pub(crate) struct Backoff {
-    backoff: exponential_backoff::IntoIter,
-}
-
-impl Backoff {
-    #[must_use]
-    pub(crate) fn new(config: &BackoffConfig) -> Backoff {
-        Backoff {
-            backoff: exponential_backoff::Backoff::new(
-                config.max_retries,
-                config.min_sleep,
-                config.max_sleep,
-            )
-            .into_iter(),
-        }
-    }
-
-    fn retry(&mut self) -> google_apis_common::Retry {
-        self.backoff.next().flatten().map_or(
-            google_apis_common::Retry::Abort,
-            google_apis_common::Retry::After,
-        )
+        to_retry(&decision)
     }
 }
 
