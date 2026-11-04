@@ -144,6 +144,10 @@ pub(crate) enum SaveBodyToStdout {
         expected: u64,
         actual: u64,
     },
+    Md5Mismatch {
+        expected: Digest,
+        actual: Digest,
+    },
 }
 
 impl Display for SaveBodyToStdout {
@@ -154,14 +158,21 @@ impl Display for SaveBodyToStdout {
             SaveBodyToStdout::Request(_) => return f.write_str("unable to resume the download"),
             SaveBodyToStdout::CannotRestart => {
                 return f.write_str(
-                    "the download broke off and the server sent the file from the start again, \
-                     which cannot be undone on stdout; download to a file instead",
+                    "the download broke off and must start over (the file changed on Drive or \
+                     the server sent it from the start again), which cannot be undone on stdout; \
+                     download to a file instead",
                 )
             }
             SaveBodyToStdout::SizeMismatch { expected, actual } => {
                 return write!(
                     f,
                     "size mismatches (expected {expected} bytes, received {actual})"
+                )
+            }
+            SaveBodyToStdout::Md5Mismatch { expected, actual } => {
+                return write!(
+                    f,
+                    "md5 mismatches (expected {expected:x}, actual is {actual:x})"
                 )
             }
         };
@@ -176,7 +187,9 @@ impl Error for SaveBodyToStdout {
             SaveBodyToStdout::ReadChunk(source) => Some(source),
             SaveBodyToStdout::WriteChunk(source) => Some(source),
             SaveBodyToStdout::Request(source) => Some(source),
-            SaveBodyToStdout::CannotRestart | SaveBodyToStdout::SizeMismatch { .. } => None,
+            SaveBodyToStdout::CannotRestart
+            | SaveBodyToStdout::SizeMismatch { .. }
+            | SaveBodyToStdout::Md5Mismatch { .. } => None,
         }
     }
 }

@@ -140,7 +140,8 @@ Google Docs, Sheets and Slides have no binary content. Use [`files export`](#goo
 for them.
 
 A download that breaks off (a dropped connection, an HTTP/2 `GOAWAY`) continues where it stopped, with a
-`Warning:` line on stderr. The file is checked against its MD5 checksum, or its size when Drive has no
+`Warning:` line on stderr, but only if the file did not change on Drive meanwhile; a changed file is
+downloaded again from the start (with `--stdout`, the command fails instead). The file is checked against its MD5 checksum, or its size when Drive has no
 checksum, before it gets its final name; until then it is a hidden `.gdrive-<id>.part` file next to it,
 removed again if the download fails. Resuming works within one run of gdrive, not across runs.
 

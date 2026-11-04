@@ -193,6 +193,8 @@ pub(crate) enum MediaError {
     },
     /// A download could not continue where it stopped.
     Resume { reason: StopReason },
+    /// The file's metadata could not be fetched to check that it did not change.
+    Metadata(Box<google_drive3::Error>),
 }
 
 impl MediaError {
@@ -250,6 +252,9 @@ impl Display for MediaError {
             MediaError::Resume { reason } => {
                 write!(f, "the download could not be resumed ({reason})")
             }
+            MediaError::Metadata(_) => {
+                f.write_str("unable to check whether the file changed on Drive")
+            }
         }
     }
 }
@@ -261,6 +266,7 @@ impl Error for MediaError {
             MediaError::Request(source) => Some(source),
             MediaError::Token(source) => Some(source.as_ref()),
             MediaError::Transport { source, .. } => Some(source),
+            MediaError::Metadata(source) => Some(source),
             MediaError::InvalidToken | MediaError::Status { .. } | MediaError::Resume { .. } => {
                 None
             }

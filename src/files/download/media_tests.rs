@@ -7,8 +7,9 @@ use http_body_util::BodyExt;
 use serde_json::json;
 
 use super::{
-    download_with_hub, file_content, save_to_file, Config, Destination, ExistingFileAction,
-    Expected, Next, ResumableDownload,
+    download_with_hub, file_content,
+    resume::{Identity, Revision},
+    save_to_file, Config, Destination, ExistingFileAction, Expected, Next, ResumableDownload,
 };
 use crate::common::{
     drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT},
@@ -21,7 +22,7 @@ async fn media_request(acknowledge_abuse: bool) -> crate::common::mock_server::R
     let hub = server.hub();
 
     let source = file_content(&hub, "file-id", acknowledge_abuse, String::from("test")).unwrap();
-    let mut download = ResumableDownload::new(source, hub.retrier().state(), None);
+    let mut download = ResumableDownload::new(source, hub.retrier().state(), Expected::default());
     let Next::Body { body, restart } = download.next().await.unwrap() else {
         panic!("expected a body");
     };
@@ -168,13 +169,13 @@ async fn download(
 ) -> Result<(), super::errors::SaveBodyToFile> {
     let hub = server.hub();
     let source = file_content(&hub, "file-id", false, String::from("test download")).unwrap();
-    let mut download = ResumableDownload::new(source, hub.retrier().state(), size);
+    let mut download =
+        ResumableDownload::new(source, hub.retrier().state(), Expected { md5, size });
     let first = download
         .next()
         .await
         .map_err(|err| super::errors::SaveBodyToFile::Request(Box::new(err)))?;
-    let expected = Expected { md5, size };
-    save_to_file(download, first, &dir.join("out.bin"), "file-id", expected).await
+    save_to_file(download, first, &dir.join("out.bin"), "file-id").await
 }
 
 /// The file holds exactly `expected`; on failure, says where it differs instead of printing it.
@@ -505,5 +506,211 @@ async fn a_missing_file_is_not_retried() {
 
     assert!(result.is_err());
     assert_eq!(server.requests().len(), 1);
+    assert_eq!(dir_entries(dir.path()), Vec::<String>::new());
+}
+
+/// Downloads `file-id` like [`download`], resuming only while the file is still at `revision`.
+async fn download_revision(
+    server: &MockServer,
+    dir: &Path,
+    revision: Revision,
+) -> Result<(), super::errors::SaveBodyToFile> {
+    let hub = server.hub();
+    let source = file_content(&hub, "file-id", false, String::from("test download")).unwrap();
+    let mut download = ResumableDownload::new(source, hub.retrier().state(), revision.expected())
+        .with_identity(Identity::new(&hub, "file-id", revision));
+    let first = download
+        .next()
+        .await
+        .map_err(|err| super::errors::SaveBodyToFile::Request(Box::new(err)))?;
+    save_to_file(download, first, &dir.join("out.bin"), "file-id").await
+}
+
+/// A `files.get` reply with the fields of a [`Revision`].
+fn revision_reply(version: u64, md5: Option<md5::Digest>, size: usize, modified: &str) -> Response {
+    let mut file = json!({
+        "id": "file-id",
+        "version": version.to_string(),
+        "size": size.to_string(),
+        "modifiedTime": modified,
+    });
+    if let Some(md5) = md5 {
+        file["md5Checksum"] = format!("{md5:x}").into();
+    }
+    Response::json(200, &file)
+}
+
+fn revision(version: i64, md5: Option<md5::Digest>, size: usize, modified: &str) -> Revision {
+    Revision {
+        version: Some(version),
+        md5,
+        size: Some(size as u64),
+        modified_time: Some(modified.parse().unwrap()),
+    }
+}
+
+const BEFORE: &str = "2026-11-01T10:00:00.000Z";
+const AFTER: &str = "2026-11-01T10:05:00.000Z";
+
+#[tokio::test]
+async fn a_file_replaced_by_one_of_the_same_size_is_downloaded_again_from_the_start() {
+    // Version B replaces version A between the break and the resume: same size, other bytes.
+    let a = content();
+    let b = a.to_uppercase();
+    assert_eq!(a.len(), b.len());
+    let cut = 20_000;
+    let server = MockServer::start(vec![
+        Response::raw(200, &a).cut_after(cut),
+        // The check before the resume sees the new revision.
+        revision_reply(8, Some(md5::compute(&b)), b.len(), AFTER),
+        Response::raw(200, &b),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    download_revision(
+        &server,
+        dir.path(),
+        revision(7, Some(md5::compute(&a)), a.len(), BEFORE),
+    )
+    .await
+    .expect("the new revision is downloaded and checked against its own md5");
+
+    assert_content(&dir.path().join("out.bin"), &b);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].path, "/drive/v3/files/file-id");
+    assert_eq!(
+        requests[1].query_param("fields"),
+        Some("id%2Cversion%2Cmd5Checksum%2Csize%2CmodifiedTime")
+    );
+    assert_eq!(
+        requests[2].header("range"),
+        None,
+        "a changed file is requested from the start, never resumed"
+    );
+    assert_eq!(dir_entries(dir.path()), ["out.bin"]);
+}
+
+#[tokio::test]
+async fn a_change_that_the_metadata_does_not_show_yet_is_caught_by_if_range() {
+    // No md5 and unchanged metadata: only the ETag tells the versions apart.
+    let a = content();
+    let b = a.to_uppercase();
+    let cut = 20_000;
+    let server = MockServer::start(vec![
+        Response::raw(200, &a)
+            .with_header("ETag", "\"rev-a\"")
+            .cut_after(cut),
+        revision_reply(7, None, a.len(), BEFORE),
+        // The server answers the If-Range of an outdated ETag with all of the new content.
+        Response::raw(200, &b).with_header("ETag", "\"rev-b\""),
+        revision_reply(8, None, b.len(), AFTER),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    download_revision(&server, dir.path(), revision(7, None, a.len(), BEFORE))
+        .await
+        .unwrap();
+
+    assert_content(&dir.path().join("out.bin"), &b);
+    let requests = server.requests();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[2].header("range"),
+        Some(format!("bytes={cut}-").as_str())
+    );
+    assert_eq!(requests[2].header("if-range"), Some("\"rev-a\""));
+    assert_eq!(dir_entries(dir.path()), ["out.bin"]);
+}
+
+#[tokio::test]
+async fn an_unchanged_file_is_resumed_with_its_etag() {
+    let content = content();
+    let total = content.len();
+    let cut = 20_000;
+    let server = MockServer::start(vec![
+        Response::raw(200, &content)
+            .with_header("ETag", "\"rev-a\"")
+            .cut_after(cut),
+        revision_reply(7, Some(md5::compute(&content)), total, BEFORE),
+        Response::raw(206, &content[cut..]).with_header(
+            "Content-Range",
+            &format!("bytes {cut}-{}/{total}", total - 1),
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    download_revision(
+        &server,
+        dir.path(),
+        revision(7, Some(md5::compute(&content)), total, BEFORE),
+    )
+    .await
+    .unwrap();
+
+    assert_content(&dir.path().join("out.bin"), &content);
+    let requests = server.requests();
+    assert_eq!(
+        requests[2].header("range"),
+        Some(format!("bytes={cut}-").as_str())
+    );
+    assert_eq!(requests[2].header("if-range"), Some("\"rev-a\""));
+}
+
+#[tokio::test]
+async fn a_weak_etag_is_not_sent_as_if_range() {
+    let content = content();
+    let total = content.len();
+    let cut = 20_000;
+    let server = MockServer::start(vec![
+        Response::raw(200, &content)
+            .with_header("ETag", "W/\"rev-a\"")
+            .cut_after(cut),
+        Response::raw(206, &content[cut..]).with_header(
+            "Content-Range",
+            &format!("bytes {cut}-{}/{total}", total - 1),
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    download(&server, dir.path(), Some(total as u64), None)
+        .await
+        .unwrap();
+
+    assert_eq!(server.requests()[1].header("if-range"), None);
+}
+
+#[tokio::test]
+async fn a_file_deleted_before_the_resume_is_a_clean_error() {
+    let content = content();
+    let server = MockServer::start(vec![
+        Response::raw(200, &content).cut_after(20_000),
+        Response::json(
+            404,
+            &json!({"error": {"code": 404, "message": "File not found: file-id."}}),
+        ),
+    ])
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let result = download_revision(
+        &server,
+        dir.path(),
+        revision(7, None, content.len(), BEFORE),
+    )
+    .await;
+
+    let Err(error) = result else {
+        panic!("a file that is gone cannot be resumed");
+    };
+    let message = crate::error_message(&error);
+    assert!(
+        message.contains("unable to check whether the file changed on Drive"),
+        "{message}"
+    );
     assert_eq!(dir_entries(dir.path()), Vec::<String>::new());
 }

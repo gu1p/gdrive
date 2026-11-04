@@ -51,8 +51,9 @@ pub(crate) async fn get_file(hub: &Hub, file_id: &str) -> FileResult {
             .get(file_id)
             .param(
                 "fields",
-                "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,driveId,shared,\
-                description,webContentLink,webViewLink,shortcutDetails(targetId,targetMimeType)",
+                "id,name,size,createdTime,modifiedTime,version,md5Checksum,mimeType,parents,\
+                driveId,shared,description,webContentLink,webViewLink,\
+                shortcutDetails(targetId,targetMimeType)",
             )
             .supports_all_drives(true)
             .add_scope(google_drive3::api::Scope::Full)

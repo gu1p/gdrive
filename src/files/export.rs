@@ -72,7 +72,12 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
     );
     let source = export_content(hub, &config.file_id, mime_type, label)
         .map_err(|err| Error::ExportFile(Box::new(err)))?;
-    let mut download = ResumableDownload::new(source, hub.retrier().state(), None);
+    // No md5 or size to check for an export; it always starts over, so it needs no identity.
+    let expected = Expected {
+        md5: file.md5_checksum.as_deref().and_then(parse_md5_digest),
+        size: None,
+    };
+    let mut download = ResumableDownload::new(source, hub.retrier().state(), expected);
     let first = download
         .next()
         .await
@@ -85,19 +90,9 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
         config.file_path.display()
     );
 
-    let expected = Expected {
-        md5: file.md5_checksum.as_deref().and_then(parse_md5_digest),
-        size: None,
-    };
-    files::download::save_to_file(
-        download,
-        first,
-        &config.file_path,
-        &config.file_id,
-        expected,
-    )
-    .await
-    .map_err(Error::SaveFile)?;
+    files::download::save_to_file(download, first, &config.file_path, &config.file_id)
+        .await
+        .map_err(Error::SaveFile)?;
 
     println!("Successfully exported {}", config.file_path.display());
 
