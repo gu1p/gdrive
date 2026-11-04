@@ -82,7 +82,8 @@ fn local(dir: &Path, path: &str) -> PathBuf {
         .fold(dir.to_path_buf(), |path, name| path.join(name))
 }
 
-/// `path` with the platform's separator, as gdrive prints it.
+/// `path` with the platform's separator, as gdrive prints local paths on stdout. Warnings and
+/// errors show paths below the destination with `/`.
 fn shown(path: &str) -> String {
     local(Path::new(""), path).display().to_string()
 }
@@ -329,11 +330,11 @@ async fn a_failed_file_stops_the_download_and_removes_the_temporary_files() {
     );
     assert!(error.contains("--continue-on-error"), "{error}");
     let err = downloaded.err.lines();
+    // The path below the destination, with `/` on every platform.
     assert!(
-        err[0].starts_with(&format!(
-            "Error: unable to download '{}': unable to download file from drive",
-            shown("Root/bad.bin")
-        )),
+        err[0].starts_with(
+            "Error: unable to download 'Root/bad.bin': unable to download file from drive"
+        ),
         "{err:?}"
     );
     assert_eq!(
@@ -617,11 +618,10 @@ async fn an_existing_local_file_fails_without_overwrite() {
         .error()
         .starts_with("Error: the recursive download is incomplete"));
     let err = downloaded.err.lines();
+    // The path below the destination with `/`, then the local file as the platform shows it.
     assert!(
-        err[0].starts_with(&format!(
-            "Error: unable to download '{}': file '",
-            shown("Root/x.txt")
-        )) && err[0].ends_with("' already exists, use --overwrite to overwrite it"),
+        err[0].starts_with("Error: unable to download 'Root/x.txt': file '")
+            && err[0].ends_with("' already exists, use --overwrite to overwrite it"),
         "{err:?}"
     );
     assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "mine");

@@ -6,7 +6,7 @@ use crate::{
     common::{
         file_tree_drive::{self, errors::FileIdentifier},
         hub_helper::GetHubError,
-        local_name::UnusableName,
+        local_name::{self, UnusableName},
         media_client::MediaError,
     },
     transfer::scheduler::{Incomplete, OutputError},
@@ -112,7 +112,7 @@ impl Display for Download {
                 write!(f, "unable to save body to file '{}'", path.display())
             }
             Download::RecursiveFile { path, source: _ } => {
-                write!(f, "unable to download '{}'", path.display())
+                write!(f, "unable to download '{}'", local_name::tree_path(path))
             }
             Download::Incomplete(_) => f.write_str("the recursive download is incomplete"),
             Download::WriteOutput(_) => {

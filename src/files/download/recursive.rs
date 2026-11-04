@@ -217,7 +217,7 @@ impl Source {
             Ok(()) => None,
             Err(err) => Some(Job::done(
                 JobKind::Metadata,
-                path.display().to_string(),
+                local_name::tree_path(path),
                 Outcome::failed(errors::Download::CreateDirectory(abs_path, err)),
             )),
         }
@@ -236,7 +236,7 @@ struct Files {
 impl Files {
     fn job(self: &Arc<Self>, file: PlannedFile) -> Job {
         let files = Arc::clone(self);
-        let label = file.path.display().to_string();
+        let label = local_name::tree_path(&file.path);
         let size = file.size;
         let partial = PartialFiles::new(self.root_path.join(&file.path), &file.id);
         let cleanup = partial.clone();
@@ -276,7 +276,7 @@ impl Files {
             return Ok(Outcome::Unchanged);
         }
 
-        let label = format!("download of '{}'", file.path.display());
+        let label = format!("download of '{}'", local_name::tree_path(&file.path));
         let source = file_content(&self.hub, &file.id, self.acknowledge_abuse, label)
             .map_err(|err| E::DownloadFile(Box::new(err)))?;
         // The walk lists md5 and size; the first check before a resume adds the rest.

@@ -138,7 +138,8 @@ fn created_paths(created: &[Created]) -> Vec<String> {
     paths
 }
 
-/// `path` with the platform's separator, as gdrive prints it.
+/// `path` with the platform's separator, as gdrive prints local paths on stdout. Warnings and
+/// errors show paths from the uploaded folder with `/`.
 fn shown(path: &str) -> String {
     path.split('/')
         .fold(PathBuf::new(), |path, name| path.join(name))
@@ -281,11 +282,9 @@ async fn a_failing_file_stops_the_upload_by_default() {
         "{error}"
     );
     let err = uploaded.err.lines();
+    // The path from the uploaded folder, with `/` on every platform.
     assert!(
-        err[0].starts_with(&format!(
-            "Error: unable to upload '{}': unable to upload file",
-            shown("photos/b.txt")
-        )),
+        err[0].starts_with("Error: unable to upload 'photos/b.txt': unable to upload file"),
         "{err:?}"
     );
     let files = server
@@ -352,10 +351,7 @@ async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
     );
     let err = uploaded.err.lines();
     assert!(
-        err[0].starts_with(&format!(
-            "Error: unable to upload '{}': unable to create directory",
-            shown("photos/2024")
-        )),
+        err[0].starts_with("Error: unable to upload 'photos/2024': unable to create directory"),
         "{err:?}"
     );
     assert_eq!(
@@ -453,12 +449,11 @@ async fn continue_on_error_uploads_everything_that_can_be_read() {
         "every readable folder and file: {created:?}"
     );
     let err = uploaded.err.lines();
-    let link = shown("photos/2024/dangling.jpg");
     assert!(
-        err.iter().any(|line| line.starts_with(&format!(
-            "Error: unable to upload '{link}': unable to read it from the local disk: symbolic \
-            link '"
-        ))),
+        err.iter().any(|line| line.starts_with(
+            "Error: unable to upload 'photos/2024/dangling.jpg': unable to read it from the local \
+            disk: symbolic link '"
+        )),
         "{err:?}"
     );
     if locked {
@@ -466,11 +461,10 @@ async fn continue_on_error_uploads_everything_that_can_be_read() {
             uploaded.error(),
             "Error: the recursive upload is incomplete: 1 file and 1 folder failed"
         );
-        assert!(err.iter().any(|line| line.starts_with(&format!(
-            "Error: unable to upload '{}': unable to read it from the local disk: unable to \
-            read directory content",
-            shown("photos/locked")
-        ))));
+        assert!(err.iter().any(|line| line.starts_with(
+            "Error: unable to upload 'photos/locked': unable to read it from the local disk: \
+            unable to read directory content"
+        )));
         assert_eq!(
             err.last().unwrap(),
             &format!(
