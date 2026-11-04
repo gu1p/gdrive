@@ -9,6 +9,10 @@ use crate::common::retry::{Retrier, RetryPolicy, Throttle};
 
 /// The Drive API client of a command: google-drive3's hub, and the retry policy and throttle
 /// that every request made through it shares.
+///
+/// Cloning is cheap and shares the connection pool, the credentials (and so the token cache) and
+/// the throttle, so that a rate limit seen by one clone holds back the others.
+#[derive(Clone)]
 pub(crate) struct Hub {
     drive: DriveHub<HttpsConnector<HttpConnector>>,
     /// The Drive API base URL the hub was set up with (google-drive3 has no getter for it).
@@ -62,8 +66,9 @@ impl Hub {
         }
     }
 
-    /// The Drive API base URL, ending in `/`: `https://www.googleapis.com/drive/v3/` outside
-    /// tests.
+    /// The Drive API base URL, ending in `/` (`https://www.googleapis.com/drive/v3/` unless a
+    /// test changed it), for requests google-drive3 cannot build, such as ones with extra
+    /// headers. google-drive3 only has a setter for it.
     pub(crate) fn drive_base_url(&self) -> &str {
         &self.drive_base_url
     }
