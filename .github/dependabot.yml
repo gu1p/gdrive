@@ -21,6 +21,10 @@ updates:
       # applied through [patch.crates-io]; it is updated by hand, together
       # with google-drive3, and the fixes re-applied.
       - dependency-name: google-apis-common
+      # A major google-drive3 bump could require google-apis-common 9.x, which
+      # would silently bypass the vendored 8.0.0 patch; update both by hand.
+      - dependency-name: google-drive3
+        update-types: ["version-update:semver-major"]
     commit-message:
       prefix: build
 
