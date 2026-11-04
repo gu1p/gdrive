@@ -9,6 +9,7 @@ use mime::Mime;
 
 use crate::{
     common::{
+        delegate::{ChunkSize, MultipartThreshold},
         drive_file::{DocType, FileExtension},
         file_info::{self, FileInfo},
         hub_helper::{get_hub, GetHubError},
@@ -25,15 +26,27 @@ pub(crate) struct Config {
     pub(crate) file_path: PathBuf,
     pub(crate) parents: Option<Vec<String>>,
     pub(crate) print_only_id: bool,
+    pub(crate) chunk_size: ChunkSize,
+    pub(crate) multipart_threshold: MultipartThreshold,
+}
+
+impl Config {
+    /// How the file goes up: as `files upload` does, with the selected chunk size and multipart
+    /// threshold, the sessions recorded in the account directory.
+    fn upload_options(&self) -> UploadOptions {
+        UploadOptions {
+            chunk_size: self.chunk_size.in_bytes(),
+            multipart_threshold: self.multipart_threshold.in_bytes(),
+            session_dir: account_session_dir(),
+            session_identity: account_session_identity(),
+            ..UploadOptions::default()
+        }
+    }
 }
 
 pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let options = UploadOptions {
-        session_dir: account_session_dir(),
-        session_identity: account_session_identity(),
-        ..UploadOptions::default()
-    };
+    let options = config.upload_options();
 
     let (doc_type, source_mime_type) =
         import_types(&config.file_path).ok_or(Error::UnsupportedFileType)?;
@@ -171,14 +184,51 @@ impl Display for Error {
 mod tests {
     use std::path::Path;
 
-    use super::{import_target, import_types};
+    use super::{import_target, import_types, Config};
     use crate::{
         common::{
+            delegate::{ChunkSize, MultipartThreshold},
             drive_file::{DocType, MIME_TYPE_DRIVE_DOCUMENT},
             mock_server::{MockServer, Response},
         },
         transfer::upload::{upload_path, UploadOptions},
     };
+
+    fn config(chunk_size: &str, multipart_threshold: &str) -> Config {
+        Config {
+            file_path: "notes.md".into(),
+            parents: None,
+            print_only_id: false,
+            chunk_size: chunk_size.parse().unwrap(),
+            multipart_threshold: multipart_threshold.parse().unwrap(),
+        }
+    }
+
+    #[test]
+    fn the_import_gets_the_selected_chunk_size_and_threshold() {
+        // `files import notes.md --chunk-size 1 --multipart-threshold 0`
+        let options = config("1", "0").upload_options();
+        assert_eq!(options.chunk_size, 1 << 20);
+        assert_eq!(options.multipart_threshold, 0);
+        assert!(options.verify_md5);
+
+        let options = config("64", "16").upload_options();
+        assert_eq!(options.chunk_size, 64 << 20);
+        assert_eq!(options.multipart_threshold, 16 << 20);
+    }
+
+    #[test]
+    fn without_the_flags_the_import_uploads_as_before() {
+        let options = Config {
+            chunk_size: ChunkSize::default(),
+            multipart_threshold: MultipartThreshold::default(),
+            ..config("1", "0")
+        }
+        .upload_options();
+        let defaults = UploadOptions::default();
+        assert_eq!(options.chunk_size, defaults.chunk_size);
+        assert_eq!(options.multipart_threshold, defaults.multipart_threshold);
+    }
 
     #[test]
     fn markdown_is_imported_as_a_document_from_text_markdown() {

@@ -479,6 +479,14 @@ enum FileCommand {
         /// Print only id of file
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
+
+        /// Set chunk size in MB, must be a power of two.
+        #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
+        chunk_size: ChunkSize,
+
+        /// Upload files of at most this many MB in a single request; larger files are uploaded in chunks and can be resumed. 0 uploads every non-empty file in chunks
+        #[arg(long, value_name = "MB", default_value_t = MultipartThreshold::default())]
+        multipart_threshold: MultipartThreshold,
     },
 
     /// Export google document to file
@@ -893,11 +901,15 @@ async fn handle_files_command(
             file_path,
             parent,
             print_only_id,
+            chunk_size,
+            multipart_threshold,
         } => {
             files::import(files::import::Config {
                 file_path,
                 parents: parent,
                 print_only_id,
+                chunk_size,
+                multipart_threshold,
             })
             .await?;
         }
@@ -1530,6 +1542,61 @@ mod flag_tests {
             for extension in doc_type.supported_export_types() {
                 let extension = extension.to_string();
                 assert!(listed.contains(extension.as_str()), "{extension}: {help}");
+            }
+        }
+    }
+
+    #[test]
+    fn import_takes_the_chunk_size_and_threshold_of_upload() {
+        let FileCommand::Import {
+            chunk_size,
+            multipart_threshold,
+            ..
+        } = parse(&[
+            "files",
+            "import",
+            "a.md",
+            "--chunk-size",
+            "1",
+            "--multipart-threshold",
+            "0",
+        ])
+        else {
+            panic!("expected import");
+        };
+        assert_eq!(chunk_size.in_bytes(), 1 << 20);
+        assert_eq!(multipart_threshold.in_bytes(), 0);
+
+        // The same defaults as upload.
+        let FileCommand::Import {
+            chunk_size,
+            multipart_threshold,
+            ..
+        } = parse(&["files", "import", "a.md"])
+        else {
+            panic!("expected import");
+        };
+        let FileCommand::Upload {
+            chunk_size: upload_chunk_size,
+            multipart_threshold: upload_multipart_threshold,
+            ..
+        } = parse(&["files", "upload", "a.md"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(chunk_size.in_bytes(), upload_chunk_size.in_bytes());
+        assert_eq!(multipart_threshold, upload_multipart_threshold);
+
+        // And the same parsing: what upload rejects, import rejects.
+        for (flag, value) in [
+            ("--chunk-size", "3"),
+            ("--chunk-size", "0"),
+            ("--multipart-threshold", "-1"),
+            ("--multipart-threshold", "many"),
+        ] {
+            for command in ["upload", "import"] {
+                let result = Cli::try_parse_from(["gdrive", "files", command, "a.md", flag, value]);
+                assert!(result.is_err(), "files {command} {flag} {value}");
             }
         }
     }
