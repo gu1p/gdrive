@@ -134,6 +134,15 @@ cargo build --release --locked
 ./target/release/gdrive version
 ```
 
+Or, from the clone, let the Makefile build and install it into a directory on your PATH:
+
+```sh
+make install                      # release build, copies to ~/.local/bin
+make install PREFIX=/usr/local    # system-wide (needs write access to /usr/local/bin)
+make uninstall                    # removes it again
+make check                        # fmt + clippy + test, the CI gate
+```
+
 Or install straight from the repository into `~/.cargo/bin`:
 
 ```sh

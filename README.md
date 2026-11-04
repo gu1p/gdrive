@@ -86,8 +86,10 @@ You need Rust 1.88 or later ([rustup](https://rustup.rs/)).
 cargo install --git https://github.com/gu1p/gdrive --locked
 ```
 
-This installs `gdrive` from `main` into `~/.cargo/bin`; add `--tag v4.0.0-alpha.1` for the release. To
-build from a clone instead, run `cargo build --release --locked`; the binary is `target/release/gdrive`.
+This installs `gdrive` from `main` into `~/.cargo/bin`; add `--tag v4.0.0-alpha.1` for the release. From a
+clone, `make install` builds the release binary and puts it in `~/.local/bin` (set `PREFIX=/usr/local`
+or `BINDIR=...` for another place); it tells you if that directory is not on your PATH. `make check`
+runs the same formatting, lint and test gate as CI, and `make help` lists the targets.
 
 ## Quick start
 
