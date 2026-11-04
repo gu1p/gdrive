@@ -257,6 +257,30 @@ fn unique_local_names_with(
     Ok(UniqueNames { names, changes })
 }
 
+/// Name of the temporary file that a download of `file_id` writes before it is renamed to its
+/// final name: `.gdrive-<id>.part`, then `.gdrive-<id>-1.part`, `.gdrive-<id>-2.part`, ... for
+/// the following `attempt`s. An id that is not 1 to 64 ASCII letters, digits, `-` or `_` is
+/// replaced with its hex MD5. The name does not depend on the file name, so it stays short and
+/// two files that differ only in their extension never share it.
+#[must_use]
+pub(crate) fn temp_file_name(file_id: &str, attempt: u32) -> String {
+    let is_plain_id = (1..=64).contains(&file_id.len())
+        && file_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let id = if is_plain_id {
+        Cow::Borrowed(file_id)
+    } else {
+        Cow::Owned(format!("{:x}", md5::compute(file_id.as_bytes())))
+    };
+
+    if attempt == 0 {
+        format!(".gdrive-{id}.part")
+    } else {
+        format!(".gdrive-{id}-{attempt}.part")
+    }
+}
+
 /// Joins `component` to `base` so that the result is always directly under `base`.
 ///
 /// `component` should come from [`local_name`]. As a second line of defense, separators and
@@ -425,8 +449,9 @@ mod tests {
     use std::path::{Component, Path};
 
     use super::{
-        id_tag, local_name, safe_join, safe_join_with, sanitize, unique_local_names_with,
-        InvalidName, NameChange, NameEntry, Rules, UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
+        id_tag, local_name, safe_join, safe_join_with, sanitize, temp_file_name,
+        unique_local_names_with, InvalidName, NameChange, NameEntry, Rules, UniqueNames,
+        UnusableName, MAX_COMPONENT_BYTES,
     };
 
     const UNIX: Rules = Rules {
@@ -838,5 +863,36 @@ mod tests {
         let warning = result.changes[0].to_string();
         assert!(!warning.contains('\u{1b}'), "{warning}");
         assert!(warning.contains("\\u{1b}"), "{warning}");
+    }
+
+    #[test]
+    fn temp_file_name_uses_plain_ids() {
+        let id = "1AbC_-xYz0123456789";
+        assert_eq!(temp_file_name(id, 0), format!(".gdrive-{id}.part"));
+        assert_eq!(temp_file_name(id, 1), format!(".gdrive-{id}-1.part"));
+        assert_eq!(temp_file_name(id, 42), format!(".gdrive-{id}-42.part"));
+    }
+
+    #[test]
+    fn temp_file_name_hashes_unusual_ids() {
+        // md5("") = d41d8cd98f00b204e9800998ecf8427e
+        assert_eq!(
+            temp_file_name("", 0),
+            ".gdrive-d41d8cd98f00b204e9800998ecf8427e.part"
+        );
+
+        let base = Path::new("dir");
+        for id in ["../../x", "a/b", "id with space", &"x".repeat(65)] {
+            let name = temp_file_name(id, 0);
+            assert!(name.starts_with(".gdrive-") && name.len() < 64, "{name}");
+            assert!(!name.contains(['/', '\\', ' ']), "{name}");
+            assert_eq!(safe_join(base, &name).parent(), Some(base));
+        }
+    }
+
+    #[test]
+    fn temp_file_names_differ_per_id() {
+        assert_ne!(temp_file_name("id-a", 0), temp_file_name("id-b", 0));
+        assert_ne!(temp_file_name("a/b", 0), temp_file_name("a_b", 0));
     }
 }
