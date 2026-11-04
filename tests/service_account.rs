@@ -286,9 +286,16 @@ async fn an_adc_account_stores_only_its_type_and_finds_the_credentials_on_each_r
 
 #[tokio::test]
 async fn adc_without_any_credentials_is_a_clear_error() {
-    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let metadata_host = closed.local_addr().unwrap().to_string();
-    drop(closed);
+    // A port of this test on which nothing answers: connections are closed without a reply. A
+    // port bound and released again could meanwhile become a mock server of another test (of
+    // another test process too), which would then answer gdrive.
+    let silent = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let metadata_host = silent.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((connection, _)) = silent.accept().await {
+            drop(connection);
+        }
+    });
     let home = tempfile::tempdir().unwrap();
     let home = home.path();
 

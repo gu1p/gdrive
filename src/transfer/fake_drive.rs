@@ -271,6 +271,7 @@ pub(crate) struct Behavior {
     /// committing nothing.
     pub(crate) chunk_unavailable: HashMap<String, u64>,
     /// Chunks that start at or after this offset get no reply, like a transfer that hangs.
+    /// [`FakeDrive::wait_for_stalled_chunks`] waits until that many have arrived.
     pub(crate) chunks_stalled_from: Option<u64>,
     /// The first this many file uploads (multipart creates of files, first chunks of resumable
     /// sessions) are held until all of them have arrived, so they are in flight together.
@@ -410,6 +411,8 @@ struct State {
     list_rendezvous: Rendezvous,
     /// Whether a media download has arrived, for [`Behavior::list_after_media`].
     media_arrived: watch::Sender<bool>,
+    /// The chunks held without a reply ([`Behavior::chunks_stalled_from`]).
+    stalled_chunks: watch::Sender<usize>,
 }
 
 pub(crate) struct FakeDrive {
@@ -456,6 +459,7 @@ impl FakeDrive {
             media_rendezvous,
             list_rendezvous,
             media_arrived: watch::channel(false).0,
+            stalled_chunks: watch::channel(0).0,
         });
 
         let server_state = Arc::clone(&state);
@@ -520,6 +524,20 @@ impl FakeDrive {
     /// The chunk and status requests of resumable sessions, in arrival order.
     pub(crate) fn chunks(&self) -> Vec<Chunk> {
         self.state.chunks.lock().expect("chunks lock").clone()
+    }
+
+    /// The chunks that arrived and are held without a reply ([`Behavior::chunks_stalled_from`]).
+    pub(crate) fn stalled_chunks(&self) -> usize {
+        *self.state.stalled_chunks.borrow()
+    }
+
+    /// Returns once `count` chunks are held without a reply ([`Behavior::chunks_stalled_from`]):
+    /// each was sent in full after the chunks before it were on Drive and answered, so the
+    /// uploads that sent them are in the middle of their sessions, waiting.
+    pub(crate) async fn wait_for_stalled_chunks(&self, count: usize) {
+        let mut stalled = self.state.stalled_chunks.subscribe();
+        // The sender lives as long as `self`.
+        let _ = stalled.wait_for(|stalled| *stalled >= count).await;
     }
 
     /// The most resumable sessions that were started and not completed at the same time.
@@ -931,8 +949,9 @@ async fn session_request(
 }
 
 /// What a request of a session waits for before it is answered: [`Behavior::chunk_delay`]; a
-/// chunk from [`Behavior::chunks_stalled_from`] on, forever; and the first chunk of a session,
-/// for those of the others ([`Behavior::upload_rendezvous`]). `first` is the chunk's first byte.
+/// chunk from [`Behavior::chunks_stalled_from`] on, forever (counted as stalled once its body
+/// has arrived); and the first chunk of a session, for those of the others
+/// ([`Behavior::upload_rendezvous`]). `first` is the chunk's first byte.
 async fn hold_chunk(state: &State, first: Option<u64>) {
     if let Some(first) = first {
         if state
@@ -940,6 +959,7 @@ async fn hold_chunk(state: &State, first: Option<u64>) {
             .chunks_stalled_from
             .is_some_and(|from| first >= from)
         {
+            state.stalled_chunks.send_modify(|stalled| *stalled += 1);
             std::future::pending::<()>().await;
         }
         if first == 0 {

@@ -488,16 +488,29 @@ mod tests {
         );
     }
 
+    /// `127.0.0.1:PORT` of a port that accepts connections and closes them without a reply, for
+    /// the rest of the test (the task ends with the test's runtime).
+    async fn silent_port() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            while let Ok((connection, _)) = listener.accept().await {
+                drop(connection);
+            }
+        });
+        host
+    }
+
     #[tokio::test]
     async fn no_credentials_anywhere_is_a_clear_error() {
         if std::env::var_os(ENV_VAR).is_some() {
             eprintln!("skipped: {ENV_VAR} is set for the test process");
             return;
         }
-        // A port nothing listens on.
-        let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let host = closed.local_addr().unwrap().to_string();
-        drop(closed);
+        // A port of this test on which nothing answers. A port bound and released again could
+        // meanwhile become a mock server of another test, which would then answer this request,
+        // and lose a reply meant for its own test.
+        let host = silent_port().await;
         let dir = tempfile::tempdir().unwrap();
 
         let source = resolve_with(&env(dir.path(), &[("GCE_METADATA_HOST", &host)]))

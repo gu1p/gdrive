@@ -1,7 +1,8 @@
 # Releasing gdrive
 
 Releases are built and published by [`.github/workflows/release.yml`](../.github/workflows/release.yml)
-when a tag `vX.Y.Z` is pushed; binaries are never uploaded by hand.
+when a tag `v<version>` is pushed (`v4.0.0`, or `v4.0.0-alpha.1` for a pre-release); binaries are never
+uploaded by hand.
 
 ## Supported platforms
 
@@ -15,7 +16,7 @@ when a tag `vX.Y.Z` is pushed; binaries are never uploaded by hand.
 
 Each archive holds the single binary (`gdrive`, or `gdrive.exe` on Windows) at its root, like upstream's
 archives. The `linux-x64`, `macos-x64` and `windows-x64` names are upstream's and stay unchanged so existing
-install scripts keep working. The newest stable release is always reachable at
+install scripts keep working. The newest stable release (once there is one) is always reachable at
 
     https://github.com/gu1p/gdrive/releases/latest/download/<asset>
 
@@ -33,8 +34,9 @@ SmartScreen may warn on first run.
 ## Cutting a release
 
 1. Make sure CI is green on `main`.
-2. Bump `version` in `Cargo.toml` (for example to `4.0.0`, or `4.0.0-alpha.1` for a pre-release) and update
-   the lockfile entry, which release builds check with `--locked`:
+2. Bump `version` in `Cargo.toml` (for example to `4.0.0`, or `4.0.0-alpha.2` for a pre-release) and update
+   the lockfile entry, which release builds check with `--locked`. In `CHANGELOG.md`, replace `(unreleased)`
+   in the heading of the version with the release date:
 
    ```sh
    cargo update -p gdrive --offline   # changes only gdrive's own entry in Cargo.lock
@@ -42,16 +44,19 @@ SmartScreen may warn on first run.
    git commit -am "build: release 4.0.0"
    ```
 
-   Merge that commit to `main`.
+   Merge that commit to `main`. For the first release, `4.0.0-alpha.1`, `Cargo.toml` and `Cargo.lock` have
+   that version already; only the date in `CHANGELOG.md` is left to set.
 3. Optional but recommended: run a dry run. In GitHub, open Actions > Release > Run workflow and pick `main`.
    It builds, checks and packages every target exactly as a release would, and keeps the archives and
-   `SHA256SUMS` as workflow artifacts for 7 days. It creates no release.
-4. Tag the release commit on `main` and push the tag:
+   `SHA256SUMS` as workflow artifacts for 7 days. It creates no release, and without a tag it skips the
+   check of the tag against `Cargo.toml`.
+4. Tag the release commit on `main` and push the tag. The tag is `v` plus the version in `Cargo.toml`,
+   exactly:
 
    ```sh
    git switch main && git pull
-   git tag -a v4.0.0 -m "gdrive 4.0.0"
-   git push origin v4.0.0
+   git tag -a v4.0.0-alpha.1 -m "gdrive 4.0.0-alpha.1"   # v4.0.0 for 4.0.0, and so on
+   git push origin v4.0.0-alpha.1
    ```
 
 5. Watch the Release workflow. It
@@ -63,8 +68,10 @@ SmartScreen may warn on first run.
      release commit (`gdrive version` must print `Commit: <sha>`; the Intel macOS binary, which cannot run
      on the arm64 build machine, is searched for the hash instead);
    - checks that exactly the five expected asset names exist, writes `SHA256SUMS`, and creates the GitHub
-     release with the archives, `SHA256SUMS` and notes generated from the merged pull requests. A tag with a
-     `-` suffix becomes a pre-release.
+     release with the archives, `SHA256SUMS` and notes that GitHub generates from the pull requests merged
+     since the previous release. Changes merged without a pull request are not in those notes; the list
+     of changes is the version's section of `CHANGELOG.md`. A tag with a `-` suffix
+     (`v4.0.0-alpha.1`) becomes a pre-release, which is not marked as the latest release.
 
    The release only appears once every target has built, so a failed target never leaves a release with
    missing assets.
