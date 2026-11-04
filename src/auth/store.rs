@@ -330,6 +330,13 @@ impl TokenStore {
 #[async_trait::async_trait]
 impl TokenStorage for TokenStore {
     async fn set(&self, scopes: &[&str], mut token: TokenInfo) -> Result<(), TokenStorageError> {
+        // yup-oauth2 also hands over the "token" of an answer without one (`{}` with a 503): it
+        // must not replace a working token. Nor is a service account token without an expiry
+        // cached: it would never be renewed.
+        let no_access_token = token.access_token.as_deref().is_none_or(str::is_empty);
+        if no_access_token || (self.credential.is_some() && token.expires_at.is_none()) {
+            return Ok(());
+        }
         if token.refresh_token.is_none() {
             token.refresh_token.clone_from(&self.refresh_token);
         }
@@ -870,6 +877,41 @@ mod tests {
         let access = auth.token(&[METADATA]).await.unwrap();
         assert_eq!(access.token(), Some("from-gdrive"));
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_never_caches_a_token_without_access_token_or_a_service_token_without_expiry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(1)))]);
+        loaded.save(&path).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        let user = TokenStore::new(path.clone(), loaded.clone(), Some(String::from("r1")));
+        for access_token in [None, Some(String::new())] {
+            let empty = TokenInfo {
+                access_token,
+                ..token("", None, Duration::hours(1))
+            };
+            user.set(&DRIVE_SCOPES, empty).await.unwrap();
+        }
+
+        let service = TokenStore::for_credential(path.clone(), loaded, String::from("robot"));
+        let no_expiry = TokenInfo {
+            expires_at: None,
+            ..token("forever", None, Duration::hours(1))
+        };
+        service.set(&DRIVE_SCOPES, no_expiry).await.unwrap();
+
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert_eq!(
+            user.get(&DRIVE_SCOPES)
+                .await
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("old")
+        );
     }
 
     #[tokio::test]

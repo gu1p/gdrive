@@ -372,6 +372,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_token_endpoint_that_answers_without_a_token_adds_nothing() {
+        let setup = setup(vec![(503, String::from("{}"))]).await;
+
+        let error = add_service_account_in(
+            config_root(&setup),
+            http_client(),
+            &config(&setup, None, None),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                *error,
+                Error::Credentials(service::Error::NoAccessToken { .. })
+            ),
+            "{error:?}"
+        );
+        let message = crate::error_message(&*error);
+        assert!(
+            message.starts_with("Error: the service account key does not work: the answer to the token request of service account"),
+            "{message}"
+        );
+        assert!(!config_root(&setup).join(TEST_CLIENT_EMAIL).exists());
+    }
+
+    #[tokio::test]
     async fn nothing_is_stored_when_the_key_does_not_work() {
         let setup = setup(vec![(
             400,

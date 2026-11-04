@@ -323,7 +323,14 @@ where
         let identity = || Arc::clone(&self.identity);
         let result = tokio::time::timeout(self.timeout, self.auth.token(&SERVICE_SCOPES)).await;
         match (result, &*self.identity) {
-            (Ok(Ok(token)), _) => Ok(token),
+            // yup-oauth2 takes any JSON object without an "error" as a token, also the `{}` of a
+            // 503, and does not show the status.
+            (Ok(Ok(token)), _) if token.token().is_some_and(|token| !token.trim().is_empty()) => {
+                Ok(token)
+            }
+            (Ok(Ok(_)), _) => Err(Error::NoAccessToken {
+                identity: identity(),
+            }),
             // Off Google Cloud the metadata server's name does not resolve, or nothing answers.
             (Err(_), Identity::MetadataServer { .. }) => Err(Error::NoMetadataServer {
                 identity: identity(),
@@ -519,6 +526,10 @@ pub(crate) enum Error {
         identity: Arc<Identity>,
         timeout: Duration,
     },
+    /// The answer to the token request had no access token.
+    NoAccessToken {
+        identity: Arc<Identity>,
+    },
     /// The last place to look for Application Default Credentials did not answer.
     NoMetadataServer {
         identity: Arc<Identity>,
@@ -556,6 +567,11 @@ impl Display for Error {
                 }
                 Ok(())
             }
+            Error::NoAccessToken { identity } => write!(
+                f,
+                "the answer to the token request of {identity} has no access token; the token \
+                 endpoint may be down or not be Google's"
+            ),
             Error::Timeout { identity, timeout } => write!(
                 f,
                 "no answer to the token request of {identity} within {} seconds",
@@ -600,6 +616,7 @@ impl error::Error for Error {
             | Error::Build { .. }
             | Error::Token { .. }
             | Error::Timeout { .. }
+            | Error::NoAccessToken { .. }
             | Error::NoMetadataServer { .. } => None,
         }
     }
@@ -1043,6 +1060,55 @@ mod tests {
         );
         assert!(message.contains("123456789012345678901"), "{message}");
         assert!(message.ends_with("Domain-wide delegation)."), "{message}");
+    }
+
+    #[tokio::test]
+    async fn answers_without_an_access_token_are_errors_and_are_not_cached() {
+        for status in [200, 503] {
+            for body in [
+                "{}",
+                r#"{"token_type":"Bearer","expires_in":3599}"#,
+                r#"{"access_token":"","expires_in":3599}"#,
+            ] {
+                let server = MockServer::start(vec![(status, String::from(body))]).await;
+                let dir = tempfile::tempdir().unwrap();
+                let tokens_path = dir.path().join("tokens.json");
+                let key = parse(&key_value(&server.url("/token"))).unwrap();
+                let credentials = ServiceCredentials::service_account(
+                    http_client(),
+                    key,
+                    None,
+                    Some(&tokens_path),
+                )
+                .await
+                .unwrap();
+
+                let error = credentials.access_token().await.unwrap_err();
+                assert!(
+                    matches!(error, Error::NoAccessToken { .. }),
+                    "{status} {body}: {error:?}"
+                );
+                assert!(error.to_string().contains("has no access token"), "{error}");
+                assert!(!tokens_path.exists(), "{status} {body}: cached");
+            }
+        }
+
+        // An error answer is reported as such.
+        let server = MockServer::start(vec![(
+            503,
+            String::from(r#"{"error":"backend_error","error_description":"try again"}"#),
+        )])
+        .await;
+        let key = parse(&key_value(&server.url("/token"))).unwrap();
+        let credentials = ServiceCredentials::service_account(http_client(), key, None, None)
+            .await
+            .unwrap();
+        let error = credentials.access_token().await.unwrap_err();
+        assert!(matches!(error, Error::Token { .. }), "{error:?}");
+        assert!(
+            error.to_string().contains("backend_error: try again"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
