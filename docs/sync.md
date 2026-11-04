@@ -32,7 +32,8 @@ A sync runs in three phases.
      sharing and its history (`gdrive files update` does the same for one file).
    - `down` writes every download to a temporary file next to the destination,
      `.gdrive-<id>.part`, and renames it into place only when its size and md5 match Drive's.
-     A new file never replaces a local file that appeared after the inventory.
+     A new file never replaces a local file that appeared after the inventory, not even one that
+     appeared while it was downloaded: that item fails and the other file stays.
 3. **Deletion**, only with `--delete`; see [Deleting extras](#deleting-extras).
 
 The direction decides what is the source:
@@ -53,7 +54,7 @@ The direction decides what is the source:
   without reading the file. Every download sets the local time to Drive's `modifiedTime`, with all its
   precision, so a second `sync down` reads nothing. Otherwise gdrive computes the md5 of the local file:
   equal to Drive's, the file is unchanged and gets Drive's time (so the next run does not read it
-  again); different, it is changed.
+  again), unless it changed after it was read; different, it is changed.
 - `up`: same size: gdrive computes the md5 of the local file and compares it with Drive's. Drive's
   `modifiedTime` is the time of the upload, not the time of the local file, so it says nothing here.
 - A Google Docs file exported by `down --export`: unchanged when the local file has the document's
@@ -112,8 +113,11 @@ With `--delete`, extras are removed after the transfer phase:
   go one by one.
 - **Local:** an extra is **moved** to `LOCAL_DIR/.gdrive-trash/<time of the run>/`, under its path below
   `LOCAL_DIR`, for example `LOCAL_DIR/.gdrive-trash/20261104T102030Z/photos/old.jpg`. Before it moves,
-  gdrive checks that it is still what the inventory saw (the type, and for a file the size and the
-  modification time); a file you edited in the meantime stays and the run fails. With
+  gdrive checks that it is still exactly what the inventory saw: for a folder, every entry in it, nothing
+  added or missing; for each entry its type and identity (device and inode on Unix), and for a file its
+  size and modification time. Every path is reached from `LOCAL_DIR` without following a symlink, so a
+  folder replaced by a symlink to elsewhere is never entered. Anything that changed stays, and the run
+  fails. With
   `--delete-permanently` (only for `down`, and only together with `--delete`) local extras are removed
   instead: the files the inventory saw, one by one, and then their directories if they are empty.
 
@@ -131,7 +135,7 @@ exit status 1, when:
 - a local file named like a Google Docs file that is skipped, or like any of its exports
   (`Report`, `Report.docx`, `Report.pdf`, ... for the document `Report`), or like a shortcut;
 - the names a download would give Drive files with the same name (`report.pdf` and
-  `report~1a2b3c4d.pdf`);
+  `report~1a2b3c4d.pdf`), also for the exports of documents with the same name;
 - local symlinks (`down`), temporary download files (`.gdrive-*.part`), and `LOCAL_DIR/.gdrive-trash`
   itself, which a sync never looks into.
 
