@@ -41,7 +41,7 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   URL) is an error.
 - **Progress on stderr.** On a terminal, downloads, uploads, updates, imports and exports draw a progress
   bar on stderr. `--no-progress` or `GDRIVE_PROGRESS=0` turns it off; when stderr is not a terminal nothing
-  is drawn unless `--progress` is given. stdout is unchanged.
+  is drawn unless `--progress` is given or `GDRIVE_PROGRESS=1` is set. stdout is unchanged.
 - **`files info`** prints a last line `Trashed: yes` (or `Trashed: yes (explicitly)`) for a file in the
   trash. The output for any other file is unchanged.
 - **Local names of downloads.** A Drive name that cannot be a local file name is changed: `/`, `\` and
@@ -81,7 +81,8 @@ Accounts and login:
   tokens, after checking that it is the same Google account.
 - `account add --manual` (alias `--no-browser`) for machines without a browser: open the printed URL
   anywhere and paste the address the browser lands on. `--port N` sets the redirect port (`0` picks a free
-  one). The login sends PKCE and checks `state`; a redirect of another login is ignored.
+  one, in browser mode only; `--manual` needs a fixed port). The login sends PKCE and checks `state`; a
+  redirect of another login is ignored.
 - Service accounts: `account add --service-account KEY_JSON [--subject EMAIL] [--name NAME]`, with
   `--subject` for domain-wide delegation. See [Service accounts](docs/service_accounts.md).
 - Application Default Credentials: `account add --adc [--name NAME]` uses `GOOGLE_APPLICATION_CREDENTIALS`,
