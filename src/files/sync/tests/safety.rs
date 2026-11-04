@@ -691,3 +691,117 @@ async fn down_never_writes_through_or_deletes_symlinks() {
         .is_symlink());
     assert_eq!(server.media(), Vec::<String>::new());
 }
+
+/// Starts `config`'s sync against `server`, whose content replies wait for `gate`; once the
+/// request for `id` arrived (in `requests`), puts `appeared` at `path` and lets it go on.
+async fn sync_while_appearing(
+    server: &FakeDrive,
+    config: &Config,
+    gate: &std::sync::Arc<tokio::sync::Semaphore>,
+    arrived: impl Fn() -> bool,
+    path: &std::path::Path,
+) -> super::Synced {
+    let run = sync(server, config);
+    let meanwhile = async {
+        while !arrived() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::write(path, "someone else's").unwrap();
+        gate.add_permits(100);
+    };
+    let (synced, ()) = tokio::join!(run, meanwhile);
+    synced
+}
+
+#[tokio::test]
+async fn a_new_file_never_replaces_one_that_appeared_during_its_download() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let behavior = Behavior {
+        content_gate: Some(std::sync::Arc::clone(&gate)),
+        ..Behavior::default()
+    };
+    let files = drive(vec![FakeFile::blob("new", "new.txt", "root", "from drive")]);
+    let server = FakeDrive::start(files, behavior).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("new.txt");
+
+    let synced = sync_while_appearing(
+        &server,
+        &config(Direction::Down, dir.path()),
+        &gate,
+        || server.media().contains(&String::from("new")),
+        &path,
+    )
+    .await;
+
+    assert!(
+        synced.error().contains("1 item failed"),
+        "{}",
+        synced.error()
+    );
+    assert!(
+        synced
+            .err
+            .text()
+            .contains("appeared while the file was downloaded"),
+        "{}",
+        synced.err.text()
+    );
+    assert_eq!(read(dir.path(), "new.txt"), "someone else's");
+    assert_eq!(temp_files(dir.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_new_export_never_replaces_a_file_that_appeared_during_it() {
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let behavior = Behavior {
+        content_gate: Some(std::sync::Arc::clone(&gate)),
+        ..Behavior::default()
+    };
+    let files = drive(vec![FakeFile::native(
+        "doc",
+        "Report",
+        "root",
+        "application/vnd.google-apps.document",
+        "exported",
+    )]);
+    let server = FakeDrive::start(files, behavior).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Report.docx");
+    let config = Config {
+        export: Some(crate::files::export::ExportFormats::DEFAULT),
+        ..config(Direction::Down, dir.path())
+    };
+
+    let synced = sync_while_appearing(
+        &server,
+        &config,
+        &gate,
+        || !server.exports().is_empty(),
+        &path,
+    )
+    .await;
+
+    assert!(
+        synced.error().contains("1 item failed"),
+        "{}",
+        synced.error()
+    );
+    assert_eq!(read(dir.path(), "Report.docx"), "someone else's");
+    assert_eq!(temp_files(dir.path()), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_changed_file_still_replaces_the_local_one() {
+    // Only new files refuse to replace: an update is meant to.
+    let files = drive(vec![FakeFile::blob("a", "a.txt", "root", "from drive")]);
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("a.txt", "local")]);
+
+    let synced = sync(&server, &config(Direction::Down, dir.path())).await;
+
+    synced.ok();
+    assert_eq!(synced.lines(), super::lines(&["update a.txt"]));
+    assert_eq!(read(dir.path(), "a.txt"), "from drive");
+}

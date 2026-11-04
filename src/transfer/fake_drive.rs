@@ -287,6 +287,9 @@ pub(crate) struct Behavior {
     pub(crate) upload_rendezvous: usize,
     /// The first this many media downloads are held until all of them have arrived.
     pub(crate) media_rendezvous: usize,
+    /// Every media download and export waits for a permit of this semaphore before it is
+    /// answered (and takes it), so that a test acts while the request is in flight.
+    pub(crate) content_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// The first queries naming one of these folders, as many as there are folders, are held
     /// until all of them have arrived.
     pub(crate) list_rendezvous: HashSet<String>,
@@ -658,7 +661,7 @@ async fn handle(
         .and_then(|id| id.strip_prefix('/'))
     {
         if let Some(id) = id.strip_suffix("/export") {
-            return Ok(export(&state, id, &params));
+            return Ok(export(&state, id, &params).await);
         }
         if params
             .iter()
@@ -1152,6 +1155,7 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         .get_or_insert_with(Instant::now);
     state.media_arrived.send_replace(true);
     state.media_rendezvous.join().await;
+    pass_gate(state).await;
 
     let behavior = &state.behavior;
     if let Some(delay) = behavior.media_missing.get(id) {
@@ -1186,7 +1190,16 @@ async fn media(state: &State, id: &str) -> FakeResponse {
 }
 
 /// `files.export`: the document's content, sent in chunks without `Content-Length`.
-fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
+/// Waits for a permit of [`Behavior::content_gate`], if there is one.
+async fn pass_gate(state: &State) {
+    if let Some(gate) = &state.behavior.content_gate {
+        if let Ok(permit) = gate.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+async fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
     let mime_type = params
         .iter()
         .find(|(key, _)| key == "mimeType")
@@ -1197,6 +1210,7 @@ fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse 
         .lock()
         .expect("exports lock")
         .push((id.to_owned(), mime_type));
+    pass_gate(state).await;
 
     if state.behavior.export_too_large.contains(id) {
         let message = "This file is too large to be exported.";

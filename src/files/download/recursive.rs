@@ -47,7 +47,7 @@ use tokio::fs;
 use super::{
     err_if_local_file_exists, errors, file_content, local_file_is_identical, remove_temp_file,
     resume::{Expected, Identity, ResumableDownload, Revision},
-    save_through, Config, ExistingFileAction, MAX_TEMP_FILE_ATTEMPTS,
+    save_through_with, Commit, Config, ExistingFileAction, MAX_TEMP_FILE_ATTEMPTS,
 };
 use crate::{
     common::{
@@ -355,6 +355,15 @@ impl Files {
         }
     }
 
+    /// A new file of a plan never replaces what appeared at its path during the download.
+    fn commit(&self) -> Commit {
+        if self.planned && self.existing_file_action == ExistingFileAction::Abort {
+            Commit::NoReplace
+        } else {
+            Commit::Replace
+        }
+    }
+
     fn job(self: &Arc<Self>, file: PlannedFile) -> Job {
         let files = Arc::clone(self);
         let label = local_name::tree_path(&file.path);
@@ -423,9 +432,14 @@ impl Files {
                 .await;
         }
         // `save_to_file`, with every temporary file it creates noted for the cleanup.
-        save_through(download, first, &abs_file_path, &file.id, |file| {
-            partial.track(file)
-        })
+        save_through_with(
+            download,
+            first,
+            &abs_file_path,
+            &file.id,
+            self.commit(),
+            |file| partial.track(file),
+        )
         .await
         .map_err(|source| E::SaveBodyToFile {
             path: abs_file_path.clone(),
@@ -507,9 +521,14 @@ impl Files {
                 ))
                 .await;
         }
-        save_through(download, first, &abs_file_path, &export.id, |file| {
-            partial.track(file)
-        })
+        save_through_with(
+            download,
+            first,
+            &abs_file_path,
+            &export.id,
+            self.commit(),
+            |file| partial.track(file),
+        )
         .await
         .map_err(|source| E::SaveBodyToFile {
             path: abs_file_path.clone(),
