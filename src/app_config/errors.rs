@@ -5,6 +5,8 @@ use std::{
     path::PathBuf,
 };
 
+use crate::common::json_error::RedactedJsonError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DefaultBasePath;
 
@@ -308,26 +310,12 @@ pub(crate) enum LoadSecret {
         path: PathBuf,
         source: io::Error,
     },
-    /// secret.json is not valid. Holds only where and what kind of error, neither the content nor
-    /// the `serde_json` error: the file has the client secret, and `serde_json` quotes input in its
-    /// messages ("invalid type: string \"...\"").
+    /// secret.json is not valid. Holds neither the content nor the `serde_json` error, which can
+    /// quote it: the file has the client secret.
     Deserialize {
         path: PathBuf,
-        category: serde_json::error::Category,
-        line: usize,
-        column: usize,
+        error: RedactedJsonError,
     },
-}
-
-impl LoadSecret {
-    pub(crate) fn deserialize(path: PathBuf, error: &serde_json::Error) -> Self {
-        LoadSecret::Deserialize {
-            path,
-            category: error.classify(),
-            line: error.line(),
-            column: error.column(),
-        }
-    }
 }
 
 impl Display for LoadSecret {
@@ -336,25 +324,11 @@ impl Display for LoadSecret {
             LoadSecret::Read { path, source: _ } => {
                 write!(f, "unable to read the content of file '{}'", path.display())
             }
-            LoadSecret::Deserialize {
-                path,
-                category,
-                line,
-                column,
-            } => {
-                let problem = match category {
-                    serde_json::error::Category::Io => "read error",
-                    serde_json::error::Category::Syntax => "invalid JSON",
-                    serde_json::error::Category::Data => "a value is missing or has the wrong type",
-                    serde_json::error::Category::Eof => "unexpected end of file",
-                };
-                write!(
-                    f,
-                    "'{}' is not a valid client credentials file ({problem} at line {line} \
-                     column {column})",
-                    path.display()
-                )
-            }
+            LoadSecret::Deserialize { path, error } => write!(
+                f,
+                "'{}' is not a valid client credentials file ({error})",
+                path.display()
+            ),
         }
     }
 }

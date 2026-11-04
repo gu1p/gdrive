@@ -9,7 +9,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::store::TokenFile;
+use crate::{auth::store::TokenFile, common::json_error::RedactedJsonError};
 
 const SYSTEM_CONFIG_DIR_NAME: &str = ".config";
 const BASE_PATH_DIR_NAME: &str = "gdrive3";
@@ -223,7 +223,10 @@ impl AppConfig {
         };
         match serde_json::from_str(&content) {
             Ok(secret) => Ok(secret),
-            Err(error) => Err(errors::LoadSecret::deserialize(path.to_path_buf(), &error)),
+            Err(error) => Err(errors::LoadSecret::Deserialize {
+                path: path.to_path_buf(),
+                error: RedactedJsonError::from(&error),
+            }),
         }
     }
 

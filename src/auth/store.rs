@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
 use yup_oauth2::storage::{TokenInfo, TokenStorage, TokenStorageError};
 
+use crate::common::json_error::RedactedJsonError;
+
 /// One `tokens.json` entry: a token and the scopes it was issued for.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct TokenEntry {
@@ -136,12 +138,12 @@ impl TokenFile {
             }
         };
 
-        // Do not put the content into the error: it holds the tokens.
+        // Neither the content nor the serde_json error, which can quote it: it holds the tokens.
         Self::from_json(&content)
             .map(Some)
-            .map_err(|source| LoadError::Parse {
+            .map_err(|error| LoadError::Parse {
                 path: path.to_path_buf(),
-                source,
+                error: RedactedJsonError::from(&error),
             })
     }
 
@@ -299,7 +301,7 @@ pub(crate) enum LoadError {
     },
     Parse {
         path: PathBuf,
-        source: serde_json::Error,
+        error: RedactedJsonError,
     },
 }
 
@@ -307,8 +309,12 @@ impl Display for LoadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             LoadError::Read { path, .. } => write!(f, "unable to read '{}'", path.display()),
-            LoadError::Parse { path, .. } => {
-                write!(f, "'{}' is not a valid tokens file", path.display())
+            LoadError::Parse { path, error } => {
+                write!(
+                    f,
+                    "'{}' is not a valid tokens file ({error})",
+                    path.display()
+                )
             }
         }
     }
@@ -318,7 +324,7 @@ impl Error for LoadError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LoadError::Read { source, .. } => Some(source),
-            LoadError::Parse { source, .. } => Some(source),
+            LoadError::Parse { .. } => None,
         }
     }
 }
@@ -641,13 +647,24 @@ mod tests {
     async fn load_reports_invalid_content_without_echoing_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokens.json");
-        tokio::fs::write(&path, r#"{"refresh_token": "secret"}"#)
-            .await
-            .unwrap();
+        // The second and third make serde_json quote the token in its own message.
+        for content in [
+            r#"{"refresh_token": "secret"}"#,
+            r#"[{"scopes": [], "token": "ya29.secret"}]"#,
+            r#"[{"scopes": "1//secret", "token": {}}]"#,
+        ] {
+            tokio::fs::write(&path, content).await.unwrap();
 
-        let error = TokenFile::load(&path).await.unwrap_err();
-        assert!(matches!(error, LoadError::Parse { .. }));
-        assert!(!error.to_string().contains("secret"));
+            let error = TokenFile::load(&path).await.unwrap_err();
+            assert!(matches!(error, LoadError::Parse { .. }));
+            // The whole chain, as main prints it
+            let message = crate::error_message(&error);
+            assert!(
+                message.contains("is not a valid tokens file ("),
+                "{message}"
+            );
+            assert!(!message.contains("secret"), "{message}");
+        }
     }
 
     /// A flow delegate that answers the (non-listening) interactive installed flow with a code.
