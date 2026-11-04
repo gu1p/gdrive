@@ -8,14 +8,18 @@
 //! request and the most requests it had in flight at once. `files.get` of a stored file returns
 //! the fields its `fields` mask names, so a test can check what a metadata request asks for;
 //! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
-//! the other requests. `files.export` of a Workspace document ([`FakeFile::native`]) returns its
-//! content in whatever format is asked for, without `Content-Length` as Drive sends exports, and
-//! records the format ([`FakeDrive::exports`]).
+//! the other requests, with a strong `ETag` (the md5 of the content), and with
+//! `Range: bytes=<first>-` the rest of it from that byte (206, or 416 past the end) unless an
+//! `If-Range` names another `ETag` ([`FakeDrive::media_ranges`]). `files.export` of a Workspace
+//! document ([`FakeFile::native`]) returns its content in whatever format is asked for, without
+//! `Content-Length` as Drive sends exports, and records the format ([`FakeDrive::exports`]).
+//! `about.get` names the account ([`Behavior::account_email`]).
 //!
 //! For recursive uploads it answers `files.generateIds`, multipart `files.create` (the uploads
 //! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
 //! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
-//! last). Like Drive, a create fails with 404 when a parent does not exist yet.
+//! last). Like Drive, a create fails with 404 when a parent does not exist yet. The
+//! `modifiedTime` and `createdTime` of a create's metadata are the new file's.
 //!
 //! For syncs it answers multipart `files.update` of a stored file's content (a `PATCH` to the
 //! upload path, [`FakeDrive::updates`]), metadata `files.update` (a `PATCH` of JSON, such as
@@ -54,6 +58,7 @@ use tokio::{
 use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 
 const LIST_PATH: &str = "/drive/v3/files";
+const ABOUT_PATH: &str = "/drive/v3/about";
 const GENERATE_IDS_PATH: &str = "/drive/v3/files/generateIds";
 const UPLOAD_PATH: &str = "/upload/drive/v3/files";
 const SESSION_PATH: &str = "/upload-session/";
@@ -77,6 +82,8 @@ pub(crate) struct FakeFile {
     pub(crate) content: Option<String>,
     /// `modifiedTime`, RFC 3339.
     pub(crate) modified_time: Option<String>,
+    /// `createdTime`, RFC 3339.
+    pub(crate) created_time: Option<String>,
 }
 
 impl FakeFile {
@@ -215,6 +222,9 @@ impl FakeFile {
         if let Some(modified_time) = &self.modified_time {
             file.insert("modifiedTime".into(), json!(modified_time));
         }
+        if let Some(created_time) = &self.created_time {
+            file.insert("createdTime".into(), json!(created_time));
+        }
         if let Some(resource_key) = &self.resource_key {
             file.insert("resourceKey".into(), json!(resource_key));
         }
@@ -296,6 +306,8 @@ pub(crate) struct Behavior {
     pub(crate) list_rendezvous: HashSet<String>,
     /// A query naming one of these folders is answered only once a media download has arrived.
     pub(crate) list_after_media: HashSet<String>,
+    /// The email address `about.get` reports; `fake@example.com` without one.
+    pub(crate) account_email: Option<String>,
 }
 
 /// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
@@ -361,6 +373,9 @@ pub(crate) struct Created {
     pub(crate) mime_type: String,
     pub(crate) parents: Vec<String>,
     pub(crate) content: Vec<u8>,
+    /// The `modifiedTime` and `createdTime` of the metadata.
+    pub(crate) modified_time: Option<String>,
+    pub(crate) creation_time: Option<String>,
     /// The position of the request's arrival among all arrivals and replies of creates.
     pub(crate) arrived: usize,
     /// The position of its reply.
@@ -399,6 +414,8 @@ struct State {
     max_in_flight: AtomicUsize,
     /// The file ids of media downloads.
     media: Mutex<Vec<String>>,
+    /// The file ids and `Range` headers of media downloads.
+    media_ranges: Mutex<Vec<(String, Option<String>)>>,
     /// The file ids and MIME types of exports.
     exports: Mutex<Vec<(String, String)>>,
     media_in_flight: AtomicUsize,
@@ -462,6 +479,7 @@ impl FakeDrive {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             media: Mutex::new(Vec::new()),
+            media_ranges: Mutex::new(Vec::new()),
             exports: Mutex::new(Vec::new()),
             media_in_flight: AtomicUsize::new(0),
             media_max_in_flight: AtomicUsize::new(0),
@@ -529,6 +547,15 @@ impl FakeDrive {
     /// The file ids of the media downloads, in arrival order.
     pub(crate) fn media(&self) -> Vec<String> {
         self.state.media.lock().expect("media lock").clone()
+    }
+
+    /// The file ids and `Range` headers of the media downloads, in arrival order.
+    pub(crate) fn media_ranges(&self) -> Vec<(String, Option<String>)> {
+        self.state
+            .media_ranges
+            .lock()
+            .expect("media ranges lock")
+            .clone()
     }
 
     /// The file ids and requested MIME types of the exports, in arrival order.
@@ -699,10 +726,13 @@ async fn handle(
             .iter()
             .any(|(key, value)| key == "alt" && value == "media")
         {
-            return Ok(media(&state, id).await);
+            return Ok(media(&state, id, request.headers()).await);
         }
         state.gets.lock().expect("gets lock").push(id.to_owned());
         return Ok(get(&state, id, &params));
+    }
+    if path == ABOUT_PATH {
+        return Ok(about(&state));
     }
     if path != LIST_PATH {
         return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
@@ -823,24 +853,19 @@ fn finish_create(
         return error(StatusCode::NOT_FOUND, &format!("File not found: {parent}."));
     }
 
+    let time = |key: &str| metadata[key].as_str().map(String::from);
     let created = Created {
         id: text("id"),
         name,
         mime_type,
         parents,
         content,
+        modified_time: time("modifiedTime"),
+        creation_time: time("createdTime"),
         arrived,
         answered: state.create_events.fetch_add(1, Ordering::SeqCst),
     };
-    let reply = json!({
-        "kind": "drive#file",
-        "id": created.id,
-        "name": created.name,
-        "mimeType": created.mime_type,
-        "parents": created.parents,
-        "size": created.content.len().to_string(),
-        "md5Checksum": format!("{:x}", md5::compute(&created.content)),
-    });
+    let reply = created_reply(&created);
     state.files().push(FakeFile {
         id: created.id.clone(),
         name: created.name.clone(),
@@ -850,10 +875,32 @@ fn finish_create(
         md5: (!is_folder_type(&created.mime_type))
             .then(|| format!("{:x}", md5::compute(&created.content))),
         content: Some(String::from_utf8_lossy(&created.content).into_owned()),
+        modified_time: created.modified_time.clone(),
+        created_time: created.creation_time.clone(),
         ..FakeFile::default()
     });
     state.created.lock().expect("created lock").push(created);
     json_response(StatusCode::OK, &reply)
+}
+
+/// The file resource of a create.
+fn created_reply(created: &Created) -> Value {
+    let mut reply = json!({
+        "kind": "drive#file",
+        "id": created.id,
+        "name": created.name,
+        "mimeType": created.mime_type,
+        "parents": created.parents,
+        "size": created.content.len().to_string(),
+        "md5Checksum": format!("{:x}", md5::compute(&created.content)),
+    });
+    if let Some(modified_time) = &created.modified_time {
+        reply["modifiedTime"] = json!(modified_time);
+    }
+    if let Some(creation_time) = &created.creation_time {
+        reply["createdTime"] = json!(creation_time);
+    }
+    reply
 }
 
 fn is_folder_type(mime_type: &str) -> bool {
@@ -1157,17 +1204,7 @@ fn finish_session_create(
             .lock()
             .expect("created lock")
             .last()
-            .map(|created| {
-                json!({
-                    "kind": "drive#file",
-                    "id": created.id,
-                    "name": created.name,
-                    "mimeType": created.mime_type,
-                    "parents": created.parents,
-                    "size": created.content.len().to_string(),
-                    "md5Checksum": format!("{:x}", md5::compute(&created.content)),
-                })
-            });
+            .map(created_reply);
         session_done(state, session, reply);
     }
     response
@@ -1268,10 +1305,34 @@ fn split<'a>(haystack: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
     pieces
 }
 
-/// `files.get?alt=media`: the content of a blob.
-async fn media(state: &State, id: &str) -> FakeResponse {
+/// `about.get`: the account of [`Behavior::account_email`].
+fn about(state: &State) -> FakeResponse {
+    let email = state
+        .behavior
+        .account_email
+        .as_deref()
+        .unwrap_or("fake@example.com");
+    json_response(StatusCode::OK, &json!({"user": {"emailAddress": email}}))
+}
+
+/// `files.get?alt=media`: the content of a blob, from the first byte of its `Range`
+/// (`bytes=<first>-`) unless an `If-Range` is not the content's `ETag`.
+async fn media(state: &State, id: &str, headers: &hyper::HeaderMap) -> FakeResponse {
+    let header = |name| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+    };
+    let range = header(hyper::header::RANGE);
+    let if_range = header(hyper::header::IF_RANGE);
     let _media = InFlight::new(&state.media_in_flight, &state.media_max_in_flight);
     state.media.lock().expect("media lock").push(id.to_owned());
+    state
+        .media_ranges
+        .lock()
+        .expect("media ranges lock")
+        .push((id.to_owned(), range.clone()));
     state
         .first_media
         .lock()
@@ -1296,18 +1357,48 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         return error(StatusCode::NOT_FOUND, "File not found.");
     };
 
+    let total = content.len();
+    let etag = format!("\"{:x}\"", md5::compute(&content));
+    let first = range
+        .as_deref()
+        .and_then(|range| range.strip_prefix("bytes="))
+        .and_then(|range| range.strip_suffix('-'))
+        .and_then(|first| first.parse::<usize>().ok())
+        .filter(|_| if_range.as_ref().is_none_or(|tag| *tag == etag));
+    let mut response = hyper::Response::builder()
+        .header("content-type", "application/octet-stream")
+        .header("etag", etag.as_str());
+    let content = match first {
+        Some(first) if first >= total => {
+            return response
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("content-range", format!("bytes */{total}"))
+                .body(Full::new(Bytes::new()).boxed())
+                .expect("valid response");
+        }
+        Some(first) => {
+            response = response.status(StatusCode::PARTIAL_CONTENT).header(
+                "content-range",
+                format!("bytes {first}-{}/{total}", total - 1),
+            );
+            Bytes::from(content).slice(first..)
+        }
+        None => {
+            response = response.status(StatusCode::OK);
+            Bytes::from(content)
+        }
+    };
+
     let length = content.len();
     let body = if behavior.media_stalled.contains(id) {
-        let half = Bytes::from(content).slice(..length / 2);
+        let half = content.slice(..length / 2);
         let frames = stream::iter([Ok::<_, Infallible>(hyper::body::Frame::data(half))])
             .chain(stream::pending());
         BodyExt::boxed(StreamBody::new(frames))
     } else {
-        Full::new(Bytes::from(content)).boxed()
+        Full::new(content).boxed()
     };
-    hyper::Response::builder()
-        .status(StatusCode::OK)
-        .header("content-type", "application/octet-stream")
+    response
         .header("content-length", length)
         .body(body)
         .expect("valid response")
@@ -1546,7 +1637,95 @@ fn json_response(status: StatusCode, body: &Value) -> FakeResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::parent_ids;
+    use http_body_util::BodyExt;
+    use hyper::{Request, StatusCode};
+
+    use super::{parent_ids, Behavior, FakeDrive, FakeFile};
+    use crate::common::media_client::MediaClient;
+
+    #[tokio::test]
+    async fn media_downloads_follow_range_and_if_range() {
+        let blob = FakeFile::blob("b", "b.txt", "root", "0123456789");
+        let drive = FakeDrive::start(vec![blob], Behavior::default()).await;
+        let hub = drive.hub();
+        let client = MediaClient::new(&hub);
+        let url = client
+            .drive_url(&["files", "b"], &[("alt", "media")])
+            .unwrap();
+        let send = |range: Option<&str>, if_range: Option<&str>| {
+            let mut request = Request::get(url.as_str());
+            if let Some(range) = range {
+                request = request.header("range", range);
+            }
+            if let Some(if_range) = if_range {
+                request = request.header("if-range", if_range);
+            }
+            let request = request
+                .body(google_apis_common::to_body::<String>(None))
+                .unwrap();
+            let client = client.clone();
+            async move {
+                let response = client.send(request).await.unwrap();
+                let (parts, body) = response.into_parts();
+                let body = body.collect().await.unwrap().to_bytes();
+                (parts.status, parts.headers, body)
+            }
+        };
+
+        let (status, headers, body) = send(None, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(&body[..], b"0123456789");
+        let etag = headers["etag"].to_str().unwrap().to_owned();
+        assert_eq!(etag, format!("\"{:x}\"", md5::compute("0123456789")));
+
+        let (status, headers, body) = send(Some("bytes=4-"), Some(&etag)).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(headers["content-range"], "bytes 4-9/10");
+        assert_eq!(headers["content-length"], "6");
+        assert_eq!(&body[..], b"456789");
+
+        let (status, _, body) = send(Some("bytes=4-"), Some("\"other\"")).await;
+        assert_eq!(status, StatusCode::OK, "another ETag: the whole content");
+        assert_eq!(&body[..], b"0123456789");
+
+        let (status, headers, _) = send(Some("bytes=10-"), None).await;
+        assert_eq!(status, StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(headers["content-range"], "bytes */10");
+
+        assert_eq!(
+            drive.media_ranges(),
+            [
+                (String::from("b"), None),
+                (String::from("b"), Some(String::from("bytes=4-"))),
+                (String::from("b"), Some(String::from("bytes=4-"))),
+                (String::from("b"), Some(String::from("bytes=10-"))),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn about_names_the_account() {
+        let drive = FakeDrive::start(
+            Vec::new(),
+            Behavior {
+                account_email: Some(String::from("me@example.com")),
+                ..Behavior::default()
+            },
+        )
+        .await;
+        let hub = drive.hub();
+        let (_, about) = hub
+            .about()
+            .get()
+            .param("fields", "user(emailAddress)")
+            .doit()
+            .await
+            .unwrap();
+        assert_eq!(
+            about.user.and_then(|user| user.email_address).as_deref(),
+            Some("me@example.com")
+        );
+    }
 
     #[test]
     fn top_level_fields_skip_nested_masks() {
