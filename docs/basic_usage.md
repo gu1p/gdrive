@@ -41,12 +41,23 @@ Most commands take a file id or a folder id. An id is a string such as
   | Google Doc, Sheet, Slides | `https://docs.google.com/document/d/<ID>/edit` (also `spreadsheets/d/`, `presentation/d/`) |
 
 - `gdrive drives list` prints the ids of your shared drives.
-- `files upload`, `files mkdir` and `files import` print the new id. With `--print-only-id` they print
-  nothing else, which is handy in scripts:
+- `files upload`, `files mkdir` and `files import` print the new id. With `--print-only-id`, a single
+  upload, a `mkdir` and an `import` print only the id (without a trailing newline), which is handy in
+  scripts:
 
   ```sh
   folder=$(gdrive files mkdir backups --print-only-id)
   gdrive files upload --parent "$folder" db.tar.gz
+  ```
+
+  `files upload --recursive --print-only-id` prints one line per folder and file instead, as
+  `<path>: <id>`. The paths start with the name of the uploaded folder:
+
+  ```text
+  photos: 1AbCdEfGhIjKlMnOpQrStUvWxYz012345
+  photos/cat.jpg: 1BcDeFgHiJkLmNoPqRsTuVwXyZ123456
+  photos/2024: 1CdEfGhIjKlMnOpQrStUvWxYzA234567
+  photos/2024/dog.jpg: 1DeFgHiJkLmNoPqRsTuVwXyZAb345678
   ```
 
 `root` is Google's alias for the top folder of My Drive. You can use it wherever gdrive expects a folder
@@ -149,9 +160,13 @@ Things to know:
   recursive download is planned.
 - gdrive reads the whole folder tree before it downloads the first file, so a large folder can be silent
   for a while. Then it downloads one file at a time.
-- **There is no `--skip`.** gdrive 2 had `--skip` to skip existing files. In gdrive 3, run the same
-  command again with `--overwrite`. Files whose local copy has the same MD5 checksum are skipped; the rest
-  are downloaded again. Without `--overwrite`, the command stops when the local folder already exists.
+- **There is no `--skip`.** gdrive 2's `--skip` kept every local file that already existed. gdrive 3 has
+  no exact equivalent yet. Without `--overwrite`, a recursive download stops when the local folder already
+  exists. A real skip-existing mode is planned (roadmap milestone 2, item 6).
+- **`--overwrite` replaces local changes.** When you run a recursive download again with `--overwrite`,
+  gdrive skips files whose local copy has the same MD5 checksum as the Drive file. Every other local file
+  with the same path is replaced by the Drive version, including files you edited locally. Do not use it
+  as a replacement for `--skip` on folders with local edits.
 - A Drive name that contains `/` makes the download fail
   ([upstream #19](https://github.com/glotlabs/gdrive/issues/19)). A fix is planned.
 
@@ -252,7 +267,7 @@ Without options, `permissions share` makes the file readable by anyone who has t
 | `gdrive download -r <ID>` | `gdrive files download --recursive <ID>` |
 | `gdrive download --path <DIR> <ID>` | `gdrive files download --destination <DIR> <ID>` |
 | `gdrive download --force <ID>` | `gdrive files download --overwrite <ID>` |
-| `gdrive download --skip -r <ID>` | `gdrive files download --recursive --overwrite <ID>` (skips identical files, see above) |
+| `gdrive download --skip -r <ID>` | No exact equivalent. `--overwrite` is not the same: it replaces local files whose content differs (see [Download a folder](#download-a-folder)). Planned. |
 | `gdrive upload -p <ID> <FILE>` | `gdrive files upload --parent <ID> <FILE>` |
 | `gdrive upload -r <DIR>` | `gdrive files upload --recursive <DIR>` |
 | `gdrive update <ID> <FILE>` | `gdrive files update <ID> <FILE>` |
