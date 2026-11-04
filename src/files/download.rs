@@ -1,4 +1,6 @@
 pub(crate) mod errors;
+#[cfg(test)]
+mod media_tests;
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +34,8 @@ pub(crate) struct Config {
     pub(crate) follow_shortcuts: bool,
     pub(crate) download_directories: bool,
     pub(crate) destination: Destination,
+    /// Download files Google flagged as malware or spam (owner or shared drive organizer only).
+    pub(crate) acknowledge_abuse: bool,
 }
 
 impl Config {
@@ -76,13 +80,16 @@ pub(crate) enum ExistingFileAction {
     Overwrite,
 }
 
-#[async_recursion]
 pub(crate) async fn download(config: Config) -> Result<(), errors::Download> {
+    let hub = get_hub().await.map_err(errors::Download::Hub)?;
+    download_with_hub(&hub, config).await
+}
+
+#[async_recursion]
+async fn download_with_hub(hub: &Hub, config: Config) -> Result<(), errors::Download> {
     use errors::Download as E;
 
-    let hub = get_hub().await.map_err(E::Hub)?;
-
-    let file = files::info::get_file(&hub, &config.file_id)
+    let file = files::info::get_file(hub, &config.file_id)
         .await
         .map_err(|err| E::GetFile(Box::new(err)))?;
 
@@ -104,15 +111,15 @@ pub(crate) async fn download(config: Config) -> Result<(), errors::Download> {
         let file_id = target_file_id
             .ok_or_else(|| E::MissingShortcutTarget(FileIdentifier::new(name, id)))?;
 
-        download(Config { file_id, ..config }).await?;
+        download_with_hub(hub, Config { file_id, ..config }).await?;
     } else if drive_file::is_directory(&file) {
         if !config.download_directories {
             return Err(E::IsDirectory(FileIdentifier::from(file)));
         }
 
-        download_directory(&hub, file, &config).await?;
+        download_directory(hub, file, &config).await?;
     } else {
-        download_regular(&hub, &file, &config).await?;
+        download_regular(hub, &file, &config).await?;
     }
 
     Ok(())
@@ -125,7 +132,7 @@ async fn download_regular(
 ) -> Result<(), errors::Download> {
     use errors::Download as E;
 
-    let body = download_file(hub, &config.file_id)
+    let body = download_file(hub, &config.file_id, config.acknowledge_abuse)
         .await
         .map_err(E::DownloadFile)?;
 
@@ -192,7 +199,7 @@ async fn download_directory(
                 continue;
             }
 
-            let body = download_file(hub, &file.drive_id)
+            let body = download_file(hub, &file.drive_id, config.acknowledge_abuse)
                 .await
                 .map_err(E::DownloadFile)?;
 
@@ -216,11 +223,16 @@ async fn download_directory(
     Ok(())
 }
 
-async fn download_file(hub: &Hub, file_id: &str) -> Result<Body, Box<google_drive3::Error>> {
+async fn download_file(
+    hub: &Hub,
+    file_id: &str,
+    acknowledge_abuse: bool,
+) -> Result<Body, Box<google_drive3::Error>> {
     let (response, _) = hub
         .files()
         .get(file_id)
         .supports_all_drives(true)
+        .acknowledge_abuse(acknowledge_abuse)
         .param("alt", "media")
         .add_scope(google_drive3::api::Scope::Full)
         .doit()

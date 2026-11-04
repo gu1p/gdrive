@@ -226,4 +226,13 @@ impl PatchFile {
         };
         self
     }
+
+    #[must_use]
+    pub(crate) fn with_trashed(mut self, trashed: bool) -> Self {
+        self.file = google_drive3::api::File {
+            trashed: Some(trashed),
+            ..self.file
+        };
+        self
+    }
 }

@@ -50,6 +50,7 @@ pub(crate) const EXTENSION_PPTX: &str = "pptx";
 pub(crate) const EXTENSION_ODP: &str = "odp";
 pub(crate) const EXTENSION_EPUB: &str = "epub";
 pub(crate) const EXTENSION_TXT: &str = "txt";
+pub(crate) const EXTENSION_MD: &str = "md";
 
 pub(crate) const MIME_TYPE_DOC: &str = "application/msword";
 pub(crate) const MIME_TYPE_DOCX: &str =
@@ -74,6 +75,7 @@ pub(crate) const MIME_TYPE_PPTX: &str =
 pub(crate) const MIME_TYPE_ODP: &str = "application/vnd.oasis.opendocument.presentation";
 pub(crate) const MIME_TYPE_EPUB: &str = "application/epub+zip";
 pub(crate) const MIME_TYPE_TXT: &str = "text/plain";
+pub(crate) const MIME_TYPE_MD: &str = "text/markdown";
 
 create_mime_from_str!(
     MIME_TYPE_DOC => MIME_TYPE_DOC_MIME: "microsoft doc",
@@ -96,6 +98,7 @@ create_mime_from_str!(
     MIME_TYPE_ODP => MIME_TYPE_ODP_MIME: "opendocument presentation",
     MIME_TYPE_EPUB => MIME_TYPE_EPUB_MIME: "epub document",
     MIME_TYPE_TXT => MIME_TYPE_TXT_MIME: "plain text",
+    MIME_TYPE_MD => MIME_TYPE_MD_MIME: "markdown",
 );
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +109,7 @@ pub(crate) enum DocType {
 }
 
 impl DocType {
-    const IMPORT_EXTENSION_MAP: [(FileExtension, DocType); 18] = [
+    const IMPORT_EXTENSION_MAP: [(FileExtension, DocType); 19] = [
         (FileExtension::Doc, DocType::Document),
         (FileExtension::Docx, DocType::Document),
         (FileExtension::Odt, DocType::Document),
@@ -117,6 +120,7 @@ impl DocType {
         (FileExtension::Rtf, DocType::Document),
         (FileExtension::Pdf, DocType::Document),
         (FileExtension::Html, DocType::Document),
+        (FileExtension::Md, DocType::Document),
         (FileExtension::Xls, DocType::Spreadsheet),
         (FileExtension::Xlsx, DocType::Spreadsheet),
         (FileExtension::Csv, DocType::Spreadsheet),
@@ -178,6 +182,7 @@ impl DocType {
                 FileExtension::Rtf,
                 FileExtension::Txt,
                 FileExtension::Html,
+                FileExtension::Md,
             ],
 
             DocType::Spreadsheet => &[
@@ -259,6 +264,7 @@ pub(crate) enum FileExtension {
     Odp,
     Epub,
     Txt,
+    Md,
 }
 
 impl FileExtension {
@@ -285,6 +291,7 @@ impl FileExtension {
                 | (Self::Odp, Self::Odp)
                 | (Self::Epub, Self::Epub)
                 | (Self::Txt, Self::Txt)
+                | (Self::Md, Self::Md)
         )
     }
 }
@@ -312,6 +319,7 @@ impl fmt::Display for FileExtension {
             FileExtension::Odp => EXTENSION_ODP,
             FileExtension::Epub => EXTENSION_EPUB,
             FileExtension::Txt => EXTENSION_TXT,
+            FileExtension::Md => EXTENSION_MD,
         };
 
         f.write_str(s)
@@ -344,6 +352,7 @@ impl FileExtension {
             EXTENSION_ODP => Some(FileExtension::Odp),
             EXTENSION_EPUB => Some(FileExtension::Epub),
             EXTENSION_TXT => Some(FileExtension::Txt),
+            EXTENSION_MD => Some(FileExtension::Md),
             _ => None,
         }
     }
@@ -371,6 +380,7 @@ impl FileExtension {
             FileExtension::Odp => &MIME_TYPE_ODP_MIME,
             FileExtension::Epub => &MIME_TYPE_EPUB_MIME,
             FileExtension::Txt => &MIME_TYPE_TXT_MIME,
+            FileExtension::Md => &MIME_TYPE_MD_MIME,
         }
     }
 }
@@ -388,4 +398,49 @@ pub(crate) fn is_binary(file: &google_drive3::api::File) -> bool {
 #[must_use]
 pub(crate) fn is_shortcut(file: &google_drive3::api::File) -> bool {
     file.mime_type.as_deref() == Some(MIME_TYPE_DRIVE_SHORTCUT)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{DocType, FileExtension};
+
+    #[test]
+    fn md_extension_maps_to_text_markdown() {
+        let extension = FileExtension::from_path(Path::new("notes.md")).unwrap();
+        assert_eq!(extension, FileExtension::Md);
+        assert_eq!(extension.to_string(), "md");
+        assert_eq!(extension.get_export_mime().essence_str(), "text/markdown");
+    }
+
+    #[test]
+    fn documents_export_to_markdown() {
+        assert!(DocType::Document.can_export_to(FileExtension::Md));
+        assert!(!DocType::Spreadsheet.can_export_to(FileExtension::Md));
+        assert!(!DocType::Presentation.can_export_to(FileExtension::Md));
+    }
+
+    #[test]
+    fn markdown_imports_as_a_document() {
+        assert_eq!(
+            DocType::from_file_path(Path::new("notes.md")),
+            Some(DocType::Document)
+        );
+        assert!(DocType::SUPPORTED_INPUT_TYPES.contains(&FileExtension::Md));
+    }
+
+    #[test]
+    fn every_extension_round_trips_through_its_name() {
+        let all = DocType::SUPPORTED_INPUT_TYPES
+            .iter()
+            .chain(DocType::Document.supported_export_types())
+            .chain(DocType::Spreadsheet.supported_export_types())
+            .chain(DocType::Presentation.supported_export_types());
+
+        for &extension in all {
+            let path = format!("file.{extension}");
+            assert_eq!(FileExtension::from_path(Path::new(&path)), Some(extension));
+        }
+    }
 }

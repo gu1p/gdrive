@@ -3,6 +3,7 @@ mod account;
 mod app_config;
 mod auth;
 mod common;
+mod completions;
 mod drives;
 mod files;
 mod hub;
@@ -51,6 +52,20 @@ enum Command {
     Permissions {
         #[command(subcommand)]
         command: PermissionCommand,
+    },
+
+    /// Print a shell completion script to stdout
+    ///
+    /// Load it in the current shell, or save it where your shell looks for completions:
+    ///   bash:       source <(gdrive completions bash)
+    ///   zsh:        gdrive completions zsh > "${fpath[1]}/_gdrive"
+    ///   fish:       gdrive completions fish > ~/.config/fish/completions/gdrive.fish
+    ///   powershell: gdrive completions powershell | Out-String | Invoke-Expression
+    #[command(verbatim_doc_comment)]
+    Completions {
+        /// Shell to generate the script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// Print version information
@@ -148,6 +163,10 @@ impl LoginArgs {
 enum DriveCommand {
     /// List drives
     List {
+        /// Max drives to list [default: all]
+        #[arg(long, value_parser = parse_positive_usize)]
+        max: Option<usize>,
+
         /// Don't print header
         #[arg(long)]
         skip_header: bool,
@@ -173,22 +192,36 @@ enum FileCommand {
     /// List files
     List {
         /// Max files to list
-        #[arg(long, default_value_t = 30)]
+        #[arg(short, long, default_value_t = 30)]
         max: usize,
 
-        /// Query. See <https://developers.google.com/drive/search-parameters>
-        #[arg(long, default_value_t = ListQuery::default())]
-        query: ListQuery,
+        /// Query. See <https://developers.google.com/workspace/drive/api/guides/search-files> [default: "'root' in parents and trashed = false"]
+        ///
+        /// With --parent, lists only the files in that folder that match:
+        /// `'<DIRECTORY_ID>' in parents and trashed = false and (<QUERY>)`. With --drive, searches
+        /// the whole shared drive instead of its top level: `trashed = false and (<QUERY>)`. In
+        /// both cases `trashed = false` is left out if the query mentions trashed, so
+        /// `--query 'trashed = true'` lists the trash.
+        #[arg(short, long)]
+        query: Option<String>,
 
-        /// Order by. See <https://developers.google.com/drive/api/v3/reference/files/list>
+        /// Order by. See <https://developers.google.com/workspace/drive/api/reference/rest/v3/files/list>
         #[arg(long, default_value_t = ListSortOrder::default())]
         order_by: ListSortOrder,
 
         /// List files in a specific folder
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        ///
+        /// Without --query, lists the files in the folder that are not trashed. With --query,
+        /// lists the files in the folder that match the query (not trashed, unless the query
+        /// mentions trashed).
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<String>,
 
         /// List files on a shared drive
+        ///
+        /// Without --query, lists the files that are not trashed at the top level of the drive,
+        /// or in the --parent folder. With --query, searches the whole drive, or only the
+        /// --parent folder (not trashed, unless the query mentions trashed).
         #[arg(long, value_name = "DRIVE_ID")]
         drive: Option<String>,
 
@@ -200,9 +233,24 @@ enum FileCommand {
         #[arg(long)]
         full_name: bool,
 
-        /// Field separator
+        /// Field separator. Columns stay aligned; for tab-separated values use --tsv
         #[arg(long, default_value_t = String::from("\t"))]
         field_separator: String,
+
+        /// Print tab-separated values for scripts
+        ///
+        /// Columns are not aligned, names are not truncated, and a tab, newline, carriage return
+        /// or backslash in a name is written as `\t`, `\n`, `\r` or `\\`.
+        #[arg(long, conflicts_with = "field_separator")]
+        tsv: bool,
+
+        /// Print a JSON array of files for scripts
+        ///
+        /// Each object has the keys id, name, type (as in the Type column), mimeType, size (in
+        /// bytes, null when Drive reports none, as for folders and shortcuts) and createdTime
+        /// (RFC 3339, UTC).
+        #[arg(long, conflicts_with_all = ["tsv", "field_separator", "skip_header"])]
+        json: bool,
     },
 
     /// Download file
@@ -211,7 +259,7 @@ enum FileCommand {
         file_id: String,
 
         /// Overwrite existing files and folders
-        #[arg(long)]
+        #[arg(short, long)]
         overwrite: bool,
 
         /// Follow shortcut and download target file (does not work with recursive download)
@@ -219,16 +267,20 @@ enum FileCommand {
         follow_shortcuts: bool,
 
         /// Download directories
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
 
         /// Path where the file/directory should be downloaded to
-        #[arg(long, value_name = "PATH")]
+        #[arg(short, long, value_name = "PATH")]
         destination: Option<PathBuf>,
 
         /// Write file to stdout
         #[arg(long)]
         stdout: bool,
+
+        /// Download files that Google flagged as malware or spam. Only the owner of a file, or an organizer of its shared drive, can do this
+        #[arg(long)]
+        acknowledge_abuse: bool,
     },
 
     /// Upload file
@@ -241,11 +293,11 @@ enum FileCommand {
         mime: Option<Mime>,
 
         /// Upload to an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
 
         /// Upload directories. Note that this will always create a new directory on drive and will not update existing directories with the same name
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
 
         /// Set chunk size in MB, must be a power of two.
@@ -292,12 +344,31 @@ enum FileCommand {
 
     /// Delete file
     Delete {
-        /// File id
-        file_id: String,
+        /// File id. Several ids are deleted one after another; the command fails if any of them fails
+        #[arg(required = true)]
+        file_id: Vec<String>,
 
         /// Delete directory and all it's content
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
+    },
+
+    /// Move file/directory to the trash. A shortcut is trashed itself, not its target
+    Trash {
+        /// File id. Several ids are trashed one after another; the command fails if any of them fails
+        #[arg(required = true)]
+        file_id: Vec<String>,
+
+        /// Trash directory and all its content
+        #[arg(short, long)]
+        recursive: bool,
+    },
+
+    /// Restore file/directory from the trash
+    Untrash {
+        /// File id. Several ids are restored one after another; the command fails if any of them fails
+        #[arg(required = true)]
+        file_id: Vec<String>,
     },
 
     /// Create directory
@@ -306,7 +377,7 @@ enum FileCommand {
         name: String,
 
         /// Create in an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
 
         /// Print only id of folder
@@ -342,13 +413,13 @@ enum FileCommand {
     },
 
     /// Import file as a google document/spreadsheet/presentation.
-    /// Example of file types that can be imported: doc, docx, odt, pdf, html, xls, xlsx, csv, ods, ppt, pptx, odp
+    /// Supported file types: doc, docx, odt, rtf, pdf, html, md, jpg, jpeg, gif, png (document), xls, xlsx, csv, tsv, ods (spreadsheet), ppt, pptx, odp (presentation)
     Import {
         /// Path to file
         file_path: PathBuf,
 
         /// Upload to an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
 
         /// Print only id of file
@@ -361,11 +432,11 @@ enum FileCommand {
         /// File id
         file_id: String,
 
-        /// File path to export to. The file extension will determine the export format
+        /// File path to export to. The file extension will determine the export format. Documents: pdf, odt, docx, epub, rtf, txt, html, md. Spreadsheets: csv, tsv, ods, xlsx, pdf. Presentations: pdf, pptx, odp, txt
         file_path: PathBuf,
 
         /// Overwrite existing files
-        #[arg(long)]
+        #[arg(short, long)]
         overwrite: bool,
     },
 }
@@ -455,12 +526,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
         Command::Drives { command } => match command {
             DriveCommand::List {
+                max,
                 skip_header,
                 field_separator,
             } => {
                 drives::list(drives::list::Config {
                     skip_header,
                     field_separator,
+                    max_drives: max,
                 })
                 .await?;
             }
@@ -472,6 +545,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
         Command::Permissions { command } => {
             handle_permissions_command(command).await?;
+        }
+
+        Command::Completions { shell } => {
+            completions::completions(shell, <Cli as clap::CommandFactory>::command())?;
         }
 
         Command::Version => {
@@ -562,18 +639,30 @@ async fn handle_files_command(
             skip_header,
             full_name,
             field_separator,
+            tsv,
+            json,
         } => {
-            let parent_query = parent.map(|folder_id| ListQuery::FilesInFolder { folder_id });
-            let drive_query = drive.map(|drive_id| ListQuery::FilesOnDrive { drive_id });
-            let q = parent_query.or(drive_query).unwrap_or(query);
+            let output = if json {
+                files::list::Output::Json
+            } else if tsv {
+                files::list::Output::Tsv { skip_header }
+            } else {
+                files::list::Output::Table {
+                    skip_header,
+                    truncate_name: !full_name,
+                    field_separator,
+                }
+            };
 
             files::list(files::list::Config {
-                query: q,
+                query: ListQuery {
+                    query,
+                    parent,
+                    drive,
+                },
                 order_by,
                 max_files: max,
-                skip_header,
-                truncate_name: !full_name,
-                field_separator,
+                output,
             })
             .await?;
         }
@@ -585,6 +674,7 @@ async fn handle_files_command(
             recursive,
             destination,
             stdout,
+            acknowledge_abuse,
         } => {
             let existing_file_action = if overwrite {
                 files::download::ExistingFileAction::Overwrite
@@ -606,6 +696,7 @@ async fn handle_files_command(
                 follow_shortcuts,
                 download_directories: recursive,
                 destination: dst,
+                acknowledge_abuse,
             })
             .await?;
         }
@@ -654,8 +745,26 @@ async fn handle_files_command(
 
         FileCommand::Delete { file_id, recursive } => {
             files::delete(files::delete::Config {
-                file_id,
+                file_ids: file_id,
                 delete_directories: recursive,
+            })
+            .await?;
+        }
+
+        FileCommand::Trash { file_id, recursive } => {
+            files::trash(files::trash::Config {
+                file_ids: file_id,
+                action: files::trash::Action::Trash,
+                trash_directories: recursive,
+            })
+            .await?;
+        }
+
+        FileCommand::Untrash { file_id } => {
+            files::trash(files::trash::Config {
+                file_ids: file_id,
+                action: files::trash::Action::Untrash,
+                trash_directories: false,
             })
             .await?;
         }
@@ -782,4 +891,371 @@ async fn handle_account_command(
     }
 
     Ok(())
+}
+
+/// Parses a count that must be at least 1.
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(String::from("expected a positive integer")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::{CommandFactory, Parser};
+
+    use super::{parse_positive_usize, Cli, Command, DriveCommand, FileCommand, PermissionCommand};
+    use crate::files::list::ListQuery;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    fn parse_files_list(args: &[&str]) -> ListQuery {
+        let cli = Cli::try_parse_from(["gdrive", "files", "list"].iter().chain(args))
+            .expect("arguments should parse");
+        let Command::Files {
+            command:
+                FileCommand::List {
+                    query,
+                    parent,
+                    drive,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected files list");
+        };
+        ListQuery {
+            query,
+            parent,
+            drive,
+        }
+    }
+
+    #[test]
+    fn files_list_keeps_default_query_without_flags() {
+        let query = parse_files_list(&[]);
+        assert_eq!(query.q(), "'root' in parents and trashed = false");
+        assert_eq!(query.drive_id(), None);
+    }
+
+    #[test]
+    fn files_list_query_is_not_dropped_by_parent_or_drive() {
+        let query = parse_files_list(&["--query", "name = 'a'", "--parent", "P"]);
+        assert_eq!(
+            query.q(),
+            "'P' in parents and trashed = false and (name = 'a')"
+        );
+
+        let query = parse_files_list(&["--drive", "D", "--query", "name = 'a'"]);
+        assert_eq!(query.q(), "trashed = false and (name = 'a')");
+        assert_eq!(query.drive_id(), Some("D"));
+    }
+
+    #[test]
+    fn positive_usize_rejects_zero_and_non_numbers() {
+        assert_eq!(parse_positive_usize("1"), Ok(1));
+        assert_eq!(parse_positive_usize("250"), Ok(250));
+        for invalid in ["0", "-1", "", "ten", "1.5"] {
+            assert!(parse_positive_usize(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn drives_list_max_defaults_to_all() {
+        let parse_max = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["gdrive", "drives", "list"].iter().chain(args))?;
+            let Command::Drives {
+                command: DriveCommand::List { max, .. },
+            } = cli.command
+            else {
+                panic!("expected drives list");
+            };
+            Ok::<_, clap::Error>(max)
+        };
+
+        assert_eq!(parse_max(&[]).expect("no flags"), None);
+        assert_eq!(parse_max(&["--max", "250"]).expect("--max 250"), Some(250));
+        assert!(parse_max(&["--max", "0"]).is_err());
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once(&"gdrive").chain(args))
+    }
+
+    fn files_list_flags(args: &[&str]) -> (String, bool, bool) {
+        let cli = parse(&[&["files", "list"], args].concat()).expect("arguments should parse");
+        let Command::Files {
+            command:
+                FileCommand::List {
+                    field_separator,
+                    tsv,
+                    json,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected files list");
+        };
+        (field_separator, tsv, json)
+    }
+
+    /// 3.9 compatibility: the separator is used as given, so the two characters `\t` stay two
+    /// characters; real tabs come from --tsv.
+    #[test]
+    fn field_separator_is_taken_literally() {
+        assert_eq!(files_list_flags(&[]).0, "\t");
+        assert_eq!(files_list_flags(&["--field-separator", r"\t"]).0, r"\t");
+        assert_eq!(files_list_flags(&["--field-separator", "\t"]).0, "\t");
+        assert_eq!(files_list_flags(&["--field-separator", ","]).0, ",");
+
+        let cli = parse(&["drives", "list", "--field-separator", r"\t"]).expect("parse");
+        let Command::Drives {
+            command: DriveCommand::List {
+                field_separator, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected drives list");
+        };
+        assert_eq!(field_separator, r"\t");
+
+        let cli = parse(&["permissions", "list", "F", "--field-separator", r"\t"]).expect("parse");
+        let Command::Permissions {
+            command: PermissionCommand::List {
+                field_separator, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected permissions list");
+        };
+        assert_eq!(field_separator, r"\t");
+    }
+
+    #[test]
+    fn files_list_output_flags() {
+        assert_eq!(
+            files_list_flags(&["--tsv"]),
+            (String::from("\t"), true, false)
+        );
+        assert_eq!(
+            files_list_flags(&["--json"]),
+            (String::from("\t"), false, true)
+        );
+        assert!(parse(&["files", "list", "--tsv", "--skip-header", "--full-name"]).is_ok());
+        assert!(parse(&["files", "list", "--json", "--full-name", "--max", "5"]).is_ok());
+
+        for conflicting in [
+            &["--tsv", "--field-separator", ","][..],
+            &["--json", "--tsv"],
+            &["--json", "--field-separator", ","],
+            &["--json", "--skip-header"],
+        ] {
+            let err = parse(&[&["files", "list"], conflicting].concat())
+                .err()
+                .unwrap_or_else(|| panic!("{conflicting:?} should be rejected"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+    }
+}
+
+#[cfg(test)]
+mod flag_tests {
+    use std::collections::HashSet;
+
+    use clap::CommandFactory;
+
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::{Cli, Command, FileCommand};
+    use crate::common::drive_file::DocType;
+
+    fn words(text: &str) -> HashSet<&str> {
+        text.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+
+    fn files_subcommand(name: &str) -> clap::Command {
+        Cli::command()
+            .find_subcommand("files")
+            .and_then(|files| files.find_subcommand(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("files {name} should exist"))
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // Catches duplicated short or long flags, which clap only reports at runtime.
+        Cli::command().debug_assert();
+    }
+
+    fn all_commands(command: &clap::Command) -> Vec<&clap::Command> {
+        let mut out = vec![command];
+        for sub in command.get_subcommands() {
+            out.extend(all_commands(sub));
+        }
+        out
+    }
+
+    #[test]
+    fn short_s_is_reserved() {
+        // -s is kept free for a future sync flag.
+        let cli = Cli::command();
+        for command in all_commands(&cli) {
+            for arg in command.get_arguments() {
+                assert_ne!(
+                    arg.get_short(),
+                    Some('s'),
+                    "{} {:?} uses -s",
+                    command.get_name(),
+                    arg.get_id(),
+                );
+            }
+        }
+    }
+
+    fn parse(args: &[&str]) -> FileCommand {
+        let cli = Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied()))
+            .unwrap_or_else(|err| panic!("{args:?}: {err}"));
+        match cli.command {
+            Command::Files { command } => command,
+            _ => panic!("{args:?} should be a files command"),
+        }
+    }
+
+    #[test]
+    fn short_flags_parse() {
+        let FileCommand::List {
+            max, query, parent, ..
+        } = parse(&["files", "list", "-m", "5", "-q", "name = 'a'", "-p", "dir"])
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(max, 5);
+        assert_eq!(query.as_deref(), Some("name = 'a'"));
+        assert_eq!(parent.as_deref(), Some("dir"));
+
+        let FileCommand::Download {
+            overwrite,
+            recursive,
+            destination,
+            ..
+        } = parse(&["files", "download", "id", "-o", "-r", "-d", "out"])
+        else {
+            panic!("expected download");
+        };
+        assert!(overwrite && recursive);
+        assert_eq!(destination, Some(PathBuf::from("out")));
+
+        let FileCommand::Upload {
+            parent, recursive, ..
+        } = parse(&["files", "upload", "path", "-p", "dir", "-r"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(parent, Some(vec![String::from("dir")]));
+        assert!(recursive);
+
+        assert!(matches!(
+            parse(&["files", "delete", "id", "-r"]),
+            FileCommand::Delete {
+                recursive: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "trash", "id", "-r"]),
+            FileCommand::Trash {
+                recursive: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "mkdir", "name", "-p", "dir"]),
+            FileCommand::Mkdir {
+                parent: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "import", "a.md", "-p", "dir"]),
+            FileCommand::Import {
+                parent: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "export", "id", "a.md", "-o"]),
+            FileCommand::Export {
+                overwrite: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn delete_and_trash_take_several_ids() {
+        let FileCommand::Delete { file_id, .. } = parse(&["files", "delete", "a", "b", "-r"])
+        else {
+            panic!("expected delete");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+
+        let FileCommand::Trash { file_id, .. } = parse(&["files", "trash", "a", "b"]) else {
+            panic!("expected trash");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+
+        let FileCommand::Untrash { file_id } = parse(&["files", "untrash", "a", "b"]) else {
+            panic!("expected untrash");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+
+        for command in ["delete", "trash", "untrash"] {
+            assert!(
+                Cli::try_parse_from(["gdrive", "files", command]).is_err(),
+                "files {command} needs at least one id"
+            );
+        }
+    }
+
+    #[test]
+    fn import_help_lists_every_supported_type() {
+        let import = files_subcommand("import");
+        let about = import.get_about().unwrap().to_string();
+        let listed = words(&about);
+
+        for extension in DocType::SUPPORTED_INPUT_TYPES {
+            let extension = extension.to_string();
+            assert!(listed.contains(extension.as_str()), "{extension}: {about}");
+        }
+    }
+
+    #[test]
+    fn export_help_lists_every_supported_type() {
+        let export = files_subcommand("export");
+        let file_path = export
+            .get_positionals()
+            .find(|arg| arg.get_id() == "file_path")
+            .unwrap();
+        let help = file_path.get_help().unwrap().to_string();
+        let listed = words(&help);
+
+        for doc_type in [
+            DocType::Document,
+            DocType::Spreadsheet,
+            DocType::Presentation,
+        ] {
+            for extension in doc_type.supported_export_types() {
+                let extension = extension.to_string();
+                assert!(listed.contains(extension.as_str()), "{extension}: {help}");
+            }
+        }
+    }
 }
