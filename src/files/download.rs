@@ -3,6 +3,7 @@ pub(crate) mod errors;
 mod media_tests;
 #[cfg(test)]
 pub(crate) use media_tests::assert_content;
+mod recursive;
 pub(crate) mod resume;
 
 use std::path::{Path, PathBuf};
@@ -18,16 +19,15 @@ use tokio::{
 use crate::{
     common::{
         drive_file,
-        file_tree_drive::{self, errors::FileIdentifier, FileTreeDrive},
+        file_tree_drive::errors::FileIdentifier,
         hub_helper::get_hub,
-        human_size::human_size,
         local_name::{self, NameChange, UnusableName},
         md5_writer::Md5Writer,
         media_client::{MediaClient, MediaError},
-        FileTreeLike, FolderLike,
     },
     files,
     hub::Hub,
+    transfer::scheduler::{self, Printer},
 };
 pub(crate) use resume::Expected;
 use resume::{copy_body, BodyError, Identity, MediaSource, Next, ResumableDownload, Revision};
@@ -40,6 +40,9 @@ pub(crate) struct Config {
     pub(crate) destination: Destination,
     /// Download files Google flagged as malware or spam (owner or shared drive organizer only).
     pub(crate) acknowledge_abuse: bool,
+    /// How many files a recursive download transfers at once, and whether it goes on after a
+    /// failure.
+    pub(crate) transfer: scheduler::Options,
 }
 
 impl Config {
@@ -177,84 +180,15 @@ async fn download_regular(
     Ok(())
 }
 
+/// Downloads the folder `file` and everything in it: the files are downloaded while the
+/// folder is still being listed, `config.transfer.jobs` at a time (see [`recursive`]).
 async fn download_directory(
     hub: &Hub,
     file: google_drive3::api::File,
     config: &Config,
 ) -> Result<(), errors::Download> {
-    use errors::Download as E;
-
-    let tree = FileTreeDrive::from_file(hub, file)
-        .await
-        .map_err(E::CreateFileTree)?;
-
-    let tree_info = tree.info();
-
-    println!(
-        "Found {} files in {} directories with a total size of {}",
-        tree_info.file_count,
-        tree_info.folder_count,
-        human_size(tree_info.total_file_size),
-    );
-
-    let root_path = config.canonical_destination_root()?;
-
-    for folder in &tree.folders() {
-        let folder_path = folder.info.relative_path();
-        let abs_folder_path = root_path.join(&folder_path);
-
-        println!("Creating directory {}", folder_path.display());
-        fs::create_dir_all(&abs_folder_path)
-            .await
-            .map_err(|err| E::CreateDirectory(abs_folder_path, err))?;
-
-        for file in folder.files() {
-            let file_path = file.relative_path();
-            let abs_file_path = root_path.join(&file_path);
-
-            err_if_local_file_exists(&abs_file_path, config.existing_file_action).await?;
-
-            if local_file_is_identical(&abs_file_path, &file).await {
-                continue;
-            }
-
-            let label = format!("download of '{}'", file_path.display());
-            let source = file_content(hub, &file.drive_id, config.acknowledge_abuse, label)
-                .map_err(|err| E::DownloadFile(Box::new(err)))?;
-            // The walk lists md5 and size; the first check before a resume adds the rest.
-            let revision = Revision {
-                md5: file.md5,
-                size: Some(file.size),
-                ..Revision::default()
-            };
-            let identity = Identity::new(hub, &file.drive_id, revision);
-            let mut download =
-                ResumableDownload::new(source, hub.retrier().state(), revision.expected())
-                    .with_identity(identity);
-            let first = download
-                .next()
-                .await
-                .map_err(|err| E::DownloadFile(Box::new(err)))?;
-
-            println!("Downloading file '{}'", file_path.display());
-            if let Err(source) = save_to_file(download, first, &abs_file_path, &file.drive_id).await
-            {
-                return Err(E::SaveBodyToFile {
-                    path: abs_file_path,
-                    source,
-                });
-            }
-        }
-    }
-
-    println!(
-        "Downloaded {} files in {} directories with a total size of {}",
-        tree_info.file_count,
-        tree_info.folder_count,
-        human_size(tree_info.total_file_size)
-    );
-
-    Ok(())
+    let printer = Printer::stdio();
+    recursive::download_directory(hub, file, config, &printer, scheduler::ctrl_c()).await
 }
 
 /// The content of a Drive file: `files.get?alt=media`, which supports `Range` requests.
@@ -300,7 +234,7 @@ pub(crate) async fn save_to_file(
 }
 
 /// [`save_to_file`] writing through `writer(temporary file)`; tests use it to inject write
-/// errors.
+/// errors, the recursive download to note which temporary files it created.
 async fn save_through<W>(
     download: ResumableDownload<'_>,
     first: Next,
@@ -695,10 +629,11 @@ async fn err_if_local_file_exists(
     }
 }
 
-async fn local_file_is_identical(path: &Path, file: &file_tree_drive::File) -> bool {
+/// Whether the local file at `path` has the md5 of the Drive file, `md5`.
+async fn local_file_is_identical(path: &Path, md5: Option<&Digest>) -> bool {
     if path.exists() {
         match compute_md5_from_path(path).await {
-            Ok(file_md5) => file.md5.as_ref().is_some_and(|md5| md5 == &file_md5),
+            Ok(file_md5) => md5.is_some_and(|md5| md5 == &file_md5),
             Err(err) => {
                 eprintln!(
                     "Warning: Error while computing md5 of '{}': {}",
@@ -870,6 +805,7 @@ mod tests {
             download_directories: true,
             destination: Destination::Path(destination.to_path_buf()),
             acknowledge_abuse: false,
+            transfer: crate::transfer::scheduler::Options::default(),
         }
     }
 

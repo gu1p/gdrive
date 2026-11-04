@@ -1168,7 +1168,7 @@ mod tests {
         );
 
         // Found through the source chain of a command error, also when boxed.
-        let upload = crate::files::upload::Error::Upload(Box::new(quota));
+        let upload = crate::files::upload::Error::Mkdir(Box::new(quota));
         assert!(account_hint(&upload, &service_account).is_some());
 
         // Not for user accounts.
@@ -1189,7 +1189,7 @@ mod tests {
         let delegated = AccountType::ServiceAccount {
             subject: Some(String::from("user@example.com")),
         };
-        let upload = crate::files::upload::Error::Upload(Box::new(
+        let upload = crate::files::upload::Error::Mkdir(Box::new(
             google_apis_common::Error::BadRequest(json!({"error": {
                 "code": 403, "message": "The user's Drive storage quota has been exceeded.",
                 "errors": [{"reason": "storageQuotaExceeded"}]

@@ -2,11 +2,14 @@ use std::{error::Error, fmt::Display, io, path::PathBuf};
 
 use md5::Digest;
 
-use crate::common::{
-    file_tree_drive::{self, errors::FileIdentifier},
-    hub_helper::GetHubError,
-    local_name::UnusableName,
-    media_client::MediaError,
+use crate::{
+    common::{
+        file_tree_drive::{self, errors::FileIdentifier},
+        hub_helper::GetHubError,
+        local_name::UnusableName,
+        media_client::MediaError,
+    },
+    transfer::scheduler::{Incomplete, OutputError},
 };
 
 #[derive(Debug)]
@@ -36,6 +39,17 @@ pub(crate) enum Download {
         path: PathBuf,
         source: SaveBodyToFile,
     },
+    /// A file of a recursive download failed; `path` is relative to the destination.
+    RecursiveFile {
+        path: PathBuf,
+        source: Box<Download>,
+    },
+    /// Files or folders of a recursive download failed, or it was interrupted.
+    Incomplete(Incomplete),
+    /// Drive reported `incompleteSearch` while listing a recursive download.
+    IncompleteListing,
+    /// stdout or stderr of a recursive download could not be written.
+    WriteOutput(OutputError),
 }
 
 impl Display for Download {
@@ -97,6 +111,17 @@ impl Display for Download {
             Download::SaveBodyToFile { path, source: _ } => {
                 write!(f, "unable to save body to file '{}'", path.display())
             }
+            Download::RecursiveFile { path, source: _ } => {
+                write!(f, "unable to download '{}'", path.display())
+            }
+            Download::Incomplete(_) => f.write_str("the recursive download is incomplete"),
+            Download::WriteOutput(_) => {
+                f.write_str("unable to write the output of the recursive download")
+            }
+            Download::IncompleteListing => f.write_str(
+                "Drive did not search everything while listing the folders, some files may be \
+                missing; use --continue-on-error to accept an incomplete listing",
+            ),
         }
     }
 }
@@ -117,11 +142,15 @@ impl Error for Download {
             | Download::DestinationPathNotADirectory(_)
             | Download::MissingShortcutTarget(_)
             | Download::IsShortcut(_)
-            | Download::StdoutNotValidDestination => None,
+            | Download::StdoutNotValidDestination
+            | Download::IncompleteListing => None,
             Download::CreateDirectory(_, source)
             | Download::CanonicalizeDestinationPath(_, source) => Some(source),
             Download::SaveBodyToStdout(save_body_to_stdout) => Some(save_body_to_stdout),
             Download::SaveBodyToFile { source, .. } => Some(source),
+            Download::RecursiveFile { source, .. } => Some(source),
+            Download::Incomplete(source) => Some(source),
+            Download::WriteOutput(source) => Some(source),
         }
     }
 }

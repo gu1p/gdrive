@@ -12,7 +12,7 @@ mod proxy;
 mod transfer;
 mod version;
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use common::{
@@ -21,6 +21,7 @@ use common::{
 };
 use files::list::{ListQuery, ListSortOrder};
 use mime::Mime;
+use transfer::scheduler::Options;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None, disable_version_flag = true)]
@@ -327,6 +328,14 @@ enum FileCommand {
         /// Download files that Google flagged as malware or spam. Only the owner of a file, or an organizer of its shared drive, can do this
         #[arg(long)]
         acknowledge_abuse: bool,
+
+        /// With --recursive: download up to N files at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// With --recursive: when a file fails, go on with the others instead of stopping. The command still exits with an error
+        #[arg(long)]
+        continue_on_error: bool,
     },
 
     /// Upload file
@@ -365,6 +374,14 @@ enum FileCommand {
         /// Print only id of file/folder
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
+
+        /// With --recursive: upload up to N files at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// With --recursive: when a file or folder fails, go on with the others instead of stopping. The command still exits with an error
+        #[arg(long)]
+        continue_on_error: bool,
     },
 
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
@@ -552,19 +569,42 @@ enum PermissionCommand {
     },
 }
 
+/// `--jobs`: 1 to [`Options::MAX_JOBS`].
+fn parse_jobs(value: &str) -> Result<NonZeroUsize, String> {
+    let jobs = value.parse::<usize>().map_err(|err| err.to_string())?;
+    NonZeroUsize::new(jobs)
+        .filter(|jobs| jobs.get() <= Options::MAX_JOBS)
+        .ok_or_else(|| format!("must be between 1 and {}", Options::MAX_JOBS))
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
-        let mut message = error_message(err.as_ref());
-        if let Some(hint) = common::hub_helper::account_hint(err.as_ref()) {
-            message.push('\n');
-            message.push_str(&hint);
-        }
-        eprintln!("{message}");
+        eprintln!("{}", failure_message(err.as_ref()));
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// What gdrive prints for a failed command, and for each failed file of a recursive transfer:
+/// the [`error_message`], and the hint for the current account (a service account's storage,
+/// for example) when there is one.
+fn failure_message(err: &(dyn std::error::Error + 'static)) -> String {
+    failure_message_with(err, common::hub_helper::account_hint)
+}
+
+/// [`failure_message`] with the account hint of `hint`.
+fn failure_message_with(
+    err: &(dyn std::error::Error + 'static),
+    hint: impl FnOnce(&(dyn std::error::Error + 'static)) -> Option<String>,
+) -> String {
+    let mut message = error_message(err);
+    if let Some(hint) = hint(err) {
+        message.push('\n');
+        message.push_str(&hint);
+    }
+    message
 }
 
 /// The message printed for a failed command, in the format of gdrive 3.x: `Error: ` and the
@@ -757,6 +797,8 @@ async fn handle_files_command(
             destination,
             stdout,
             acknowledge_abuse,
+            jobs,
+            continue_on_error,
         } => {
             let existing_file_action = if overwrite {
                 files::download::ExistingFileAction::Overwrite
@@ -779,6 +821,7 @@ async fn handle_files_command(
                 download_directories: recursive,
                 destination: dst,
                 acknowledge_abuse,
+                transfer: Options::new(jobs, continue_on_error),
             })
             .await?;
         }
@@ -793,6 +836,8 @@ async fn handle_files_command(
             print_chunk_errors,
             print_chunk_info,
             print_only_id,
+            jobs,
+            continue_on_error,
         } => {
             files::upload(files::upload::Config {
                 file_path,
@@ -804,6 +849,7 @@ async fn handle_files_command(
                 print_chunk_info,
                 upload_directories: recursive,
                 print_only_id,
+                transfer: Options::new(jobs, continue_on_error),
             })
             .await?;
         }
@@ -1108,7 +1154,7 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        parse_positive_usize, AccountCommand, Cli, Command, DriveCommand, FileCommand,
+        parse_jobs, parse_positive_usize, AccountCommand, Cli, Command, DriveCommand, FileCommand,
         PermissionCommand,
     };
     use crate::files::list::ListQuery;
@@ -1167,6 +1213,61 @@ mod tests {
         for invalid in ["0", "-1", "", "ten", "1.5"] {
             assert!(parse_positive_usize(invalid).is_err(), "{invalid:?}");
         }
+    }
+
+    #[test]
+    fn jobs_are_1_to_64_and_default_to_4() {
+        assert_eq!(parse_jobs("1").map(std::num::NonZeroUsize::get), Ok(1));
+        assert_eq!(parse_jobs("64").map(std::num::NonZeroUsize::get), Ok(64));
+        for invalid in ["0", "65", "-1", "", "four"] {
+            assert!(parse_jobs(invalid).is_err(), "{invalid:?}");
+        }
+
+        let download = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["gdrive", "files", "download", "id"].iter().chain(args))
+                .expect("valid flags");
+            let Command::Files {
+                command:
+                    FileCommand::Download {
+                        jobs,
+                        continue_on_error,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected files download");
+            };
+            (jobs.get(), continue_on_error)
+        };
+        assert_eq!(download(&["-r"]), (4, false));
+        assert_eq!(
+            download(&["-r", "--jobs", "8", "--continue-on-error"]),
+            (8, true)
+        );
+
+        let cli = Cli::try_parse_from([
+            "gdrive",
+            "files",
+            "upload",
+            "dir",
+            "-r",
+            "--jobs",
+            "2",
+            "--continue-on-error",
+        ])
+        .expect("valid flags");
+        let Command::Files {
+            command:
+                FileCommand::Upload {
+                    jobs,
+                    continue_on_error,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected files upload");
+        };
+        assert_eq!((jobs.get(), continue_on_error), (2, true));
     }
 
     #[test]
