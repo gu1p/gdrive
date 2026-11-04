@@ -16,7 +16,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::Mutex};
+use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
 use yup_oauth2::storage::{TokenInfo, TokenStorage, TokenStorageError};
 
 /// One `tokens.json` entry: a token and the scopes it was issued for.
@@ -148,18 +148,42 @@ impl TokenFile {
     /// renames it over `path`.
     pub(crate) async fn save(&self, path: &Path) -> io::Result<()> {
         let json = self.to_json().map_err(io::Error::other)?;
-        let temp_path = temp_path_for(path);
-
-        let result = write_new_file(&temp_path, json.as_bytes()).await;
-        let result = match result {
-            Ok(()) => tokio::fs::rename(&temp_path, path).await,
-            Err(error) => Err(error),
-        };
-        if result.is_err() {
-            let _ = tokio::fs::remove_file(&temp_path).await;
-        }
-        result
+        replace_file(path, json.as_bytes(), write_and_sync).await
     }
+}
+
+/// Replaces `path` with `content`. `write` fills a new temporary file next to `path`, which is
+/// renamed over `path` only when `write` succeeded. On any error the temporary file is removed
+/// and `path` keeps its previous content.
+async fn replace_file<W>(path: &Path, content: &[u8], write: W) -> io::Result<()>
+where
+    W: AsyncFnOnce(&mut File, &[u8]) -> io::Result<()>,
+{
+    let temp_path = temp_path_for(path);
+    let result = async {
+        let mut file = open_new_file(&temp_path).await?;
+        write(&mut file, content).await?;
+        // Closed before the rename, which Windows refuses for an open file.
+        drop(file);
+        tokio::fs::rename(&temp_path, path).await
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&temp_path).await;
+    }
+    result
+}
+
+/// Writes all of `content` to `file` and makes it durable.
+///
+/// tokio's `File` hands each write to a background thread and reports its error only with the
+/// next operation: `write_all` can return before the data is written, and `sync_all` does not
+/// report a pending write error, but `flush` does. Without the flush a full disk (ENOSPC) could
+/// go unnoticed and an empty file would replace a working tokens.json.
+async fn write_and_sync(file: &mut File, content: &[u8]) -> io::Result<()> {
+    file.write_all(content).await?;
+    file.flush().await?;
+    file.sync_all().await
 }
 
 fn covers(stored: &[String], requested: &[&str]) -> bool {
@@ -184,16 +208,12 @@ fn temp_path_for(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-async fn write_new_file(path: &Path, content: &[u8]) -> io::Result<()> {
+async fn open_new_file(path: &Path) -> io::Result<File> {
     let mut options = tokio::fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     options.mode(0o600);
-
-    let mut file = options.open(path).await?;
-    file.write_all(content).await?;
-    file.sync_all().await?;
-    Ok(())
+    options.open(path).await
 }
 
 /// `tokens.json` exposed to yup-oauth2 as its token storage.
@@ -461,6 +481,59 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+    }
+
+    #[tokio::test]
+    async fn failed_write_keeps_the_previous_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let previous = file(&[(&DRIVE_SCOPES, token("a", Some("keep"), Duration::hours(1)))]);
+        previous.save(&path).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        // The disk fills up halfway through the new content.
+        let new_content = br#"[{"scopes":[],"token":{}}]"#;
+        let error = replace_file(
+            &path,
+            new_content,
+            async |file: &mut File, content: &[u8]| {
+                file.write_all(&content[..content.len() / 2]).await?;
+                file.flush().await?;
+                Err(io::Error::from(io::ErrorKind::StorageFull))
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["tokens.json"]);
+    }
+
+    /// Why `write_and_sync` flushes: on a full device tokio's `write_all` succeeds and only the
+    /// flush reports ENOSPC.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_errors_of_a_full_disk_are_reported() {
+        async fn open_full() -> io::Result<File> {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .await
+        }
+        let Ok(mut file) = open_full().await else {
+            return;
+        };
+        file.write_all(b"[]").await.unwrap();
+        let error = file.flush().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+
+        let mut file = open_full().await.unwrap();
+        assert!(write_and_sync(&mut file, b"[]").await.is_err());
     }
 
     #[tokio::test]
