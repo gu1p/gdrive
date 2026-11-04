@@ -8,10 +8,10 @@ use mime::Mime;
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         drive_file::MIME_TYPE_DRIVE_FOLDER,
         empty_file::EmptyFile,
         hub_helper::{get_hub, GetHubError},
+        retry::retry_api,
     },
     files::FileResult,
     hub::Hub,
@@ -27,9 +27,8 @@ pub(crate) struct Config {
 
 pub(crate) async fn mkdir(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
-    let file = create_directory(&hub, &config, &delegate_config)
+    let file = create_directory(&hub, &config)
         .await
         .map_err(|err| Box::new(Error::CreateDirectory(err)))?;
 
@@ -50,11 +49,7 @@ pub(crate) async fn mkdir(config: Config) -> Result<(), Box<Error>> {
     clippy::result_large_err,
     reason = "Ok variant is bigger, see test next to FileResult"
 )]
-pub(crate) async fn create_directory(
-    hub: &Hub,
-    config: &Config,
-    delegate_config: &UploadDelegateConfig,
-) -> FileResult {
+pub(crate) async fn create_directory(hub: &Hub, config: &Config) -> FileResult {
     static DRIVE_FOLDER_MIME: LazyLock<Mime> =
         LazyLock::new(|| MIME_TYPE_DRIVE_FOLDER.parse().unwrap());
 
@@ -66,19 +61,21 @@ pub(crate) async fn create_directory(
         ..google_drive3::api::File::default()
     };
 
-    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
-
-    let req = hub
-        .files()
-        .create(dst_file)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true);
-
-    let (_, file) = req
-        .upload(EmptyFile, Mime::clone(&*DRIVE_FOLDER_MIME))
-        .await?;
+    // A folder is a create with an empty media part: a metadata call.
+    let (_, file) = retry_api(hub.retrier(), "files.create", |mut delegate| {
+        let dst_file = dst_file.clone();
+        async move {
+            hub.files()
+                .create(dst_file)
+                .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .supports_all_drives(true)
+                .upload(EmptyFile, Mime::clone(&*DRIVE_FOLDER_MIME))
+                .await
+        }
+    })
+    .await?;
 
     Ok(file)
 }

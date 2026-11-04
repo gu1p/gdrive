@@ -23,6 +23,8 @@ pub(crate) mod permission;
 )]
 pub(crate) mod retry;
 #[cfg(test)]
+mod retry_api_tests;
+#[cfg(test)]
 pub(crate) mod stub_server;
 pub(crate) mod table;
 

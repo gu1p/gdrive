@@ -2,9 +2,9 @@ use std::{error, fmt, io};
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         hub_helper::{get_hub, GetHubError},
         paginate::{self, Page, PageRequest},
+        retry::retry_api,
         table::{self, Table},
     },
     hub::Hub,
@@ -25,15 +25,10 @@ pub(crate) struct Config {
 
 pub(crate) async fn list(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
-    let drives = list_drives(
-        &hub,
-        &delegate_config,
-        config.max_drives.unwrap_or(usize::MAX),
-    )
-    .await
-    .map_err(Error::ListDrives)?;
+    let drives = list_drives(&hub, config.max_drives.unwrap_or(usize::MAX))
+        .await
+        .map_err(Error::ListDrives)?;
 
     write_drives_table(io::stdout(), &config, drives).map_err(Error::WriteOutput)?;
 
@@ -68,24 +63,25 @@ fn write_drives_table(
 
 async fn list_drives(
     hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
     max_drives: usize,
 ) -> Result<Vec<google_drive3::api::Drive>, Box<google_drive3::Error>> {
     paginate::collect_pages(max_drives, MAX_PAGE_SIZE, async |page: PageRequest| {
-        let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
+        let page = &page;
+        let (_, drive_list) = retry_api(hub.retrier(), "drives.list", |mut delegate| async move {
+            let mut req = hub
+                .drives()
+                .list()
+                .page_size(page.page_size)
+                .param("fields", FIELDS)
+                .add_scope(google_drive3::api::Scope::Full);
 
-        let mut req = hub
-            .drives()
-            .list()
-            .page_size(page.page_size)
-            .param("fields", FIELDS)
-            .add_scope(google_drive3::api::Scope::Full);
+            if let Some(token) = &page.page_token {
+                req = req.page_token(token);
+            }
 
-        if let Some(token) = &page.page_token {
-            req = req.page_token(token);
-        }
-
-        let (_, drive_list) = req.delegate(&mut delegate).doit().await?;
+            req.delegate(&mut delegate).doit().await
+        })
+        .await?;
 
         Ok(Page {
             items: drive_list.drives.unwrap_or_default(),
@@ -130,7 +126,6 @@ mod tests {
 
     use super::{list_drives, write_drives_table, Config, FIELDS};
     use crate::common::{
-        delegate::UploadDelegateConfig,
         stub_server::{Request, StubServer, TIMEOUT},
         table::FailingWriter,
     };
@@ -152,13 +147,10 @@ mod tests {
         let server = StubServer::start(pages).await.expect("start stub server");
         let hub = server.hub().expect("create hub");
 
-        let drives = tokio::time::timeout(
-            TIMEOUT,
-            list_drives(&hub, &UploadDelegateConfig::default(), max_drives),
-        )
-        .await
-        .expect("listing should finish")
-        .expect("listing should succeed");
+        let drives = tokio::time::timeout(TIMEOUT, list_drives(&hub, max_drives))
+            .await
+            .expect("listing should finish")
+            .expect("listing should succeed");
 
         let ids = drives.into_iter().filter_map(|drive| drive.id).collect();
         (ids, server.requests().await)

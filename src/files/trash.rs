@@ -8,10 +8,10 @@ use std::{
 
 use crate::{
     common::{
-        delegate::UploadDelegateConfig,
         drive_file,
         file_tree_drive::errors::FileIdentifier,
         hub_helper::{get_hub, GetHubError},
+        retry::retry_api,
     },
     files::{
         self,
@@ -75,15 +75,18 @@ async fn trash_file(
     action: Action,
     trash_directories: bool,
 ) -> Result<(), Error> {
-    let (_, file) = hub
-        .files()
-        .get(file_id)
-        .param("fields", FILE_FIELDS)
-        .supports_all_drives(true)
-        .add_scope(google_drive3::api::Scope::Full)
-        .doit()
-        .await
-        .map_err(|err| Error::GetFile(Box::new(err)))?;
+    let (_, file) = retry_api(hub.retrier(), "files.get", |mut delegate| async move {
+        hub.files()
+            .get(file_id)
+            .param("fields", FILE_FIELDS)
+            .supports_all_drives(true)
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .doit()
+            .await
+    })
+    .await
+    .map_err(|err| Error::GetFile(Box::new(err)))?;
 
     let name = file.name.clone().unwrap_or_default();
 
@@ -96,7 +99,7 @@ async fn trash_file(
     }
 
     let patch_file = PatchFile::new(file_id.to_owned()).with_trashed(action == Action::Trash);
-    files::update::update_metadata(hub, &UploadDelegateConfig::default(), patch_file)
+    files::update::update_metadata(hub, patch_file)
         .await
         .map_err(|err| Error::Update(action, Box::new(err)))?;
 

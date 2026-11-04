@@ -8,6 +8,7 @@ use crate::{
         drive_file,
         file_tree_drive::errors::FileIdentifier,
         hub_helper::{get_hub, GetHubError},
+        retry::retry_api,
     },
     files::{
         self,
@@ -45,13 +46,17 @@ async fn delete_file(hub: &Hub, file_id: &str, delete_directories: bool) -> Resu
         return Err(Error::IsDirectory(FileIdentifier::from(file)));
     }
 
-    hub.files()
-        .delete(file_id)
-        .supports_all_drives(true)
-        .add_scope(google_drive3::api::Scope::Full)
-        .doit()
-        .await
-        .map_err(|err| Error::DeleteFile(Box::new(err)))?;
+    retry_api(hub.retrier(), "files.delete", |mut delegate| async move {
+        hub.files()
+            .delete(file_id)
+            .supports_all_drives(true)
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .doit()
+            .await
+    })
+    .await
+    .map_err(|err| Error::DeleteFile(Box::new(err)))?;
 
     println!("Deleted '{}'", file.name.unwrap_or_default());
 

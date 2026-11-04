@@ -34,6 +34,10 @@ use hyper::{
 };
 use tokio::time::Instant;
 
+/// What to do about a 401, in the style of the auth errors.
+const UNAUTHORIZED_HINT: &str =
+    "; run 'gdrive account reauth' to authorize the current account again";
+
 /// A longer `Retry-After` is cut down to this.
 pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 
@@ -238,10 +242,12 @@ pub(crate) enum StopReason {
 impl Display for StopReason {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            StopReason::Unauthorized => f.write_str(
-                "Google did not accept the access token; run 'gdrive account reauth' to \
-                 authorize the current account again",
-            ),
+            StopReason::Unauthorized => {
+                write!(
+                    f,
+                    "Google did not accept the access token{UNAUTHORIZED_HINT}"
+                )
+            }
             StopReason::Forbidden {
                 reason: Some(reason),
             } => {
@@ -698,10 +704,11 @@ pub(crate) struct AccessTokenRejected {
 
 impl Display for AccessTokenRejected {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str("Google did not accept the access token")?;
         if let Some(message) = &self.message {
-            write!(f, "{message} ")?;
+            write!(f, " ({message})")?;
         }
-        Display::fmt(&StopReason::Unauthorized, f)
+        f.write_str(UNAUTHORIZED_HINT)
     }
 }
 

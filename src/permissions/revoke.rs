@@ -5,9 +5,9 @@ use std::{
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         hub_helper::{get_hub, GetHubError},
         permission,
+        retry::retry_api,
     },
     files,
     hub::Hub,
@@ -22,13 +22,12 @@ pub(crate) struct Config {
 
 pub(crate) async fn revoke(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
     let file = files::info::get_file(&hub, &config.file_id)
         .await
         .map_err(|err| Error::GetFile(Box::new(err)))?;
 
-    let permissions = permissions::list::list_permissions(&hub, &delegate_config, &config.file_id)
+    let permissions = permissions::list::list_permissions(&hub, &config.file_id)
         .await
         .map_err(Error::ListPermissions)?;
 
@@ -38,7 +37,6 @@ pub(crate) async fn revoke(config: Config) -> Result<(), Error> {
 
         delete_permission(
             &hub,
-            &delegate_config,
             &config.file_id,
             permission.id.as_deref().unwrap_or_default(),
         )
@@ -51,23 +49,27 @@ pub(crate) async fn revoke(config: Config) -> Result<(), Error> {
 
 async fn delete_permission(
     hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
     file_id: &str,
     permission_id: &str,
 ) -> Result<(), Box<google_drive3::Error>> {
-    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
-
-    hub.permissions()
-        .delete(file_id, permission_id)
-        .param(
-            "fields",
-            "id,role,type,domain,emailAddress,allowFileDiscovery",
-        )
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit()
-        .await?;
+    retry_api(
+        hub.retrier(),
+        "permissions.delete",
+        |mut delegate| async move {
+            hub.permissions()
+                .delete(file_id, permission_id)
+                .param(
+                    "fields",
+                    "id,role,type,domain,emailAddress,allowFileDiscovery",
+                )
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .supports_all_drives(true)
+                .doit()
+                .await
+        },
+    )
+    .await?;
 
     Ok(())
 }

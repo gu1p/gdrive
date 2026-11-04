@@ -213,7 +213,7 @@ async fn upload_directory(
     config: UploadDirectoryConfig,
     delegate_config: &UploadDelegateConfig,
 ) -> Result<(), Error> {
-    let mut ids = IdGen::new(hub, delegate_config);
+    let mut ids = IdGen::new(hub);
     let tree = FileTree::from_path(&config.file_path, &mut ids)
         .await
         .map_err(Error::CreateFileTree)?;
@@ -253,7 +253,6 @@ async fn upload_directory(
                 parents: folder_parents,
                 print_only_id: false,
             },
-            delegate_config,
         )
         .await
         .map_err(|err| Error::Mkdir(Box::new(err)))?;

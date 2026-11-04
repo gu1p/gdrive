@@ -12,7 +12,7 @@ use crate::{
         file_helper,
         file_info::{self, FileInfo},
         hub_helper::{get_hub, GetHubError},
-        retry::RetryPolicy,
+        retry::{retry_api, RetryPolicy},
     },
     files::{
         self,
@@ -155,26 +155,23 @@ where
     clippy::result_large_err,
     reason = "Ok variant is bigger, see test next to FileResult"
 )]
-pub(crate) async fn update_metadata(
-    hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
-    patch_file: PatchFile,
-) -> FileResult {
-    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
-
-    let (_, file) = hub
-        .files()
-        .update(patch_file.file, &patch_file.id)
-        .param(
-            "fields",
-            "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,\
-            description,webContentLink,webViewLink",
-        )
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit_without_upload()
-        .await?;
+pub(crate) async fn update_metadata(hub: &Hub, patch_file: PatchFile) -> FileResult {
+    let patch_file = &patch_file;
+    let (_, file) = retry_api(hub.retrier(), "files.update", |mut delegate| async move {
+        hub.files()
+            .update(patch_file.file.clone(), &patch_file.id)
+            .param(
+                "fields",
+                "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,\
+                description,webContentLink,webViewLink",
+            )
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .supports_all_drives(true)
+            .doit_without_upload()
+            .await
+    })
+    .await?;
 
     Ok(file)
 }

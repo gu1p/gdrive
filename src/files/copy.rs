@@ -6,9 +6,9 @@ use std::{
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         drive_file,
         hub_helper::{get_hub, GetHubError},
+        retry::retry_api,
     },
     files::{self, info::DisplayConfig, FileResult},
     hub::Hub,
@@ -22,7 +22,6 @@ pub(crate) struct Config {
 
 pub(crate) async fn copy(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
     let file = files::info::get_file(&hub, &config.file_id)
         .await
@@ -51,7 +50,7 @@ pub(crate) async fn copy(config: Config) -> Result<(), Error> {
         to_folder_id: config.to_folder_id,
     };
 
-    let new_file = copy_file(&hub, &delegate_config, &copy_config)
+    let new_file = copy_file(&hub, &copy_config)
         .await
         .map_err(|err| Error::Copy(Box::new(err)))?;
 
@@ -69,26 +68,26 @@ struct CopyConfig {
     clippy::result_large_err,
     reason = "Ok variant is bigger, see test next to FileResult"
 )]
-async fn copy_file(
-    hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
-    config: &CopyConfig,
-) -> FileResult {
-    let mut delegate = UploadDelegate::new(delegate_config, &hub.retrier().throttle);
-
+async fn copy_file(hub: &Hub, config: &CopyConfig) -> FileResult {
     let file = google_drive3::api::File {
         parents: Some(vec![config.to_folder_id.clone()]),
         ..google_drive3::api::File::default()
     };
 
-    let (_, file) = hub
-        .files()
-        .copy(file, &config.file_id)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit().await?;
+    let (_, file) = retry_api(hub.retrier(), "files.copy", |mut delegate| {
+        let file = file.clone();
+        async move {
+            hub.files()
+                .copy(file, &config.file_id)
+                .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .supports_all_drives(true)
+                .doit()
+                .await
+        }
+    })
+    .await?;
 
     Ok(file)
 }
