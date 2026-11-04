@@ -1,0 +1,316 @@
+//! The source side of a migration: each `FILE_ID`, and for a folder everything in it, listed by
+//! the walk ([`crate::transfer::walk`]) before anything is migrated, and kept as a compact tree
+//! (the fields a migration needs, not Drive's whole file resource).
+
+use std::{collections::HashMap, sync::Arc};
+
+use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use google_drive3::api::File;
+
+use super::Error;
+use crate::{
+    common::{drive_file, retry::retry_read},
+    hub::Hub,
+    transfer::{
+        scheduler::Printer,
+        walk::{Children, EntryKind, FolderKey, Walk, WalkItem, WalkOptions, WalkRoot},
+    },
+};
+
+/// The fields of a `FILE_ID` that is migrated.
+const ROOT_FIELDS: &str =
+    "id,name,mimeType,size,md5Checksum,modifiedTime,driveId,resourceKey,trashed";
+
+/// The prefix of the Google Workspace MIME types.
+const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
+
+/// What a migration knows about a source file (not a folder).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct SourceFile {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) mime_type: String,
+    pub(super) size: Option<i64>,
+    pub(super) md5: Option<String>,
+    pub(super) modified_time: Option<DateTime<Utc>>,
+}
+
+impl SourceFile {
+    fn of(file: &File) -> Self {
+        SourceFile {
+            id: file.id.clone().unwrap_or_default(),
+            name: file.name.clone().unwrap_or_default(),
+            mime_type: file.mime_type.clone().unwrap_or_default(),
+            size: file.size,
+            md5: file.md5_checksum.clone(),
+            modified_time: file.modified_time,
+        }
+    }
+
+    /// The file as the relay takes it: the fields of a listing.
+    pub(super) fn to_drive_file(&self) -> File {
+        File {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            mime_type: Some(self.mime_type.clone()),
+            size: self.size,
+            md5_checksum: self.md5.clone(),
+            modified_time: self.modified_time,
+            ..File::default()
+        }
+    }
+
+    /// The size of the content of a blob; `None` when Drive has none (shortcuts) and for
+    /// Workspace files, whose size says nothing about their export.
+    pub(super) fn content_size(&self) -> Option<u64> {
+        if self.is_native() {
+            return None;
+        }
+        self.size.and_then(|size| u64::try_from(size).ok())
+    }
+
+    /// [`Self::content_size`], 0 without one.
+    pub(super) fn bytes(&self) -> u64 {
+        self.content_size().unwrap_or_default()
+    }
+
+    /// A Google Docs, Sheets, ... file: migrated by export and conversion.
+    pub(super) fn is_native(&self) -> bool {
+        self.mime_type.starts_with(GOOGLE_APPS_PREFIX)
+            && self.mime_type != drive_file::MIME_TYPE_DRIVE_SHORTCUT
+            && self.mime_type != drive_file::MIME_TYPE_DRIVE_FOLDER
+    }
+}
+
+/// A source file and its path from the `FILE_ID` it was found under.
+#[derive(Debug, Clone)]
+pub(super) struct SourceItem {
+    pub(super) file: SourceFile,
+    /// The Drive names joined with `/`, starting with the name of the `FILE_ID`.
+    pub(super) label: String,
+}
+
+/// A source folder and what the walk found in it.
+#[derive(Debug)]
+pub(super) struct SourceFolder {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) label: String,
+    pub(super) children: Vec<SourceNode>,
+    /// Drive reported an incomplete search for it: some children may be missing.
+    pub(super) incomplete: bool,
+    /// The folder could not be listed ([`Error::ListSource`]) or is its own ancestor
+    /// ([`Error::Cycle`]): it is not migrated.
+    pub(super) error: Option<Error>,
+}
+
+#[derive(Debug)]
+pub(super) enum SourceNode {
+    File(SourceItem),
+    Folder(SourceFolder),
+}
+
+impl SourceNode {
+    pub(super) fn name(&self) -> &str {
+        match self {
+            SourceNode::File(item) => &item.file.name,
+            SourceNode::Folder(folder) => &folder.name,
+        }
+    }
+}
+
+/// What the walk found, for the first line of output and for the progress.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Totals {
+    pub(super) files: u64,
+    pub(super) folders: u64,
+    pub(super) bytes: u64,
+    /// Some folder was listed incompletely.
+    pub(super) incomplete: bool,
+}
+
+impl Totals {
+    pub(super) fn add(&mut self, node: &SourceNode) {
+        let mut pending = vec![node];
+        while let Some(node) = pending.pop() {
+            match node {
+                SourceNode::File(item) => {
+                    self.files += 1;
+                    self.bytes += item.file.bytes();
+                }
+                SourceNode::Folder(folder) => {
+                    self.folders += 1;
+                    self.incomplete |= folder.incomplete;
+                    pending.extend(&folder.children);
+                }
+            }
+        }
+    }
+}
+
+/// Gets the source file `id` and, for a folder, lists everything in it, `listing_jobs`
+/// requests at once. Incomplete searches are warned about on stderr as they come.
+pub(super) async fn discover(
+    hub: &Hub,
+    id: &str,
+    listing_jobs: usize,
+    printer: &Printer,
+) -> Result<SourceNode, Error> {
+    let file = get(hub, id).await.map_err(|source| Error::GetSource {
+        id: id.to_owned(),
+        source,
+    })?;
+    if !drive_file::is_directory(&file) {
+        let file = SourceFile::of(&file);
+        let label = file.name.clone();
+        return Ok(SourceNode::File(SourceItem { file, label }));
+    }
+    Ok(SourceNode::Folder(
+        walk(hub, file, listing_jobs, printer).await,
+    ))
+}
+
+async fn get(hub: &Hub, id: &str) -> Result<File, Box<google_drive3::Error>> {
+    let (_, file) = retry_read(hub.retrier(), "files.get", |mut delegate| async move {
+        hub.files()
+            .get(id)
+            .param("fields", ROOT_FIELDS)
+            .supports_all_drives(true)
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .doit()
+            .await
+    })
+    .await
+    .map_err(Box::new)?;
+    Ok(file)
+}
+
+/// A folder while the walk runs.
+#[derive(Debug, Default)]
+struct Building {
+    children: Vec<Pending>,
+    done: bool,
+    incomplete: bool,
+    error: Option<Error>,
+}
+
+/// A child whose folder, if it is one, is assembled after the walk.
+#[derive(Debug)]
+enum Pending {
+    File(SourceFile),
+    /// `None`: not listed, a folder that is its own ancestor (or has no id).
+    Folder(SourceFile, Option<FolderKey>),
+}
+
+async fn walk(hub: &Hub, root: File, listing_jobs: usize, printer: &Printer) -> SourceFolder {
+    let walk_root = WalkRoot {
+        id: root.id.clone().unwrap_or_default(),
+        name: root.name.clone().unwrap_or_default(),
+        drive_id: root.drive_id.clone(),
+        resource_key: root.resource_key.clone(),
+    };
+    let root = SourceFile::of(&root);
+    let options = WalkOptions {
+        listing_jobs,
+        ..WalkOptions::default()
+    };
+    let mut walk = Walk::start(Arc::new(hub.clone()), walk_root, options);
+
+    let mut folders: HashMap<FolderKey, Building> = HashMap::new();
+    while let Some(item) = walk.next().await {
+        match item {
+            WalkItem::Entry(entry) => {
+                let file = SourceFile::of(&entry.file);
+                let pending = match (entry.kind, entry.children) {
+                    (EntryKind::Folder, Children::Listed(key)) => Pending::Folder(file, Some(key)),
+                    (EntryKind::Folder, Children::None | Children::Cycle) => {
+                        Pending::Folder(file, None)
+                    }
+                    _ => Pending::File(file),
+                };
+                folders
+                    .entry(entry.parent)
+                    .or_default()
+                    .children
+                    .push(pending);
+            }
+            WalkItem::FolderDone(key) => folders.entry(key).or_default().done = true,
+            WalkItem::FolderError(error) => {
+                let key = error.folder.key;
+                folders.entry(key).or_default().error = Some(Error::ListSource(error));
+            }
+            WalkItem::IncompleteSearch(incomplete) => {
+                for folder in &incomplete.folders {
+                    folders.entry(folder.key).or_default().incomplete = true;
+                    printer
+                        .err(format!(
+                            "Warning: Drive did not search everything while listing '{}', some \
+                            files may be missing",
+                            label_of(&root.name, &folder.components)
+                        ))
+                        .await;
+                }
+            }
+        }
+    }
+    assemble(
+        FolderKey::ROOT,
+        root.id,
+        root.name.clone(),
+        root.name,
+        &mut folders,
+    )
+}
+
+/// The path of a folder of the walk below the root `root`.
+fn label_of(root: &str, components: &[String]) -> String {
+    std::iter::once(root)
+        .chain(components.iter().map(String::as_str))
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The folder `key` with everything below it, from the folders of the walk. A folder the walk
+/// did not finish counts as listed incompletely.
+fn assemble(
+    key: FolderKey,
+    id: String,
+    name: String,
+    label: String,
+    folders: &mut HashMap<FolderKey, Building>,
+) -> SourceFolder {
+    let building = folders.remove(&key).unwrap_or_default();
+    let incomplete = building.incomplete || !building.done;
+    let children = building
+        .children
+        .into_iter()
+        .map(|child| match child {
+            Pending::File(file) => {
+                let label = format!("{label}/{}", file.name);
+                SourceNode::File(SourceItem { file, label })
+            }
+            Pending::Folder(file, Some(key)) => {
+                let child_label = format!("{label}/{}", file.name);
+                SourceNode::Folder(assemble(key, file.id, file.name, child_label, folders))
+            }
+            Pending::Folder(file, None) => SourceNode::Folder(SourceFolder {
+                label: format!("{label}/{}", file.name),
+                id: file.id,
+                name: file.name,
+                children: Vec::new(),
+                incomplete: false,
+                error: Some(Error::Cycle),
+            }),
+        })
+        .collect();
+    SourceFolder {
+        id,
+        name,
+        label,
+        children,
+        incomplete: incomplete && building.error.is_none(),
+        error: building.error,
+    }
+}
