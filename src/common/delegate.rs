@@ -32,6 +32,13 @@ pub(crate) struct UploadDelegateConfig {
 /// The helper's retry contract (vendor/google-apis-common/GDRIVE-PATCHES.md): after
 /// `Retry::After` a failed chunk is resent from its first byte, a transport error resends the
 /// same chunk, and a 308 that took none of the chunk is handed to `http_failure` like a failure.
+///
+/// Throttle limitation: the helper calls the delegate synchronously and never awaits it, so a
+/// rate limit signaled to the shared [`Throttle`] by another request does not hold back the
+/// chunks of an upload that is already running; only its retries (whose `Retry::After` includes
+/// the throttle's hold) and the start of the next upload wait for it. Waiting for the throttle
+/// before every chunk needs the gdrive-owned resumable uploader (milestone 2, item 1 of
+/// docs/triage/README.md), which sends its chunks itself.
 pub(crate) struct UploadDelegate<'a> {
     config: &'a UploadDelegateConfig,
     retry: RetryState,
