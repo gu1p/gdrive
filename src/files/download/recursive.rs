@@ -133,7 +133,11 @@ async fn finish(
             .await;
     }
     printer.err(report.summary()).await;
-    printer.flush().await;
+    // A lost output is the first thing to fix; the rest of the report may follow from it.
+    printer
+        .flush()
+        .await
+        .map_err(errors::Download::WriteOutput)?;
 
     result
 }

@@ -15,10 +15,14 @@ use futures::{future, stream, Stream, StreamExt};
 use tokio::{sync::Semaphore, time::sleep};
 
 use super::{
-    capture::output, Counts, Job, JobKind, JobOutput, Options, Outcome, Printer, Report, Scheduler,
-    SkipReason, Subtree,
+    capture::{output, Captured},
+    Counts, Job, JobKind, JobOutput, Options, Outcome, Printer, Report, Scheduler, SkipReason,
+    Subtree,
 };
-use crate::transfer::progress::{JobId, ProgressEvent, ProgressSink};
+use crate::{
+    common::table::FailingWriter,
+    transfer::progress::{JobId, ProgressEvent, ProgressSink},
+};
 
 fn options(jobs: usize, continue_on_error: bool) -> Options {
     Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error)
@@ -206,7 +210,7 @@ async fn the_first_failure_stops_the_run_and_cleans_up_the_running_jobs() {
     let report = Scheduler::new(options(2, false), output.printer.clone())
         .run(source, future::pending())
         .await;
-    output.printer.flush().await;
+    output.printer.flush().await.unwrap();
 
     assert!(report.stopped);
     assert_eq!(report.files.failed, 1);
@@ -239,7 +243,7 @@ async fn continue_on_error_finishes_the_other_jobs_and_still_fails() {
     jobs.push(failure("worse", 10 * MS));
 
     let report = run(options(2, true), &output.printer, jobs).await;
-    output.printer.flush().await;
+    output.printer.flush().await.unwrap();
 
     assert!(!report.stopped);
     assert_eq!(
@@ -266,7 +270,7 @@ async fn cancel_aborts_the_running_jobs_and_runs_their_cleanup() {
     let report = Scheduler::new(options(3, true), output.printer.clone())
         .run(stream::iter(jobs), sleep(50 * MS))
         .await;
-    output.printer.flush().await;
+    output.printer.flush().await.unwrap();
 
     assert!(report.interrupted);
     assert!(!report.stopped);
@@ -299,7 +303,7 @@ async fn a_panicking_job_fails_and_is_cleaned_up() {
     });
 
     let report = run(options(1, true), &output.printer, vec![job]).await;
-    output.printer.flush().await;
+    output.printer.flush().await.unwrap();
 
     assert_eq!(report.files.failed, 1);
     assert_eq!(cleaned.load(Ordering::SeqCst), 1);
@@ -503,7 +507,7 @@ async fn lines_of_parallel_jobs_stay_whole_and_in_order() {
         .collect();
 
     run(options(8, false), &output.printer, jobs).await;
-    output.printer.flush().await;
+    output.printer.flush().await.unwrap();
 
     let lines = output.out.lines();
     assert_eq!(lines.len(), 60);
@@ -618,4 +622,72 @@ fn options_scale_the_queue_with_the_jobs() {
         (4, 2, 8)
     );
     assert!(!options.continue_on_error);
+}
+
+/// Media jobs that each print a line to stdout and take 10 ms.
+fn printing(count: usize) -> Vec<Job> {
+    (0..count)
+        .map(|i| {
+            Job::new(JobKind::Media, format!("f{i}"), move |context| async move {
+                context.printer.out(format!("f{i}: id-{i}")).await;
+                sleep(10 * MS).await;
+                Outcome::Transferred { bytes: 1 }.into()
+            })
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_output_that_cannot_be_written_stops_the_run_and_fails_it() {
+    let err = Captured::default();
+    let printer = Printer::to(FailingWriter(io::ErrorKind::StorageFull), err.clone());
+
+    let report = run(options(2, false), &printer, printing(20)).await;
+
+    assert!(report.output_failed);
+    assert!(report.files.transferred < 20, "{:?}", report.files);
+    assert!(report.files.cancelled > 0, "{:?}", report.files);
+    let error = printer.flush().await.unwrap_err();
+    assert!(
+        crate::error_message(&error).starts_with("Error: unable to write to stdout: "),
+        "{error}"
+    );
+    let incomplete = report.check().unwrap_err().to_string();
+    assert!(
+        incomplete.starts_with("the output could not be written, "),
+        "{incomplete}"
+    );
+    // stderr still works: the summary of the caller would reach it.
+    printer.err("Summary").await;
+    assert!(printer.flush().await.is_err(), "the failure stays");
+    assert_eq!(err.lines(), ["Summary"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn continue_on_error_finishes_the_jobs_when_the_output_fails() {
+    let printer = Printer::to(
+        FailingWriter(io::ErrorKind::StorageFull),
+        Captured::default(),
+    );
+
+    let report = run(options(2, true), &printer, printing(10)).await;
+
+    assert_eq!(report.files.transferred, 10);
+    assert!(report.output_failed);
+    assert!(report.check().is_err());
+    assert!(printer.flush().await.is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_closed_pipe_ends_the_output_quietly() {
+    let err = Captured::default();
+    let printer = Printer::to(FailingWriter(io::ErrorKind::BrokenPipe), err.clone());
+
+    let report = run(options(2, false), &printer, printing(10)).await;
+
+    assert_eq!(report.files.transferred, 10);
+    assert!(!report.output_failed);
+    assert!(report.check().is_ok());
+    printer.flush().await.unwrap();
+    assert_eq!(err.lines(), Vec::<String>::new());
 }

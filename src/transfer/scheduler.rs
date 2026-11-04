@@ -39,10 +39,13 @@
 //! - A job that ends failed or cancelled takes its [`Subtree`] with it: an upload folder that
 //!   could not be created counts every file and folder below it as cancelled.
 //! - Output: jobs print through the run's [`Printer`], a single task that writes whole lines in
-//!   the order it receives them, so parallel jobs never interleave their lines.
+//!   the order it receives them, so parallel jobs never interleave their lines. Output that
+//!   cannot be written (a full disk behind stdout, not a closed pipe) stops the run like a
+//!   failure, and fails the report.
 
 #[cfg(test)]
 pub(crate) mod capture;
+mod printer;
 #[cfg(test)]
 mod tests;
 
@@ -51,17 +54,15 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter, Write as _},
     future::Future,
-    io::{self, Write},
     num::NonZeroUsize,
     pin::{pin, Pin},
     sync::Arc,
 };
 
 use futures::{future::BoxFuture, FutureExt, Stream, StreamExt};
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::{self, JoinError, JoinSet},
-};
+use tokio::task::{self, JoinError, JoinSet};
+
+pub(crate) use printer::{OutputError, Printer};
 
 use super::{
     progress::{JobId, JobProgress, NoProgress, ProgressEvent, ProgressSink},
@@ -341,6 +342,8 @@ pub(crate) struct Report {
     pub(crate) stopped: bool,
     /// The run was cancelled from outside (Ctrl-C).
     pub(crate) interrupted: bool,
+    /// The printer could not write the output ([`Printer::flush`] has the error).
+    pub(crate) output_failed: bool,
 }
 
 impl Report {
@@ -397,7 +400,8 @@ impl Report {
 
     /// `Ok` when every item ended without a failure and the run was not interrupted.
     pub(crate) fn check(&self) -> Result<(), Incomplete> {
-        if self.files.failed == 0 && self.folders.failed == 0 && !self.interrupted {
+        let failed = self.files.failed + self.folders.failed;
+        if failed == 0 && !self.interrupted && !self.output_failed {
             return Ok(());
         }
         Err(Incomplete {
@@ -406,6 +410,7 @@ impl Report {
             cancelled: self.files.cancelled + self.folders.cancelled,
             stopped: self.stopped && !self.interrupted,
             interrupted: self.interrupted,
+            output_failed: self.output_failed,
         })
     }
 }
@@ -418,12 +423,15 @@ pub(crate) struct Incomplete {
     cancelled: u64,
     stopped: bool,
     interrupted: bool,
+    output_failed: bool,
 }
 
 impl Display for Incomplete {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         if self.interrupted {
             f.write_str("interrupted")?;
+        } else if self.failed_files + self.failed_folders == 0 && self.output_failed {
+            f.write_str("the output could not be written")?;
         } else {
             match (self.failed_files, self.failed_folders) {
                 (files, 0) => write!(f, "{} failed", plural(files, "file", "files"))?,
@@ -578,6 +586,7 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
         let mut cancel = pin!(cancel.fuse());
 
         loop {
+            self.output_check();
             self.start_ready();
             let pull = self.source.is_some() && !self.stopping && self.queued() < self.queue();
             // Nothing runs, so nothing is queued either: every queued job of a kind with a free
@@ -610,6 +619,16 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
         }
 
         self.report
+    }
+
+    /// A failed output stops the run like a failed job: what it prints is lost.
+    fn output_check(&mut self) {
+        if !self.report.output_failed && self.printer.failed() {
+            self.report.output_failed = true;
+            if !self.options.continue_on_error {
+                self.stop();
+            }
+        }
     }
 
     fn queue(&self) -> usize {
@@ -851,89 +870,3 @@ impl Display for JobPanicked {
 }
 
 impl Error for JobPanicked {}
-
-/// The only writer to stdout and stderr while a run goes on: one task writes the lines that the
-/// clones send, each whole and in the order received. Cloning is cheap; the task ends when the
-/// last clone is dropped.
-#[derive(Debug, Clone)]
-pub(crate) struct Printer {
-    sender: mpsc::Sender<Message>,
-}
-
-#[derive(Debug)]
-enum Message {
-    Line { target: Target, text: String },
-    Flush(oneshot::Sender<()>),
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Target {
-    Stdout,
-    Stderr,
-}
-
-impl Printer {
-    /// Lines waiting for the writer before a sender waits.
-    const CAPACITY: usize = 256;
-
-    /// A printer to the process's stdout and stderr, on the current runtime.
-    #[must_use]
-    pub(crate) fn stdio() -> Printer {
-        Printer::to(io::stdout(), io::stderr())
-    }
-
-    /// A printer to `out` and `err`, on the current runtime.
-    #[must_use]
-    pub(crate) fn to<O, E>(mut out: O, mut err: E) -> Printer
-    where
-        O: Write + Send + 'static,
-        E: Write + Send + 'static,
-    {
-        let (sender, mut messages) = mpsc::channel(Self::CAPACITY);
-        tokio::spawn(async move {
-            while let Some(message) = messages.recv().await {
-                match message {
-                    Message::Line { target, text } => {
-                        let writer: &mut dyn Write = match target {
-                            Target::Stdout => &mut out,
-                            Target::Stderr => &mut err,
-                        };
-                        // A closed stdout (a pipe whose reader exited) loses output; the
-                        // transfers go on and the exit status still tells.
-                        let _ = writeln!(writer, "{text}").and_then(|()| writer.flush());
-                    }
-                    Message::Flush(done) => {
-                        let _ = out.flush();
-                        let _ = err.flush();
-                        let _ = done.send(());
-                    }
-                }
-            }
-        });
-        Printer { sender }
-    }
-
-    /// Prints `line` and a newline to stdout.
-    pub(crate) async fn out(&self, line: impl Into<String>) {
-        self.send(Target::Stdout, line.into()).await;
-    }
-
-    /// Prints `line` and a newline to stderr.
-    pub(crate) async fn err(&self, line: impl Into<String>) {
-        self.send(Target::Stderr, line.into()).await;
-    }
-
-    /// Waits until every line sent before is written, so that output printed directly
-    /// afterwards follows it.
-    pub(crate) async fn flush(&self) {
-        let (done, written) = oneshot::channel();
-        if self.sender.send(Message::Flush(done)).await.is_ok() {
-            let _ = written.await;
-        }
-    }
-
-    async fn send(&self, target: Target, text: String) {
-        // The task only ends with the last sender, so this cannot fail while `self` lives.
-        let _ = self.sender.send(Message::Line { target, text }).await;
-    }
-}

@@ -13,13 +13,14 @@ use super::upload_directory;
 use crate::{
     common::{
         delegate::UploadDelegateConfig, drive_file::MIME_TYPE_DRIVE_FOLDER, retry::RetryPolicy,
+        table::FailingWriter,
     },
     files::upload::{CommonConfig, Error, UploadDirectoryConfig},
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
         scheduler::{
             capture::{output, Captured},
-            Options,
+            Options, Printer,
         },
     },
 };
@@ -81,26 +82,28 @@ impl Uploaded {
 
 async fn upload(server: &FakeDrive, config: UploadDirectoryConfig) -> Uploaded {
     let output = output();
-    let hub = server.hub();
-    let delegate_config = UploadDelegateConfig {
-        retry_policy: RetryPolicy::for_tests(),
-        ..UploadDelegateConfig::default()
-    };
-    let run = upload_directory(
-        &hub,
-        config,
-        &delegate_config,
-        &output.printer,
-        future::pending(),
-    );
-    let result = tokio::time::timeout(Duration::from_secs(20), run)
-        .await
-        .expect("the upload should end");
+    let result = upload_through(server, config, &output.printer).await;
     Uploaded {
         result,
         out: output.out,
         err: output.err,
     }
+}
+
+async fn upload_through(
+    server: &FakeDrive,
+    config: UploadDirectoryConfig,
+    printer: &Printer,
+) -> Result<(), Error> {
+    let hub = server.hub();
+    let delegate_config = UploadDelegateConfig {
+        retry_policy: RetryPolicy::for_tests(),
+        ..UploadDelegateConfig::default()
+    };
+    let run = upload_directory(&hub, config, &delegate_config, printer, future::pending());
+    tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the upload should end")
 }
 
 fn is_folder(created: &Created) -> bool {
@@ -348,4 +351,28 @@ async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
         "Summary: 3 transferred (7 B), 0 unchanged, 0 skipped, 0 failed, 3 cancelled; \
         1 folder failed"
     );
+}
+
+#[tokio::test]
+async fn ids_that_cannot_be_printed_fail_the_upload() {
+    let (_dir, root) = local_tree();
+    let server = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let mut config = config(&root, 2, false);
+    config.common.print_only_id = true;
+    let err = Captured::default();
+    let printer = Printer::to(FailingWriter(std::io::ErrorKind::StorageFull), err.clone());
+
+    let result = upload_through(&server, config, &printer).await;
+
+    let error = crate::error_message(&result.unwrap_err());
+    assert!(
+        error.starts_with(
+            "Error: unable to write the output of the recursive upload: unable to write to \
+            stdout: "
+        ),
+        "{error}"
+    );
+    // The upload stopped once the first id was lost.
+    assert!(server.created().len() < 10, "{:?}", server.created());
+    assert!(err.text().contains("Summary: "));
 }

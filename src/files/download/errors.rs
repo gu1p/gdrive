@@ -9,7 +9,7 @@ use crate::{
         local_name::UnusableName,
         media_client::MediaError,
     },
-    transfer::scheduler::Incomplete,
+    transfer::scheduler::{Incomplete, OutputError},
 };
 
 #[derive(Debug)]
@@ -48,6 +48,8 @@ pub(crate) enum Download {
     Incomplete(Incomplete),
     /// Drive reported `incompleteSearch` while listing a recursive download.
     IncompleteListing,
+    /// stdout or stderr of a recursive download could not be written.
+    WriteOutput(OutputError),
 }
 
 impl Display for Download {
@@ -113,6 +115,9 @@ impl Display for Download {
                 write!(f, "unable to download '{}'", path.display())
             }
             Download::Incomplete(_) => f.write_str("the recursive download is incomplete"),
+            Download::WriteOutput(_) => {
+                f.write_str("unable to write the output of the recursive download")
+            }
             Download::IncompleteListing => f.write_str(
                 "Drive did not search everything while listing the folders, some files may be \
                 missing; use --continue-on-error to accept an incomplete listing",
@@ -145,6 +150,7 @@ impl Error for Download {
             Download::SaveBodyToFile { source, .. } => Some(source),
             Download::RecursiveFile { source, .. } => Some(source),
             Download::Incomplete(source) => Some(source),
+            Download::WriteOutput(source) => Some(source),
         }
     }
 }

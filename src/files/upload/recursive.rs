@@ -86,7 +86,8 @@ pub(super) async fn upload_directory(
             .await;
     }
     printer.err(report.summary()).await;
-    printer.flush().await;
+    // A lost output (the ids of --print-only-id) is the first thing to fix.
+    printer.flush().await.map_err(Error::WriteOutput)?;
     result
 }
 

@@ -296,6 +296,8 @@ pub(crate) enum Error {
     },
     /// Files or folders of a recursive upload failed, or it was interrupted.
     Incomplete(scheduler::Incomplete),
+    /// stdout or stderr of a recursive upload could not be written.
+    WriteOutput(scheduler::OutputError),
 }
 
 impl error::Error for Error {
@@ -310,6 +312,7 @@ impl error::Error for Error {
             Error::CreateFileTree(file_tree) => Some(file_tree),
             Error::RecursiveItem { source, .. } => Some(source),
             Error::Incomplete(source) => Some(source),
+            Error::WriteOutput(source) => Some(source),
         }
     }
 }
@@ -340,6 +343,9 @@ impl Display for Error {
                 write!(f, "unable to upload '{}'", path.display())
             }
             Error::Incomplete(_) => f.write_str("the recursive upload is incomplete"),
+            Error::WriteOutput(_) => {
+                f.write_str("unable to write the output of the recursive upload")
+            }
         }
     }
 }
