@@ -10,7 +10,7 @@ use google_drive3::api::File;
 
 use super::Error;
 use crate::{
-    common::{drive_file, retry::retry_read},
+    common::{drive_file, local_name, retry::retry_read},
     hub::Hub,
     transfer::{
         scheduler::Printer,
@@ -87,8 +87,19 @@ impl SourceFile {
 #[derive(Debug, Clone)]
 pub(super) struct SourceItem {
     pub(super) file: SourceFile,
-    /// The Drive names joined with `/`, starting with the name of the `FILE_ID`.
+    /// The Drive names joined with `/`, starting with the name of the `FILE_ID`, with control
+    /// characters escaped ([`label`]): for output only.
     pub(super) label: String,
+}
+
+/// `name` below the folder labelled `parent` (none for a `FILE_ID`), with control characters
+/// escaped: a name with a newline or an escape sequence cannot break or forge a line.
+pub(super) fn label(parent: Option<&str>, name: &str) -> String {
+    let name = local_name::printable(name);
+    match parent {
+        Some(parent) => format!("{parent}/{name}"),
+        None => name.into_owned(),
+    }
 }
 
 /// A source folder and what the walk found in it.
@@ -163,7 +174,7 @@ pub(super) async fn discover(
     })?;
     if !drive_file::is_directory(&file) {
         let file = SourceFile::of(&file);
-        let label = file.name.clone();
+        let label = label(None, &file.name);
         return Ok(SourceNode::File(SourceItem { file, label }));
     }
     Ok(SourceNode::Folder(
@@ -255,21 +266,21 @@ async fn walk(hub: &Hub, root: File, listing_jobs: usize, printer: &Printer) -> 
             }
         }
     }
+    let root_label = label(None, &root.name);
     assemble(
         FolderKey::ROOT,
         root.id,
-        root.name.clone(),
         root.name,
+        root_label,
         &mut folders,
     )
 }
 
-/// The path of a folder of the walk below the root `root`.
+/// The label of a folder of the walk below the root `root`.
 fn label_of(root: &str, components: &[String]) -> String {
-    std::iter::once(root)
-        .chain(components.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join("/")
+    components
+        .iter()
+        .fold(label(None, root), |parent, name| label(Some(&parent), name))
 }
 
 /// The folder `key` with everything below it, from the folders of the walk. A folder the walk
@@ -288,15 +299,15 @@ fn assemble(
         .into_iter()
         .map(|child| match child {
             Pending::File(file) => {
-                let label = format!("{label}/{}", file.name);
+                let label = self::label(Some(&label), &file.name);
                 SourceNode::File(SourceItem { file, label })
             }
             Pending::Folder(file, Some(key)) => {
-                let child_label = format!("{label}/{}", file.name);
+                let child_label = self::label(Some(&label), &file.name);
                 SourceNode::Folder(assemble(key, file.id, file.name, child_label, folders))
             }
             Pending::Folder(file, None) => SourceNode::Folder(SourceFolder {
-                label: format!("{label}/{}", file.name),
+                label: self::label(Some(&label), &file.name),
                 id: file.id,
                 name: file.name,
                 children: Vec::new(),
