@@ -1012,3 +1012,77 @@ async fn an_existing_export_fails_without_overwrite_and_is_replaced_with_it() {
         "new"
     );
 }
+
+#[tokio::test]
+async fn an_unchanged_export_is_not_exported_again() {
+    let document = |modified: &str| {
+        vec![
+            FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, modified)
+                .modified(modified),
+            // Without modifiedTime nothing tells that it is unchanged.
+            FakeFile::native("undated", "undated", "root", MIME_TYPE_DRIVE_DOCUMENT, "x"),
+        ]
+    };
+    let destination = tempfile::tempdir().unwrap();
+    let report = local(destination.path(), "Root/report.docx");
+    let overwrite = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..exporting(destination.path(), "default", false)
+    };
+
+    let server = FakeDrive::start(document("2024-05-06T07:08:09.123Z"), Behavior::default()).await;
+    download(&server, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    assert_eq!(server.exports().len(), 2);
+
+    // Unchanged on Drive: left alone, with --overwrite and without.
+    for config in [&overwrite, &exporting(destination.path(), "default", true)] {
+        let again = download(&server, config, future::pending()).await;
+        let summary = again.err.lines().last().unwrap().clone();
+        if config.existing_file_action == ExistingFileAction::Overwrite {
+            again.result.unwrap();
+            assert_eq!(
+                summary,
+                "Summary: 1 transferred (1 B), 1 unchanged, 0 skipped, 0 failed, 0 cancelled"
+            );
+        } else {
+            // The undated export exists and cannot be told unchanged.
+            assert_eq!(
+                summary,
+                "Summary: 0 transferred (0 B), 1 unchanged, 0 skipped, 1 failed, 0 cancelled"
+            );
+        }
+    }
+    let exported = server.exports();
+    assert_eq!(
+        exported.iter().filter(|(id, _)| id == "doc").count(),
+        1,
+        "{exported:?}"
+    );
+
+    // Edited on Drive: exported again with --overwrite, an error without.
+    let edited = FakeDrive::start(document("2024-05-06T07:08:10Z"), Behavior::default()).await;
+    let strict = download(
+        &edited,
+        &exporting(destination.path(), "default", true),
+        future::pending(),
+    )
+    .await;
+    assert!(strict
+        .error()
+        .starts_with("Error: the recursive download is incomplete: 2 files failed"));
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "2024-05-06T07:08:09.123Z"
+    );
+    download(&edited, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "2024-05-06T07:08:10Z"
+    );
+}

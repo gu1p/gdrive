@@ -52,14 +52,28 @@ pub(crate) async fn export(config: Config) -> Result<(), Error> {
     export_with_hub(&hub, config).await
 }
 
+/// Exports the document to `config.file_path`. Without `--overwrite`, an existing file is an
+/// error unless it is an unchanged export of the document ([`is_unchanged_export`]), which is
+/// left alone. The exported file gets the document's `modifiedTime` as its modification time.
 async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
-    if config.file_path.exists() && config.existing_file_action == ExistingFileAction::Abort {
-        return Err(Error::FileExists(config.file_path));
-    }
+    let keep_existing =
+        config.file_path.exists() && config.existing_file_action == ExistingFileAction::Abort;
 
     let file = files::info::get_file(hub, &config.file_id)
         .await
         .map_err(|err| Error::GetFile(Box::new(err)))?;
+
+    if keep_existing {
+        if is_unchanged_export(&config.file_path, file.modified_time).await {
+            println!(
+                "Skipping export of '{}': {} is up to date",
+                file.name.as_deref().unwrap_or_default().escape_debug(),
+                config.file_path.display()
+            );
+            return Ok(());
+        }
+        return Err(Error::FileExists(config.file_path));
+    }
 
     let drive_mime = file.mime_type.ok_or(Error::MissingDriveMime)?;
     let Some(doc_type) = DocType::from_mime_type(&drive_mime) else {
@@ -108,6 +122,14 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
     files::download::save_to_file(download, first, &config.file_path, &config.file_id)
         .await
         .map_err(Error::SaveFile)?;
+    if let Some(modified_time) = file.modified_time {
+        if let Err(err) = set_modified_time(&config.file_path, modified_time).await {
+            eprintln!(
+                "Warning: unable to set the modification time of '{}': {err}",
+                config.file_path.display()
+            );
+        }
+    }
 
     println!("Successfully exported {}", config.file_path.display());
 
@@ -180,6 +202,25 @@ impl error::Error for ExportTooLarge {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         Some(self.0.as_ref())
     }
+}
+
+/// Whether the local file at `path` is an unchanged export of a document last modified at
+/// `modified_time` (Drive's `modifiedTime`): a regular file whose modification time is
+/// `modified_time`, to the second. gdrive gives every export that time, and an edit of the
+/// document changes `modifiedTime`. Compared to the second so that filesystems that keep
+/// coarser times than Drive's milliseconds (exFAT, HFS+) still match; on FAT, with two-second
+/// times, half the exports are simply exported again. `false` without `modified_time`.
+pub(crate) async fn is_unchanged_export(path: &Path, modified_time: Option<DateTime<Utc>>) -> bool {
+    let Some(modified_time) = modified_time else {
+        return false;
+    };
+    let Ok(metadata) = tokio::fs::symlink_metadata(path).await else {
+        return false;
+    };
+    metadata.is_file()
+        && metadata.modified().is_ok_and(|local| {
+            DateTime::<Utc>::from(local).timestamp() == modified_time.timestamp()
+        })
 }
 
 /// Sets the modification time of the file at `path` to `time`, the Drive file's `modifiedTime`.
@@ -416,6 +457,98 @@ mod tests {
                 .starts_with("export of a document to this file type is not supported"),
             "{error}"
         );
+    }
+
+    /// Sets the modification time of `path` to the RFC 3339 `time`.
+    fn set_mtime(path: &std::path::Path, time: &str) {
+        let time = chrono::DateTime::parse_from_rfc3339(time).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::from(time))
+            .unwrap();
+    }
+
+    fn mtime_millis(path: &std::path::Path) -> i64 {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        chrono::DateTime::<chrono::Utc>::from(modified).timestamp_millis()
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_export_is_kept_without_overwrite_and_replaced_with_it() {
+        let file = json!({
+            "id": "doc",
+            "name": "Notes",
+            "mimeType": MIME_TYPE_DRIVE_DOCUMENT,
+            "modifiedTime": "2024-05-06T07:08:09.123Z",
+        });
+        let server = MockServer::start(vec![
+            Response::json(200, &file),
+            Response::json(200, &file),
+            Response::raw(200, "fresh"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "exported before").unwrap();
+        set_mtime(&path, "2024-05-06T07:08:09Z");
+        let config = |existing_file_action| Config {
+            file_id: String::from("doc"),
+            file_path: path.clone(),
+            existing_file_action,
+            format: None,
+        };
+
+        export_with_hub(&server.hub(), config(ExistingFileAction::Abort))
+            .await
+            .unwrap();
+        crate::files::download::assert_content(&path, "exported before");
+        assert_eq!(server.requests().len(), 1, "no export");
+
+        export_with_hub(&server.hub(), config(ExistingFileAction::Overwrite))
+            .await
+            .unwrap();
+        crate::files::download::assert_content(&path, "fresh");
+        assert_eq!(mtime_millis(&path), 1_714_979_289_123);
+    }
+
+    #[tokio::test]
+    async fn a_changed_export_is_not_replaced_without_overwrite() {
+        let server = MockServer::start(vec![Response::json(
+            200,
+            &json!({
+                "id": "doc",
+                "name": "Notes",
+                "mimeType": MIME_TYPE_DRIVE_DOCUMENT,
+                "modifiedTime": "2024-05-06T07:08:10Z",
+            }),
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "exported before").unwrap();
+        set_mtime(&path, "2024-05-06T07:08:09Z");
+
+        let error = export_with_hub(
+            &server.hub(),
+            Config {
+                file_id: String::from("doc"),
+                file_path: path.clone(),
+                existing_file_action: ExistingFileAction::Abort,
+                format: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .ends_with("already exists, use --overwrite to overwrite it"),
+            "{error}"
+        );
+        crate::files::download::assert_content(&path, "exported before");
     }
 
     #[test]

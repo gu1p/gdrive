@@ -21,7 +21,10 @@
 //! the same temporary file. Exports have no md5 or size on Drive: only the size the server
 //! announces (`Content-Length`, when it sends one) is checked. Drive exports at most 10 MB per
 //! file; a larger export fails with a message that says so. The exported file gets the
-//! document's `modifiedTime` as its modification time.
+//! document's `modifiedTime` as its modification time, and a local file at the export's path
+//! with that time is an unchanged export: it is left alone, with or without `--overwrite`
+//! (where a file with content is compared by md5). Any other existing file there is replaced
+//! only with `--overwrite`.
 
 #[cfg(test)]
 mod tests;
@@ -47,7 +50,9 @@ use crate::{
         human_size::human_size,
         local_name,
     },
-    files::export::{export_content, is_export_too_large, set_modified_time, ExportTooLarge},
+    files::export::{
+        export_content, is_export_too_large, is_unchanged_export, set_modified_time, ExportTooLarge,
+    },
     hub::Hub,
     transfer::{
         scheduler::{
@@ -386,6 +391,9 @@ impl Files {
         use errors::Download as E;
 
         let abs_file_path = self.root_path.join(&export.path);
+        if is_unchanged_export(&abs_file_path, export.modified_time).await {
+            return Ok(Outcome::Unchanged);
+        }
         err_if_local_file_exists(&abs_file_path, self.existing_file_action).await?;
 
         let label = format!("export of '{}'", export.path.display());
