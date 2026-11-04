@@ -141,7 +141,7 @@ impl<'a> Identity<'a> {
 
     /// The metadata requests name the file's `resource_key`, if it has one.
     #[must_use]
-        pub(crate) fn with_resource_key(mut self, resource_key: Option<&str>) -> Self {
+    pub(crate) fn with_resource_key(mut self, resource_key: Option<&str>) -> Self {
         self.resource_key = resource_key.map(str::to_owned);
         self
     }
@@ -162,7 +162,7 @@ impl<'a> Identity<'a> {
     /// Whether the file is at another revision now than the one it started with: a field that
     /// both revisions know differs. Fields the starting revision does not know are not compared,
     /// so a caller that leaves out `version` and `modifiedTime` compares the content only.
-        pub(crate) async fn changed(&self) -> Result<bool, MediaError> {
+    pub(crate) async fn changed(&self) -> Result<bool, MediaError> {
         let current = self.fetch().await?;
         Ok(self.revision.differs_from(&current))
     }

@@ -65,7 +65,7 @@ impl<'a> MediaClient<'a> {
     /// every request it authorizes (not in those to a session URL). Without a key, or with one
     /// that cannot be a header, the client is unchanged.
     #[must_use]
-        pub(crate) fn with_resource_key(mut self, file_id: &str, resource_key: Option<&str>) -> Self {
+    pub(crate) fn with_resource_key(mut self, file_id: &str, resource_key: Option<&str>) -> Self {
         self.resource_keys = resource_keys_value(file_id, resource_key);
         self
     }
