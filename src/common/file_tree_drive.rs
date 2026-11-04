@@ -461,7 +461,7 @@ mod tests {
         common::{
             drive_file::MIME_TYPE_DRIVE_FOLDER, local_name::InvalidName, FileTreeLike, FolderLike,
         },
-        files::list,
+        files::{self, list},
         transfer::{
             fake_drive::{Behavior, FakeDrive, FakeFile},
             walk::WalkOptions,
@@ -782,6 +782,31 @@ mod tests {
         // The root's children are named as soon as the root's listing ends: of the 5 requests of
         // the whole tree, only the root's and at most the next one were sent.
         assert!(server.request_count() <= 2, "{}", server.request_count());
+    }
+
+    #[tokio::test]
+    async fn shared_drive_folder_from_its_metadata_is_listed_in_its_drive() {
+        let files = vec![
+            FakeFile::folder("root", "Root", "drive-root").in_drive("drv"),
+            FakeFile::folder("a", "a", "root").in_drive("drv"),
+            FakeFile::blob("a1", "x.txt", "a", "x").in_drive("drv"),
+        ];
+        let server = FakeDrive::start(files, Behavior::default()).await;
+        let hub = server.hub();
+
+        // The metadata request of `files download`; the fake answers only the fields it asks for.
+        let file = files::info::get_file(&hub, "root").await.unwrap();
+        assert_eq!(file.drive_id.as_deref(), Some("drv"));
+        let tree = FileTreeDrive::from_file(&hub, file).await.unwrap();
+
+        assert_eq!(file_paths(&tree), [components("Root/a/x.txt")]);
+        assert_eq!(server.gets(), ["root"]);
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            assert_eq!(request.param("corpora"), Some("drive"));
+            assert_eq!(request.param("driveId"), Some("drv"));
+        }
     }
 
     #[tokio::test]

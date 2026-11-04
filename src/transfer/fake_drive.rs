@@ -4,7 +4,8 @@
 //! server holds a set of files and answers every query from them, so it works however many
 //! requests are in flight and in whatever order they arrive. It understands the queries the walk
 //! sends: `'<id>' in parents` terms joined by `or`, and `trashed = false`. It also records every
-//! request and the most requests it had in flight at once.
+//! request and the most requests it had in flight at once. `files.get` of a stored file returns
+//! the fields its `fields` mask names, so a test can check what a metadata request asks for.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -213,6 +214,8 @@ struct State {
     files: Vec<FakeFile>,
     behavior: Behavior,
     requests: Mutex<Vec<ListRequest>>,
+    /// The ids of `files.get` requests.
+    gets: Mutex<Vec<String>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
 }
@@ -233,6 +236,7 @@ impl FakeDrive {
             files,
             behavior,
             requests: Mutex::new(Vec::new()),
+            gets: Mutex::new(Vec::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
         });
@@ -260,6 +264,11 @@ impl FakeDrive {
 
     pub(crate) fn requests(&self) -> Vec<ListRequest> {
         self.state.requests.lock().expect("requests lock").clone()
+    }
+
+    /// The file ids of the `files.get` requests, which [`Self::requests`] does not include.
+    pub(crate) fn gets(&self) -> Vec<String> {
+        self.state.gets.lock().expect("gets lock").clone()
     }
 
     pub(crate) fn request_count(&self) -> usize {
@@ -303,10 +312,6 @@ async fn handle(
 ) -> Result<FakeResponse, Infallible> {
     let _in_flight = InFlight::new(&state);
 
-    if request.method() != Method::GET || request.uri().path() != LIST_PATH {
-        return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
-    }
-
     let params = request
         .uri()
         .query()
@@ -316,6 +321,22 @@ async fn handle(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+
+    let path = request.uri().path();
+    if request.method() != Method::GET {
+        return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
+    }
+    if let Some(id) = path
+        .strip_prefix(LIST_PATH)
+        .and_then(|id| id.strip_prefix('/'))
+    {
+        state.gets.lock().expect("gets lock").push(id.to_owned());
+        return Ok(get(&state, id, &params));
+    }
+    if path != LIST_PATH {
+        return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
+    }
+
     let q = params
         .iter()
         .find(|(key, _)| key == "q")
@@ -415,6 +436,39 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     json_response(StatusCode::OK, &body)
 }
 
+/// `files.get`: the stored file with the top-level fields of the `fields` mask (all without one).
+fn get(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
+    let Some(file) = state.files.iter().find(|file| file.id == id) else {
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    };
+    let mut file = file.to_json(true);
+    let fields = params
+        .iter()
+        .find(|(key, _)| key == "fields")
+        .map(|(_, fields)| top_level_fields(fields));
+    if let (Some(fields), Some(object)) = (fields, file.as_object_mut()) {
+        object.retain(|key, _| fields.contains(key));
+    }
+    json_response(StatusCode::OK, &file)
+}
+
+/// The top-level names of a fields mask: `a,b(c,d),e` gives `a`, `b`, `e`.
+fn top_level_fields(mask: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut depth = 0_usize;
+    for c in mask.chars().chain([',']) {
+        match c {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => fields.push(std::mem::take(&mut field).trim().to_owned()),
+            c if depth == 0 => field.push(c),
+            _ => {}
+        }
+    }
+    fields
+}
+
 /// A page token is the offset and a digest of the query, so a token sent with another query is
 /// rejected as Drive would.
 fn token(offset: usize, q: &str) -> String {
@@ -473,6 +527,14 @@ fn json_response(status: StatusCode, body: &Value) -> FakeResponse {
 #[cfg(test)]
 mod tests {
     use super::parent_ids;
+
+    #[test]
+    fn top_level_fields_skip_nested_masks() {
+        assert_eq!(
+            super::top_level_fields("id, name,shortcutDetails(targetId,targetMimeType),driveId"),
+            ["id", "name", "shortcutDetails", "driveId"]
+        );
+    }
 
     #[test]
     fn parent_ids_reads_quoted_and_escaped_ids() {
