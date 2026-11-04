@@ -304,18 +304,23 @@ async fn create_temp_file(
 
         match created {
             Ok(file) => return Ok((tmp_file_path, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                // A regular file is a stale or concurrent temporary file: try the next name.
+            Err(err) => {
+                // Windows reports an existing directory as a permission error rather than
+                // AlreadyExists, so inspect the path on any failure.
                 let existing = fs::symlink_metadata(&tmp_file_path).await;
-                if existing.is_ok_and(|metadata| !metadata.is_file()) {
-                    return Err(refuse(format!(
-                        "refusing to use '{}' as a temporary file: it exists and is not a \
-                        regular file",
-                        tmp_file_path.display()
-                    )));
+                match existing {
+                    Ok(metadata) if !metadata.is_file() => {
+                        return Err(refuse(format!(
+                            "refusing to use '{}' as a temporary file: it exists and is not a \
+                            regular file",
+                            tmp_file_path.display()
+                        )));
+                    }
+                    // A regular file is a stale or concurrent temporary file: try the next name.
+                    Ok(_) if err.kind() == io::ErrorKind::AlreadyExists => {}
+                    _ => return Err(errors::SaveBodyToFile::CreateFile(err)),
                 }
             }
-            Err(err) => return Err(errors::SaveBodyToFile::CreateFile(err)),
         }
     }
 
