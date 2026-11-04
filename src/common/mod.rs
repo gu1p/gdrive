@@ -9,6 +9,7 @@ pub(crate) mod file_tree_drive;
 pub(crate) mod file_tree_like;
 pub(crate) mod hub_helper;
 pub(crate) mod id_gen;
+pub(crate) mod local_name;
 pub(crate) mod md5_writer;
 pub(crate) mod permission;
 pub(crate) mod table;
