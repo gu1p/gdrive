@@ -215,14 +215,6 @@ pub(crate) async fn upload_path(
 /// [`upload_path`] for a seekable reader, with the retry policy `policy` (and the hub's
 /// throttle). The content is the whole reader, measured when the upload starts. The content type
 /// is `target.mime`, `application/octet-stream` without one.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "for sources without a path; every command uploads files by path since the \
-                  recursive upload moved to upload_path"
-    )
-)]
 pub(crate) async fn upload_reader<R: Read + Seek + Send>(
     hub: &Hub,
     reader: R,
