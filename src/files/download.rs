@@ -205,17 +205,7 @@ async fn download_directory(
 ) -> Result<(), errors::Download> {
     let printer = Printer::stdio();
     let display = ProgressDisplay::recursive(config.progress, config.transfer.jobs);
-    let downloaded = recursive::download_directory(
-        hub,
-        file,
-        config,
-        &printer,
-        display.sink(),
-        scheduler::ctrl_c(),
-    )
-    .await;
-    display.finish();
-    downloaded
+    recursive::download_directory(hub, file, config, &printer, display, scheduler::ctrl_c()).await
 }
 
 /// The content of a Drive file: `files.get?alt=media`, which supports `Range` requests.

@@ -35,20 +35,21 @@ use crate::{
     files::mkdir,
     hub::Hub,
     transfer::{
-        progress::{ConfirmedTotal, JobProgress, ProgressEvent, ProgressSink},
+        progress::{ConfirmedTotal, JobProgress, ProgressDisplay, ProgressEvent},
         scheduler::{Job, JobContext, JobKind, JobOutput, Outcome, Printer, Scheduler, Subtree},
         upload::{upload_path, UploadOptions, UploadTarget},
     },
 };
 
-/// Uploads the local folder of `config`, printing through `printer` and reporting to
-/// `progress`, until every file is done or `cancel` resolves.
+/// Uploads the local folder of `config`, printing through `printer` and showing the progress on
+/// `progress`, until every file is done or `cancel` resolves. The progress is gone before the
+/// summary is printed.
 pub(super) async fn upload_directory(
     hub: &Hub,
     config: UploadDirectoryConfig,
     options: &UploadOptions,
     printer: &Printer,
-    progress: Arc<dyn ProgressSink>,
+    progress: ProgressDisplay,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<(), Error> {
     let UploadDirectoryConfig { file_path, common } = config;
@@ -90,14 +91,15 @@ pub(super) async fn upload_directory(
     let root = uploads.folder_job(tree.root, common.parents);
     let jobs = unreadable.chain([root]).collect::<Vec<_>>();
     // The files come as follow-ups of their folders: the totals are the walk's.
-    progress.event(&ProgressEvent::Planned {
+    progress.sink().event(&ProgressEvent::Planned {
         files: tree_info.file_count + unreadable_files,
         bytes: tree_info.total_file_size,
     });
     let report = Scheduler::new(common.transfer, printer.clone())
-        .with_progress(progress)
+        .with_progress(progress.sink())
         .run(stream::iter(jobs), cancel)
         .await;
+    progress.finish();
 
     let result = report.check().map_err(Error::Incomplete);
     if result.is_ok() && !print_only_id {

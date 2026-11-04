@@ -269,17 +269,7 @@ async fn upload_directory(
 ) -> Result<(), Error> {
     let printer = Printer::stdio();
     let display = ProgressDisplay::recursive(config.common.progress, config.common.transfer.jobs);
-    let uploaded = recursive::upload_directory(
-        hub,
-        config,
-        options,
-        &printer,
-        display.sink(),
-        scheduler::ctrl_c(),
-    )
-    .await;
-    display.finish();
-    uploaded
+    recursive::upload_directory(hub, config, options, &printer, display, scheduler::ctrl_c()).await
 }
 
 #[derive(Debug)]

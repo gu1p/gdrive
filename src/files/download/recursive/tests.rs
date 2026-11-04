@@ -22,10 +22,10 @@ use crate::{
     },
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
-        progress::{JobId, Mode, NoProgress, ProgressEvent, ProgressSink},
+        progress::{JobId, Mode, NoProgress, ProgressDisplay, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
-            Options,
+            Options, Printer,
         },
     },
 };
@@ -90,7 +90,7 @@ async fn download_reporting(
         root_folder(),
         config,
         &output.printer,
-        progress,
+        ProgressDisplay::reporting_to(progress),
         cancel,
     );
     let result = tokio::time::timeout(Duration::from_secs(20), run)
@@ -1342,4 +1342,46 @@ async fn downloaded_and_exported_bytes_are_reported_as_they_are_written() {
             "{label}: reported while it was written: {reports:?}"
         );
     }
+}
+
+/// Where the plain line of a display and the lines of the run go to one stream: the line was
+/// drawn and erased before the summary, and nothing is drawn after it.
+fn assert_progress_gone_before_the_summary(written: &str) {
+    let drawn = written.find(" files, ").expect("the progress is drawn");
+    let erased = written
+        .rfind(&format!("\r{}\r", " ".repeat(80)))
+        .expect("the progress is erased");
+    let summary = written.find("Summary: ").expect("a summary");
+    assert!(drawn < erased && erased < summary, "{written:?}");
+    assert!(!written[summary..].contains('\r'), "{written:?}");
+}
+
+#[tokio::test]
+async fn the_progress_is_gone_before_the_summary() {
+    let files = vec![
+        FakeFile::blob("a", "a.txt", "root", "a"),
+        FakeFile::blob("b", "b.txt", "root", "b"),
+    ];
+    // Long enough for the display to draw.
+    let behavior = Behavior {
+        media_delay: Duration::from_millis(500),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(files, behavior).await;
+    let destination = tempfile::tempdir().unwrap();
+    let written = Captured::default();
+    let printer = Printer::to(written.clone(), written.clone());
+
+    download_directory(
+        &server.hub(),
+        root_folder(),
+        &config(destination.path(), 2, false),
+        &printer,
+        ProgressDisplay::plain_on(written.clone()),
+        future::pending(),
+    )
+    .await
+    .unwrap();
+
+    assert_progress_gone_before_the_summary(&written.text());
 }

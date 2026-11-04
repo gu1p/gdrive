@@ -16,7 +16,7 @@ use crate::{
     files::upload::{CommonConfig, Error, UploadDirectoryConfig},
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
-        progress::{Mode, NoProgress, ProgressEvent, ProgressSink},
+        progress::{Mode, NoProgress, ProgressDisplay, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
             JobKind, Options, Printer,
@@ -135,7 +135,14 @@ async fn upload_reporting(
     cancel: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), Error> {
     let hub = server.hub();
-    let run = upload_directory(&hub, config, options, printer, progress, cancel);
+    let run = upload_directory(
+        &hub,
+        config,
+        options,
+        printer,
+        ProgressDisplay::reporting_to(progress),
+        cancel,
+    );
     tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the upload should end")
@@ -701,4 +708,41 @@ async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
     let sent = server.chunks().len();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(server.chunks().len(), sent);
+}
+
+#[tokio::test]
+async fn the_progress_is_gone_before_the_summary() {
+    let (_dir, root) = local_tree();
+    // Long enough for the display to draw.
+    let behavior = Behavior {
+        upload_delay: Duration::from_millis(150),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(Vec::new(), behavior).await;
+    let written = Captured::default();
+    let printer = Printer::to(written.clone(), written.clone());
+
+    let hub = server.hub();
+    upload_directory(
+        &hub,
+        config(&root, 2, false),
+        &UploadOptions::default(),
+        &printer,
+        ProgressDisplay::plain_on(written.clone()),
+        future::pending(),
+    )
+    .await
+    .unwrap();
+
+    // The line was drawn and erased before the last lines, and nothing is drawn after them.
+    let written = written.text();
+    let drawn = written.find(" files, ").expect("the progress is drawn");
+    let erased = written
+        .rfind(&format!("\r{}\r", " ".repeat(80)))
+        .expect("the progress is erased");
+    let uploaded = written
+        .find("Uploaded 6 files")
+        .expect("the end of the upload");
+    assert!(drawn < erased && erased < uploaded, "{written:?}");
+    assert!(!written[uploaded..].contains('\r'), "{written:?}");
 }

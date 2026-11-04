@@ -97,6 +97,26 @@ impl ProgressDisplay {
         Arc::clone(&self.sink)
     }
 
+    /// A display that draws nothing and reports to `sink`, for tests of what a command reports.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn reporting_to(sink: Arc<dyn ProgressSink>) -> ProgressDisplay {
+        ProgressDisplay { sink, drawer: None }
+    }
+
+    /// A recursive display that draws its plain line ([`Drawing::Line`]) on `out`, for tests of
+    /// what a command writes. Outside [`terminal::suspend`].
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn plain_on<W>(out: W) -> ProgressDisplay
+    where
+        W: io::Write + Send + 'static,
+    {
+        Self::open(Layout::Run { files: 0 }, Drawing::Line, false, move |hz| {
+            plain_target(out, 80, hz)
+        })
+    }
+
     /// Stops drawing and takes the bars off the terminal.
     pub(crate) fn finish(mut self) {
         if let Some(drawer) = &mut self.drawer {
