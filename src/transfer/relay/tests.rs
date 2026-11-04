@@ -109,8 +109,8 @@ fn time(text: &str) -> DateTime<Utc> {
 /// the blobs.
 const EXPORT_OFFSET: u64 = 7;
 
-/// A file of the source Drive. A blob's content is the test content from 0, an export's from
-/// [`EXPORT_OFFSET`].
+/// A file of the source Drive. A blob's content is the test content from `seed` (0 unless it
+/// changed), an export's from [`EXPORT_OFFSET`].
 #[derive(Debug, Clone)]
 struct SourceFile {
     id: String,
@@ -121,6 +121,7 @@ struct SourceFile {
     /// The `md5Checksum` the metadata reports: the content's, another one, or none.
     md5: Option<String>,
     version: i64,
+    seed: u64,
 }
 
 impl SourceFile {
@@ -132,6 +133,7 @@ impl SourceFile {
             size,
             md5: Some(md5_of(0, size)),
             version: 1,
+            seed: 0,
         }
     }
 
@@ -156,6 +158,7 @@ impl SourceFile {
             size: export_size,
             md5: None,
             version: 1,
+            seed: 0,
         }
     }
 
@@ -186,6 +189,16 @@ impl SourceFile {
         resource
     }
 
+    /// The file with another content of the same size: a new seed, version and `ETag`, and the
+    /// md5 of the new content if it had one.
+    fn changed(&mut self) {
+        self.version += 1;
+        self.seed += 1;
+        if self.md5.is_some() {
+            self.md5 = Some(md5_of(self.seed, self.size));
+        }
+    }
+
     /// What a listing has of the file: all of the resource.
     fn listing(&self) -> google_drive3::api::File {
         serde_json::from_value(self.resource()).unwrap()
@@ -210,6 +223,12 @@ struct SourceFaults {
     unstable_etag: bool,
     /// Break the first export reply off half-way.
     cut_export: bool,
+    /// The file changes (another content of the same size, a new version and `ETag`) just
+    /// before the media request with this number (from 0) is answered: after the relay checked
+    /// the metadata, before it gets the content.
+    change_before_media: Option<u32>,
+    /// Send media replies without an `ETag`.
+    no_etag: bool,
 }
 
 /// A request the source received.
@@ -392,13 +411,19 @@ fn handle(
         let cut = guard.faults.cut_export && guard.export_replies == 0;
         guard.export_replies += 1;
         drop(guard);
-        let end = EXPORT_OFFSET + file.size;
-        let stop = cut.then_some((EXPORT_OFFSET + file.size / 2, Stop::Cut));
+        let stop = cut.then_some((file.size / 2, Stop::Cut));
+        let content = Generated {
+            id: file.id.clone(),
+            base: EXPORT_OFFSET,
+            start: 0,
+            end: file.size,
+            stop,
+        };
         // No Content-Length, as Drive sends exports.
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", MIME_TYPE_DOCX)
-            .body(generated(state, served, &file.id, EXPORT_OFFSET, end, stop))
+            .body(content.body(state, served))
             .unwrap();
     }
     if !logged.is_media() {
@@ -420,8 +445,13 @@ fn media_reply(
     let reply = guard.media_replies;
     guard.media_replies += 1;
     let faults = guard.faults.clone();
-    if faults.unstable_etag {
-        if let Some(stored) = guard.files.iter_mut().find(|stored| stored.id == id) {
+    let mut file = file.clone();
+    if let Some(stored) = guard.files.iter_mut().find(|stored| stored.id == id) {
+        if faults.change_before_media == Some(reply) {
+            stored.changed();
+            file = stored.clone();
+        }
+        if faults.unstable_etag {
             stored.version += 1;
         }
     }
@@ -437,10 +467,11 @@ fn media_reply(
         .and_then(|range| range.strip_suffix('-'))
         .and_then(|first| first.parse::<u64>().ok())
         .filter(|_| !faults.ignore_range)
-        .filter(|_| logged.if_range.as_ref().is_none_or(|tag| *tag == etag));
-    let mut builder = Response::builder()
-        .header("content-type", file.mime.as_str())
-        .header("etag", etag);
+        .filter(|_| logged.if_range.as_ref().is_none_or(|tag| *tag == etag) || faults.no_etag);
+    let mut builder = Response::builder().header("content-type", file.mime.as_str());
+    if !faults.no_etag {
+        builder = builder.header("etag", etag.as_str());
+    }
     let start = match first {
         Some(first) if first >= file.size => {
             return builder
@@ -474,9 +505,16 @@ fn media_reply(
     .into_iter()
     .flatten()
     .min_by_key(|(at, _)| *at);
+    let content = Generated {
+        id: file.id.clone(),
+        base: file.seed,
+        start,
+        end: file.size,
+        stop,
+    };
     builder
         .header("content-length", file.size - start)
-        .body(generated(state, served, &file.id, start, file.size, stop))
+        .body(content.body(state, served))
         .unwrap()
 }
 
@@ -492,45 +530,59 @@ enum Stop {
 /// Bytes per frame of a generated body.
 const FRAME: u64 = 64 * KIB;
 
-/// A body with the test content from `start` to `end`, produced as it is sent and counted in
-/// `served`; broken off at the offset of `stop`.
-fn generated(
-    state: &Arc<Mutex<SourceState>>,
-    served: &Arc<AtomicU64>,
-    id: &str,
+/// A body of generated content.
+struct Generated {
+    /// The file it is the content of.
+    id: String,
+    /// Where the content starts in the test content.
+    base: u64,
+    /// The offsets in the content of the first byte and past the last one.
     start: u64,
     end: u64,
+    /// Where the body breaks off, and how.
     stop: Option<(u64, Stop)>,
-) -> Body {
-    let (state, served, id) = (Arc::clone(state), Arc::clone(served), id.to_owned());
-    let frames = futures::stream::unfold(Some(start), move |position| {
-        let (state, served, id) = (Arc::clone(&state), Arc::clone(&served), id.clone());
-        async move {
-            let position = position?;
-            if let Some((at, how)) = stop.filter(|(at, _)| *at == position) {
-                if how == Stop::Change {
-                    let mut state = state.lock().unwrap();
-                    if let Some(file) = state.files.iter_mut().find(|file| file.id == id) {
-                        file.version += 1;
-                        file.md5 = Some(md5_of(1, 1));
+}
+
+impl Generated {
+    /// The body, produced as it is sent and counted in `served`.
+    fn body(self, state: &Arc<Mutex<SourceState>>, served: &Arc<AtomicU64>) -> Body {
+        let (state, served) = (Arc::clone(state), Arc::clone(served));
+        let Generated {
+            id,
+            base,
+            start,
+            end,
+            stop,
+        } = self;
+        let frames = futures::stream::unfold(Some(start), move |position| {
+            let (state, served, id) = (Arc::clone(&state), Arc::clone(&served), id.clone());
+            async move {
+                let position = position?;
+                if let Some((at, how)) = stop.filter(|(at, _)| *at == position) {
+                    if how == Stop::Change {
+                        let mut state = state.lock().unwrap();
+                        if let Some(file) = state.files.iter_mut().find(|file| file.id == id) {
+                            file.version += 1;
+                            file.md5 = Some(md5_of(1, 1));
+                        }
                     }
+                    // Let the frames before go out first.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    return Some((Err(io::Error::other(format!("cut at {at}"))), None));
                 }
-                // Let the frames before go out first.
-                tokio::time::sleep(Duration::from_millis(20)).await;
-                return Some((Err(io::Error::other(format!("cut at {at}"))), None));
+                if position >= end {
+                    return None;
+                }
+                let limit = stop.map_or(end, |(at, _)| at.min(end));
+                let len = FRAME.min(limit - position);
+                let mut data = vec![0; usize::try_from(len).unwrap()];
+                fill(base + position, &mut data);
+                served.fetch_add(len, Ordering::SeqCst);
+                Some((Ok(Frame::data(Bytes::from(data))), Some(position + len)))
             }
-            if position >= end {
-                return None;
-            }
-            let limit = stop.map_or(end, |(at, _)| at.min(end));
-            let len = FRAME.min(limit - position);
-            let mut data = vec![0; usize::try_from(len).unwrap()];
-            fill(position, &mut data);
-            served.fetch_add(len, Ordering::SeqCst);
-            Some((Ok(Frame::data(Bytes::from(data))), Some(position + len)))
-        }
-    });
-    StreamBody::new(frames).boxed_unsync()
+        });
+        StreamBody::new(frames).boxed_unsync()
+    }
 }
 
 fn empty() -> Body {
@@ -1199,6 +1251,108 @@ async fn a_source_that_changes_while_it_is_read_fails_with_source_changed() {
 }
 
 #[tokio::test]
+async fn a_source_that_changes_between_the_check_and_the_resume_fails_with_source_changed() {
+    for md5 in [false, true] {
+        let size = 4 * CHUNK;
+        let blob = SourceFile::blob("blob", size);
+        let file = SourceFile {
+            md5: blob.md5.clone().filter(|_| md5),
+            ..blob
+        };
+        let source = SourceDrive::start(
+            vec![file.clone()],
+            SourceFaults {
+                cut_at: Some(600_000),
+                // After the metadata check before the resume: the same size, other bytes.
+                change_before_media: Some(1),
+                ..SourceFaults::default()
+            },
+        );
+        let dest = MockDrive::start(Faults::default()).await;
+
+        let error = relay(
+            &source,
+            &dest,
+            &file.listing(),
+            &target(),
+            &options(CHUNK),
+            None,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            matches!(error, RelayError::SourceChanged),
+            "md5 {md5}: {error:?}"
+        );
+        let log = source.log();
+        let media: Vec<_> = log.iter().filter(|request| request.is_media()).collect();
+        assert_eq!(media.len(), 2, "{log:?}");
+        assert_eq!(media[1].range.as_deref(), Some("bytes=600000-"));
+        assert_eq!(media[1].if_range.as_deref(), Some("\"blob-v1\""));
+        let checked = log
+            .iter()
+            .take_while(|request| request.range.is_none())
+            .filter(|request| request.is_metadata())
+            .count();
+        // Without an md5 in the listing, the metadata is fetched first too.
+        assert_eq!(checked, if md5 { 1 } else { 2 }, "{log:?}");
+        let state = dest.state();
+        assert!(state.files.is_empty(), "no copy: {}", state.log_text());
+    }
+}
+
+#[tokio::test]
+async fn a_source_without_md5_or_etag_is_not_resumed() {
+    let size = 4 * CHUNK;
+    let faults = SourceFaults {
+        cut_at: Some(600_000),
+        no_etag: true,
+        ..SourceFaults::default()
+    };
+    let unproven = SourceFile {
+        md5: None,
+        ..SourceFile::blob("blob", size)
+    };
+    let source = SourceDrive::start(vec![unproven.clone()], faults.clone());
+    let dest = MockDrive::start(Faults::default()).await;
+
+    let error = relay(
+        &source,
+        &dest,
+        &unproven.listing(),
+        &target(),
+        &options(CHUNK),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(matches!(error, RelayError::SourceChanged), "{error:?}");
+    assert_eq!(source.media().len(), 1, "no resume is asked for");
+    assert!(dest.state().files.is_empty());
+
+    // With an md5, the metadata proves the content the same: resumed without If-Range.
+    let file = SourceFile::blob("blob", size);
+    let source = SourceDrive::start(vec![file.clone()], faults);
+    let dest = MockDrive::start(Faults::default()).await;
+    let result = relay(
+        &source,
+        &dest,
+        &file.listing(),
+        &target(),
+        &options(CHUNK),
+        None,
+    )
+    .await;
+    assert_copied(&dest, result, size);
+    let media = source.media();
+    assert_eq!(media.len(), 2);
+    assert_eq!(media[1].range.as_deref(), Some("bytes=600000-"));
+    assert_eq!(media[1].if_range, None);
+}
+
+#[tokio::test]
 async fn a_source_changed_since_its_listing_fails_with_source_changed() {
     let size = 2 * CHUNK;
     let listed = SourceFile {
@@ -1723,6 +1877,45 @@ async fn a_session_that_completed_before_the_run_ended_is_taken_without_reading_
     assert_eq!(state.files["gen-id-1"].content, content(0, SESSION_SIZE));
     drop(state);
     assert!(records.files().is_empty(), "the record is deleted");
+}
+
+#[tokio::test]
+async fn a_source_without_md5_is_not_recorded() {
+    let records = Records::new();
+    let file = SourceFile {
+        md5: None,
+        ..SourceFile::blob("blob", SESSION_SIZE)
+    };
+    let source = SourceDrive::start(vec![file.clone()], SourceFaults::default());
+    let dest = MockDrive::start(Faults {
+        die_after_chunks: Some(2),
+        ..Faults::default()
+    })
+    .await;
+
+    relay(
+        &source,
+        &dest,
+        &file.listing(),
+        &target(),
+        &records.options(),
+        None,
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(
+        records.files(),
+        Vec::<PathBuf>::new(),
+        "nothing is recorded"
+    );
+    assert!(
+        source
+            .log()
+            .iter()
+            .all(|request| request.path != "/drive/v3/about"),
+        "no account is looked up for a record"
+    );
 }
 
 #[tokio::test]

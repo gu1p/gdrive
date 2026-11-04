@@ -13,10 +13,14 @@
 //!   off is requested again the same way, within the source hub's retry policy. Before each such
 //!   request, the source's metadata is fetched again: a file whose size or `md5Checksum`
 //!   changed (its `version` and `modifiedTime` when it has no md5) fails with
-//!   [`RelayError::SourceChanged`] rather than mixing two revisions. A reply with the whole
-//!   content to a `Range` request is read up to the offset when that is cheap
-//!   ([`DISCARD_LIMIT`]), else asked for again without `If-Range` (and read up to the offset
-//!   if it is the whole content again: the server ignores `Range`).
+//!   [`RelayError::SourceChanged`] rather than mixing two revisions in the copy.
+//! - A resume continues only content that is provably the same. A reply with the whole content
+//!   to a `Range` request says that the content is not the one of the `If-Range` (or that the
+//!   server ignores `Range`): the metadata is fetched again, and only a source with an
+//!   `md5Checksum` whose md5 and size are unchanged is read on, up to the offset when that is
+//!   cheap ([`DISCARD_LIMIT`]), else asked for again without `If-Range`. A source without an
+//!   md5 has nothing to prove that: it fails with [`RelayError::SourceChanged`], as does any
+//!   resume of a source with neither an md5 nor a strong `ETag`.
 //! - The md5 Drive computes for the copy is compared with the source's `md5Checksum`, on top of
 //!   the uploader's own check of the bytes it sent.
 //! - The copy gets the source's `modifiedTime` and `createdTime`.
@@ -26,9 +30,10 @@
 //!   `importFormats` turn images into Documents), so a copy would not be a drawing.
 //! - With [`UploadOptions::session_dir`], the session of a resumable relay is recorded with the
 //!   identity of the source ([`SourceIdentity::remote`]: the source's account, file id, size
-//!   and md5 or version), and a later relay of the same source to the same target continues it
-//!   without reading the bytes the session holds again. Exports are not recorded: an export is
-//!   not the same bytes twice.
+//!   and md5), and a later relay of the same source to the same target continues it, or takes
+//!   the file of a session that completed, without reading the bytes the session holds again.
+//!   A source without an md5 is not recorded (nothing would prove the content the same), and
+//!   neither are exports: an export is not the same bytes twice.
 
 #[cfg(test)]
 mod tests;
@@ -295,7 +300,7 @@ impl Error for RelayError {
 ///
 /// The md5 checks follow `opts.verify_md5`. A continued session is checked by the md5s alone,
 /// without reading the bytes it holds again; a source without `md5Checksum` is copied
-/// unchecked end to end.
+/// unchecked end to end, is never recorded, and is resumed only with a strong `ETag`.
 pub(crate) async fn relay_file(
     source: &Hub,
     dest: &Hub,
@@ -482,19 +487,17 @@ impl Relay<'_> {
         Ok(copy)
     }
 
-    /// The identity of the source in a session record, if the source's account is known.
+    /// The identity of the source in a session record, if the source has an md5 and its account
+    /// is known. Without an md5, nothing would prove that the content a later run reads is the
+    /// one the session holds the start of.
     async fn identity(&self, size: u64, label: &str) -> Option<SourceIdentity> {
-        let md5 = self.file.md5_checksum.as_deref();
-        if md5.is_none() && self.file.version.is_none() {
-            // Nothing would tell whether it changed: such a session is never continued.
-            return None;
-        }
+        let md5 = self.file.md5_checksum.as_deref()?;
         match account_of(self.source).await {
             Ok(Some(account)) => Some(SourceIdentity::remote(
                 &account,
                 self.id,
                 size,
-                md5,
+                Some(md5),
                 self.file.version,
             )),
             Ok(None) => {
@@ -683,6 +686,8 @@ pub(super) struct DriveSource<'a> {
     media: MediaSource<'a>,
     /// The source's content as its metadata describes it, compared before every new reply.
     identity: Identity<'a>,
+    /// Whether the metadata has an md5, which proves the content the same when it is unchanged.
+    has_md5: bool,
     retry: RetryState,
     size: u64,
     label: String,
@@ -715,6 +720,7 @@ impl<'a> DriveSource<'a> {
             revision.version = None;
             revision.modified_time = None;
         }
+        let has_md5 = revision.md5.is_some();
         Ok(DriveSource {
             media: MediaSource::Drive {
                 client,
@@ -722,6 +728,7 @@ impl<'a> DriveSource<'a> {
                 label: label.clone(),
             },
             identity: Identity::new(hub, id, revision),
+            has_md5,
             retry: hub.retrier().state(),
             size,
             label,
@@ -788,17 +795,21 @@ impl<'a> DriveSource<'a> {
         }
     }
 
+    /// Whether the metadata shows another content now.
+    async fn changed(&self) -> Result<bool, SourceFailure> {
+        self.identity.changed().await.map_err(SourceFailure::Media)
+    }
+
     /// A reply with the content from `offset` on, or one from the start that is read up to
-    /// there. Every request but the first is made only once the metadata shows the same
-    /// content.
+    /// there. Every request but the first, and a first one past the start (a continued
+    /// session), is made only once the metadata shows the same content; a resume of a source
+    /// with neither an md5 nor a strong `ETag` is not made at all: nothing would show that the
+    /// rest is of the same content as what was read before.
     async fn open(&mut self, offset: u64) -> Result<Stream, SourceFailure> {
-        if self.opened
-            && self
-                .identity
-                .changed()
-                .await
-                .map_err(SourceFailure::Media)?
-        {
+        if offset > 0 && !self.has_md5 && self.etag.is_none() {
+            return Err(SourceFailure::Changed);
+        }
+        if (self.opened || offset > 0) && self.changed().await? {
             return Err(SourceFailure::Changed);
         }
         self.opened = true;
@@ -814,9 +825,15 @@ impl<'a> DriveSource<'a> {
                     if content_length(&reply.headers).is_some_and(|length| length != self.size) {
                         return Err(SourceFailure::Changed);
                     }
+                    // All of the content to a Range request: it is not the content of the
+                    // If-Range any more, or the server ignores Range. Only an unchanged md5
+                    // proves it the same content as what was read before.
+                    if offset > 0 && (!self.has_md5 || self.changed().await?) {
+                        return Err(SourceFailure::Changed);
+                    }
                     if if_range.is_some() && offset > DISCARD_LIMIT {
-                        // The ETag did not match, though the metadata shows the same content:
-                        // ask for the range alone rather than read this far again.
+                        // The ETag did not match, though the md5 shows the same content: ask
+                        // for the range alone rather than read this far again.
                         self.etag = None;
                         self.wait(
                             Decision::Retry {
