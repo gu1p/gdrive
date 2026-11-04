@@ -2,6 +2,7 @@ mod about;
 mod account;
 mod app_config;
 mod common;
+mod completions;
 mod drives;
 mod files;
 mod hub;
@@ -50,6 +51,20 @@ enum Command {
     Permissions {
         #[command(subcommand)]
         command: PermissionCommand,
+    },
+
+    /// Print a shell completion script to stdout
+    ///
+    /// Load it in the current shell, or save it where your shell looks for completions:
+    ///   bash:       source <(gdrive completions bash)
+    ///   zsh:        gdrive completions zsh > "${fpath[1]}/_gdrive"
+    ///   fish:       gdrive completions fish > ~/.config/fish/completions/gdrive.fish
+    ///   powershell: gdrive completions powershell | Out-String | Invoke-Expression
+    #[command(verbatim_doc_comment)]
+    Completions {
+        /// Shell to generate the script for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 
     /// Print version information
@@ -439,6 +454,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
         Command::Permissions { command } => {
             handle_permissions_command(command).await?;
+        }
+
+        Command::Completions { shell } => {
+            completions::completions(shell, <Cli as clap::CommandFactory>::command())?;
         }
 
         Command::Version => {
