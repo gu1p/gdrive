@@ -290,6 +290,50 @@ are sent, so a larger chunk size does not take more memory.
   a second copy: gdrive looks the file up instead. Drive takes no id for an import; it is marked with a
   private app property (`gdriveUploadId`) and searched for by it.
 
+## Progress output
+
+While files are transferred, gdrive shows the progress on stderr, if stderr is a terminal. One file gets a
+bar:
+
+```text
+[===============>                          ] 120 MB/310 MB (38%), 11.2 MB/s, ETA 17s
+```
+
+A recursive transfer gets a line for the whole run and one per file in transfer, at most `--jobs`:
+
+```text
+[==========>                ] 14/52 files, 1.2 GB/3.1 GB (38%), 24.5 MB/s, ETA 1m 18s, 1 failed
+  photos/2024/IMG_0412.jpg               [=======>            ] 3.1 MB/8 MB, 2.2 MB/s
+  photos/2024/IMG_0413.jpg               [==>                 ] 1 MB/7.4 MB, 1.9 MB/s
+```
+
+- The bytes are confirmed bytes: for a download, what is written to the local file; for an upload, what
+  Drive acknowledged. An upload moves a chunk at a time (`--chunk-size`, 32 MB by default), as Drive
+  confirms chunks; a file of at most 5 MB goes up in one request and completes in one step.
+- While a recursive download still lists the folder, the totals are `?` and the line says what was found
+  so far: `3/? files (12 found), 45.6 MB/? (120 MB found)`. A recursive upload knows its totals from the
+  start: it lists the local folder first.
+- What a file does not transfer (it is unchanged, skipped, failed or cancelled) leaves the total, so the
+  total is what the run transfers. Failed files and folders are counted at the end of the line.
+- The rate is that of the last few seconds; ETA is the time left at that rate. Without a known size (an
+  export), there is a spinner instead of a bar and no ETA.
+- Lines that gdrive prints during the transfer (`Downloading ...`, warnings, errors) appear above the
+  bars, whole. The bars disappear when the transfer ends, before the last messages and the summary.
+  Nothing of the progress goes to stdout: the output of `--stdout` and `--print-only-id` is the same with
+  and without it.
+
+When it shows:
+
+| Setting | Progress |
+|---|---|
+| (default) | When stderr is a terminal and `TERM` is not `dumb`. With `files download --stdout`, only if stdout is not a terminal as well, so that the bars do not mix with the content. |
+| `--progress` | Always. Where stderr is not a terminal (a CI log, `script`, a file), a single line rewritten after a carriage return once a second. |
+| `--no-progress` | Never. |
+| `GDRIVE_PROGRESS=1`, `GDRIVE_PROGRESS=0` | Like `--progress` and `--no-progress`, when neither flag is given. Other values are ignored with a warning. |
+
+The flags work on `files download`, `files upload`, `files update`, `files import` and `files export`. When
+both are given, the last one wins, so a script can force the progress on or off whatever an alias adds.
+
 ## Update a file
 
 ```sh
