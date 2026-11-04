@@ -147,7 +147,7 @@ mod tests {
     use super::import_types;
     use crate::{
         common::{
-            delegate::UploadDelegateConfig,
+            delegate::{ChunkSize, UploadDelegateConfig},
             drive_file::{DocType, MIME_TYPE_DRIVE_DOCUMENT},
             file_info::FileInfo,
             mock_server::{MockServer, Response},
@@ -223,5 +223,84 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("# Title"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn resumable_import_sends_source_type_and_target_mime() {
+        // Above the chunk size the upload is resumable: the initiation request carries the
+        // metadata and announces the content type, then the content follows in chunks.
+        const MIB: usize = 1 << 20;
+        let content = vec![b'#'; MIB + 1];
+        let total = content.len();
+
+        let server = MockServer::start(vec![
+            Response::json(200, &serde_json::json!({}))
+                .with_header("Location", "{root}upload-session"),
+            Response::json(308, &serde_json::json!({}))
+                .with_header("Range", &format!("bytes=0-{}", MIB - 1)),
+            Response::json(
+                200,
+                &serde_json::json!({"id": "new-id", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+            ),
+        ])
+        .await;
+
+        let (doc_type, source_mime_type) = import_types(Path::new("notes.md")).unwrap();
+        let file_info = FileInfo {
+            name: Cow::Borrowed("notes.md"),
+            mime_type: Cow::Borrowed(doc_type.mime()),
+            source_mime_type: Some(source_mime_type),
+            parents: None,
+            size: total as u64,
+        };
+        let delegate_config = UploadDelegateConfig {
+            chunk_size: ChunkSize::Approx1,
+            ..UploadDelegateConfig::default()
+        };
+
+        files::upload::upload_file(
+            &server.hub(),
+            Cursor::new(content),
+            None,
+            file_info,
+            &delegate_config,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 3);
+
+        let initiation = &requests[0];
+        assert_eq!(initiation.method, "POST");
+        assert_eq!(initiation.path, "/resumable/upload/drive/v3/files");
+        assert_eq!(initiation.query_param("uploadType"), Some("resumable"));
+        assert_eq!(
+            initiation.header("x-upload-content-type"),
+            Some("text/markdown")
+        );
+        assert_eq!(
+            initiation.body_json(),
+            serde_json::json!({"name": "notes.md", "mimeType": MIME_TYPE_DRIVE_DOCUMENT})
+        );
+
+        let chunks = &requests[1..];
+        let ranges: Vec<_> = chunks
+            .iter()
+            .map(|chunk| chunk.header("content-range").unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ranges,
+            [
+                format!("bytes 0-{}/{total}", MIB - 1),
+                format!("bytes {MIB}-{MIB}/{total}"),
+            ]
+        );
+        for chunk in chunks {
+            assert_eq!(chunk.path, "/upload-session");
+            assert_eq!(chunk.header("content-type"), Some("text/markdown"));
+        }
+        let uploaded: usize = chunks.iter().map(|chunk| chunk.body.len()).sum();
+        assert_eq!(uploaded, total);
     }
 }

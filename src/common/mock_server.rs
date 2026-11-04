@@ -27,6 +27,8 @@ pub(crate) struct Request {
     pub(crate) path: String,
     /// Raw (not percent-decoded) query pairs, in the order they were sent.
     pub(crate) query: Vec<(String, String)>,
+    /// Header names are lowercase.
+    pub(crate) headers: Vec<(String, String)>,
     pub(crate) body: Vec<u8>,
 }
 
@@ -35,6 +37,13 @@ impl Request {
         self.query
             .iter()
             .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
     }
 
@@ -51,6 +60,7 @@ impl Request {
 #[derive(Debug, Clone)]
 pub(crate) struct Response {
     status: u16,
+    headers: Vec<(String, String)>,
     body: String,
 }
 
@@ -58,8 +68,16 @@ impl Response {
     pub(crate) fn json(status: u16, body: &serde_json::Value) -> Self {
         Self {
             status,
+            headers: Vec::new(),
             body: body.to_string(),
         }
+    }
+
+    /// `{root}` in `value` is replaced by the server's root URL (`http://127.0.0.1:PORT/`), for
+    /// headers that point back at the server such as a resumable upload's `Location`.
+    pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
     }
 }
 
@@ -80,6 +98,7 @@ impl MockServer {
         let requests = Arc::new(Mutex::new(Vec::new()));
 
         let recorded = Arc::clone(&requests);
+        let root_url = format!("http://{addr}/");
         let mut responses = VecDeque::from(responses);
         let task = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
@@ -91,7 +110,7 @@ impl MockServer {
                 let response = responses.pop_front().unwrap_or_else(|| {
                     Response::json(500, &serde_json::json!({"error": "unexpected request"}))
                 });
-                write_response(&mut stream, &response).await;
+                write_response(&mut stream, &response, &root_url).await;
             }
         });
 
@@ -138,10 +157,14 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
     let method = request_line.next()?.to_owned();
     let target = request_line.next()?.to_owned();
 
-    let content_length = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+        .collect();
+    let content_length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
         .unwrap_or(0);
 
     let mut body = buf[header_end + 4..].to_vec();
@@ -168,17 +191,26 @@ async fn read_request(stream: &mut TcpStream) -> Option<Request> {
         method,
         path: path.to_owned(),
         query,
+        headers,
         body,
     })
 }
 
-async fn write_response(stream: &mut TcpStream, response: &Response) {
-    let head = format!(
+async fn write_response(stream: &mut TcpStream, response: &Response, root_url: &str) {
+    let mut head = format!(
         "HTTP/1.1 {} Mock\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-        Connection: close\r\n\r\n",
+        Connection: close\r\n",
         response.status,
         response.body.len()
     );
+    for (name, value) in &response.headers {
+        let value = value.replace("{root}", root_url);
+        head.push_str(name);
+        head.push_str(": ");
+        head.push_str(&value);
+        head.push_str("\r\n");
+    }
+    head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
     let _ = stream.write_all(response.body.as_bytes()).await;
     let _ = stream.shutdown().await;
