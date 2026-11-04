@@ -801,3 +801,37 @@ async fn a_stop_cancels_the_follow_ups_that_were_not_taken() {
     );
     assert_eq!(taken.load(Ordering::SeqCst), 50);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_job_gets_the_hint_of_the_account_like_a_failed_command() {
+    use crate::app_config::account_type::AccountType;
+
+    let output = output();
+    let job = Job::new(JobKind::Media, "photos/cat.jpg", |_| async {
+        let reply = serde_json::json!({"error": {
+            "code": 403,
+            "message": "Service Accounts do not have storage quota.",
+            "errors": [{"domain": "usageLimits", "reason": "storageQuotaExceeded"}],
+        }});
+        Outcome::failed(google_drive3::Error::BadRequest(reply)).into()
+    });
+    let service_account = AccountType::ServiceAccount { subject: None };
+
+    let report = Scheduler::new(options(1, false), output.printer.clone())
+        .with_describe(move |error| {
+            crate::failure_message_with(error, |error| {
+                crate::auth::service::account_hint(error, &service_account)
+            })
+        })
+        .run(stream::iter([job]), future::pending())
+        .await;
+    output.printer.flush().await.unwrap();
+
+    assert_eq!(report.files.failed, 1);
+    let err = output.err.text();
+    assert!(err.starts_with("Error: "), "{err}");
+    assert!(
+        err.contains("\nHint: service accounts have no Drive storage of their own"),
+        "{err}"
+    );
+}

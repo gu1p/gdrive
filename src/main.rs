@@ -569,16 +569,31 @@ fn parse_jobs(value: &str) -> Result<NonZeroUsize, String> {
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
-        let mut message = error_message(err.as_ref());
-        if let Some(hint) = common::hub_helper::account_hint(err.as_ref()) {
-            message.push('\n');
-            message.push_str(&hint);
-        }
-        eprintln!("{message}");
+        eprintln!("{}", failure_message(err.as_ref()));
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// What gdrive prints for a failed command, and for each failed file of a recursive transfer:
+/// the [`error_message`], and the hint for the current account (a service account's storage,
+/// for example) when there is one.
+fn failure_message(err: &(dyn std::error::Error + 'static)) -> String {
+    failure_message_with(err, common::hub_helper::account_hint)
+}
+
+/// [`failure_message`] with the account hint of `hint`.
+fn failure_message_with(
+    err: &(dyn std::error::Error + 'static),
+    hint: impl FnOnce(&(dyn std::error::Error + 'static)) -> Option<String>,
+) -> String {
+    let mut message = error_message(err);
+    if let Some(hint) = hint(err) {
+        message.push('\n');
+        message.push_str(&hint);
+    }
+    message
 }
 
 /// The message printed for a failed command, in the format of gdrive 3.x: `Error: ` and the

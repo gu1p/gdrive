@@ -505,11 +505,15 @@ pub(crate) async fn ctrl_c() {
     }
 }
 
+/// Turns the error of a failed job into what is printed for it.
+type Describe = Arc<dyn Fn(&(dyn Error + 'static)) -> String + Send + Sync>;
+
 /// Runs jobs per its [`Options`]; see the module documentation.
 pub(crate) struct Scheduler {
     options: Options,
     printer: Printer,
     progress: Arc<dyn ProgressSink>,
+    describe: Describe,
 }
 
 impl Scheduler {
@@ -519,7 +523,21 @@ impl Scheduler {
             options,
             printer,
             progress: Arc::new(NoProgress),
+            // As a failed command: the message of the error and the account's hint.
+            describe: Arc::new(crate::failure_message),
         }
+    }
+
+    /// Prints failures with `describe` instead of the command's format, for tests that cannot
+    /// set up an account.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_describe(
+        mut self,
+        describe: impl Fn(&(dyn Error + 'static)) -> String + Send + Sync + 'static,
+    ) -> Self {
+        self.describe = Arc::new(describe);
+        self
     }
 
     #[must_use]
@@ -547,6 +565,7 @@ impl Scheduler {
             options: self.options,
             printer: self.printer.clone(),
             progress: Arc::clone(&self.progress),
+            describe: Arc::clone(&self.describe),
             source: Some(Box::pin(source)),
             pending: PerKind::default(),
             active: PerKind::default(),
@@ -601,6 +620,7 @@ struct Run<S> {
     options: Options,
     printer: Printer,
     progress: Arc<dyn ProgressSink>,
+    describe: Describe,
     /// `None` once exhausted or dropped by a stop.
     source: Option<Pin<Box<S>>>,
     pending: PerKind<VecDeque<Queued>>,
@@ -865,7 +885,7 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
             outcome: &outcome,
         });
         if let Outcome::Failed { error } = &outcome {
-            let message = crate::error_message(error.as_ref());
+            let message = (self.describe)(error.as_ref());
             self.printer.err(message).await;
         }
         self.report.record(kind, &outcome);
