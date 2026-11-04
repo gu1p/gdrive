@@ -1,3 +1,4 @@
+pub(crate) mod account_type;
 pub(crate) mod errors;
 
 use std::{
@@ -50,6 +51,10 @@ pub(crate) fn switch_account(config: &AppConfig) -> Result<(), errors::SaveAccou
 pub(crate) fn list_accounts() -> Result<Vec<String>, errors::ListAccounts> {
     let base_path =
         AppConfig::default_base_path().map_err(errors::ListAccounts::DefaultBasePath)?;
+    list_accounts_in(base_path)
+}
+
+fn list_accounts_in(base_path: PathBuf) -> Result<Vec<String>, errors::ListAccounts> {
     if let Err(source) = fs::create_dir_all(&base_path) {
         return Err(errors::ListAccounts::CreateBaseDir {
             path: base_path,
@@ -69,7 +74,7 @@ pub(crate) fn list_accounts() -> Result<Vec<String>, errors::ListAccounts> {
     let mut accounts: Vec<String> = entries
         .filter_map(Result::ok)
         .filter(|entry| entry.path().is_dir())
-        .filter(|entry| entry.path().join(TOKENS_CONFIG_NAME).exists())
+        .filter(|entry| account_type::is_account_dir(&entry.path()))
         .map(|entry| entry.file_name().to_string_lossy().to_string())
         .collect();
 
@@ -132,12 +137,7 @@ impl AppConfig {
         use errors::LoadAccountWithSecret as E;
 
         // The name becomes a directory under the config root: one plain path component only.
-        let mut components = Path::new(account_name).components();
-        let single_component = matches!(
-            (components.next(), components.next()),
-            (Some(std::path::Component::Normal(_)), None)
-        );
-        if !single_component || account_name.contains(['/', '\\']) {
+        if !account_type::is_valid_account_name(account_name) {
             return Err(E::InvalidName(account_name.to_owned()));
         }
 

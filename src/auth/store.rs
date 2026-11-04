@@ -155,6 +155,13 @@ impl TokenFile {
     }
 }
 
+/// Replaces `path` atomically with `content`, like [`TokenFile::save`]: the file is created with
+/// mode 0600 on Unix from the start, never made private after the fact. For other files that hold
+/// credentials, such as a service account key.
+pub(crate) async fn write_private_file(path: &Path, content: &[u8]) -> io::Result<()> {
+    replace_file(path, content, write_and_sync).await
+}
+
 /// Replaces `path` with `content`. `write` fills a new temporary file next to `path`, which is
 /// renamed over `path` only when `write` succeeded. On any error the temporary file is removed
 /// and `path` keeps its previous content.

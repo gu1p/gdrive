@@ -150,7 +150,7 @@ where
     }
 }
 
-type GetTokenOutput<'a> = Pin<
+pub(super) type GetTokenOutput<'a> = Pin<
     Box<
         dyn Future<Output = Result<Option<String>, Box<dyn error::Error + Send + Sync>>>
             + Send

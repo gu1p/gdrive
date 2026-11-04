@@ -1,4 +1,5 @@
 pub(crate) mod add;
+pub(crate) mod add_service;
 pub(crate) mod current;
 pub(crate) mod export;
 pub(crate) mod import;
@@ -8,6 +9,7 @@ pub(crate) mod remove;
 pub(crate) mod switch;
 
 pub(crate) use add::add;
+pub(crate) use add_service::add_service_account;
 pub(crate) use current::current;
 pub(crate) use export::export;
 pub(crate) use import::import;

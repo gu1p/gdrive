@@ -39,7 +39,9 @@ time = "0.3.7"
 tokio = { version = "1.23.0", features = ["full"] }
 unicode-normalization = "0.1.24"
 url = "2.5"
-yup-oauth2 = { version = "12.1.2", default-features = false }
+# service-account: ServiceAccountAuthenticator (JWT signed with ring) for `account add
+# --service-account` and Application Default Credentials. The other default features stay off.
+yup-oauth2 = { version = "12.1.2", default-features = false, features = ["service-account", "ring"] }
 
 [dev-dependencies]
 # The mock Google upload server in tests/ needs hyper's server side.

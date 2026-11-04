@@ -6,6 +6,7 @@
 //! when that is not possible.
 
 pub(crate) mod login;
+pub(crate) mod service;
 pub(crate) mod store;
 pub(crate) mod stored;
 

@@ -78,9 +78,15 @@ enum AccountCommand {
     /// Asks for the Client ID and Client Secret, then for your approval in a browser. By default
     /// gdrive receives the browser's redirect on port 8085 of localhost (see --port); on a remote
     /// or headless machine use --manual.
+    ///
+    /// With --service-account, adds a service account from its JSON key file instead; nothing is
+    /// asked. See `docs/service_accounts.md`.
     Add {
         #[command(flatten)]
         login: LoginArgs,
+
+        #[command(flatten)]
+        service: ServiceAccountArgs,
     },
 
     /// Authorize an existing account again
@@ -126,6 +132,27 @@ enum AccountCommand {
         /// Path to archive
         file_path: PathBuf,
     },
+}
+
+/// The accounts `account add` adds without a login.
+#[derive(clap::Args)]
+struct ServiceAccountArgs {
+    /// Add a service account from its JSON key file
+    ///
+    /// gdrive gets a token with the key to check it, then stores the key in the account's
+    /// directory. Service accounts have no Drive storage of their own: they work in shared drives
+    /// they are a member of and on files shared with them, or, with --subject, as a Google
+    /// Workspace user.
+    #[arg(long, value_name = "KEY_JSON", conflicts_with_all = ["manual", "port"])]
+    service_account: Option<PathBuf>,
+
+    /// Act for this Google Workspace user (domain-wide delegation, set up by an administrator)
+    #[arg(long, value_name = "EMAIL", requires = "service_account")]
+    subject: Option<String>,
+
+    /// Name of the new account [default: the `client_email` of the key]
+    #[arg(long, value_name = "NAME", requires = "service_account")]
+    name: Option<String>,
 }
 
 /// How the login of `account add` and `account reauth` gets the authorization.
@@ -500,7 +527,12 @@ enum PermissionCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
-        eprintln!("{}", error_message(err.as_ref()));
+        let mut message = error_message(err.as_ref());
+        if let Some(hint) = common::hub_helper::storage_hint(err.as_ref()) {
+            message.push('\n');
+            message.push_str(hint);
+        }
+        eprintln!("{message}");
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -859,12 +891,21 @@ async fn handle_account_command(
     command: AccountCommand,
 ) -> Result<(), Box<dyn std::error::Error + 'static>> {
     match command {
-        AccountCommand::Add { login } => {
-            account::add(&account::add::Config {
-                mode: login.mode(),
-                port: login.port,
-            })
-            .await?;
+        AccountCommand::Add { login, service } => {
+            if let Some(key_path) = service.service_account {
+                account::add_service_account(&account::add_service::ServiceAccountConfig {
+                    key_path,
+                    subject: service.subject,
+                    name: service.name,
+                })
+                .await?;
+            } else {
+                account::add(&account::add::Config {
+                    mode: login.mode(),
+                    port: login.port,
+                })
+                .await?;
+            }
         }
 
         AccountCommand::List => {
@@ -989,7 +1030,10 @@ mod error_message_tests {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{parse_positive_usize, Cli, Command, DriveCommand, FileCommand, PermissionCommand};
+    use super::{
+        parse_positive_usize, AccountCommand, Cli, Command, DriveCommand, FileCommand,
+        PermissionCommand,
+    };
     use crate::files::list::ListQuery;
 
     #[test]
@@ -1068,6 +1112,63 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once(&"gdrive").chain(args))
+    }
+
+    #[test]
+    fn account_add_takes_a_service_account_key_with_subject_and_name() {
+        let cli = parse(&[
+            "account",
+            "add",
+            "--service-account",
+            "key.json",
+            "--subject",
+            "user@example.com",
+            "--name",
+            "robot",
+        ])
+        .expect("arguments should parse");
+        let Command::Account {
+            command: AccountCommand::Add { login, service },
+        } = cli.command
+        else {
+            panic!("expected account add");
+        };
+        assert_eq!(
+            service.service_account.as_deref(),
+            Some(std::path::Path::new("key.json"))
+        );
+        assert_eq!(service.subject.as_deref(), Some("user@example.com"));
+        assert_eq!(service.name.as_deref(), Some("robot"));
+        assert!(!login.manual);
+
+        // The OAuth login still parses as before.
+        assert!(parse(&["account", "add"]).is_ok());
+        assert!(parse(&["account", "add", "--manual", "--port", "9000"]).is_ok());
+    }
+
+    #[test]
+    fn service_account_flags_do_not_mix_with_the_oauth_login() {
+        for args in [
+            &["account", "add", "--subject", "user@example.com"][..],
+            &["account", "add", "--name", "robot"],
+            &[
+                "account",
+                "add",
+                "--service-account",
+                "key.json",
+                "--manual",
+            ],
+            &[
+                "account",
+                "add",
+                "--service-account",
+                "key.json",
+                "--port",
+                "9000",
+            ],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} should not parse");
+        }
     }
 
     fn files_list_flags(args: &[&str]) -> (String, bool, bool) {

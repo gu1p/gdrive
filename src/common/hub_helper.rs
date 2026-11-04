@@ -5,8 +5,12 @@ use std::{
 };
 
 use crate::{
-    app_config::{self, AppConfig},
-    auth::{self, stored::StoredCredentials},
+    app_config::{
+        self,
+        account_type::{AccountType, LoadAccountType},
+        AppConfig,
+    },
+    auth::{self, service::ServiceCredentials, stored::StoredCredentials},
     hub::{self, Hub},
 };
 
@@ -16,6 +20,16 @@ use crate::{
 /// refreshed, the error is a [`auth::ReauthRequired`] that tells the user to log in again.
 pub(crate) async fn get_hub() -> Result<Hub, GetHubError> {
     let app_cfg = AppConfig::load_current_account().map_err(GetHubError::LoadCurrentAccount)?;
+    match app_cfg
+        .account_type()
+        .map_err(GetHubError::LoadAccountType)?
+    {
+        AccountType::User => {}
+        AccountType::ServiceAccount { subject } => {
+            return service_account_hub(&app_cfg, subject).await;
+        }
+    }
+
     let secret = app_cfg.load_secret().map_err(GetHubError::LoadSecret)?;
     let client = hub::token_http_client().map_err(GetHubError::Hub)?;
     let credentials = StoredCredentials::load(
@@ -39,11 +53,40 @@ pub(crate) async fn get_hub() -> Result<Hub, GetHubError> {
     Ok(hub)
 }
 
+/// A Drive hub for the service account `app_cfg`, with a token got (or taken from the cache)
+/// before the command starts working.
+async fn service_account_hub(
+    app_cfg: &AppConfig,
+    subject: Option<String>,
+) -> Result<Hub, GetHubError> {
+    let client = hub::token_http_client().map_err(GetHubError::Hub)?;
+    let credentials = ServiceCredentials::load(client, app_cfg, subject)
+        .await
+        .map_err(GetHubError::Service)?;
+    credentials
+        .access_token()
+        .await
+        .map_err(GetHubError::Service)?;
+    Hub::new(credentials).map_err(GetHubError::Hub)
+}
+
+/// The hint for a failed command of the current account, if it is a service account that ran
+/// into Drive's rule that service accounts have no storage of their own.
+pub(crate) fn storage_hint(error: &(dyn Error + 'static)) -> Option<&'static str> {
+    let account_type = AppConfig::load_current_account()
+        .ok()?
+        .account_type()
+        .ok()?;
+    auth::service::storage_hint(error, &account_type)
+}
+
 #[derive(Debug)]
 pub(crate) enum GetHubError {
     LoadCurrentAccount(app_config::errors::LoadCurrentAccount),
     LoadSecret(app_config::errors::LoadSecret),
+    LoadAccountType(LoadAccountType),
     Auth(auth::stored::Error),
+    Service(auth::service::Error),
     Hub(io::Error),
 }
 
@@ -52,7 +95,9 @@ impl Error for GetHubError {
         match self {
             GetHubError::LoadCurrentAccount(source) => Some(source),
             GetHubError::LoadSecret(source) => Some(source),
+            GetHubError::LoadAccountType(source) => Some(source),
             GetHubError::Auth(source) => Some(source),
+            GetHubError::Service(source) => Some(source),
             GetHubError::Hub(source) => Some(source),
         }
     }
@@ -63,7 +108,8 @@ impl Display for GetHubError {
         let s = match self {
             GetHubError::LoadCurrentAccount(_) => "unable to load current account",
             GetHubError::LoadSecret(_) => "unable to load secret",
-            GetHubError::Auth(_) => "unable to authenticate",
+            GetHubError::LoadAccountType(_) => "unable to load the account type",
+            GetHubError::Auth(_) | GetHubError::Service(_) => "unable to authenticate",
             GetHubError::Hub(_) => "unable to create Google Drive hub",
         };
 

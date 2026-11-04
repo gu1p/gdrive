@@ -8,7 +8,7 @@ use std::{
 use yup_oauth2::storage::TokenInfo;
 
 use crate::{
-    app_config,
+    app_config::{self, account_type::AccountType},
     auth::{self, login, store::TokenFile},
     hub,
 };
@@ -48,12 +48,14 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
         .map_err(|error| Error::About(*error))?
         .map_or(Cow::Borrowed("unknown"), Into::into);
 
+    let existing = app_config::AppConfig::load_account(&email).map_err(Error::LoadAccount)?;
+    if !matches!(existing.account_type(), Ok(AccountType::User)) {
+        return Err(Error::NotAUserAccount(email.into_owned()).into());
+    }
+
     // When the account is added again with the same client, Google may leave out the refresh
     // token; keep the stored one then.
-    let previous = app_config::AppConfig::load_account(&email)
-        .map_err(Error::LoadAccount)?
-        .tokens_of_client(&secret.client_id)
-        .await;
+    let previous = existing.tokens_of_client(&secret.client_id).await;
     let tokens = TokenFile::after_login(previous.as_ref(), &auth::DRIVE_SCOPES, token);
     auth::warn_if_no_refresh_token(&tokens, &email);
 
@@ -106,6 +108,7 @@ pub(crate) enum Error {
     AddAccount(app_config::errors::AddAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
     About(google_drive3::Error),
+    NotAUserAccount(String),
 }
 
 impl error::Error for Error {
@@ -118,6 +121,7 @@ impl error::Error for Error {
             Error::AddAccount(error) => Some(error),
             Error::SwitchAccount(error) => Some(error),
             Error::About(error) => Some(error),
+            Error::NotAUserAccount(_) => None,
         }
     }
 }
@@ -132,6 +136,13 @@ impl Display for Error {
             Error::AddAccount(_) => "unable to add account in the config",
             Error::SwitchAccount(_) => "unable to switch account in the config",
             Error::About(_) => "failed to get user info",
+            Error::NotAUserAccount(name) => {
+                return write!(
+                    f,
+                    "account '{name}' exists already and does not log in with an OAuth client; \
+                     nothing was changed\nUse `gdrive account remove {name}` to remove it first."
+                )
+            }
         };
 
         f.write_str(s)
