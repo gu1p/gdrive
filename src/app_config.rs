@@ -223,7 +223,10 @@ impl AppConfig {
         };
         match serde_json::from_str(&content) {
             Ok(secret) => Ok(secret),
-            Err(source) => Err(errors::LoadSecret::Deserialize { content, source }),
+            Err(source) => Err(errors::LoadSecret::Deserialize {
+                path: path.to_path_buf(),
+                source,
+            }),
         }
     }
 
@@ -421,7 +424,21 @@ mod tests {
             r#"{"client_id":"","client_secret":"s"}"#,
         )
         .unwrap();
-        let error = AppConfig::load_account_with_secret_in(base, "empty").unwrap_err();
+        let error = AppConfig::load_account_with_secret_in(base.clone(), "empty").unwrap_err();
         assert!(matches!(error, E::IncompleteSecret(_)), "{error:?}");
+    }
+
+    #[test]
+    fn invalid_secret_json_is_reported_without_its_content() {
+        use error_trace::ErrorTrace;
+
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig::new(dir.path().to_path_buf(), Account::new("me"));
+        config.create_account_dir().unwrap();
+        fs::write(config.secret_path(), r#"{"client_secret":"s3cr3t"}"#).unwrap();
+
+        let error = config.load_secret().unwrap_err();
+        assert!(matches!(error, errors::LoadSecret::Deserialize { .. }));
+        assert!(!error.trace().to_string().contains("s3cr3t"));
     }
 }

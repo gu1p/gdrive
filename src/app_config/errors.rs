@@ -304,8 +304,9 @@ pub(crate) enum LoadSecret {
         path: PathBuf,
         source: io::Error,
     },
+    /// secret.json is not valid. Holds the path, never the content: it has the client secret.
     Deserialize {
-        content: String,
+        path: PathBuf,
         source: serde_json::Error,
     },
 }
@@ -316,8 +317,12 @@ impl Display for LoadSecret {
             LoadSecret::Read { path, source: _ } => {
                 write!(f, "unable to read the content of file '{}'", path.display())
             }
-            LoadSecret::Deserialize { content, source: _ } => {
-                write!(f, "unable to serialize the content '{content}'")
+            LoadSecret::Deserialize { path, source: _ } => {
+                write!(
+                    f,
+                    "'{}' is not a valid client credentials file",
+                    path.display()
+                )
             }
         }
     }
