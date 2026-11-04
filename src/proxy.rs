@@ -832,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn drive_requests_go_through_a_connect_tunnel_with_basic_auth() {
         let drive = DriveServer::start(vec![me()]).await;
-        let root_url = format!("http://{}/", drive.addr());
+        let root_url = drive.root_url();
         // "user:p@ss", the @ percent-encoded in the URL.
         let expected_auth = "Basic dXNlcjpwQHNz";
         let proxy = TestProxy::connect(Some(expected_auth)).await;
@@ -858,11 +858,9 @@ mod tests {
         let proxy = TestProxy::connect_fragmented().await;
         let value = format!("http://{}", proxy.addr());
 
-        let hub = Hub::for_mock_server_through(
-            &format!("http://{}/", drive.addr()),
-            connector(&[("HTTP_PROXY", &value)]),
-        )
-        .unwrap();
+        let hub =
+            Hub::for_mock_server_through(&drive.root_url(), connector(&[("HTTP_PROXY", &value)]))
+                .unwrap();
         assert_eq!(
             about(&hub).await.unwrap().as_deref(),
             Some("me@example.com")
@@ -895,7 +893,7 @@ mod tests {
             let proxy = TestProxy::connect_answering(answer).await;
             let value = format!("http://{}", proxy.addr());
             let hub = Hub::for_mock_server_through(
-                &format!("http://{}/", drive.addr()),
+                &drive.root_url(),
                 connector(&[("HTTP_PROXY", &value)]),
             )
             .unwrap();
@@ -941,7 +939,7 @@ mod tests {
     #[tokio::test]
     async fn no_proxy_bypasses_the_proxy() {
         let drive = DriveServer::start(vec![me()]).await;
-        let root_url = format!("http://{}/", drive.addr());
+        let root_url = drive.root_url();
         let proxy = TestProxy::connect(None).await;
         let value = format!("http://{}", proxy.addr());
 
@@ -1029,11 +1027,9 @@ mod tests {
         let drive = DriveServer::start(vec![me()]).await;
         let proxy = TestProxy::connect(Some("Basic other")).await;
         let value = format!("http://user:hunter2@{}", proxy.addr());
-        let hub = Hub::for_mock_server_through(
-            &format!("http://{}/", drive.addr()),
-            connector(&[("ALL_PROXY", &value)]),
-        )
-        .unwrap();
+        let hub =
+            Hub::for_mock_server_through(&drive.root_url(), connector(&[("ALL_PROXY", &value)]))
+                .unwrap();
 
         let error = about(&hub).await.unwrap_err();
         let message = crate::error_message(&*error);
@@ -1052,12 +1048,13 @@ mod tests {
     async fn socks5_proxies_with_and_without_remote_dns() {
         let drive = DriveServer::start(vec![me(), me()]).await;
         let port = drive.addr().port();
+        let root = drive.root_path();
         let proxy = TestProxy::socks5().await;
 
         // socks5: the address is resolved here and sent as an IP address.
         let value = format!("socks5://robot:pa55@{}", proxy.addr());
         let hub = Hub::for_mock_server_through(
-            &format!("http://127.0.0.1:{port}/"),
+            &format!("http://127.0.0.1:{port}{root}"),
             connector(&[("ALL_PROXY", &value)]),
         )
         .unwrap();
@@ -1069,7 +1066,7 @@ mod tests {
         // socks5h: the proxy gets the host name.
         let value = format!("socks5h://{}", proxy.addr());
         let hub = Hub::for_mock_server_through(
-            &format!("http://localhost:{port}/"),
+            &format!("http://localhost:{port}{root}"),
             connector(&[("ALL_PROXY", &value)]),
         )
         .unwrap();

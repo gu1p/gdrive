@@ -9,8 +9,25 @@
 //! [`ProgressEvent::Bytes`], and one [`ProgressEvent::Finished`]. [`ProgressEvent::SourceDone`]
 //! comes once, when no further job will be queued from the source (the walk ended): from then on
 //! the totals are final, apart from follow-up jobs (an upload's folder releasing its children).
+//! A run whose totals are known before its jobs are (a local tree, walked first) says so with
+//! [`ProgressEvent::Planned`], before the first job; the part of them below a job that failed or
+//! was cancelled, and which will never be queued, is taken back with
+//! [`ProgressEvent::SubtreeCancelled`].
+//!
+//! [`render`] draws the events on stderr; [`terminal`] decides whether it does (`--progress`,
+//! `--no-progress`, `GDRIVE_PROGRESS`, a terminal on stderr) and keeps other output above the
+//! bars.
 
-use std::sync::Arc;
+pub(crate) mod render;
+pub(crate) mod terminal;
+
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
+pub(crate) use render::ProgressDisplay;
+pub(crate) use terminal::{eprintln, println, suspend, Mode};
 
 use super::scheduler::{JobKind, Outcome};
 
@@ -20,15 +37,17 @@ pub(crate) struct JobId(pub(crate) u64);
 
 /// What happened to a job. Borrowed: a sink copies what it keeps.
 #[derive(Debug)]
-// Only the tests read the fields until the progress display of milestone 2 item 5 does.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by the progress display, which is not written yet"
-    )
-)]
 pub(crate) enum ProgressEvent<'a> {
+    /// The run will transfer `files` files of `bytes` bytes in all: the totals, known before
+    /// the jobs are.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the recursive upload sends it from the next commit on"
+        )
+    )]
+    Planned { files: u64, bytes: u64 },
     /// The job entered the scheduler's queue. `size` is the content size when known.
     Queued {
         job: JobId,
@@ -45,11 +64,21 @@ pub(crate) enum ProgressEvent<'a> {
     Finished {
         job: JobId,
         kind: JobKind,
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the display knows its jobs by id; for sinks that keep no record of them"
+            )
+        )]
         label: &'a str,
         outcome: &'a Outcome,
     },
     /// The source of jobs is exhausted.
     SourceDone,
+    /// A job ended failed or cancelled and takes its subtree with it: `files` files of `bytes`
+    /// bytes below it will never be queued. Follows the job's [`ProgressEvent::Finished`].
+    SubtreeCancelled { files: u64, bytes: u64 },
 }
 
 /// Receives the [`ProgressEvent`]s of a run. Called from the scheduler's task and from the jobs'
@@ -88,5 +117,67 @@ impl JobProgress {
                 bytes,
             });
         }
+    }
+}
+
+/// Turns the running total that an uploader reports (the bytes Drive holds) into the increments
+/// of a [`JobProgress`]: only what is past the largest total so far is new, so a byte is counted
+/// once, also when a session starts over.
+pub(crate) struct ConfirmedTotal {
+    progress: JobProgress,
+    total: AtomicU64,
+}
+
+impl ConfirmedTotal {
+    #[must_use]
+    pub(crate) fn new(progress: JobProgress) -> Self {
+        ConfirmedTotal {
+            progress,
+            total: AtomicU64::new(0),
+        }
+    }
+
+    /// Drive holds `total` bytes of the content.
+    pub(crate) fn held(&self, total: u64) {
+        let before = self.total.fetch_max(total, Ordering::SeqCst);
+        self.progress.bytes(total.saturating_sub(before));
+    }
+
+    /// The largest total reported.
+    #[must_use]
+    pub(crate) fn total(&self) -> u64 {
+        self.total.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{ConfirmedTotal, JobId, JobProgress, ProgressEvent, ProgressSink};
+
+    #[derive(Default)]
+    struct Bytes(Mutex<Vec<u64>>);
+
+    impl ProgressSink for Bytes {
+        fn event(&self, event: &ProgressEvent<'_>) {
+            if let ProgressEvent::Bytes { bytes, .. } = event {
+                self.0.lock().unwrap().push(*bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn a_confirmed_total_counts_each_byte_once() {
+        let sink = Arc::new(Bytes::default());
+        let confirmed = ConfirmedTotal::new(JobProgress::new(JobId(0), sink.clone()));
+
+        // A session that starts over reports 0 and then the same bytes again.
+        for total in [0, 256, 512, 512, 0, 256, 768] {
+            confirmed.held(total);
+        }
+
+        assert_eq!(*sink.0.lock().unwrap(), [256, 256, 256]);
+        assert_eq!(confirmed.total(), 768);
     }
 }

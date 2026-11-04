@@ -22,10 +22,7 @@ mod tests;
 use std::{
     future::Future,
     path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
 };
 
 use futures::stream;
@@ -42,19 +39,21 @@ use crate::{
     files::mkdir,
     hub::Hub,
     transfer::{
-        progress::JobProgress,
+        progress::{ConfirmedTotal, JobProgress, ProgressDisplay, ProgressEvent},
         scheduler::{Job, JobContext, JobKind, JobOutput, Outcome, Printer, Scheduler, Subtree},
         upload::{upload_path, UploadOptions, UploadTarget},
     },
 };
 
-/// Uploads the local folder of `config`, printing through `printer`, until every file is done
-/// or `cancel` resolves.
+/// Uploads the local folder of `config`, printing through `printer` and showing the progress on
+/// `progress`, until every file is done or `cancel` resolves. The progress is gone before the
+/// summary is printed.
 pub(super) async fn upload_directory(
     hub: &Hub,
     config: UploadDirectoryConfig,
     options: &UploadOptions,
     printer: &Printer,
+    progress: ProgressDisplay,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<(), Error> {
     let UploadDirectoryConfig { file_path, common } = config;
@@ -81,6 +80,8 @@ pub(super) async fn upload_directory(
         options: options.clone(),
         print_only_id,
     });
+    let unreadable_files = tree.unreadable.iter().filter(|entry| !entry.is_dir).count();
+    let unreadable_files = u64::try_from(unreadable_files).unwrap_or(u64::MAX);
     let unreadable = tree.unreadable.into_iter().map(|entry| {
         let kind = if entry.is_dir {
             JobKind::Metadata
@@ -93,9 +94,16 @@ pub(super) async fn upload_directory(
     });
     let root = uploads.folder_job(tree.root, common.parents);
     let jobs = unreadable.chain([root]).collect::<Vec<_>>();
+    // The files come as follow-ups of their folders: the totals are the walk's.
+    progress.sink().event(&ProgressEvent::Planned {
+        files: tree_info.file_count + unreadable_files,
+        bytes: tree_info.total_file_size,
+    });
     let report = Scheduler::new(common.transfer, printer.clone())
+        .with_progress(progress.sink())
         .run(stream::iter(jobs), cancel)
         .await;
+    progress.finish();
 
     let result = report.check().map_err(Error::Incomplete);
     if result.is_ok() && !print_only_id {
@@ -290,18 +298,15 @@ pub(crate) async fn send_file(
     progress: &JobProgress,
 ) -> Result<u64, Error> {
     // The uploader tells the bytes Drive holds so far; progress takes what is new.
-    let confirmed = AtomicU64::new(0);
-    let report = |held: u64| {
-        let before = confirmed.fetch_max(held, Ordering::SeqCst);
-        progress.bytes(held.saturating_sub(before));
-    };
+    let confirmed = ConfirmedTotal::new(progress.clone());
+    let report = |held| confirmed.held(held);
     let uploaded = upload_path(hub, path, target, options, Some(&report))
         .await
         .map_err(|err| Error::Transfer(Box::new(err)))?;
     let size = uploaded
         .size
         .and_then(|size| u64::try_from(size).ok())
-        .unwrap_or_else(|| confirmed.load(Ordering::SeqCst));
+        .unwrap_or_else(|| confirmed.total());
     Ok(size)
 }
 
@@ -312,14 +317,17 @@ fn failed(path: PathBuf, source: Error) -> Outcome {
     })
 }
 
-/// The files and folders below `folder`.
+/// The files and folders below `folder`, and the sizes of the files.
 fn subtree(folder: &file_tree::Folder) -> Subtree {
     let mut subtree = Subtree::default();
     let mut folders = vec![folder];
     while let Some(folder) = folders.pop() {
         for child in &folder.children {
             match child {
-                Node::File(_) => subtree.files += 1,
+                Node::File(file) => {
+                    subtree.files += 1;
+                    subtree.bytes += file.size;
+                }
                 Node::Folder(folder) => {
                     subtree.folders += 1;
                     folders.push(folder);

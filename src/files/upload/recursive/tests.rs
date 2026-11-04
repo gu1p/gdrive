@@ -6,6 +6,7 @@ use std::{
     future,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -15,9 +16,10 @@ use crate::{
     files::upload::{CommonConfig, Error, UploadDirectoryConfig},
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
+        progress::{Mode, NoProgress, ProgressDisplay, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
-            Options, Printer,
+            JobKind, Options, Printer,
         },
         upload::UploadOptions,
     },
@@ -60,6 +62,7 @@ fn config(path: &Path, jobs: usize, continue_on_error: bool) -> UploadDirectoryC
             upload_directories: true,
             print_only_id: false,
             transfer: Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error),
+            progress: Mode::Never,
         },
     }
 }
@@ -111,8 +114,35 @@ async fn upload_with(
     printer: &Printer,
     cancel: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), Error> {
+    upload_reporting(
+        server,
+        config,
+        options,
+        printer,
+        Arc::new(NoProgress),
+        cancel,
+    )
+    .await
+}
+
+/// [`upload_with`], reporting to `progress`.
+async fn upload_reporting(
+    server: &FakeDrive,
+    config: UploadDirectoryConfig,
+    options: &UploadOptions,
+    printer: &Printer,
+    progress: Arc<dyn ProgressSink>,
+    cancel: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), Error> {
     let hub = server.hub();
-    let run = upload_directory(&hub, config, options, printer, cancel);
+    let run = upload_directory(
+        &hub,
+        config,
+        options,
+        printer,
+        ProgressDisplay::reporting_to(progress),
+        cancel,
+    );
     tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the upload should end")
@@ -326,6 +356,37 @@ async fn continue_on_error_uploads_the_other_files_and_still_fails() {
     );
 }
 
+/// The totals a run planned, the bytes it confirmed, and what failed folders took along.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Totals {
+    planned: (u64, u64),
+    finished: u64,
+    confirmed: u64,
+    cancelled: (u64, u64),
+}
+
+#[derive(Default)]
+struct Recorder(Mutex<Totals>);
+
+impl ProgressSink for Recorder {
+    fn event(&self, event: &ProgressEvent<'_>) {
+        let mut totals = self.0.lock().unwrap();
+        match *event {
+            ProgressEvent::Planned { files, bytes } => totals.planned = (files, bytes),
+            ProgressEvent::Bytes { bytes, .. } => totals.confirmed += bytes,
+            ProgressEvent::Finished {
+                kind: JobKind::Media,
+                ..
+            } => totals.finished += 1,
+            ProgressEvent::SubtreeCancelled { files, bytes } => {
+                totals.cancelled.0 += files;
+                totals.cancelled.1 += bytes;
+            }
+            _ => {}
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
     let (_dir, root) = local_tree();
@@ -334,8 +395,23 @@ async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
+    let output = output();
+    let recorder = Arc::new(Recorder::default());
 
-    let uploaded = upload(&server, config(&root, 2, true)).await;
+    let result = upload_reporting(
+        &server,
+        config(&root, 2, true),
+        &UploadOptions::default(),
+        &output.printer,
+        Arc::clone(&recorder) as Arc<dyn ProgressSink>,
+        future::pending(),
+    )
+    .await;
+    let uploaded = Uploaded {
+        result,
+        out: output.out,
+        err: output.err,
+    };
 
     assert_eq!(
         uploaded.error(),
@@ -360,6 +436,17 @@ async fn a_folder_that_cannot_be_created_cancels_everything_in_it() {
         err.last().unwrap(),
         "Summary: 3 transferred (7 B), 0 unchanged, 0 skipped, 0 failed, 3 cancelled; \
         1 folder failed"
+    );
+    // The progress's totals: the three files of 2024 leave them with their folder, so the
+    // run ends at what it planned.
+    assert_eq!(
+        *recorder.0.lock().unwrap(),
+        Totals {
+            planned: (6, TREE_SIZE as u64),
+            finished: 3,
+            confirmed: 7,
+            cancelled: (3, 13),
+        }
     );
 }
 
@@ -575,28 +662,17 @@ async fn concurrent_multi_chunk_uploads_retry_a_failed_chunk() {
 async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
     let (_dir, root, _files) = big_tree();
     let behavior = Behavior {
-        // Every upload gets its first chunk on Drive and then hangs on the second, so no file
-        // can be completed before Ctrl-C, however slow the machine is.
+        // Every upload gets its first chunk on Drive, and the fake holds its second without a
+        // reply, so no file can be completed before Ctrl-C, however slow the machine is.
         chunks_stalled_from: Some(256 * 1024),
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
     let output = output();
-    // Ctrl-C once both running uploads have a chunk on Drive.
-    let cancel = async {
-        loop {
-            let started = server
-                .chunks()
-                .iter()
-                .filter(|chunk| chunk.status == 308)
-                .map(|chunk| chunk.name.clone())
-                .collect::<HashSet<_>>();
-            if started.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
+    // Ctrl-C once the fake holds the second chunk of both running uploads: both have their first
+    // chunk on Drive and are in the middle of their sessions. The fake says when, so nothing
+    // here depends on how long the uploads take.
+    let cancel = server.wait_for_stalled_chunks(2);
 
     let result = upload_with(
         &server,
@@ -617,8 +693,64 @@ async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
     assert!(output.err.lines().contains(&String::from(
         "Interrupted: cancelling the transfers in progress"
     )));
+    // Drive answered the first chunk of the two uploads and holds their second.
+    let answered = server.chunks();
+    assert_eq!(
+        answered
+            .iter()
+            .map(|chunk| (chunk.first, chunk.status))
+            .collect::<Vec<_>>(),
+        [(Some(0), 308), (Some(0), 308)],
+        "{answered:?}"
+    );
+    assert_eq!(
+        answered
+            .iter()
+            .map(|chunk| &chunk.name)
+            .collect::<HashSet<_>>()
+            .len(),
+        2
+    );
+    assert_eq!(server.stalled_chunks(), 2);
     // The aborted uploads send nothing more.
-    let sent = server.chunks().len();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(server.chunks().len(), sent);
+    assert_eq!(server.chunks(), answered);
+    assert_eq!(server.stalled_chunks(), 2);
+}
+
+#[tokio::test]
+async fn the_progress_is_gone_before_the_summary() {
+    let (_dir, root) = local_tree();
+    // Long enough for the display to draw.
+    let behavior = Behavior {
+        upload_delay: Duration::from_millis(150),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(Vec::new(), behavior).await;
+    let written = Captured::default();
+    let printer = Printer::to(written.clone(), written.clone());
+
+    let hub = server.hub();
+    upload_directory(
+        &hub,
+        config(&root, 2, false),
+        &UploadOptions::default(),
+        &printer,
+        ProgressDisplay::plain_on(written.clone()),
+        future::pending(),
+    )
+    .await
+    .unwrap();
+
+    // The line was drawn and erased before the last lines, and nothing is drawn after them.
+    let written = written.text();
+    let drawn = written.find(" files, ").expect("the progress is drawn");
+    let erased = written
+        .rfind(&format!("\r{}\r", " ".repeat(80)))
+        .expect("the progress is erased");
+    let uploaded = written
+        .find("Uploaded 6 files")
+        .expect("the end of the upload");
+    assert!(drawn < erased && erased < uploaded, "{written:?}");
+    assert!(!written[uploaded..].contains('\r'), "{written:?}");
 }

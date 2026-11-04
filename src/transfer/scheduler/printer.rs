@@ -12,9 +12,12 @@ use std::{
 
 use tokio::sync::{mpsc, oneshot};
 
+use crate::transfer::progress;
+
 /// The only writer to stdout and stderr while a run goes on: one task writes the lines that the
-/// clones send, each whole and in the order received. Cloning is cheap; the task ends when the
-/// last clone is dropped.
+/// clones send, each whole and in the order received, above the progress bars when a display
+/// draws ([`progress::suspend`]). Cloning is cheap; the task ends when the last clone is
+/// dropped.
 ///
 /// A stream that fails takes no further lines. A closed pipe (the reader went away, as in
 /// `| head`) ends that output quietly, as it ends a listing; any other failure (a full disk) is
@@ -127,6 +130,8 @@ impl<W: Write> Output<W> {
 impl Printer {
     /// Lines waiting for the writer before a sender waits.
     const CAPACITY: usize = 256;
+    /// Lines written at once, when that many wait.
+    const BATCH: usize = 64;
 
     /// A printer to the process's stdout and stderr, on the current runtime.
     #[must_use]
@@ -148,22 +153,36 @@ impl Printer {
             let state = task_state;
             let mut out = Output::new(out, Target::Stdout);
             let mut err = Output::new(err, Target::Stderr);
+            let mut batch = Vec::with_capacity(Self::BATCH);
             while let Some(message) = messages.recv().await {
-                match message {
-                    Message::Line {
-                        target: Target::Stdout,
-                        text,
-                    } => out.line(&text, &state),
-                    Message::Line {
-                        target: Target::Stderr,
-                        text,
-                    } => err.line(&text, &state),
-                    Message::Flush(done) => {
-                        out.flush(&state);
-                        err.flush(&state);
-                        let _ = done.send(());
+                batch.push(message);
+                while batch.len() < Self::BATCH {
+                    match messages.try_recv() {
+                        Ok(message) => batch.push(message),
+                        Err(_) => break,
                     }
                 }
+                // Above the progress bars, if any: they are taken off the terminal once per
+                // batch, not per line.
+                progress::suspend(|| {
+                    for message in batch.drain(..) {
+                        match message {
+                            Message::Line {
+                                target: Target::Stdout,
+                                text,
+                            } => out.line(&text, &state),
+                            Message::Line {
+                                target: Target::Stderr,
+                                text,
+                            } => err.line(&text, &state),
+                            Message::Flush(done) => {
+                                out.flush(&state);
+                                err.flush(&state);
+                                let _ = done.send(());
+                            }
+                        }
+                    }
+                });
             }
         });
         Printer { sender, state }

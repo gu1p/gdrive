@@ -26,7 +26,9 @@ The plan, with milestones and the triage of every upstream issue and pull reques
 ### Release binaries
 
 Download the archive for your platform from the
-[releases page](https://github.com/gu1p/gdrive/releases), together with `SHA256SUMS`.
+[releases page](https://github.com/gu1p/gdrive/releases), together with `SHA256SUMS`. The first release
+is the pre-release `v4.0.0-alpha.1`. Pre-releases are not "latest", so download them by tag:
+`https://github.com/gu1p/gdrive/releases/download/<tag>/<archive>`.
 
 | Platform | Archive |
 |---|---|
@@ -36,12 +38,14 @@ Download the archive for your platform from the
 | macOS, Intel | `gdrive_macos-x64.tar.gz` |
 | Windows x86_64 | `gdrive_windows-x64.zip` |
 
-The Linux binaries are statically linked and run on any distribution.
+The Linux binaries are statically linked and run on any distribution. The Windows binary has the C
+runtime linked in and needs no Visual C++ Redistributable. There is no 32-bit ARM binary;
+[docs/releasing.md](docs/releasing.md#supported-platforms) has a build command for it that CI does not test.
 
 **Linux and macOS**
 
 ```sh
-TAG="<release tag>"              # as shown on the releases page
+TAG=v4.0.0-alpha.1               # the release tag, as shown on the releases page
 ASSET=gdrive_linux-x64.tar.gz    # your archive from the table
 curl -fLO "https://github.com/gu1p/gdrive/releases/download/$TAG/$ASSET"
 curl -fLO "https://github.com/gu1p/gdrive/releases/download/$TAG/SHA256SUMS"
@@ -73,8 +77,6 @@ xattr -d com.apple.quarantine /usr/local/bin/gdrive
 3. Unpack `gdrive.exe` into a folder in your `PATH`, for example `%USERPROFILE%\bin`.
 4. SmartScreen may warn about an unknown publisher, because the binary is not signed. Click
    **More info**, then **Run anyway**.
-5. If Windows reports that `VCRUNTIME140.dll` is missing, install the
-   [Microsoft Visual C++ Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist).
 
 ### Build from source
 
@@ -84,8 +86,8 @@ You need Rust 1.88 or later ([rustup](https://rustup.rs/)).
 cargo install --git https://github.com/gu1p/gdrive --locked
 ```
 
-This installs `gdrive` into `~/.cargo/bin`. To build from a clone instead, run `cargo build --release
---locked`; the binary is `target/release/gdrive`.
+This installs `gdrive` from `main` into `~/.cargo/bin`; add `--tag v4.0.0-alpha.1` for the release. To
+build from a clone instead, run `cargo build --release --locked`; the binary is `target/release/gdrive`.
 
 ## Quick start
 
@@ -160,11 +162,11 @@ client that Google could block for everyone. That is what happened to the client
 Done:
 
 - Dependencies moved from git forks pinned in 2023 to current crates.io releases: google-drive3 5 to 7,
-  google-apis-common 5 to 8, hyper 0.14 to 1, yup-oauth2 8 to 12, exponential-backoff 1 to 2. File I/O
-  is asynchronous. This is dodomorandi's work.
+  google-apis-common 5 to 8, hyper 0.14 to 1, yup-oauth2 8 to 12. File I/O is asynchronous. This is
+  dodomorandi's work.
 
-For 4.0.0, milestones 0 and 1 of the [roadmap](docs/triage/README.md). These land during the alpha
-series; the notes of each release say what it contains.
+For 4.0.0, milestones 0 and 1 of the [roadmap](docs/triage/README.md). [CHANGELOG.md](CHANGELOG.md)
+lists every change of a release and what behaves differently from 3.9.1.
 
 - Resumable uploads retry a failed chunk from the right offset again. The migrated library advanced the
   offset before a retry, which could hang or fail large uploads.
@@ -182,7 +184,7 @@ series; the notes of each release say what it contains.
   no longer valid they fail fast with an error instead of waiting on port 8085. The login port is
   configurable (`--port`).
 - `gdrive account reauth` signs in again and keeps the stored refresh token if Google sends none.
-- A clear error instead of a panic when no CA certificates are found; fixes for Windows certificate errors.
+- A clear error instead of a panic when no CA certificates are found.
 - `files update` on a folder gives an error instead of a panic.
 - `--acknowledge-abuse` for files that Google flags as abusive; recursive jobs count per-file errors and
   exit non-zero.
@@ -190,17 +192,34 @@ series; the notes of each release say what it contains.
 
 Also in 4.0.0:
 
-- `gdrive account add --manual` for machines without a browser (from the authentication milestone).
+- `gdrive account add --manual` for machines without a browser; the login sends PKCE and checks `state`.
 - Service accounts (`gdrive account add --service-account`, with `--subject` for domain-wide delegation)
   and Application Default Credentials (`gdrive account add --adc`).
 - Proxy support through `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, including SOCKS5.
-- Release archives for Linux x86_64 and ARM64, macOS ARM64 and Intel, and Windows, with `SHA256SUMS`.
+- Release archives for Linux x86_64 and ARM64, macOS ARM64 and Intel, and Windows (without the Visual C++
+  runtime), with `SHA256SUMS`.
+- gdrive's own resumable uploads: chunks are read from the disk as they are sent, the MD5 checksum is
+  checked after the upload, and an interrupted `files upload`, `files update` or `files import` continues
+  in the next run. `--multipart-threshold` sets which files go up in a single request.
+- A download that breaks off continues where it stopped (`Range`), within the same run; the size is
+  checked also for files without an MD5 checksum.
 - Recursive download and upload transfer 4 files at a time (`--jobs N`). A recursive download starts
   while it still lists the folder. `--continue-on-error` finishes the other files after a failure; every
   failure is reported and makes the command exit non-zero, and a summary line goes to stderr.
 - `files download --recursive --export default` exports Google Docs, Sheets, Slides and Drawings (to
   docx, xlsx, pptx and png, or a format per type such as `--export md,sheets=ods`) instead of skipping
-  them, and does not export an unchanged document again.
+  them, and does not export an unchanged document again. `files export --format` picks the format.
+- Progress on stderr for downloads, uploads, updates, imports and exports: a bar with the rate and the
+  time left, and for recursive transfers a line for the run and one per file. On by default on a
+  terminal; `--progress`, `--no-progress` and `GDRIVE_PROGRESS` change that. See
+  [Progress output](docs/basic_usage.md#progress-output).
+- `files trash` and `files untrash`; `files delete`, `trash` and `untrash` take several ids.
+- `files list --tsv` and `--json` for scripts; `drives list` lists all shared drives (`--max N`).
+- Markdown export and import for Google Docs.
+- `--name` for `files upload` and `files update`; an update from stdin keeps the file's name.
+- Short options: `-m`, `-q`, `-p`, `-r`, `-o`, `-d`.
+- Shell completions: `gdrive completions bash` (also zsh, fish, powershell, elvish).
+- `files info` prints `Trashed: yes` for a file in the trash.
 - `files sync up` and `files sync down` sync a local directory and a Drive folder one way: new and changed
   files only, changed Drive files updated in place, `--dry-run`, and `--delete` that runs only after a
   complete listing and a transfer without failures and moves extras to the Drive trash or
@@ -208,11 +227,11 @@ Also in 4.0.0:
 
 Planned, not done yet:
 
-- Faster transfers: resumable uploads that survive a restart, progress output,
-  download resume.
-- Shell completions; a Windows build without the Visual C++ runtime.
-- Trash and untrash, real TSV and JSON output, listing all shared drives, Markdown export and import,
-  short options.
+- A mode of `files download --recursive` that skips files that exist already (`files sync down` updates
+  them instead).
+- Download resume across runs; today a broken download resumes only within the same run.
+- From the roadmap's backlog: folder size, `.gdriveignore`, deleting local files after an upload,
+  `--account` per command, raw access tokens, a credential store outside the config directory.
 
 ## Upstream
 
@@ -230,19 +249,23 @@ MIT, see [LICENSE](LICENSE).
 - Community contributions to upstream used in this fork's documentation: anlif
   ([#66](https://github.com/glotlabs/gdrive/pull/66), basic usage), fseasy
   ([#96](https://github.com/glotlabs/gdrive/pull/96), credentials guide), TombLL
-  ([#132](https://github.com/glotlabs/gdrive/pull/132), SSH tunnel), umaumax
-  ([#137](https://github.com/glotlabs/gdrive/pull/137), typo fix), hyoklee
-  ([#138](https://github.com/glotlabs/gdrive/pull/138), `files export`), and markkkx000
+  ([#132](https://github.com/glotlabs/gdrive/pull/132), SSH tunnel guide), umaumax
+  ([#137](https://github.com/glotlabs/gdrive/pull/137), credentials guide fix), hyoklee
+  ([#138](https://github.com/glotlabs/gdrive/pull/138), basic usage fix), and markkkx000
   ([#161](https://github.com/glotlabs/gdrive/issues/161), the curl-the-redirect trick).
-- Community pull requests to upstream that planned features are ported from: CrmsnDragoon
-  ([#67](https://github.com/glotlabs/gdrive/pull/67), trash), Defman
-  ([#68](https://github.com/glotlabs/gdrive/pull/68), concurrent download), Jasper-Bekkers
-  ([#82](https://github.com/glotlabs/gdrive/pull/82), parallel upload), kenchou
-  ([#113](https://github.com/glotlabs/gdrive/pull/113), TSV output), dachrisch
-  ([#126](https://github.com/glotlabs/gdrive/pull/126), folder size), GikLaang
-  ([#141](https://github.com/glotlabs/gdrive/pull/141), system proxy), somsak
-  ([#156](https://github.com/glotlabs/gdrive/pull/156), shared-drive paging), lev-n
-  ([#159](https://github.com/glotlabs/gdrive/pull/159), Markdown), serebrov
-  ([#162](https://github.com/glotlabs/gdrive/pull/162) and [#164](https://github.com/glotlabs/gdrive/pull/164),
-  export in recursive download), antoine2711 ([#163](https://github.com/glotlabs/gdrive/pull/163), short
-  options). Each port credits its author in the commit.
+- Community pull requests to upstream whose work was ported or adapted (where code was ported, the commit
+  names the pull request):
+  - trash: CrmsnDragoon ([#67](https://github.com/glotlabs/gdrive/pull/67))
+  - Markdown export and import: Loh1917 ([#146](https://github.com/glotlabs/gdrive/pull/146)) and lev-n
+    ([#159](https://github.com/glotlabs/gdrive/pull/159))
+  - the idea for TSV output: kenchou ([#113](https://github.com/glotlabs/gdrive/pull/113))
+  - shared-drive paging: somsak ([#156](https://github.com/glotlabs/gdrive/pull/156)) and iamjoeker
+    ([#144](https://github.com/glotlabs/gdrive/pull/144))
+  - ARM builds in CI: mike-kfed ([#130](https://github.com/glotlabs/gdrive/pull/130)), gueraf
+    ([#154](https://github.com/glotlabs/gdrive/pull/154)) and stulluk ([#158](https://github.com/glotlabs/gdrive/pull/158))
+  - proxy support, the requirement: GikLaang ([#141](https://github.com/glotlabs/gdrive/pull/141))
+  - export in recursive download: serebrov ([#162](https://github.com/glotlabs/gdrive/pull/162) and
+    [#164](https://github.com/glotlabs/gdrive/pull/164))
+  - short options: antoine2711 ([#163](https://github.com/glotlabs/gdrive/pull/163))
+  - the ideas for concurrent download and upload: Defman ([#68](https://github.com/glotlabs/gdrive/pull/68)) and
+    Jasper-Bekkers ([#82](https://github.com/glotlabs/gdrive/pull/82))

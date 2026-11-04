@@ -12,6 +12,8 @@ bytes = "1.3.0"
 chrono = { version = "0.4.41", default-features = false }
 clap = { version = "4.5.41", features = ["derive"] }
 clap_complete = "4.5.67"
+# The terminal that the progress bars draw on (indicatif's own, already in the tree through it).
+console = { version = "0.16.4", default-features = false, features = ["std"] }
 error-trace = { version = "4.0.0", default-features = false }
 # Full jitter for the retry backoff; already in the tree through tempfile.
 fastrand = "2.1.0"
@@ -28,6 +30,9 @@ hyper-rustls = { version = "0.27.9", default-features = false, features = ["http
 # client-proxy: the HTTP(S)_PROXY / ALL_PROXY / NO_PROXY matcher and the SOCKS5 connector (adds
 # ipnet, for NO_PROXY address ranges).
 hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "client-proxy", "http1", "http2", "tokio"] }
+# Progress bars on stderr (#12, #44): multi-line drawing, a refresh limit and `suspend`, so that
+# the lines of a run print above the bars. Without default features: no wasm support.
+indicatif = { version = "0.18.6", default-features = false, features = ["unicode-width"] }
 md5 = "0.7.0"
 mime = "0.3.16"
 mime_guess = "2.0.4"

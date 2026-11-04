@@ -858,17 +858,21 @@ mod tests {
         auth.token(&DRIVE_SCOPES).await.unwrap();
         drop(auth);
 
-        // ... and gdrive reads it. yup-oauth2 writes without flushing, so under load the
-        // file can still be empty for a moment: poll briefly instead of asserting at once.
-        let mut written = None;
-        for _ in 0..50 {
-            if let Some(file) = TokenFile::load(&path).await.unwrap() {
-                written = Some(file);
-                break;
+        // ... and gdrive reads it. yup-oauth2 truncates the file and writes it without
+        // flushing, so under load it can be missing, empty or half written for a moment: poll
+        // (for at most 10 s) until it parses, instead of asserting at once.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let written = loop {
+            match TokenFile::load(&path).await {
+                Ok(Some(file)) => break file,
+                Ok(None) | Err(LoadError::Parse { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => panic!("yup-oauth2 should have written a valid tokens.json: {other:?}"),
             }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        let written = written.expect("yup-oauth2 should have written tokens.json");
+        };
         assert_eq!(written.entries().len(), 1);
         assert_eq!(written.entries()[0].scopes, DRIVE_SCOPES);
         assert_eq!(written.refresh_token(), Some("yup-refresh"));

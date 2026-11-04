@@ -348,6 +348,7 @@ async fn follow_ups_start_after_their_job_and_die_with_it() {
     .with_subtree(Subtree {
         files: 4,
         folders: 1,
+        ..Subtree::default()
     });
 
     let report = run(options(4, true), &output.printer, vec![a, broken]).await;
@@ -397,11 +398,12 @@ async fn aborted_folders_cancel_their_subtree() {
     )
     .with_subtree(Subtree {
         files: 2,
-        folders: 0,
+        ..Subtree::default()
     });
     let b = folder("b", &log, Vec::new()).with_subtree(Subtree {
         files: 7,
         folders: 1,
+        ..Subtree::default()
     });
     let jobs = vec![a, b, failure("bad", MS)];
     let mut options = options(1, false);
@@ -544,6 +546,10 @@ impl ProgressSink for Recorder {
                 outcome,
             } => format!("finished {job} {kind:?} {label} {outcome:?}"),
             ProgressEvent::SourceDone => String::from("source done"),
+            ProgressEvent::Planned { files, bytes } => format!("planned {files} {bytes}"),
+            ProgressEvent::SubtreeCancelled { files, bytes } => {
+                format!("subtree cancelled {files} {bytes}")
+            }
         };
         self.0.lock().unwrap().push(text);
     }
@@ -604,6 +610,57 @@ async fn progress_events_follow_every_job() {
             .filter(|event| *event == "source done")
             .count(),
         1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_failed_folder_reports_the_files_it_takes_along() {
+    let output = output();
+    let recorder = Arc::new(Recorder::default());
+    let folder = |label: &str, subtree: Subtree| {
+        Job::new(JobKind::Metadata, label, |_| async {
+            Outcome::failed(io::Error::other("no such parent")).into()
+        })
+        .with_subtree(subtree)
+    };
+    let jobs = [
+        folder(
+            "c",
+            Subtree {
+                files: 4,
+                folders: 1,
+                bytes: 40,
+            },
+        ),
+        // Only folders below: no file leaves the total.
+        folder(
+            "d",
+            Subtree {
+                folders: 2,
+                ..Subtree::default()
+            },
+        ),
+    ];
+
+    Scheduler::new(options(1, true), output.printer.clone())
+        .with_describe(ToString::to_string)
+        .with_progress(Arc::clone(&recorder) as Arc<dyn ProgressSink>)
+        .run(stream::iter(jobs), future::pending())
+        .await;
+
+    let events = recorder.0.lock().unwrap().clone();
+    let finished = events
+        .iter()
+        .position(|event| event.starts_with("finished 0 Metadata c Failed"))
+        .unwrap();
+    assert_eq!(events[finished + 1], "subtree cancelled 4 40", "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.starts_with("subtree"))
+            .count(),
+        1,
+        "{events:?}"
     );
 }
 

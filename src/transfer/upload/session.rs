@@ -33,6 +33,8 @@ use tokio::io::AsyncWriteExt;
 use crate::{
     app_config::{account_type::AccountType, AppConfig},
     auth::service::parse_key,
+    // Warnings go above the progress bars.
+    transfer::progress::eprintln,
 };
 
 /// The directory of the records, under the account directory.

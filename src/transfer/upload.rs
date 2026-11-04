@@ -70,6 +70,8 @@ use crate::{
     },
     files::generate_ids,
     hub::Hub,
+    // Warnings and chunk messages go above the progress bars.
+    transfer::progress::{eprintln, println},
 };
 
 use body::{FileSource, Md5Progress, PipeBody, ReaderSource, Segment, Source};

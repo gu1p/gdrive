@@ -60,6 +60,7 @@ use crate::{
     },
     hub::Hub,
     transfer::{
+        progress::ProgressDisplay,
         scheduler::{
             plural, Job, JobContext, JobKind, Outcome, Printer, Report, Scheduler, SkipReason,
         },
@@ -67,13 +68,15 @@ use crate::{
     },
 };
 
-/// Downloads the folder `file` into the destination of `config`, printing through `printer`,
-/// until every file is done or `cancel` resolves.
+/// Downloads the folder `file` into the destination of `config`, printing through `printer` and
+/// showing the progress on `progress`, until every file is done or `cancel` resolves. The
+/// progress is gone before the summary is printed.
 pub(super) async fn download_directory(
     hub: &Hub,
     file: google_drive3::api::File,
     config: &Config,
     printer: &Printer,
+    progress: ProgressDisplay,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<(), errors::Download> {
     use errors::Download as E;
@@ -106,8 +109,10 @@ pub(super) async fn download_directory(
         totals: Arc::clone(&totals),
     };
     let report = Scheduler::new(config.transfer, printer.clone())
+        .with_progress(progress.sink())
         .run(source.into_stream(), cancel)
         .await;
+    progress.finish();
 
     let totals = totals.lock().unwrap_or_else(PoisonError::into_inner).take();
     let exports = files.exports.snapshot();
@@ -417,9 +422,11 @@ impl Files {
             ..Revision::default()
         };
         let identity = Identity::new(&self.hub, &file.id, revision);
+        // The bytes count as they are written.
         let mut download =
             ResumableDownload::new(source, self.hub.retrier().state(), revision.expected())
-                .with_identity(identity);
+                .with_identity(identity)
+                .with_progress(context.progress.clone());
         let first = download
             .next()
             .await
@@ -445,7 +452,6 @@ impl Files {
             path: abs_file_path.clone(),
             source,
         })?;
-        context.progress.bytes(file.size);
 
         Ok(Outcome::Transferred { bytes: file.size })
     }
@@ -500,9 +506,11 @@ impl Files {
         let mime_type = export.format.get_export_mime();
         let source = export_content(&self.hub, &export.id, mime_type, label)
             .map_err(|err| E::ExportFile(Box::new(err)))?;
-        // Nothing to check but the size the server announces, if it does.
+        // Nothing to check but the size the server announces, if it does. The bytes count as
+        // they are written.
         let mut download =
-            ResumableDownload::new(source, self.hub.retrier().state(), Expected::default());
+            ResumableDownload::new(source, self.hub.retrier().state(), Expected::default())
+                .with_progress(context.progress.clone());
         let first = download.next().await.map_err(|err| {
             if is_export_too_large(&err) {
                 E::ExportTooLarge(ExportTooLarge(Box::new(err)))
@@ -549,7 +557,6 @@ impl Files {
         let bytes = fs::metadata(&abs_file_path)
             .await
             .map_or(0, |metadata| metadata.len());
-        context.progress.bytes(bytes);
 
         Ok(Outcome::Transferred { bytes })
     }

@@ -10,7 +10,11 @@ use std::{
 use async_recursion::async_recursion;
 
 use super::{FileLike, FileTreeLike, FolderInfoLike, FolderLike};
-use crate::common::{file_tree_like, id_gen::IdGen};
+use crate::{
+    common::{file_tree_like, id_gen::IdGen},
+    // Warnings go above the progress bars.
+    transfer::progress::eprintln,
+};
 
 #[derive(Debug)]
 pub(crate) struct FileTree {
