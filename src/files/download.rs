@@ -136,9 +136,13 @@ async fn download_regular(
     use errors::Download as E;
 
     let size = file.size.and_then(|size| u64::try_from(size).ok());
+    // Escaped: the Drive name is not sanitized yet and goes to the terminal.
     let label = format!(
         "download of '{}'",
-        file.name.as_deref().unwrap_or(&config.file_id)
+        file.name
+            .as_deref()
+            .unwrap_or(&config.file_id)
+            .escape_debug()
     );
     let source = file_content(hub, &config.file_id, config.acknowledge_abuse, label)
         .map_err(|err| E::DownloadFile(Box::new(err)))?;

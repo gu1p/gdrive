@@ -65,7 +65,11 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
 
     let mime_type = extension.get_export_mime();
 
-    let label = format!("export of '{}'", file.name.as_deref().unwrap_or_default());
+    // Escaped: the Drive name goes to the terminal.
+    let label = format!(
+        "export of '{}'",
+        file.name.as_deref().unwrap_or_default().escape_debug()
+    );
     let source = export_content(hub, &config.file_id, mime_type, label)
         .map_err(|err| Error::ExportFile(Box::new(err)))?;
     let mut download = ResumableDownload::new(source, hub.retrier().state(), None);
