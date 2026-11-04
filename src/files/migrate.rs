@@ -18,7 +18,8 @@
 //! with `incompleteSearch` fails its folder, so that a missing file is not created twice.
 //!
 //! Both accounts may see the same objects (a shared folder): a destination folder that holds
-//! the source item itself (the same Drive id) fails that item, and an `--into` folder that is
+//! the source item itself (the same Drive id), or a destination folder or file of the item's
+//! name that is any migrated source item, fails that item, and an `--into` folder that is
 //! migrated, or inside a migrated folder, is refused before anything starts.
 //!
 //! `--dry-run` runs the same jobs without a write: folders that would be created are not

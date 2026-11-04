@@ -90,9 +90,12 @@ missing from it and would be created a second time. That folder fails instead, w
 
 **The same file on both sides.** When both accounts can see the same folder, for example a folder of the
 source that is shared with the destination account and added to its My Drive, the destination folder may
-hold the source item itself. gdrive compares Drive ids: such an item fails with `the source and the
-destination are the same folder; nothing to do` (or `file`), nothing is copied and it never goes to the
-trash. An `--into` folder that is one of the folders to migrate, or inside one, is refused before anything
+hold the source item itself, or another item of the source. gdrive compares Drive ids with those of
+everything it migrates: an item fails, nothing is copied for it and it never goes to the trash, when its
+destination folder holds the item itself (`the source and the destination are the same folder; nothing to
+do`, or `file`), or when the destination folder or file of its name is one of the migrated source items
+(`the folder of this name in the destination is one of the source items that are migrated; nothing to
+do`). An `--into` folder that is one of the folders to migrate, or inside one, is refused before anything
 starts.
 
 ### The output
