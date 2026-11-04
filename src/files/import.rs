@@ -9,12 +9,15 @@ use mime::Mime;
 
 use crate::{
     common::{
-        delegate::UploadDelegateConfig,
         drive_file::{DocType, FileExtension},
         file_info::{self, FileInfo},
         hub_helper::{get_hub, GetHubError},
     },
     files::{self, info::DisplayConfig},
+    transfer::upload::{
+        session::{account_session_dir, account_session_identity},
+        upload_path, UploadError, UploadOptions, UploadTarget,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -26,7 +29,11 @@ pub(crate) struct Config {
 
 pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
+    let options = UploadOptions {
+        session_dir: account_session_dir(),
+        session_identity: account_session_identity(),
+        ..UploadOptions::default()
+    };
 
     let (doc_type, source_mime_type) =
         import_types(&config.file_path).ok_or(Error::UnsupportedFileType)?;
@@ -37,7 +44,7 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
         Err(err) => return Err(Box::new(Error::OpenFile(config.file_path, err))),
     };
 
-    let mut file_info = match FileInfo::from_file(
+    let file_info = match FileInfo::from_file(
         &file,
         file_info::Config {
             file_path: &config.file_path,
@@ -53,19 +60,22 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
             }))
         }
     };
-    // The Drive metadata asks for the Google type while the content goes up as what it is
-    // (e.g. text/markdown): that pair is what makes Drive convert the file.
-    file_info.source_mime_type = Some(source_mime_type);
-
-    let reader = std::io::BufReader::new(file);
+    // The uploader opens the file itself.
+    drop(file);
+    let target = import_target(
+        file_info.name.into_owned(),
+        file_info.parents.unwrap_or_default(),
+        doc_type,
+        source_mime_type,
+    );
 
     if !config.print_only_id {
         println!("Importing {} as a {}", config.file_path.display(), doc_type);
     }
 
-    let file = files::upload::upload_file(&hub, reader, None, file_info, &delegate_config)
+    let file = upload_path(&hub, &config.file_path, &target, &options, None)
         .await
-        .map_err(Error::UploadFile)?;
+        .map_err(|err| Error::UploadFile(Box::new(err)))?;
 
     if config.print_only_id {
         print!("{}", file.id.unwrap_or_default());
@@ -75,6 +85,23 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
     }
 
     Ok(())
+}
+
+/// The upload of an import: the Drive metadata asks for the Google type while the content goes
+/// up as what it is (e.g. text/markdown), the pair that makes Drive convert the file.
+fn import_target(
+    name: String,
+    parents: Vec<String>,
+    doc_type: DocType,
+    source_mime_type: &Mime,
+) -> UploadTarget {
+    UploadTarget {
+        parents,
+        name,
+        mime: Some(source_mime_type.clone()),
+        convert_to: Some(doc_type.mime().clone()),
+        ..UploadTarget::default()
+    }
 }
 
 /// The Google Workspace type a local file is imported as, and the media type of its content,
@@ -93,7 +120,7 @@ pub(crate) enum Error {
         path: PathBuf,
         source: file_info::FromFileError,
     },
-    UploadFile(google_drive3::Error),
+    UploadFile(Box<UploadError>),
     UnsupportedFileType,
 }
 
@@ -102,8 +129,9 @@ impl error::Error for Error {
         match self {
             Error::Hub(source) => Some(source),
             Error::FileInfo { source, .. } => Some(source),
-            // FIXME: correctly impl std::error::Error
-            _ => None,
+            Error::UploadFile(source) => Some(source.as_ref()),
+            // The message of the I/O error is part of the error's own.
+            Error::OpenFile(..) | Error::UnsupportedFileType => None,
         }
     }
 }
@@ -118,9 +146,7 @@ impl Display for Error {
             Error::FileInfo { path, source: _ } => {
                 write!(f, "unable to get file info for '{}'", path.display())
             }
-            Error::UploadFile(err) => {
-                write!(f, "Failed to upload file: {err}")
-            }
+            Error::UploadFile(_) => f.write_str("Failed to upload file"),
             Error::UnsupportedFileType => {
                 const _: () = const {
                     assert!(
@@ -143,17 +169,15 @@ impl Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, io::Cursor, path::Path};
+    use std::path::Path;
 
-    use super::import_types;
+    use super::{import_target, import_types};
     use crate::{
         common::{
-            delegate::{ChunkSize, UploadDelegateConfig},
             drive_file::{DocType, MIME_TYPE_DRIVE_DOCUMENT},
-            file_info::FileInfo,
             mock_server::{MockServer, Response},
         },
-        files,
+        transfer::upload::{upload_path, UploadOptions},
     };
 
     #[test]
@@ -181,6 +205,14 @@ mod tests {
         assert!(import_types(Path::new("no-extension")).is_none());
     }
 
+    /// `notes.md` with `content` in a temporary directory.
+    fn notes(content: &[u8]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, content).unwrap();
+        (dir, path)
+    }
+
     #[tokio::test]
     async fn import_upload_sends_source_type_as_content_type() {
         let server = MockServer::start(vec![Response::json(
@@ -188,26 +220,26 @@ mod tests {
             &serde_json::json!({"id": "new-id", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
         )])
         .await;
+        let (_dir, path) = notes(b"# Title");
+        let (doc_type, source_mime_type) = import_types(&path).unwrap();
+        let target = import_target(
+            String::from("notes.md"),
+            Vec::new(),
+            doc_type,
+            source_mime_type,
+        );
 
-        let (doc_type, source_mime_type) = import_types(Path::new("notes.md")).unwrap();
-        let file_info = FileInfo {
-            name: Cow::Borrowed("notes.md"),
-            mime_type: Cow::Borrowed(doc_type.mime()),
-            source_mime_type: Some(source_mime_type),
-            parents: None,
-            size: 7,
-        };
-
-        files::upload::upload_file(
+        upload_path(
             &server.hub(),
-            Cursor::new(b"# Title".to_vec()),
+            &path,
+            &target,
+            &UploadOptions::default(),
             None,
-            file_info,
-            &UploadDelegateConfig::default(),
         )
         .await
         .unwrap();
 
+        // No files.generateIds: Drive takes no id for a conversion.
         let requests = server.requests();
         assert_eq!(requests.len(), 1);
         let upload = &requests[0];
@@ -228,8 +260,8 @@ mod tests {
 
     #[tokio::test]
     async fn resumable_import_sends_source_type_and_target_mime() {
-        // Above the chunk size the upload is resumable: the initiation request carries the
-        // metadata and announces the content type, then the content follows in chunks.
+        // Above the multipart threshold the upload is resumable: the initiation request carries
+        // the metadata and announces the content type, then the content follows in chunks.
         const MIB: usize = 1 << 20;
         let content = vec![b'#'; MIB + 1];
         let total = content.len();
@@ -245,43 +277,44 @@ mod tests {
             ),
         ])
         .await;
-
-        let (doc_type, source_mime_type) = import_types(Path::new("notes.md")).unwrap();
-        let file_info = FileInfo {
-            name: Cow::Borrowed("notes.md"),
-            mime_type: Cow::Borrowed(doc_type.mime()),
-            source_mime_type: Some(source_mime_type),
-            parents: None,
-            size: total as u64,
+        let (_dir, path) = notes(&content);
+        let (doc_type, source_mime_type) = import_types(&path).unwrap();
+        let target = import_target(
+            String::from("notes.md"),
+            Vec::new(),
+            doc_type,
+            source_mime_type,
+        );
+        let options = UploadOptions {
+            chunk_size: MIB as u64,
+            multipart_threshold: MIB as u64,
+            ..UploadOptions::default()
         };
-        let delegate_config = UploadDelegateConfig {
-            chunk_size: ChunkSize::Approx1,
-            ..UploadDelegateConfig::default()
-        };
 
-        files::upload::upload_file(
-            &server.hub(),
-            Cursor::new(content),
-            None,
-            file_info,
-            &delegate_config,
-        )
-        .await
-        .unwrap();
+        upload_path(&server.hub(), &path, &target, &options, None)
+            .await
+            .unwrap();
 
         let requests = server.requests();
         assert_eq!(requests.len(), 3);
 
         let initiation = &requests[0];
         assert_eq!(initiation.method, "POST");
-        assert_eq!(initiation.path, "/resumable/upload/drive/v3/files");
+        assert_eq!(initiation.path, "/upload/drive/v3/files");
         assert_eq!(initiation.query_param("uploadType"), Some("resumable"));
         assert_eq!(
             initiation.header("x-upload-content-type"),
             Some("text/markdown")
         );
+        let mut metadata = initiation.body_json();
+        let marker = metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("appProperties")
+            .expect("an import is marked, to find it if its reply is lost");
+        assert!(marker["gdriveUploadId"].is_string(), "{marker}");
         assert_eq!(
-            initiation.body_json(),
+            metadata,
             serde_json::json!({"name": "notes.md", "mimeType": MIME_TYPE_DRIVE_DOCUMENT})
         );
 
@@ -298,6 +331,7 @@ mod tests {
             ]
         );
         for chunk in chunks {
+            assert_eq!(chunk.method, "PUT");
             assert_eq!(chunk.path, "/upload-session");
             assert_eq!(chunk.header("content-type"), Some("text/markdown"));
         }

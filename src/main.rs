@@ -15,7 +15,10 @@ mod version;
 use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
-use common::{delegate::ChunkSize, permission};
+use common::{
+    delegate::{ChunkSize, MultipartThreshold},
+    permission,
+};
 use files::list::{ListQuery, ListSortOrder};
 use mime::Mime;
 
@@ -347,6 +350,10 @@ enum FileCommand {
         #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
         chunk_size: ChunkSize,
 
+        /// Upload files of at most this many MB in a single request; larger files are uploaded in chunks and can be resumed. 0 uploads every non-empty file in chunks
+        #[arg(long, value_name = "MB", default_value_t = MultipartThreshold::default())]
+        multipart_threshold: MultipartThreshold,
+
         /// Print errors occuring during chunk upload
         #[arg(long, value_name = "", default_value_t = false)]
         print_chunk_errors: bool,
@@ -375,6 +382,10 @@ enum FileCommand {
         /// Set chunk size in MB, must be a power of two.
         #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
         chunk_size: ChunkSize,
+
+        /// Upload files of at most this many MB in a single request; larger files are uploaded in chunks and can be resumed. 0 uploads every non-empty file in chunks
+        #[arg(long, value_name = "MB", default_value_t = MultipartThreshold::default())]
+        multipart_threshold: MultipartThreshold,
 
         /// Print errors occuring during chunk upload
         #[arg(long, value_name = "", default_value_t = false)]
@@ -778,6 +789,7 @@ async fn handle_files_command(
             parent,
             recursive,
             chunk_size,
+            multipart_threshold,
             print_chunk_errors,
             print_chunk_info,
             print_only_id,
@@ -787,6 +799,7 @@ async fn handle_files_command(
                 mime_type: mime,
                 parents: parent,
                 chunk_size,
+                multipart_threshold,
                 print_chunk_errors,
                 print_chunk_info,
                 upload_directories: recursive,
@@ -800,6 +813,7 @@ async fn handle_files_command(
             file_path,
             mime,
             chunk_size,
+            multipart_threshold,
             print_chunk_errors,
             print_chunk_info,
         } => {
@@ -808,6 +822,7 @@ async fn handle_files_command(
                 file_path,
                 mime_type: mime,
                 chunk_size,
+                multipart_threshold,
                 print_chunk_errors,
                 print_chunk_info,
             })

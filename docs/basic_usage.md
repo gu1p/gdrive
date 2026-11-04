@@ -199,9 +199,36 @@ gdrive files upload --recursive ~/photos               # a local folder and ever
 - Without a file path, `files upload` reads from standard input. The Drive file then gets a generated
   name; rename it with `gdrive files rename`.
 - `--mime <MIME_TYPE>` sets the type instead of guessing it from the file name.
-- `--chunk-size <MB>` sets the upload chunk size (a power of two). Larger chunks use more memory.
+- `--chunk-size <MB>` and `--multipart-threshold <MB>` are explained in
+  [Resumable uploads](#resumable-uploads).
 - `--print-chunk-errors` and `--print-chunk-info` show retries and progress per chunk. They help when
   uploads from a cloud server are slow because of many `429`, `502` or `503` responses.
+
+### Resumable uploads
+
+A file of at most 5 MB goes up in a single request. A larger file goes up in chunks of `--chunk-size` MB
+(a power of two, 32 by default) through a resumable upload session, which `files upload`, `files update`
+and `files import` all use. `--multipart-threshold <MB>` on `files upload` and `files update` moves the
+line between the two (`0` sends every non-empty file in chunks). Chunks are read from the disk while they
+are sent, so a larger chunk size does not take more memory.
+
+- A chunk that fails (a dropped connection, a `429` or a `5xx`) is sent again after a wait: gdrive asks
+  Drive how much of the file it holds and continues from there, with a `Warning:` line on stderr.
+- An interrupted upload (gdrive stopped, the network gone for longer than the retries last) continues
+  where Drive stopped when you run the same command again, if the local file is unchanged (same path,
+  size and modification time), it goes to the same place (same folder and name, or the same file for
+  `files update`), and the upload started less than a week ago, after which Drive forgets it. Otherwise
+  it starts over. Uploads from standard input and the files of `--recursive` start over.
+- What gdrive needs to continue is kept in `~/.config/gdrive3/<account>/uploads/`, one small JSON file
+  per unfinished upload, readable only by you, deleted when the upload completes; files older than a
+  week are deleted too. A file there holds the session URL, which allows uploading to that session:
+  keep it as private as the account's tokens.
+- After the upload, gdrive compares the MD5 checksum Drive reports with the local file. If they differ,
+  for example because the file changed during the upload, the command fails and names the uploaded file's
+  id.
+- A new file gets its id before the upload starts, so a reply that is lost at the very end does not make
+  a second copy: gdrive looks the file up instead. Drive takes no id for an import; it is marked with a
+  private app property (`gdriveUploadId`) and searched for by it.
 
 ## Update a file
 

@@ -1,7 +1,7 @@
 //! Authenticated Drive requests outside google-drive3's generated calls: media downloads and
-//! exports now, gdrive's own resumable uploader later. They go through the hub's HTTP client
-//! (and so its connection pool), get their access token from the hub's token source the way
-//! google-drive3 does, and follow the hub's retry policy and throttle (`retry.rs`).
+//! exports, and gdrive's own uploader (`transfer/upload.rs`). They go through the hub's HTTP
+//! client (and so its connection pool), get their access token from the hub's token source the
+//! way google-drive3 does, and follow the hub's retry policy and throttle (`retry.rs`).
 
 use std::{
     error::Error,
@@ -59,6 +59,32 @@ impl<'a> MediaClient<'a> {
         Ok(url)
     }
 
+    /// The URL of the path `segments` under the hub's media upload URL, for example `["files"]`
+    /// for `https://www.googleapis.com/upload/drive/v3/files`, with `query`.
+    pub(crate) fn upload_url(
+        &self,
+        segments: &[&str],
+        query: &[(&str, &str)],
+    ) -> Result<url::Url, MediaError> {
+        let drive_base_url = self.hub.drive_base_url();
+        // Google serves uploads under `upload/` next to the API: `<root>drive/v3/` becomes
+        // `<root>upload/drive/v3/`.
+        let root = drive_base_url
+            .strip_suffix("drive/v3/")
+            .unwrap_or(drive_base_url);
+        let mut url = url::Url::parse(root)
+            .and_then(|root| root.join("upload/drive/v3/"))
+            .map_err(MediaError::Url)?;
+        url.path_segments_mut()
+            .map_err(|()| MediaError::Url(url::ParseError::RelativeUrlWithCannotBeABaseBase))?
+            .pop_if_empty()
+            .extend(segments);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        Ok(url)
+    }
+
     /// Sends one request with the access token (full Drive scope) and gdrive's user agent.
     /// Every reply is returned, whatever its status; only a request without reply is an error.
     pub(crate) async fn send(
@@ -78,6 +104,17 @@ impl<'a> MediaClient<'a> {
             value.set_sensitive(true);
             request.headers_mut().insert(AUTHORIZATION, value);
         }
+        self.send_without_token(request).await
+    }
+
+    /// Sends one request with gdrive's user agent but without the access token, for a URL that
+    /// authorizes the request itself: the session URL of a resumable upload. Such a request
+    /// does not depend on the token, so a token that expires during a long upload, or a token
+    /// refresh that fails, does not interrupt it.
+    pub(crate) async fn send_without_token(
+        &self,
+        mut request: Request<Body>,
+    ) -> Result<Response<Incoming>, MediaError> {
         request
             .headers_mut()
             .entry(USER_AGENT)
