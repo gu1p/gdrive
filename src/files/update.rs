@@ -21,7 +21,8 @@ use crate::{
     },
     hub::Hub,
     transfer::upload::{
-        session::account_session_dir, upload_path, UploadError, UploadOptions, UploadTarget,
+        session::{account_session_dir, account_session_identity},
+        upload_path, UploadError, UploadOptions, UploadTarget,
     },
 };
 
@@ -53,6 +54,7 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
             .file_path
             .as_ref()
             .and_then(|_| account_session_dir()),
+        session_identity: account_session_identity(),
     };
 
     let mut file_helper = match file_helper::open_file(config.file_path.as_deref()) {

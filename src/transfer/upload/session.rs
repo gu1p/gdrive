@@ -8,10 +8,15 @@
 //! chunk size and when the session started. The session URL authorizes uploads to the session,
 //! so the record is kept from other users and never printed.
 //!
+//! The record also names the Google account the session was started as: the email address
+//! Drive reports (`about.get`), or a service account's `client_email` and subject. The account
+//! directory alone does not say that: Application Default Credentials, for one, can be another
+//! account on the next run, and a session of one account must not be continued as another.
+//!
 //! A run that uploads the same source to the same target finds the record and continues the
-//! session if the source did not change (same path, size and modification time) and the
-//! session is younger than [`SESSION_LIFETIME`], Google's limit; otherwise the record is
-//! deleted and the upload starts over. The record is deleted when the upload completes or the
+//! session if the source did not change (same path, size and modification time), the run is the
+//! same account, and the session is younger than [`SESSION_LIFETIME`], Google's limit;
+//! otherwise the upload starts over in a new session. The record is deleted when the upload completes or the
 //! session turns out to be gone. Records that nothing touched for longer than the session
 //! lifetime are deleted when an upload starts.
 
@@ -25,7 +30,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 
-use crate::app_config::AppConfig;
+use crate::{
+    app_config::{account_type::AccountType, AppConfig},
+    auth::service::parse_key,
+};
 
 /// The directory of the records, under the account directory.
 pub(crate) const UPLOADS_DIR: &str = "uploads";
@@ -37,11 +45,37 @@ pub(crate) fn account_session_dir() -> Option<PathBuf> {
     Some(config.account_base_path().join(UPLOADS_DIR))
 }
 
+/// Who the current account is, when that is known without asking Drive: a service account's
+/// `client_email` and subject. `None` for a user and for Application Default Credentials, which
+/// the uploader asks Drive about.
+#[must_use]
+pub(crate) fn account_session_identity() -> Option<String> {
+    let config = AppConfig::load_current_account().ok()?;
+    let AccountType::ServiceAccount { subject } = config.account_type().ok()? else {
+        return None;
+    };
+    let content = std::fs::read(config.service_account_key_path()).ok()?;
+    let key = parse_key(&content).ok()?;
+    Some(service_account_identity(
+        &key.client_email,
+        subject.as_deref(),
+    ))
+}
+
+/// The identity of the service account `client_email` acting for `subject`, if any.
+#[must_use]
+pub(crate) fn service_account_identity(client_email: &str, subject: Option<&str>) -> String {
+    match subject {
+        Some(subject) => format!("service account {client_email} as {subject}"),
+        None => format!("service account {client_email}"),
+    }
+}
+
 /// Google expires an upload session a week after it started.
 pub(crate) const SESSION_LIFETIME: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// The format of the records; a record of another version is not used.
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 
 /// A modification time, since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +164,8 @@ pub(crate) struct SessionRecord {
     pub(crate) chunk_size: u64,
     /// When the session started, in seconds since the Unix epoch.
     pub(crate) created: u64,
+    /// The Google account the session was started as.
+    pub(crate) identity: String,
 }
 
 impl Debug for SessionRecord {
@@ -143,18 +179,20 @@ impl Debug for SessionRecord {
             .field("target", &self.target)
             .field("chunk_size", &self.chunk_size)
             .field("created", &self.created)
+            .field("identity", &self.identity)
             .finish()
     }
 }
 
 impl SessionRecord {
-    /// A record of the session at `session_url`, started now.
+    /// A record of the session at `session_url`, started now as `identity`.
     #[must_use]
     pub(crate) fn new(
         session_url: String,
         source: SourceIdentity,
         target: RecordTarget,
         chunk_size: u64,
+        identity: String,
     ) -> Self {
         SessionRecord {
             version: RECORD_VERSION,
@@ -164,6 +202,7 @@ impl SessionRecord {
             target,
             chunk_size,
             created: unix_now(),
+            identity,
         }
     }
 
@@ -324,6 +363,22 @@ mod tests {
         }
     }
 
+    fn identity() -> String {
+        String::from("me@example.com")
+    }
+
+    #[test]
+    fn a_service_account_is_its_email_and_subject() {
+        assert_eq!(
+            super::service_account_identity("sa@p.iam.gserviceaccount.com", None),
+            "service account sa@p.iam.gserviceaccount.com"
+        );
+        assert_eq!(
+            super::service_account_identity("sa@p.iam.gserviceaccount.com", Some("me@example.com")),
+            "service account sa@p.iam.gserviceaccount.com as me@example.com"
+        );
+    }
+
     fn target() -> RecordTarget {
         RecordTarget {
             parents: vec![String::from("folder")],
@@ -366,7 +421,7 @@ mod tests {
 
     #[test]
     fn a_record_continues_only_the_same_upload_of_the_same_file() {
-        let record = SessionRecord::new(String::from("url"), source(), target(), 256);
+        let record = SessionRecord::new(String::from("url"), source(), target(), 256, identity());
         assert_eq!(record.mismatch(&source(), &target()), None);
         let later_run = RecordTarget {
             file_id: None,
@@ -408,7 +463,13 @@ mod tests {
             mtime: None,
             ..source()
         };
-        let record = SessionRecord::new(String::from("url"), no_mtime.clone(), target(), 256);
+        let record = SessionRecord::new(
+            String::from("url"),
+            no_mtime.clone(),
+            target(),
+            256,
+            identity(),
+        );
         assert!(record.mismatch(&no_mtime, &target()).is_some());
     }
 
@@ -419,6 +480,7 @@ mod tests {
             source(),
             target(),
             256,
+            identity(),
         );
         let debug = format!("{record:?}");
         assert!(!debug.contains("secret"), "{debug}");
@@ -432,7 +494,8 @@ mod tests {
         let mut file = RecordFile::new(&uploads, &source(), &target());
         assert!(file.load().await.is_none());
 
-        let mut record = SessionRecord::new(String::from("url"), source(), target(), 256);
+        let mut record =
+            SessionRecord::new(String::from("url"), source(), target(), 256, identity());
         file.save(&record).await;
         record.offset = 512;
         file.save(&record).await;

@@ -60,6 +60,7 @@ fn options() -> UploadOptions {
         print_chunk_errors: true,
         print_chunk_info: true,
         session_dir: None,
+        session_identity: None,
     }
 }
 
@@ -974,6 +975,7 @@ async fn an_interrupted_upload_continues_in_the_next_run() {
     assert_eq!(record["target"]["name"], "data.bin");
     assert_eq!(record["target"]["parents"], json!(["folder-id"]));
     assert_eq!(record["target"]["file_id"], "gen-id-1");
+    assert_eq!(record["identity"], "user-a@example.com");
     assert!(record["session_url"]
         .as_str()
         .unwrap()
@@ -1010,7 +1012,12 @@ async fn an_interrupted_upload_continues_in_the_next_run() {
     assert_eq!(file.id.as_deref(), Some("gen-id-1"));
     let state = mock.state();
     let second_run = &state.log[before..];
-    assert!(second_run[0].is_status_query(), "{}", state.log_text());
+    assert_eq!(second_run[0].path, "/drive/v3/about", "who the account is");
+    assert_eq!(
+        second_run[0].query_param("fields").as_deref(),
+        Some("user(emailAddress)")
+    );
+    assert!(second_run[1].is_status_query(), "{}", state.log_text());
     let starts: Vec<_> = second_run.iter().filter_map(Logged::chunk_start).collect();
     assert_eq!(
         starts,
@@ -1141,8 +1148,8 @@ async fn a_session_that_completed_is_found_by_its_record() {
     assert_eq!(file.id.as_deref(), Some("gen-id-1"));
     let state = mock.state();
     let second_run = &state.log[before..];
-    assert_eq!(second_run.len(), 1, "{}", state.log_text());
-    assert!(second_run[0].is_status_query());
+    assert_eq!(second_run.len(), 2, "{}", state.log_text());
+    assert!(second_run[1].is_status_query());
     assert_eq!(state.files.len(), 1);
     records.assert_none();
 }
@@ -1295,5 +1302,100 @@ async fn an_expired_conversion_session_is_replaced_once_its_marker_is_not_found(
     assert_eq!(
         state.sessions[0].metadata["appProperties"], state.sessions[1].metadata["appProperties"],
         "the same marker in both sessions"
+    );
+}
+
+/// The account directory does not say who the credentials are (Application Default Credentials
+/// can be another account on the next run): a session started as one account is not continued
+/// as another.
+#[tokio::test]
+async fn a_session_of_another_account_is_not_continued() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = interrupted_run(&fixture, &records, 2).await;
+    mock.state().email = String::from("user-b@example.com");
+    let before = mock.state().log.len();
+
+    let file = upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    assert!(
+        state.log[before..]
+            .iter()
+            .all(|request| request.path != "/upload-session/0"),
+        "the other account's session is left alone\n{}",
+        state.log_text()
+    );
+    assert_eq!(state.sessions.len(), 2);
+    assert_eq!(state.sessions[1].received, fixture.data);
+    assert_eq!(
+        file.id.as_deref(),
+        Some("gen-id-2"),
+        "not the other account's id"
+    );
+    records.assert_none();
+}
+
+/// A service account is known by its key and subject, without asking Drive.
+#[tokio::test]
+async fn a_service_account_is_identified_without_a_request() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let service_account = |identity: &str| UploadOptions {
+        session_identity: Some(identity.to_owned()),
+        ..records.options()
+    };
+    let mock = MockDrive::start(Faults {
+        die_after_chunks: Some(2),
+        ..Faults::default()
+    })
+    .await;
+    upload(
+        &mock,
+        &fixture,
+        &target(),
+        &service_account("service account a"),
+    )
+    .await
+    .unwrap_err();
+    mock.revive();
+    assert_eq!(records.record()["identity"], "service account a");
+
+    let record = records.files().remove(0);
+    let saved = std::fs::read(&record).unwrap();
+
+    // Another subject: not continued.
+    upload(
+        &mock,
+        &fixture,
+        &target(),
+        &service_account("service account a as b"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(mock.state().sessions.len(), 2);
+
+    // The same service account: continued.
+    std::fs::write(&record, saved).unwrap();
+    upload(
+        &mock,
+        &fixture,
+        &target(),
+        &service_account("service account a"),
+    )
+    .await
+    .unwrap();
+    let state = mock.state();
+    assert_eq!(state.sessions.len(), 2, "no new session");
+    assert!(state.sessions[0].complete);
+    assert!(
+        state
+            .log
+            .iter()
+            .all(|request| request.path != "/drive/v3/about"),
+        "{}",
+        state.log_text()
     );
 }

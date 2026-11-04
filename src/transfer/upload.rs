@@ -141,6 +141,10 @@ pub(crate) struct UploadOptions {
     /// interrupted one (`uploads/` of the account, [`session::account_session_dir`]). `None`:
     /// an interrupted upload starts over.
     pub(crate) session_dir: Option<PathBuf>,
+    /// The Google account the sessions are recorded for, when it is known without asking Drive
+    /// (a service account, [`session::account_session_identity`]). `None`: Drive is asked
+    /// (`about.get`) before a session is recorded or continued.
+    pub(crate) session_identity: Option<String>,
 }
 
 impl Default for UploadOptions {
@@ -152,6 +156,7 @@ impl Default for UploadOptions {
             print_chunk_errors: false,
             print_chunk_info: false,
             session_dir: None,
+            session_identity: None,
         }
     }
 }
@@ -371,6 +376,8 @@ pub(crate) enum UploadError {
     SessionsExpired { sessions: u32 },
     /// Looking up whether the file had been created failed.
     Reconcile(Box<google_drive3::Error>),
+    /// Looking up the Google account, to continue a session of an earlier run, failed.
+    Identity(Box<google_drive3::Error>),
     /// The size of the source changed during the upload: Drive holds the first `uploaded`
     /// bytes of a file that has `now` bytes.
     SourceChanged {
@@ -415,7 +422,9 @@ impl UploadError {
                     google_drive3::Error::Io(io::Error::other(UploadError::Client(Box::new(error))))
                 }
             },
-            UploadError::GenerateId(error) | UploadError::Reconcile(error) => *error,
+            UploadError::GenerateId(error)
+            | UploadError::Reconcile(error)
+            | UploadError::Identity(error) => *error,
             error => google_drive3::Error::Io(io::Error::other(error)),
         }
     }
@@ -453,6 +462,7 @@ impl Display for UploadError {
             UploadError::SessionsExpired { sessions } => {
                 write!(f, "the upload session expired {sessions} times, giving up")
             }
+            UploadError::Identity(_) => f.write_str("unable to look up the Google account"),
             UploadError::Reconcile(_) => {
                 f.write_str("unable to check whether the upload created the file")
             }
@@ -484,9 +494,9 @@ impl Error for UploadError {
         match self {
             UploadError::Open { source, .. } | UploadError::Read(source) => Some(source),
             // The boxed errors themselves, not their boxes: callers downcast to them.
-            UploadError::GenerateId(source) | UploadError::Reconcile(source) => {
-                Some(source.as_ref())
-            }
+            UploadError::GenerateId(source)
+            | UploadError::Reconcile(source)
+            | UploadError::Identity(source) => Some(source.as_ref()),
             UploadError::Client(source) => Some(source.as_ref()),
             UploadError::Failed { failure, .. } => match failure.as_ref() {
                 Failure::Transport(source) => Some(source),
@@ -599,6 +609,8 @@ struct Upload<'a> {
     previous_chunk: Option<u64>,
     /// The session record, if sessions are recorded.
     recording: Option<Recording>,
+    /// The Google account of the upload, once known (see [`UploadOptions::session_identity`]).
+    identity: Option<String>,
 }
 
 impl<'a> Upload<'a> {
@@ -636,7 +648,29 @@ impl<'a> Upload<'a> {
             reported: None,
             previous_chunk: None,
             recording: None,
+            identity: options.session_identity.clone(),
         }
+    }
+
+    /// The Google account the upload runs as: the identity of the options, or the email address
+    /// Drive reports. `None` if Drive reports none.
+    async fn identity(&mut self) -> Result<Option<String>, UploadError> {
+        if self.identity.is_none() {
+            let hub = self.hub;
+            let (_, about) = retry_read(hub.retrier(), "about.get", |mut delegate| async move {
+                hub.about()
+                    .get()
+                    .param("fields", "user(emailAddress)")
+                    .add_scope(google_drive3::api::Scope::Full)
+                    .delegate(&mut delegate)
+                    .doit()
+                    .await
+            })
+            .await
+            .map_err(|error| UploadError::Identity(Box::new(error)))?;
+            self.identity = about.user.and_then(|user| user.email_address);
+        }
+        Ok(self.identity.clone())
     }
 
     /// Records the sessions of the upload of `source` in `dir`.
@@ -676,6 +710,18 @@ impl<'a> Upload<'a> {
         if let Some(why) = record.mismatch(&recording.source, &self.record_target()) {
             eprintln!(
                 "Warning: {}: not continuing the session of an earlier run, {why}",
+                self.label
+            );
+            self.forget().await;
+            return Ok(None);
+        }
+
+        // A session of another account is not continued with this one's credentials. When the
+        // account cannot be looked up, the record stays for the next run.
+        if self.identity().await?.as_ref() != Some(&record.identity) {
+            eprintln!(
+                "Warning: {}: not continuing the session of an earlier run, it was started by \
+                 another Google account",
                 self.label
             );
             self.forget().await;
@@ -724,14 +770,41 @@ impl<'a> Upload<'a> {
         }
     }
 
-    /// Records the session just started at `url`.
+    /// Records the session just started at `url`, with the account it belongs to. Without a
+    /// known account the session is not recorded.
     async fn record_session(&mut self, url: &str) {
+        if self.recording.is_none() {
+            return;
+        }
+        let identity = match self.identity().await {
+            Ok(Some(identity)) => identity,
+            Ok(None) => {
+                eprintln!(
+                    "Warning: {}: Drive does not name the account, an interrupted upload will \
+                     start over",
+                    self.label
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "Warning: {}: {error}, an interrupted upload will start over",
+                    self.label
+                );
+                return;
+            }
+        };
         let target = self.record_target();
         let chunk_size = self.options.chunk_len();
         if let Some(recording) = &mut self.recording {
             session::prune(&recording.dir).await;
-            let record =
-                SessionRecord::new(url.to_owned(), recording.source.clone(), target, chunk_size);
+            let record = SessionRecord::new(
+                url.to_owned(),
+                recording.source.clone(),
+                target,
+                chunk_size,
+                identity,
+            );
             recording.file.save(&record).await;
             recording.record = Some(record);
         }

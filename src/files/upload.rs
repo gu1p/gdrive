@@ -23,8 +23,8 @@ use crate::{
     files::{self, info::DisplayConfig, mkdir, FileResult},
     hub::Hub,
     transfer::upload::{
-        session::account_session_dir, upload_path, upload_reader, UploadError, UploadOptions,
-        UploadTarget,
+        session::{account_session_dir, account_session_identity},
+        upload_path, upload_reader, UploadError, UploadOptions, UploadTarget,
     },
 };
 
@@ -73,6 +73,7 @@ impl Config {
             print_chunk_errors,
             print_chunk_info,
             session_dir: account_session_dir(),
+            session_identity: account_session_identity(),
         };
         (
             CommonConfig {

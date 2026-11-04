@@ -144,6 +144,8 @@ pub(super) struct State {
     pub(super) dead: bool,
     pub(super) accepted_chunks: u32,
     pub(super) generated_ids: u32,
+    /// The email address `about.get` reports: the account the credentials are of.
+    pub(super) email: String,
     next_file: u32,
     /// Close the connection instead of sending the reply the request got.
     drop_reply: bool,
@@ -220,6 +222,12 @@ impl State {
         }
         if *method == Method::GET && path == "/drive/v3/files" {
             return self.list(query);
+        }
+        if *method == Method::GET && path == "/drive/v3/about" {
+            return json_reply(
+                StatusCode::OK,
+                &json!({"user": {"emailAddress": self.email}}),
+            );
         }
         if *method == Method::GET {
             if let Some(id) = path.strip_prefix("/drive/v3/files/") {
@@ -678,6 +686,7 @@ impl MockDrive {
         let addr = listener.local_addr().expect("mock server address");
         let state = Arc::new(Mutex::new(State {
             faults,
+            email: String::from("user-a@example.com"),
             ..State::default()
         }));
 

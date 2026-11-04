@@ -15,7 +15,8 @@ use crate::{
     },
     files::{self, info::DisplayConfig},
     transfer::upload::{
-        session::account_session_dir, upload_path, UploadError, UploadOptions, UploadTarget,
+        session::{account_session_dir, account_session_identity},
+        upload_path, UploadError, UploadOptions, UploadTarget,
     },
 };
 
@@ -30,6 +31,7 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
     let options = UploadOptions {
         session_dir: account_session_dir(),
+        session_identity: account_session_identity(),
         ..UploadOptions::default()
     };
 
