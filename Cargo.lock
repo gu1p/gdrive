@@ -387,15 +387,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d80eeab1d29829898de1c3be1e242af75475b47452635f0ddd32a495fd5a8143"
 
 [[package]]
-name = "exponential-backoff"
-version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08ab6e822495687a98e096a5c4baea819a52be3a849c80f861266373a5d2467f"
-dependencies = [
- "fastrand",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -534,12 +525,13 @@ dependencies = [
  "clap",
  "clap_complete",
  "error-trace",
- "exponential-backoff",
+ "fastrand",
  "futures",
  "google-apis-common",
  "google-drive3",
  "home",
  "http-body-util",
+ "httpdate",
  "human_bytes",
  "hyper",
  "hyper-rustls",

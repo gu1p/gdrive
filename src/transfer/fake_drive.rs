@@ -189,6 +189,11 @@ pub(crate) struct Behavior {
     /// Folders shared by link only: a query naming one fails with 404 unless the
     /// `X-Goog-Drive-Resource-Keys` header has `<id>/<key>` for it.
     pub(crate) resource_keys: HashMap<String, String>,
+    /// A query naming one of these folders fails with 503 the given number of times (counted
+    /// per folder) before it is answered, like a backend that is briefly unavailable.
+    pub(crate) unavailable_first: HashMap<String, usize>,
+    /// The `Retry-After` (seconds) of those 503 replies.
+    pub(crate) unavailable_retry_after: Option<u64>,
 }
 
 /// A list request as the fake saw it, with percent-decoded parameters.
@@ -216,6 +221,8 @@ struct State {
     requests: Mutex<Vec<ListRequest>>,
     /// The ids of `files.get` requests.
     gets: Mutex<Vec<String>>,
+    /// The 503 replies still to send, per folder ([`Behavior::unavailable_first`]).
+    unavailable_left: Mutex<HashMap<String, usize>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
 }
@@ -234,6 +241,7 @@ impl FakeDrive {
         let addr = listener.local_addr().expect("fake drive address");
         let state = Arc::new(State {
             files,
+            unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
             behavior,
             requests: Mutex::new(Vec::new()),
             gets: Mutex::new(Vec::new()),
@@ -368,6 +376,25 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
 
     if names(&behavior.unreadable) {
         return error(StatusCode::NOT_FOUND, "File not found.");
+    }
+    let unavailable = {
+        let mut left = state.unavailable_left.lock().expect("unavailable lock");
+        request.parents.iter().any(|id| match left.get_mut(id) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        })
+    };
+    if unavailable {
+        let mut response = error(StatusCode::SERVICE_UNAVAILABLE, "Backend Error");
+        if let Some(seconds) = behavior.unavailable_retry_after {
+            response
+                .headers_mut()
+                .insert("retry-after", hyper::header::HeaderValue::from(seconds));
+        }
+        return response;
     }
     let sent_keys = request
         .resource_keys

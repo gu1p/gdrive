@@ -5,9 +5,9 @@ use std::{
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         hub_helper::{get_hub, GetHubError},
         permission,
+        retry::retry_api,
     },
     files,
     hub::Hub,
@@ -46,7 +46,6 @@ pub(crate) async fn share(config: Config) -> Result<(), Error> {
     }
 
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
     let file = files::info::get_file(&hub, &config.file_id)
         .await
@@ -54,7 +53,7 @@ pub(crate) async fn share(config: Config) -> Result<(), Error> {
 
     print_grant_details(&file, &config);
 
-    create_permission(&hub, &delegate_config, config)
+    create_permission(&hub, config)
         .await
         .map_err(|err| Error::CreatePermission(Box::new(err)))?;
 
@@ -75,11 +74,8 @@ const _: () = {
 )]
 async fn create_permission(
     hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
     config: Config,
 ) -> Result<google_drive3::api::Permission, google_drive3::Error> {
-    let mut delegate = UploadDelegate::new(delegate_config);
-
     let requires_ownership_transfer = config.requires_ownership_transfer();
     let new_permission = google_drive3::api::Permission {
         role: Some(config.role.to_string()),
@@ -90,19 +86,25 @@ async fn create_permission(
         ..google_drive3::api::Permission::default()
     };
 
-    let (_, permission) = hub
-        .permissions()
-        .create(new_permission, &config.file_id)
-        .param(
-            "fields",
-            "id,role,type,domain,emailAddress,allowFileDiscovery",
-        )
-        .transfer_ownership(requires_ownership_transfer)
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit()
-        .await?;
+    let file_id = config.file_id.as_str();
+    let (_, permission) = retry_api(hub.retrier(), "permissions.create", |mut delegate| {
+        let new_permission = new_permission.clone();
+        async move {
+            hub.permissions()
+                .create(new_permission, file_id)
+                .param(
+                    "fields",
+                    "id,role,type,domain,emailAddress,allowFileDiscovery",
+                )
+                .transfer_ownership(requires_ownership_transfer)
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .supports_all_drives(true)
+                .doit()
+                .await
+        }
+    })
+    .await?;
 
     Ok(permission)
 }

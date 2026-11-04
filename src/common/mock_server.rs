@@ -62,6 +62,9 @@ pub(crate) struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     body: String,
+    /// Send only this many bytes of the body, then close the connection (the head still
+    /// announces the whole body).
+    cut_after: Option<usize>,
 }
 
 impl Response {
@@ -70,6 +73,7 @@ impl Response {
             status,
             headers: Vec::new(),
             body: body.to_string(),
+            cut_after: None,
         }
     }
 
@@ -79,6 +83,7 @@ impl Response {
             status,
             headers: Vec::new(),
             body: body.to_owned(),
+            cut_after: None,
         }
     }
 
@@ -86,6 +91,13 @@ impl Response {
     /// headers that point back at the server such as a resumable upload's `Location`.
     pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// The connection breaks after `bytes` bytes of the body, as when a connection is reset or
+    /// an HTTP/2 stream is ended by a GOAWAY in the middle of a download.
+    pub(crate) fn cut_after(mut self, bytes: usize) -> Self {
+        self.cut_after = Some(bytes);
         self
     }
 }
@@ -225,6 +237,17 @@ async fn write_response(stream: &mut TcpStream, response: &Response, root_url: &
     }
     head.push_str("\r\n");
     let _ = stream.write_all(head.as_bytes()).await;
-    let _ = stream.write_all(response.body.as_bytes()).await;
+    let body = response.body.as_bytes();
+    match response.cut_after {
+        Some(bytes) => {
+            let _ = stream.write_all(&body[..bytes.min(body.len())]).await;
+            let _ = stream.flush().await;
+            // Let the client read the bytes before the connection drops.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        None => {
+            let _ = stream.write_all(body).await;
+        }
+    }
     let _ = stream.shutdown().await;
 }

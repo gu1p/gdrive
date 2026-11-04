@@ -6,6 +6,7 @@ use crate::common::{
     file_tree_drive::{self, errors::FileIdentifier},
     hub_helper::GetHubError,
     local_name::UnusableName,
+    media_client::MediaError,
 };
 
 #[derive(Debug)]
@@ -16,7 +17,7 @@ pub(crate) enum Download {
         clippy::enum_variant_names,
         reason = "this is the actual download operation"
     )]
-    DownloadFile(Box<google_drive3::Error>),
+    DownloadFile(Box<MediaError>),
     MissingFileName(FileIdentifier),
     UnusableName(UnusableName),
     FileExists(FileIdentifier),
@@ -104,7 +105,8 @@ impl Error for Download {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Download::Hub(get_hub_error) => Some(get_hub_error),
-            Download::GetFile(error) | Download::DownloadFile(error) => Some(error),
+            Download::GetFile(error) => Some(error),
+            Download::DownloadFile(error) => Some(error),
             Download::CreateFileTree(error) => Some(error),
             Download::UnusableName(source) => Some(source),
             Download::MissingFileName(_)
@@ -134,6 +136,18 @@ impl From<SaveBodyToStdout> for Download {
 pub(crate) enum SaveBodyToStdout {
     ReadChunk(hyper::Error),
     WriteChunk(io::Error),
+    /// The request to resume a broken download failed.
+    Request(Box<MediaError>),
+    /// The server sent the content from the start again, which stdout cannot take back.
+    CannotRestart,
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    Md5Mismatch {
+        expected: Digest,
+        actual: Digest,
+    },
 }
 
 impl Display for SaveBodyToStdout {
@@ -141,6 +155,26 @@ impl Display for SaveBodyToStdout {
         let operation = match self {
             SaveBodyToStdout::ReadChunk(_) => "read",
             SaveBodyToStdout::WriteChunk(_) => "write",
+            SaveBodyToStdout::Request(_) => return f.write_str("unable to resume the download"),
+            SaveBodyToStdout::CannotRestart => {
+                return f.write_str(
+                    "the download broke off and must start over (the file changed on Drive or \
+                     the server sent it from the start again), which cannot be undone on stdout; \
+                     download to a file instead",
+                )
+            }
+            SaveBodyToStdout::SizeMismatch { expected, actual } => {
+                return write!(
+                    f,
+                    "size mismatches (expected {expected} bytes, received {actual})"
+                )
+            }
+            SaveBodyToStdout::Md5Mismatch { expected, actual } => {
+                return write!(
+                    f,
+                    "md5 mismatches (expected {expected:x}, actual is {actual:x})"
+                )
+            }
         };
 
         write!(f, "unable to {operation} chunk of bytes")
@@ -152,6 +186,10 @@ impl Error for SaveBodyToStdout {
         match self {
             SaveBodyToStdout::ReadChunk(source) => Some(source),
             SaveBodyToStdout::WriteChunk(source) => Some(source),
+            SaveBodyToStdout::Request(source) => Some(source),
+            SaveBodyToStdout::CannotRestart
+            | SaveBodyToStdout::SizeMismatch { .. }
+            | SaveBodyToStdout::Md5Mismatch { .. } => None,
         }
     }
 }
@@ -162,7 +200,16 @@ pub(crate) enum SaveBodyToFile {
     ReadChunk(hyper::Error),
     WriteChunk(io::Error),
     Flush(io::Error),
-    Md5Mismatch { expected: Digest, actual: Digest },
+    /// The request to resume a broken download failed.
+    Request(Box<MediaError>),
+    SizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
+    Md5Mismatch {
+        expected: Digest,
+        actual: Digest,
+    },
     RenameFile(io::Error),
 }
 
@@ -173,6 +220,11 @@ impl Display for SaveBodyToFile {
             SaveBodyToFile::ReadChunk(_) => f.write_str("unable to read chunk of bytes"),
             SaveBodyToFile::WriteChunk(_) => f.write_str("unable to write chunk of bytes"),
             SaveBodyToFile::Flush(_) => f.write_str("unable to finish writing the file"),
+            SaveBodyToFile::Request(_) => f.write_str("unable to resume the download"),
+            SaveBodyToFile::SizeMismatch { expected, actual } => write!(
+                f,
+                "size mismatches (expected {expected} bytes, received {actual})"
+            ),
             SaveBodyToFile::Md5Mismatch { expected, actual } => {
                 write!(
                     f,
@@ -188,7 +240,8 @@ impl Error for SaveBodyToFile {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             SaveBodyToFile::ReadChunk(source) => Some(source),
-            SaveBodyToFile::Md5Mismatch { .. } => None,
+            SaveBodyToFile::Request(source) => Some(source),
+            SaveBodyToFile::Md5Mismatch { .. } | SaveBodyToFile::SizeMismatch { .. } => None,
             SaveBodyToFile::CreateFile(source)
             | SaveBodyToFile::WriteChunk(source)
             | SaveBodyToFile::Flush(source)

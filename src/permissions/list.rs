@@ -6,8 +6,8 @@ use std::{
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         hub_helper::{get_hub, GetHubError},
+        retry::retry_read,
         table::{self, Table},
     },
     files,
@@ -23,13 +23,12 @@ pub(crate) struct Config {
 
 pub(crate) async fn list(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
     files::info::get_file(&hub, &config.file_id)
         .await
         .map_err(|err| Error::GetFile(Box::new(err)))?;
 
-    let permissions = list_permissions(&hub, &delegate_config, &config.file_id)
+    let permissions = list_permissions(&hub, &config.file_id)
         .await
         .map_err(Error::ListPermissions)?;
 
@@ -74,23 +73,26 @@ fn write_permissions_table(
 
 pub(crate) async fn list_permissions(
     hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
     file_id: &str,
 ) -> Result<Vec<google_drive3::api::Permission>, Box<google_drive3::Error>> {
-    let mut delegate = UploadDelegate::new(delegate_config);
-
-    let (_, permission_list) = hub
-        .permissions()
-        .list(file_id)
-        .param(
-            "fields",
-            "permissions(id,role,type,domain,emailAddress,allowFileDiscovery)",
-        )
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit()
-        .await?;
+    let (_, permission_list) = retry_read(
+        hub.retrier(),
+        "permissions.list",
+        |mut delegate| async move {
+            hub.permissions()
+                .list(file_id)
+                .param(
+                    "fields",
+                    "permissions(id,role,type,domain,emailAddress,allowFileDiscovery)",
+                )
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .supports_all_drives(true)
+                .doit()
+                .await
+        },
+    )
+    .await?;
 
     Ok(permission_list.permissions.unwrap_or_default())
 }

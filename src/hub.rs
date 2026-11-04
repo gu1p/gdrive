@@ -5,20 +5,35 @@ use google_drive3::DriveHub;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client;
 
-use crate::proxy::ProxyConnector;
+use crate::{
+    common::retry::{Retrier, RetryPolicy, Throttle},
+    proxy::ProxyConnector,
+};
 
 /// The connector of every HTTP client: rustls over a direct or proxied connection.
 pub(crate) type Connector = HttpsConnector<ProxyConnector>;
 
-/// Cloning is cheap and shares the connection pool and the credentials (and so the token cache).
+/// The Drive API client of a command: google-drive3's hub, and the retry policy and throttle
+/// that every request made through it shares.
+///
+/// Cloning is cheap and shares the connection pool, the credentials (and so the token cache) and
+/// the throttle, so that a rate limit seen by one clone holds back the others.
 #[derive(Clone)]
-pub(crate) struct Hub(DriveHub<Connector>);
+pub(crate) struct Hub {
+    drive: DriveHub<Connector>,
+    /// The Drive API base URL the hub was set up with (google-drive3 has no getter for it).
+    drive_base_url: String,
+    retrier: Retrier,
+}
+
+/// google-drive3's default base URL.
+const DRIVE_BASE_URL: &str = "https://www.googleapis.com/drive/v3/";
 
 impl Deref for Hub {
     type Target = DriveHub<Connector>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.drive
     }
 }
 
@@ -45,17 +60,35 @@ impl Hub {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(create_connector()?);
 
-        Ok(Hub(google_drive3::DriveHub::new(http_client, auth)))
+        Ok(Hub::from_drive_hub(
+            google_drive3::DriveHub::new(http_client, auth),
+            DRIVE_BASE_URL.to_owned(),
+            RetryPolicy::default(),
+        ))
     }
-}
 
-impl Hub {
-    /// The Drive API base URL (`https://www.googleapis.com/drive/v3/` unless a test changed it),
-    /// for requests google-drive3 cannot build, such as ones with extra headers.
-    pub(crate) fn drive_base_url(&self) -> String {
-        // google-drive3 only has a setter, which returns the previous value; the clone shares
-        // the client and credentials and is dropped right away.
-        self.0.clone().base_url(String::new())
+    fn from_drive_hub(
+        drive: DriveHub<Connector>,
+        drive_base_url: String,
+        policy: RetryPolicy,
+    ) -> Hub {
+        Hub {
+            drive,
+            drive_base_url,
+            retrier: Retrier::new(policy, Throttle::new()),
+        }
+    }
+
+    /// The Drive API base URL, ending in `/` (`https://www.googleapis.com/drive/v3/` unless a
+    /// test changed it), for requests google-drive3 cannot build, such as ones with extra
+    /// headers. google-drive3 only has a setter for it.
+    pub(crate) fn drive_base_url(&self) -> &str {
+        &self.drive_base_url
+    }
+
+    /// The retry policy and the throttle shared by every request of this hub.
+    pub(crate) fn retrier(&self) -> &Retrier {
+        &self.retrier
     }
 }
 
@@ -81,8 +114,8 @@ impl Hub {
             hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
                 .build(connector_with(ProxyConnector::direct())?);
         let mut hub = google_drive3::DriveHub::new(http_client, google_apis_common::NoToken);
-        hub.base_url(base_url);
-        Ok(Hub(hub))
+        hub.base_url(base_url.clone());
+        Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
     }
 }
 
@@ -105,8 +138,9 @@ impl Hub {
 
         // Not a credential: google-drive3 refuses resumable uploads without some token.
         let mut hub = DriveHub::new(http_client, String::from("mock-token"));
+        let base_url = format!("{root_url}drive/v3/");
         hub.root_url(root_url.to_owned());
-        hub.base_url(format!("{root_url}drive/v3/"));
-        Ok(Hub(hub))
+        hub.base_url(base_url.clone());
+        Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
     }
 }

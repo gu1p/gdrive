@@ -2,17 +2,17 @@ use std::{
     error,
     fmt::{Display, Formatter},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use mime::Mime;
 
 use crate::{
     common::{
-        delegate::{BackoffConfig, ChunkSize, UploadDelegate, UploadDelegateConfig},
+        delegate::{ChunkSize, UploadDelegate, UploadDelegateConfig},
         file_helper,
         file_info::{self, FileInfo},
         hub_helper::{get_hub, GetHubError},
+        retry::{retry_api, RetryPolicy},
     },
     files::{
         self,
@@ -40,11 +40,7 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
 
     let delegate_config = UploadDelegateConfig {
         chunk_size: config.chunk_size,
-        backoff_config: BackoffConfig {
-            max_retries: 20,
-            min_sleep: Duration::from_secs(1),
-            max_sleep: Duration::from_secs(60),
-        },
+        retry_policy: RetryPolicy::default(),
         print_chunk_errors: config.print_chunk_errors,
         print_chunk_info: config.print_chunk_info,
     };
@@ -128,7 +124,9 @@ where
         ..google_drive3::api::File::default()
     };
 
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let throttle = &hub.retrier().throttle;
+    let mut delegate = UploadDelegate::new(delegate_config, throttle);
+    throttle.wait().await;
 
     let req = hub
         .files()
@@ -157,26 +155,23 @@ where
     clippy::result_large_err,
     reason = "Ok variant is bigger, see test next to FileResult"
 )]
-pub(crate) async fn update_metadata(
-    hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
-    patch_file: PatchFile,
-) -> FileResult {
-    let mut delegate = UploadDelegate::new(delegate_config);
-
-    let (_, file) = hub
-        .files()
-        .update(patch_file.file, &patch_file.id)
-        .param(
-            "fields",
-            "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,\
-            description,webContentLink,webViewLink",
-        )
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit_without_upload()
-        .await?;
+pub(crate) async fn update_metadata(hub: &Hub, patch_file: PatchFile) -> FileResult {
+    let patch_file = &patch_file;
+    let (_, file) = retry_api(hub.retrier(), "files.update", |mut delegate| async move {
+        hub.files()
+            .update(patch_file.file.clone(), &patch_file.id)
+            .param(
+                "fields",
+                "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,\
+                description,webContentLink,webViewLink",
+            )
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .supports_all_drives(true)
+            .doit_without_upload()
+            .await
+    })
+    .await?;
 
     Ok(file)
 }

@@ -6,9 +6,9 @@ use std::{
 
 use crate::{
     common::{
-        delegate::{UploadDelegate, UploadDelegateConfig},
         drive_file,
         hub_helper::{get_hub, GetHubError},
+        retry::retry_api,
     },
     files::{self, FileResult},
     hub::Hub,
@@ -22,7 +22,6 @@ pub(crate) struct Config {
 
 pub(crate) async fn mv(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let delegate_config = UploadDelegateConfig::default();
 
     let old_file = files::info::get_file(&hub, &config.file_id)
         .await
@@ -55,7 +54,7 @@ pub(crate) async fn mv(config: Config) -> Result<(), Error> {
         new_parent: &config.to_folder_id,
     };
 
-    change_parent(&hub, &delegate_config, change_parent_ids)
+    change_parent(&hub, change_parent_ids)
         .await
         .map_err(|err| Error::Move(Box::new(err)))?;
 
@@ -72,25 +71,21 @@ struct ChangeParentIds<'a> {
     clippy::result_large_err,
     reason = "Ok variant is bigger, see test next to FileResult"
 )]
-async fn change_parent(
-    hub: &Hub,
-    delegate_config: &UploadDelegateConfig,
-    ids: ChangeParentIds<'_>,
-) -> FileResult {
-    let mut delegate = UploadDelegate::new(delegate_config);
-
-    let empty_file = google_drive3::api::File::default();
-
-    let (_, file) = hub
-        .files()
-        .update(empty_file, ids.file)
-        .remove_parents(ids.old_parent)
-        .add_parents(ids.new_parent)
-        .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true)
-        .doit_without_upload().await?;
+async fn change_parent(hub: &Hub, ids: ChangeParentIds<'_>) -> FileResult {
+    let ids = &ids;
+    let (_, file) = retry_api(hub.retrier(), "files.update", |mut delegate| async move {
+        hub.files()
+            .update(google_drive3::api::File::default(), ids.file)
+            .remove_parents(ids.old_parent)
+            .add_parents(ids.new_parent)
+            .param("fields", "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,description,webContentLink,webViewLink")
+            .add_scope(google_drive3::api::Scope::Full)
+            .delegate(&mut delegate)
+            .supports_all_drives(true)
+            .doit_without_upload()
+            .await
+    })
+    .await?;
 
     Ok(file)
 }

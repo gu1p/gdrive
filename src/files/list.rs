@@ -14,6 +14,7 @@ use crate::{
     common::{
         drive_file,
         hub_helper::{get_hub, GetHubError},
+        retry::retry_read,
         table::{self, Table},
     },
     files::{self, info::DisplayConfig},
@@ -179,38 +180,47 @@ pub(crate) async fn list_files(
     let mut collected_files: Vec<google_drive3::api::File> = vec![];
     let mut next_page_token: Option<String> = None;
     let q = config.query.q();
+    let q = q.as_str();
+    let order_by = config.order_by.to_string();
+    let order_by = order_by.as_str();
 
     loop {
         let max_files = config.max_files - collected_files.len();
         let page_size = min(MAX_PAGE_SIZE, max_files);
+        let page_token = next_page_token.take();
+        let page_token = page_token.as_deref();
 
-        let mut req = hub.files().list();
+        // Each page is its own operation with its own retry budget.
+        let (_, file_list) = retry_read(hub.retrier(), "files.list", |mut delegate| async move {
+            let mut req = hub.files().list();
 
-        if let Some(token) = next_page_token {
-            req = req.page_token(&token);
-        }
+            if let Some(token) = page_token {
+                req = req.page_token(token);
+            }
 
-        if !q.is_empty() {
-            req = req.q(&q);
-        }
+            if !q.is_empty() {
+                req = req.q(q);
+            }
 
-        if let Some(drive_id) = config.query.drive_id() {
-            req = req.corpora("drive").drive_id(drive_id);
-        }
+            if let Some(drive_id) = config.query.drive_id() {
+                req = req.corpora("drive").drive_id(drive_id);
+            }
 
-        let (_, file_list) = req
-            .page_size(page_size.try_into().unwrap_or(i32::MAX))
-            .order_by(&config.order_by.to_string())
-            .add_scope(google_drive3::api::Scope::Full)
-            .supports_all_drives(true)
-            .include_items_from_all_drives(true)
-            .param(
-                "fields",
-                "files(id,name,md5Checksum,mimeType,size,createdTime,parents),nextPageToken",
-            )
-            .doit()
-            .await
-            .map_err(|err| Error::ListFiles(Box::new(err)))?;
+            req.page_size(page_size.try_into().unwrap_or(i32::MAX))
+                .order_by(order_by)
+                .add_scope(google_drive3::api::Scope::Full)
+                .supports_all_drives(true)
+                .include_items_from_all_drives(true)
+                .param(
+                    "fields",
+                    "files(id,name,md5Checksum,mimeType,size,createdTime,parents),nextPageToken",
+                )
+                .delegate(&mut delegate)
+                .doit()
+                .await
+        })
+        .await
+        .map_err(|err| Error::ListFiles(Box::new(err)))?;
 
         if let Some(mut files) = file_list.files {
             collected_files.append(&mut files);

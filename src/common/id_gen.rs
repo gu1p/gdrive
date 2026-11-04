@@ -3,7 +3,7 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-use crate::{common::delegate::UploadDelegateConfig, files::generate_ids, hub::Hub};
+use crate::{files::generate_ids, hub::Hub};
 
 pub(crate) struct IdGen<'a> {
     source: Source<'a>,
@@ -13,7 +13,6 @@ pub(crate) struct IdGen<'a> {
 enum Source<'a> {
     Drive {
         hub: &'a Hub,
-        delegate_config: &'a UploadDelegateConfig,
     },
     /// Local sequential ids, for tests that must not reach Drive.
     #[cfg(test)]
@@ -22,12 +21,9 @@ enum Source<'a> {
 
 impl<'a> IdGen<'a> {
     #[must_use]
-    pub(crate) fn new(hub: &'a Hub, delegate_config: &'a UploadDelegateConfig) -> Self {
+    pub(crate) fn new(hub: &'a Hub) -> Self {
         Self {
-            source: Source::Drive {
-                hub,
-                delegate_config,
-            },
+            source: Source::Drive { hub },
             ids: Vec::new(),
         }
     }
@@ -47,11 +43,8 @@ impl<'a> IdGen<'a> {
         }
 
         match &mut self.source {
-            Source::Drive {
-                hub,
-                delegate_config,
-            } => {
-                self.ids = generate_ids::generate_ids(hub, 1000, delegate_config)
+            Source::Drive { hub } => {
+                self.ids = generate_ids::generate_ids(hub, 1000)
                     .await
                     .map_err(NextError::GenerateIds)?;
                 let id = self.ids.pop().ok_or(NextError::OutOfIds)?;

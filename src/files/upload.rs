@@ -4,20 +4,20 @@ use std::{
     fs, io,
     ops::Not,
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use mime::Mime;
 
 use crate::{
     common::{
-        delegate::{BackoffConfig, ChunkSize, UploadDelegate, UploadDelegateConfig},
+        delegate::{ChunkSize, UploadDelegate, UploadDelegateConfig},
         file_helper,
         file_info::{self, FileInfo},
         file_tree::{self, FileTree},
         hub_helper::{get_hub, GetHubError},
         human_size::human_size,
         id_gen::IdGen,
+        retry::RetryPolicy,
         FileTreeLike, FolderLike,
     },
     files::{self, info::DisplayConfig, mkdir, FileResult},
@@ -61,11 +61,10 @@ impl Config {
             file_path,
             UploadDelegateConfig {
                 chunk_size,
-                backoff_config: BackoffConfig {
-                    max_retries: 100_000,
-                    min_sleep: Duration::from_secs(1),
-                    max_sleep: Duration::from_secs(60),
-                },
+                // Bounded: a chunk the server accepts starts a new budget, so a long upload
+                // survives many transient errors, but a dead connection ends it (it used to be
+                // 100,000 retries).
+                retry_policy: RetryPolicy::default(),
                 print_chunk_errors,
                 print_chunk_info,
             },
@@ -214,7 +213,7 @@ async fn upload_directory(
     config: UploadDirectoryConfig,
     delegate_config: &UploadDelegateConfig,
 ) -> Result<(), Error> {
-    let mut ids = IdGen::new(hub, delegate_config);
+    let mut ids = IdGen::new(hub);
     let tree = FileTree::from_path(&config.file_path, &mut ids)
         .await
         .map_err(Error::CreateFileTree)?;
@@ -254,7 +253,6 @@ async fn upload_directory(
                 parents: folder_parents,
                 print_only_id: false,
             },
-            delegate_config,
         )
         .await
         .map_err(|err| Error::Mkdir(Box::new(err)))?;
@@ -344,7 +342,10 @@ where
     };
 
     let chunk_size_bytes = delegate_config.chunk_size.in_bytes();
-    let mut delegate = UploadDelegate::new(delegate_config);
+    let throttle = &hub.retrier().throttle;
+    let mut delegate = UploadDelegate::new(delegate_config, throttle);
+    // The delegate cannot wait before the first request: wait out a rate limit here.
+    throttle.wait().await;
 
     let req = hub
         .files()
