@@ -9,7 +9,7 @@ use crate::{
     common::{
         drive_file,
         file_tree_drive::errors::FileIdentifier,
-        local_name::{self, NameChange, NameEntry, UnusableName},
+        local_name::{self, NameChange, NameEntry, UniqueNames, UnusableName},
     },
     files::list,
     hub::Hub,
@@ -61,9 +61,6 @@ pub(crate) struct FolderInfo {
     pub(crate) parent: Option<Arc<Self>>,
 }
 
-/// The children of every listed folder, in listing order, with whether the walk listed them.
-type Listing = HashMap<FolderKey, Vec<(google_drive3::api::File, Children)>>;
-
 impl Folder {
     /// Lists the subtree of the folder `file` and builds the folder from the listing.
     async fn from_file(
@@ -91,87 +88,213 @@ impl Folder {
             local_name,
             parent: None,
         });
-        Folder::from_listing(info, FolderKey::ROOT, &mut listing)
+        Ok(Folder::from_listing(info, FolderKey::ROOT, &mut listing))
     }
 
-    /// Builds the folder listed under `key` and its subtree, taking their children out of
-    /// `listing`.
-    fn from_listing(
-        info: Arc<FolderInfo>,
-        key: FolderKey,
-        listing: &mut Listing,
-    ) -> Result<Folder, errors::Folder> {
-        // Skip documents and shortcuts
-        let (files, children): (Vec<_>, Vec<_>) = listing
-            .remove(&key)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(file, _)| drive_file::is_directory(file) || drive_file::is_binary(file))
-            .unzip();
-        let local_names = children_local_names(&files, &info)?;
+    /// Builds the folder listed under `key` and its subtree, taking them out of `listing`, and
+    /// reports the local names that differ from the Drive names, now that the path is known.
+    fn from_listing(info: Arc<FolderInfo>, key: FolderKey, listing: &mut Listing) -> Folder {
+        // Every listed folder ended with `FolderDone` once the walk is complete.
+        let ListedFolder { children, changes } = listing.remove(&key).unwrap_or_default();
+
+        if changes.is_empty().not() {
+            let folder_path = info.relative_path();
+            for change in &changes {
+                eprintln!("Warning: In '{}': {change}", folder_path.display());
+            }
+        }
 
         let mut folder = Folder {
             info,
-            children: Vec::with_capacity(files.len()),
+            children: Vec::with_capacity(children.len()),
         };
-
-        for ((file, children), local_name) in files.into_iter().zip(children).zip(local_names) {
-            let node = if drive_file::is_directory(&file) {
-                Node::Folder(Folder::subfolder(
-                    file,
-                    children,
-                    &folder.info,
+        for child in children {
+            let node = match child {
+                ListedChild::Folder {
+                    name,
                     local_name,
-                    listing,
-                )?)
-            } else {
-                let file = File::from_file(file, &folder, local_name)
-                    .map_err(|(source, identifier)| errors::Folder::File { identifier, source })?;
-                Node::File(file)
+                    key,
+                } => {
+                    let info = Arc::new(FolderInfo {
+                        name,
+                        local_name,
+                        parent: Some(Arc::clone(&folder.info)),
+                    });
+                    Node::Folder(Folder::from_listing(info, key, listing))
+                }
+                ListedChild::File(file) => Node::File(File {
+                    name: file.name,
+                    local_name: file.local_name,
+                    size: file.size,
+                    parent: Arc::clone(&folder.info),
+                    drive_id: file.drive_id,
+                    md5: file.md5,
+                }),
             };
             folder.children.push(node);
         }
 
-        Ok(folder)
-    }
-
-    /// Builds a child folder. Its name and id were checked by [`children_local_names`].
-    fn subfolder(
-        file: google_drive3::api::File,
-        children: Children,
-        parent: &Arc<FolderInfo>,
-        local_name: String,
-        listing: &mut Listing,
-    ) -> Result<Folder, errors::Folder> {
-        let key = match children {
-            Children::Listed(key) => key,
-            Children::None => return Err(errors::Folder::MissingFileId),
-            Children::Cycle => return Err(errors::Folder::Cycle(FileIdentifier::from(file))),
-        };
-        let name = file.name.ok_or(errors::Folder::MissingFileName)?;
-
-        let info = Arc::new(FolderInfo {
-            name,
-            local_name,
-            parent: Some(Arc::clone(parent)),
-        });
-        Folder::from_listing(info, key, listing)
+        folder
     }
 }
 
-/// Runs the walk to its end and groups the entries by the folder that listed them. The first
-/// folder that cannot be listed ends the listing with its error, as before the walk existed.
+/// What the tree keeps of a child while its folder is being listed: only folders and binary
+/// files, and only the fields the tree uses. Documents and shortcuts, which a recursive download
+/// skips, are dropped as they arrive.
+#[derive(Debug, Clone)]
+struct Child {
+    name: Option<String>,
+    id: Option<String>,
+    kind: ChildKind,
+}
+
+#[derive(Debug, Clone)]
+enum ChildKind {
+    Folder(Children),
+    File {
+        size: Option<i64>,
+        md5: Option<md5::Digest>,
+    },
+}
+
+impl Child {
+    /// `None` for a file the tree skips.
+    fn from_file(file: google_drive3::api::File, children: Children) -> Option<Child> {
+        let kind = if drive_file::is_directory(&file) {
+            ChildKind::Folder(children)
+        } else if drive_file::is_binary(&file) {
+            ChildKind::File {
+                size: file.size,
+                md5: file.md5_checksum.as_deref().and_then(parse_md5_digest),
+            }
+        } else {
+            return None;
+        };
+        Some(Child {
+            name: file.name,
+            id: file.id,
+            kind,
+        })
+    }
+
+    fn is_folder(&self) -> bool {
+        matches!(self.kind, ChildKind::Folder(_))
+    }
+
+    fn identifier(&self) -> FileIdentifier {
+        FileIdentifier::new(self.name.clone(), self.id.clone())
+    }
+
+    /// Checks the child and gives it its local name.
+    fn finish(self, local_name: String) -> Result<ListedChild, errors::Folder> {
+        let identifier = self.identifier();
+        let Child { name, id, kind } = self;
+        let (name, id) = match (name, id) {
+            (Some(name), Some(id)) => (name, id),
+            // Already reported by `children_local_names`.
+            (name, _) => {
+                let is_folder = matches!(kind, ChildKind::Folder(_));
+                return Err(missing_name_or_id(identifier, is_folder, name.is_none()));
+            }
+        };
+
+        match kind {
+            ChildKind::Folder(children) => match children {
+                Children::Listed(key) => Ok(ListedChild::Folder {
+                    name,
+                    local_name,
+                    key,
+                }),
+                Children::None => Err(errors::Folder::MissingFileId),
+                Children::Cycle => Err(errors::Folder::Cycle(identifier)),
+            },
+            ChildKind::File { size, md5 } => {
+                let file_error = |source| errors::Folder::File {
+                    identifier: FileIdentifier::Name(name.clone()),
+                    source,
+                };
+                let size = size.ok_or_else(|| file_error(errors::File::MissingFileSize))?;
+                let size = u64::try_from(size)
+                    .map_err(|source| file_error(errors::File::InvalidFileSize(source)))?;
+                Ok(ListedChild::File(ListedFile {
+                    name,
+                    local_name,
+                    size,
+                    drive_id: id,
+                    md5,
+                }))
+            }
+        }
+    }
+}
+
+/// A child of a folder whose listing is complete, with its local name.
+#[derive(Debug, Clone)]
+enum ListedChild {
+    Folder {
+        name: String,
+        local_name: String,
+        key: FolderKey,
+    },
+    File(ListedFile),
+}
+
+#[derive(Debug, Clone)]
+struct ListedFile {
+    name: String,
+    local_name: String,
+    size: u64,
+    drive_id: String,
+    md5: Option<md5::Digest>,
+}
+
+/// A folder whose listing is complete.
+#[derive(Debug, Clone, Default)]
+struct ListedFolder {
+    children: Vec<ListedChild>,
+    /// Local names that differ from the Drive names, reported once the tree is built and the
+    /// folder's local path is known.
+    changes: Vec<NameChange>,
+}
+
+impl ListedFolder {
+    /// Assigns the local names of a folder's children and checks them.
+    fn finish(children: Vec<Child>) -> Result<ListedFolder, errors::Folder> {
+        let unique = children_local_names(&children)?;
+        let children = children
+            .into_iter()
+            .zip(unique.names)
+            .map(|(child, local_name)| child.finish(local_name))
+            .collect::<Result<_, _>>()?;
+        Ok(ListedFolder {
+            children,
+            changes: unique.changes,
+        })
+    }
+}
+
+/// Every folder of the tree whose listing is complete.
+type Listing = HashMap<FolderKey, ListedFolder>;
+
+/// Runs the walk to its end. The children of a folder are kept in compact form while it is
+/// being listed, and get their local names when the walk reports its end. The first folder that
+/// cannot be listed, or whose children cannot be mapped to local names, ends the listing with
+/// its error, as before the walk existed.
 async fn list_subtree(hub: &Hub, root: WalkRoot) -> Result<Listing, errors::Folder> {
     let mut walk = Walk::start(Arc::new(hub.clone()), root, WalkOptions::default());
+    let mut in_progress = HashMap::<FolderKey, Vec<Child>>::new();
     let mut listing = Listing::new();
 
     while let Some(item) = walk.next().await {
         match item {
-            WalkItem::Entry(entry) => listing
-                .entry(entry.parent)
-                .or_default()
-                .push((*entry.file, entry.children)),
-            WalkItem::FolderDone(_) => {}
+            WalkItem::Entry(entry) => {
+                let children = in_progress.entry(entry.parent).or_default();
+                children.extend(Child::from_file(*entry.file, entry.children));
+            }
+            WalkItem::FolderDone(key) => {
+                let children = in_progress.remove(&key).unwrap_or_default();
+                listing.insert(key, ListedFolder::finish(children)?);
+            }
             WalkItem::FolderError(error) => {
                 return Err(errors::Folder::ListFiles(list::Error::ListFiles(
                     error.error,
@@ -208,34 +331,30 @@ fn root_local_name(name: &str, file_id: &str) -> Result<String, errors::Folder> 
     Ok(local_name)
 }
 
-/// Assigns safe and unique local names to the children of one folder, warning about every name
-/// that differs from the Drive name.
-fn children_local_names(
-    files: &[google_drive3::api::File],
-    parent: &FolderInfo,
-) -> Result<Vec<String>, errors::Folder> {
-    let entries = files
+/// Assigns safe and unique local names to the children of one folder. The changes are the names
+/// that differ from the Drive names.
+fn children_local_names(children: &[Child]) -> Result<UniqueNames, errors::Folder> {
+    let entries = children
         .iter()
-        .map(|file| match (file.name.as_deref(), file.id.as_deref()) {
+        .map(|child| match (child.name.as_deref(), child.id.as_deref()) {
             (Some(name), Some(id)) => Ok(NameEntry { id, name }),
-            (name, _) => Err(missing_name_or_id(file, name.is_none())),
+            (name, _) => Err(missing_name_or_id(
+                child.identifier(),
+                child.is_folder(),
+                name.is_none(),
+            )),
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    let unique = local_name::unique_local_names(&entries).map_err(errors::Folder::UnusableName)?;
-
-    if unique.changes.is_empty().not() {
-        let folder_path = parent.relative_path();
-        for change in &unique.changes {
-            eprintln!("Warning: In '{}': {change}", folder_path.display());
-        }
-    }
-
-    Ok(unique.names)
+    local_name::unique_local_names(&entries).map_err(errors::Folder::UnusableName)
 }
 
-fn missing_name_or_id(file: &google_drive3::api::File, missing_name: bool) -> errors::Folder {
-    if drive_file::is_directory(file) {
+fn missing_name_or_id(
+    identifier: FileIdentifier,
+    is_folder: bool,
+    missing_name: bool,
+) -> errors::Folder {
+    if is_folder {
         if missing_name {
             errors::Folder::MissingFileName
         } else {
@@ -247,10 +366,7 @@ fn missing_name_or_id(file: &google_drive3::api::File, missing_name: bool) -> er
         } else {
             errors::File::MissingFileId
         };
-        errors::Folder::File {
-            identifier: FileIdentifier::from(file),
-            source,
-        }
+        errors::Folder::File { identifier, source }
     }
 }
 
@@ -316,43 +432,6 @@ pub(crate) struct File {
 }
 
 impl File {
-    fn from_file(
-        file: google_drive3::api::File,
-        parent: &Folder,
-        local_name: String,
-    ) -> Result<File, (errors::File, FileIdentifier)> {
-        let name = file
-            .name
-            .ok_or((errors::File::MissingFileName, FileIdentifier::None))?;
-        let Some(size) = file.size else {
-            return Err((errors::File::MissingFileSize, FileIdentifier::Name(name)));
-        };
-        let size = match size.try_into() {
-            Ok(size) => size,
-            Err(source) => {
-                return Err((
-                    errors::File::InvalidFileSize(source),
-                    FileIdentifier::Name(name),
-                ))
-            }
-        };
-        let Some(file_id) = file.id else {
-            return Err((errors::File::MissingFileId, FileIdentifier::Name(name)));
-        };
-        let md5 = file.md5_checksum.as_deref().and_then(parse_md5_digest);
-
-        let file = File {
-            name,
-            local_name,
-            size,
-            parent: Arc::clone(&parent.info),
-            drive_id: file_id,
-            md5,
-        };
-
-        Ok(file)
-    }
-
     /// Local path relative to the download destination, built from the local names.
     #[must_use]
     pub(crate) fn relative_path(&self) -> PathBuf {
@@ -377,7 +456,7 @@ mod tests {
         sync::Arc,
     };
 
-    use super::{children_local_names, errors, File, FileTreeDrive, FolderInfo};
+    use super::{children_local_names, errors, Child, File, FileTreeDrive, FolderInfo};
     use crate::{
         common::{
             drive_file::MIME_TYPE_DRIVE_FOLDER, local_name::InvalidName, FileTreeLike, FolderLike,
@@ -397,13 +476,27 @@ mod tests {
         })
     }
 
+    /// A folder, or a binary file (it has an md5).
     fn drive_file(id: &str, name: &str, folder: bool) -> google_drive3::api::File {
         google_drive3::api::File {
             id: Some(id.to_string()),
             name: Some(name.to_string()),
             mime_type: folder.then(|| MIME_TYPE_DRIVE_FOLDER.to_string()),
+            md5_checksum: (!folder).then(|| format!("{:x}", md5::compute(id))),
+            size: (!folder).then_some(0),
             ..google_drive3::api::File::default()
         }
+    }
+
+    /// The children as the tree keeps them while their folder is listed.
+    fn children(files: &[google_drive3::api::File]) -> Vec<Child> {
+        files
+            .iter()
+            .map(|file| {
+                let children = super::Children::Listed(super::FolderKey::ROOT);
+                Child::from_file(file.clone(), children).expect("a folder or a binary file")
+            })
+            .collect()
     }
 
     #[test]
@@ -449,7 +542,6 @@ mod tests {
 
     #[test]
     fn children_get_safe_unique_names() {
-        let parent = folder_info("parent", None);
         let files = [
             drive_file("id-b", "report.pdf", false),
             drive_file("id-a", "report.pdf", false),
@@ -457,7 +549,7 @@ mod tests {
             drive_file("id-d", "plain", false),
         ];
 
-        let names = children_local_names(&files, &parent).unwrap();
+        let names = children_local_names(&children(&files)).unwrap().names;
         assert_eq!(names[1], "report.pdf");
         assert!(names[0].starts_with("report~"), "{}", names[0]);
         assert_eq!(&names[0][names[0].len() - 4..], ".pdf");
@@ -467,10 +559,9 @@ mod tests {
 
     #[test]
     fn unusable_child_name_is_an_error() {
-        let parent = folder_info("parent", None);
         let files = [drive_file("id-a", "..", true)];
 
-        let err = children_local_names(&files, &parent).unwrap_err();
+        let err = children_local_names(&children(&files)).unwrap_err();
         assert!(matches!(
             err,
             errors::Folder::UnusableName(ref name)
@@ -480,13 +571,12 @@ mod tests {
 
     #[test]
     fn child_without_name_is_an_error() {
-        let parent = folder_info("parent", None);
         let files = [google_drive3::api::File {
-            id: Some("id-a".to_string()),
-            ..google_drive3::api::File::default()
+            name: None,
+            ..drive_file("id-a", "", false)
         }];
 
-        let err = children_local_names(&files, &parent).unwrap_err();
+        let err = children_local_names(&children(&files)).unwrap_err();
         assert!(matches!(
             err,
             errors::Folder::File {
@@ -625,6 +715,57 @@ mod tests {
         assert_eq!(plain.drive_id, "id-a");
         assert_eq!(plain.size, 1);
         assert_eq!(plain.md5, Some(md5::compute("a")));
+    }
+
+    #[test]
+    fn listing_keeps_only_compact_folders_and_binary_files() {
+        let listed = |file: google_drive3::api::File| {
+            Child::from_file(file, super::Children::Listed(super::FolderKey::ROOT))
+        };
+        let document = google_drive3::api::File {
+            mime_type: Some(String::from("application/vnd.google-apps.document")),
+            md5_checksum: None,
+            ..drive_file("doc", "notes", false)
+        };
+        let shortcut = google_drive3::api::File {
+            mime_type: Some(String::from("application/vnd.google-apps.shortcut")),
+            md5_checksum: None,
+            ..drive_file("link", "link", false)
+        };
+
+        assert!(listed(document).is_none());
+        assert!(listed(shortcut).is_none());
+        assert!(listed(drive_file("a", "a", true)).is_some_and(|child| child.is_folder()));
+        assert!(listed(drive_file("b", "b", false)).is_some_and(|child| !child.is_folder()));
+        // A Drive `File` has every API field; the tree holds a small fraction of it per child.
+        assert!(
+            std::mem::size_of::<Child>() * 10 < std::mem::size_of::<google_drive3::api::File>()
+        );
+    }
+
+    #[tokio::test]
+    async fn unusable_name_stops_the_listing_when_its_folder_ends() {
+        let mut files = vec![FakeFile::folder("bad", "..", "root")];
+        let mut parent = String::from("root");
+        for level in 0..4 {
+            let id = format!("level{level}");
+            files.push(FakeFile::folder(&id, &id, &parent));
+            parent = id;
+        }
+        let behavior = Behavior {
+            delay: std::time::Duration::from_millis(50),
+            ..Behavior::default()
+        };
+
+        let (server, tree) = tree_from(files, behavior).await;
+
+        assert!(matches!(
+            tree.unwrap_err(),
+            errors::FileTreeDrive(errors::Folder::UnusableName(ref name)) if name.id == "bad"
+        ));
+        // The root's children are named as soon as the root's listing ends: of the 5 requests of
+        // the whole tree, only the root's and at most the next one were sent.
+        assert!(server.request_count() <= 2, "{}", server.request_count());
     }
 
     #[tokio::test]
