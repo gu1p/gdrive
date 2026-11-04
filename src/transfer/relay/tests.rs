@@ -1670,6 +1670,62 @@ async fn an_interrupted_relay_continues_from_the_committed_offset_in_the_next_ru
 }
 
 #[tokio::test]
+async fn a_session_that_completed_before_the_run_ended_is_taken_without_reading_the_source() {
+    let records = Records::new();
+    let file = SourceFile::blob("blob", SESSION_SIZE);
+    let first = SourceDrive::start(vec![file.clone()], SourceFaults::default());
+    // The last chunk completes the session, but its reply is lost and Drive is gone after it.
+    let dest = MockDrive::start(Faults {
+        die_after_chunks: Some(6),
+        cut_final_reply: true,
+        ..Faults::default()
+    })
+    .await;
+    let error = relay(
+        &first,
+        &dest,
+        &file.listing(),
+        &target(),
+        &records.options(),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, RelayError::Upload(_)), "{error:?}");
+    assert!(dest.state().sessions[0].complete);
+    assert_eq!(records.files().len(), 1, "the record is left");
+    dest.revive();
+
+    let source = SourceDrive::start(vec![file.clone()], SourceFaults::default());
+    let copy = relay(
+        &source,
+        &dest,
+        &file.listing(),
+        &target(),
+        &records.options(),
+        None,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error:?}\n{}", dest.log()));
+
+    assert_eq!(copy.id.as_deref(), Some("gen-id-1"));
+    assert_eq!(
+        copy.md5_checksum, file.md5,
+        "checked against the source's md5"
+    );
+    assert!(
+        source.media().is_empty(),
+        "the source is not read: {:?}",
+        source.log()
+    );
+    let state = dest.state();
+    assert_eq!(state.sessions.len(), 1);
+    assert_eq!(state.files["gen-id-1"].content, content(0, SESSION_SIZE));
+    drop(state);
+    assert!(records.files().is_empty(), "the record is deleted");
+}
+
+#[tokio::test]
 async fn a_session_is_not_continued_for_another_source_account_or_revision() {
     let records = Records::new();
     let file = SourceFile::blob("blob", SESSION_SIZE);

@@ -718,10 +718,11 @@ impl<'a> Upload<'a> {
         self
     }
 
-    /// When a session of an earlier run is continued, the md5 of the content is not checked:
-    /// that would read the bytes Drive holds from the source again, which for a relay means
-    /// downloading them again. The caller checks the file another way (the relay compares
-    /// Drive's md5 with the source's `md5Checksum`). An upload in one run is checked as always.
+    /// When a session of an earlier run is continued, or turns out to have completed, the md5
+    /// of the content is not checked: that would read the bytes Drive holds from the source
+    /// again, which for a relay means downloading them again. The caller checks the file another
+    /// way (the relay compares Drive's md5 with the source's `md5Checksum`). An upload in one
+    /// run is checked as always.
     #[must_use]
     #[cfg_attr(
         not(test),
@@ -841,6 +842,10 @@ impl<'a> Upload<'a> {
                 Ok(Some(Resumed::Session(url, offset)))
             }
             Ok(Status::Complete(file)) => {
+                // Drive holds all of it: checking it would read the whole source again.
+                if self.trust_continued {
+                    self.hasher = None;
+                }
                 self.forget().await;
                 Ok(Some(Resumed::Complete(file)))
             }

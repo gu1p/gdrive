@@ -1604,6 +1604,55 @@ async fn a_trusted_continued_session_is_not_read_again_to_hash_it() {
     );
 }
 
+#[tokio::test]
+async fn a_trusted_session_that_completed_is_not_read_again_to_hash_it() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    // The last chunk completes the session, but its reply is lost and Drive is gone after it.
+    let mock = MockDrive::start(Faults {
+        die_after_chunks: Some(5),
+        cut_final_reply: true,
+        ..Faults::default()
+    })
+    .await;
+    upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .expect_err("the first run does not get the file");
+    assert!(mock.state().sessions[0].complete);
+    mock.revive();
+    let hub = mock.hub();
+    let (target, options) = (target(), records.options());
+    let file = tokio::fs::File::open(&fixture.path).await.unwrap();
+    let metadata = file.metadata().await.unwrap();
+    let mut upload = Upload::new(
+        &hub,
+        hub.retrier().state(),
+        &target,
+        &options,
+        None,
+        SIZE,
+        mime::APPLICATION_OCTET_STREAM,
+    )
+    .trust_continued_content();
+    upload.record_in(
+        &records.uploads,
+        SourceIdentity::of(&fixture.path, &metadata).await,
+    );
+    let mut source = Noting {
+        inner: FileSource::new(file),
+        offsets: Vec::new(),
+    };
+
+    let uploaded = upload
+        .run(&mut source)
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", mock.log()));
+
+    assert_eq!(uploaded.id.as_deref(), Some("gen-id-1"));
+    assert_eq!(mock.state().sessions.len(), 1);
+    assert_eq!(source.offsets, Vec::<u64>::new(), "the source is not read");
+}
+
 /// The content [`test_data`] has at `offset`.
 fn expected_test_data(offset: u64, buf: &mut [u8]) {
     for (at, byte) in (offset..).zip(buf.iter_mut()) {
