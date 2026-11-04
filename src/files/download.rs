@@ -3,7 +3,7 @@ pub(crate) mod errors;
 mod media_tests;
 #[cfg(test)]
 pub(crate) use media_tests::assert_content;
-mod recursive;
+pub(crate) mod recursive;
 pub(crate) mod resume;
 
 use std::path::{Path, PathBuf};
@@ -257,20 +257,48 @@ async fn save_through<W>(
     first: Next,
     file_path: &Path,
     file_id: &str,
+    writer: impl FnMut(File) -> W,
+) -> Result<(), errors::SaveBodyToFile>
+where
+    W: AsyncWrite + Unpin,
+{
+    save_through_with(download, first, file_path, file_id, Commit::Replace, writer).await
+}
+
+/// [`save_through`], taking the place of `file_path` as `commit` says.
+async fn save_through_with<W>(
+    download: ResumableDownload<'_>,
+    first: Next,
+    file_path: &Path,
+    file_id: &str,
+    commit: Commit,
     mut writer: impl FnMut(File) -> W,
 ) -> Result<(), errors::SaveBodyToFile>
 where
     W: AsyncWrite + Unpin,
 {
     let (tmp_file_path, file) = create_temp_file(file_path, file_id).await?;
-    let part = TempFile::new(tmp_file_path, writer(file));
+    let mut part = TempFile::new(tmp_file_path, writer(file));
+    part.commit = commit;
     write_temp_file(download, first, part, file_path, file_id, writer).await
+}
+
+/// How a complete download takes the place of its destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Commit {
+    /// Whatever is there is replaced: an overwrite, a changed file of a sync.
+    Replace,
+    /// Nothing that is there is replaced: a new file of a sync, whose destination was free
+    /// when the download started. Something that appeared there since fails the download
+    /// ([`rename_no_replace`]).
+    NoReplace,
 }
 
 /// The temporary file a download is written to.
 struct TempFile<W> {
     path: PathBuf,
     writer: Md5Writer<W>,
+    commit: Commit,
 }
 
 impl<W: AsyncWrite + Unpin> TempFile<W> {
@@ -278,6 +306,7 @@ impl<W: AsyncWrite + Unpin> TempFile<W> {
         TempFile {
             path,
             writer: Md5Writer::new(writer),
+            commit: Commit::Replace,
         }
     }
 
@@ -289,10 +318,13 @@ impl<W: AsyncWrite + Unpin> TempFile<W> {
         writer: &mut impl FnMut(File) -> W,
     ) -> Result<(), errors::SaveBodyToFile> {
         let (path, file) = create_temp_file(file_path, file_id).await?;
-        let old = std::mem::replace(self, TempFile::new(path, writer(file)));
+        let mut new = TempFile::new(path, writer(file));
+        new.commit = self.commit;
+        let old = std::mem::replace(self, new);
         let TempFile {
             path: old_path,
             writer: old_writer,
+            ..
         } = old;
         drop(old_writer);
         remove_temp_file(&old_path).await;
@@ -409,12 +441,13 @@ where
     let TempFile {
         path: tmp_file_path,
         writer: md5_writer,
+        commit,
     } = part;
     let result = match written {
         Ok(()) => {
             // Taking the digest closes the file, before it is renamed
             let md5_digest = md5_writer.md5();
-            check_and_rename(&tmp_file_path, file_path, &download, md5_digest).await
+            check_and_rename(&tmp_file_path, file_path, &download, md5_digest, commit).await
         }
         Err(err) => Err(err),
     };
@@ -472,12 +505,14 @@ where
     }
 }
 
-/// Checks size and md5 against the revision that was downloaded and renames the temporary file.
+/// Checks size and md5 against the revision that was downloaded and renames the temporary file
+/// as `commit` says.
 async fn check_and_rename(
     tmp_file_path: &Path,
     file_path: &Path,
     download: &ResumableDownload<'_>,
     md5_digest: Digest,
+    commit: Commit,
 ) -> Result<(), errors::SaveBodyToFile> {
     use errors::SaveBodyToFile as E;
 
@@ -505,9 +540,42 @@ async fn check_and_rename(
     }
 
     // Rename temporary file to final file
-    fs::rename(&tmp_file_path, file_path)
-        .await
-        .map_err(E::RenameFile)
+    match commit {
+        Commit::Replace => fs::rename(&tmp_file_path, file_path)
+            .await
+            .map_err(E::RenameFile),
+        Commit::NoReplace => match rename_no_replace(tmp_file_path, file_path).await {
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                Err(E::DestinationAppeared(file_path.to_path_buf()))
+            }
+            renamed => renamed.map_err(E::RenameFile),
+        },
+    }
+}
+
+/// Renames `from` to `to` unless `to` exists, which fails with `AlreadyExists` and changes
+/// nothing.
+///
+/// `std::fs::rename` replaces `to` (`rename` on Unix, `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` on Windows). Here the new name is a hard link, which the system
+/// refuses atomically when the name exists, and the old name is removed after it. Where hard
+/// links are not supported (FAT, exFAT, some network filesystems), the fallback checks that
+/// `to` does not exist and renames: a file created in the instant between the check and the
+/// rename is replaced.
+async fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::hard_link(from, to).await {
+        Ok(()) => {
+            // Both names are the same file now; the content is in place either way.
+            remove_temp_file(from).await;
+            Ok(())
+        }
+        Err(err) if err.kind() == io::ErrorKind::AlreadyExists => Err(err),
+        Err(_) => match fs::symlink_metadata(to).await {
+            Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => fs::rename(from, to).await,
+            Err(err) => Err(err),
+        },
+    }
 }
 
 /// Writes a download to stdout. A body that breaks off is resumed, but content that the server
@@ -947,6 +1015,24 @@ mod tests {
 
         assert_eq!(std::fs::read(&target).unwrap(), b"content");
         assert_eq!(dir_entries(dir.path()), ["a.pdf"]);
+    }
+
+    #[tokio::test]
+    async fn a_no_replace_rename_never_replaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let (from, to) = (dir.path().join(".gdrive-x.part"), dir.path().join("x"));
+        std::fs::write(&from, b"new").unwrap();
+        std::fs::write(&to, b"theirs").unwrap();
+
+        let refused = super::rename_no_replace(&from, &to).await.unwrap_err();
+        assert_eq!(refused.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&to).unwrap(), b"theirs");
+        assert_eq!(std::fs::read(&from).unwrap(), b"new");
+
+        std::fs::remove_file(&to).unwrap();
+        super::rename_no_replace(&from, &to).await.unwrap();
+        assert_eq!(std::fs::read(&to).unwrap(), b"new");
+        assert_eq!(dir_entries(dir.path()), ["x"]);
     }
 
     #[tokio::test]

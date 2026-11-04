@@ -22,6 +22,9 @@ pub(crate) struct FileTree {
     /// The entries below the root that cannot be uploaded, in walk order. The tree holds the
     /// rest.
     pub(crate) unreadable: Vec<Unreadable>,
+    /// The directories left out as symlink cycles (with a warning), as walked: below the
+    /// canonical root, not canonicalized themselves.
+    pub(crate) cycles: Vec<PathBuf>,
 }
 
 /// An entry of the local tree that cannot be uploaded: the walk goes on without it, and a
@@ -49,6 +52,16 @@ impl FileTree {
         path: &Path,
         ids: &mut IdGen<'_>,
     ) -> Result<FileTree, errors::FileTree> {
+        Self::from_path_except(path, None, ids).await
+    }
+
+    /// [`Self::from_path`], leaving out the child of the root named `except` and everything in
+    /// it, as if it did not exist (`files sync` keeps its local trash there).
+    pub(crate) async fn from_path_except(
+        path: &Path,
+        except: Option<&str>,
+        ids: &mut IdGen<'_>,
+    ) -> Result<FileTree, errors::FileTree> {
         let canonical_path = path
             .canonicalize()
             .map_err(errors::FileTree::Canonicalize)?;
@@ -56,6 +69,8 @@ impl FileTree {
         let mut walk = Walk {
             ancestors: HashSet::from([canonical_path.clone()]),
             unreadable: Vec::new(),
+            cycles: Vec::new(),
+            except: except.map(|name| canonical_path.join(name)),
         };
         let root = Folder::from_path(&canonical_path, None, ids, &mut walk)
             .await
@@ -63,6 +78,7 @@ impl FileTree {
         Ok(FileTree {
             root,
             unreadable: walk.unreadable,
+            cycles: walk.cycles,
         })
     }
 }
@@ -72,9 +88,24 @@ struct Walk {
     /// The canonical paths of the directory being walked and of the directories above it.
     ancestors: HashSet<PathBuf>,
     unreadable: Vec<Unreadable>,
+    cycles: Vec<PathBuf>,
+    /// The path that is not walked.
+    except: Option<PathBuf>,
 }
 
 impl Walk {
+    /// Leaves out the directory `path`, which resolves to `canonical_path`, one of the
+    /// directories being walked: a symlink cycle.
+    fn cycle(&mut self, path: PathBuf, canonical_path: &Path) {
+        eprintln!(
+            "Warning: Skipping directory '{}': it resolves to '{}', which contains it (symlink \
+            cycle)",
+            path.display(),
+            canonical_path.display(),
+        );
+        self.cycles.push(path);
+    }
+
     /// Notes an entry of `folder` that cannot be uploaded.
     fn unreadable(&mut self, folder: &Folder, path: &Path, is_dir: bool, error: errors::Folder) {
         self.unreadable.push(Unreadable {
@@ -149,6 +180,9 @@ impl Folder {
                 }
             };
             let path = entry.path();
+            if walk.except.as_ref() == Some(&path) {
+                continue;
+            }
 
             // fs::metadata follows symlinks: a link is uploaded as what it points to.
             let metadata = match fs::metadata(&path) {
@@ -185,12 +219,7 @@ impl Folder {
                 };
 
                 if walk.ancestors.contains(&canonical_path) {
-                    eprintln!(
-                        "Warning: Skipping directory '{}': it resolves to '{}', which contains \
-                        it (symlink cycle)",
-                        path.display(),
-                        canonical_path.display(),
-                    );
+                    walk.cycle(path, &canonical_path);
                     continue;
                 }
 
@@ -461,6 +490,38 @@ mod tests {
         let walked = walk(&root).await.unwrap();
         assert_eq!(walked.folders, paths(["root", "root/a", "root/a/b"]));
         assert_eq!(walked.files, sizes([("root/a/file.txt", 1)]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cycles_are_recorded_and_the_excepted_child_is_left_out() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join(".trash/old")).unwrap();
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::write(root.join(".trash/old/x.txt"), b"x").unwrap();
+        std::fs::write(root.join("a/.trash"), b"not the top one").unwrap();
+        symlink("..", root.join("a/up")).unwrap();
+
+        let tree = FileTree::from_path_except(&root, Some(".trash"), &mut IdGen::sequential())
+            .await
+            .unwrap();
+
+        let canonical = root.canonicalize().unwrap();
+        assert_eq!(tree.cycles, [canonical.join("a/up")]);
+        let mut files = Vec::new();
+        for folder in tree.folders() {
+            files.extend(
+                folder
+                    .files()
+                    .iter()
+                    .map(|file| file.relative_path().to_path_buf()),
+            );
+        }
+        assert_eq!(files, [PathBuf::from("root/a/.trash")]);
+        assert!(tree.unreadable.is_empty());
     }
 
     #[cfg(unix)]

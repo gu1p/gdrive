@@ -182,9 +182,10 @@ Things to know:
   `--export default` it exports them; see
   [Google Docs in a recursive download](#google-docs-in-a-recursive-download). Shortcuts are skipped and
   counted the same way: a recursive download does not follow them.
-- **There is no `--skip`.** gdrive 2's `--skip` kept every local file that already existed. gdrive 3 has
-  no exact equivalent yet. Without `--overwrite`, a recursive download stops when the local folder already
-  exists. A real skip-existing mode is planned (roadmap milestone 2, item 6).
+- **There is no `--skip`.** gdrive 2's `--skip` kept every local file that already existed. Without
+  `--overwrite`, a recursive download stops when the local folder already exists. To bring an existing
+  local copy up to date, use `gdrive files sync down <FOLDER_ID> <DIR>` instead: it downloads only new and
+  changed files and deletes nothing (see [Sync a folder](#sync-a-folder)).
 - **`--overwrite` replaces local changes.** When you run a recursive download again with `--overwrite`,
   gdrive skips files whose local copy has the same MD5 checksum as the Drive file. Every other local file
   with the same path is replaced by the Drive version, including files you edited locally. Do not use it
@@ -272,6 +273,28 @@ gdrive files upload --recursive ~/photos               # a local folder and ever
   uploads from a cloud server are slow because of many `429`, `502` or `503` responses.
 - `--recursive` uploads 4 files at a time (`--jobs`); every Drive folder is created before anything goes
   into it. See [Recursive transfers](#recursive-transfers).
+
+## Sync a folder
+
+`files sync` makes one folder like the other, one way, like `rsync`: it transfers only new and changed
+files, and deletes what is only on the destination when you ask for it.
+
+```sh
+gdrive files sync up ~/photos <FOLDER_ID> --dry-run    # what would be uploaded
+gdrive files sync up ~/photos <FOLDER_ID>              # make the Drive folder like ~/photos
+gdrive files sync down <FOLDER_ID> ~/photos --delete   # make ~/photos like the Drive folder
+```
+
+- The contents of the two folders are synced: `~/photos/a.jpg` and `a.jpg` in the Drive folder are the
+  same file. A changed file goes up as a new revision of its Drive file, which keeps its id and sharing.
+- `--dry-run` prints one line per item (`create`, `update`, `unchanged`, `extra`, `skip:REASON`) and
+  changes nothing.
+- Nothing is deleted without `--delete`. With it, Drive files go to the Drive trash and local files to
+  `LOCAL_DIR/.gdrive-trash/`, and only after every transfer succeeded on a complete listing of both sides.
+- Google Docs files, shortcuts, names that differ only in letter case and, for `down`, local symlinks are
+  skipped and never deleted. `sync down --export SPEC` exports Google Docs files.
+
+The whole story, including what is never deleted and how to restore: [Sync a folder one way](sync.md).
 
 ## Recursive transfers
 
@@ -485,7 +508,7 @@ Without options, `permissions share` makes the file readable by anyone who has t
 | `gdrive download -r <ID>` | `gdrive files download --recursive <ID>` |
 | `gdrive download --path <DIR> <ID>` | `gdrive files download --destination <DIR> <ID>` |
 | `gdrive download --force <ID>` | `gdrive files download --overwrite <ID>` |
-| `gdrive download --skip -r <ID>` | No exact equivalent. `--overwrite` is not the same: it replaces local files whose content differs (see [Download a folder](#download-a-folder)). Planned. |
+| `gdrive download --skip -r <ID>` | `gdrive files sync down <ID> <DIR>` is the closest: it keeps unchanged files and also updates changed ones (see [Sync a folder](#sync-a-folder)). `--overwrite` is not the same. |
 | `gdrive upload -p <ID> <FILE>` | `gdrive files upload --parent <ID> <FILE>` |
 | `gdrive upload -r <DIR>` | `gdrive files upload --recursive <DIR>` |
 | `gdrive update <ID> <FILE>` | `gdrive files update <ID> <FILE>` |
@@ -497,7 +520,7 @@ Without options, `permissions share` makes the file readable by anyone who has t
 | `gdrive share list <ID>` | `gdrive permissions list <ID>` |
 | `gdrive share revoke <ID> <PERMISSION_ID>` | `gdrive permissions revoke --id <PERMISSION_ID> <ID>` |
 | `gdrive about` | `gdrive account current` |
-| `gdrive sync upload`, `gdrive sync download` | No equivalent yet. Planned. |
+| `gdrive sync upload <DIR> <ID>`, `gdrive sync download <ID> <DIR>` | `gdrive files sync up <DIR> <ID>`, `gdrive files sync down <ID> <DIR>`; `--delete-extraneous` is `--delete`, which moves extras to a trash instead of deleting them (see [Sync a folder one way](sync.md)) |
 | `gdrive revision ...` | No equivalent. |
 | `--service-account` | Not supported yet. Planned. |
 

@@ -346,6 +346,19 @@ enum FileCommand {
         progress: ProgressArgs,
     },
 
+    /// Sync a local directory and a Drive folder one way, like rsync
+    ///
+    /// `sync up` makes the Drive folder like the local directory, `sync down` the local
+    /// directory like the Drive folder: new files are created, changed ones updated (a changed
+    /// Drive file gets a new revision, its id stays). Nothing is deleted unless --delete is given,
+    /// and then only after everything was transferred and both sides were listed completely:
+    /// Drive files go to the Drive trash, local files to LOCAL_DIR/.gdrive-trash/. Use --dry-run
+    /// first: it prints the same lines as the real run, one per item. See docs/sync.md.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommand,
+    },
+
     /// Upload file
     Upload {
         /// Path of file to upload
@@ -570,6 +583,78 @@ impl ProgressArgs {
 }
 
 #[derive(Subcommand)]
+enum SyncCommand {
+    /// Make the Drive folder like the local directory: upload new and changed files
+    ///
+    /// Files are compared by size and md5 (every local file whose size matches is read).
+    /// Symlinks are followed, as by `files upload --recursive`. Google Docs files, shortcuts and
+    /// names that are ambiguous (the same when letter case and Unicode normalization are
+    /// ignored) are skipped and never deleted.
+    Up {
+        /// The local directory whose contents are synced
+        local_dir: PathBuf,
+
+        /// Id of the Drive folder to sync into
+        folder_id: String,
+
+        #[command(flatten)]
+        args: SyncArgs,
+    },
+
+    /// Make the local directory like the Drive folder: download new and changed files
+    ///
+    /// A file whose size and modification time match Drive's is unchanged without being read
+    /// (downloads set the time); otherwise files of the same size are compared by md5. Local
+    /// symlinks are never written through or deleted. Google Docs files are skipped unless
+    /// --export is given, and local files with their names are never deleted.
+    Down {
+        /// Id of the Drive folder whose contents are synced
+        folder_id: String,
+
+        /// The local directory to sync into; created if it does not exist
+        local_dir: PathBuf,
+
+        #[command(flatten)]
+        args: SyncArgs,
+
+        /// With --delete: remove local extras for good instead of moving them to LOCAL_DIR/.gdrive-trash/
+        #[arg(long, requires = "delete")]
+        delete_permanently: bool,
+
+        /// Export Google Docs, Sheets, Slides and Drawings, as `files download --recursive --export` does. SPEC is a profile, `default` (docs=docx, sheets=xlsx, slides=pptx, drawings=png) or `md`, and/or TYPE=FORMAT overrides separated by commas, for example `md,sheets=ods` or `docs=pdf,drawings=skip`
+        #[arg(long, value_name = "SPEC", value_parser = ExportFormats::parse)]
+        export: Option<ExportFormats>,
+
+        /// Download files that Google flagged as malware or spam. Only the owner of a file, or an organizer of its shared drive, can do this
+        #[arg(long)]
+        acknowledge_abuse: bool,
+    },
+}
+
+/// The options of both directions of `files sync`.
+#[derive(clap::Args)]
+struct SyncArgs {
+    /// Print what would be done, one line per item (create, update, unchanged, extra, extra->trash, skip:REASON), and change nothing
+    #[arg(long)]
+    dry_run: bool,
+
+    /// Also remove what exists only on the destination, once everything was transferred and both sides were listed completely: Drive files go to the Drive trash, local files to LOCAL_DIR/.gdrive-trash/<time>/
+    #[arg(long)]
+    delete: bool,
+
+    /// Transfer up to N files at once (1 to 64)
+    #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+    jobs: NonZeroUsize,
+
+    /// When a file fails, go on with the others instead of stopping. Nothing is deleted after a failure, and the command still exits with an error
+    #[arg(long)]
+    continue_on_error: bool,
+
+    #[command(flatten)]
+    progress: ProgressArgs,
+}
+
+#[derive(Subcommand)]
 enum PermissionCommand {
     /// Grant permission to file
     Share {
@@ -642,6 +727,65 @@ fn parse_jobs(value: &str) -> Result<NonZeroUsize, String> {
     NonZeroUsize::new(jobs)
         .filter(|jobs| jobs.get() <= Options::MAX_JOBS)
         .ok_or_else(|| format!("must be between 1 and {}", Options::MAX_JOBS))
+}
+
+/// The configuration of a `files sync` command line.
+fn sync_config(command: SyncCommand) -> files::sync::Config {
+    use files::sync::{Config, DeleteMode, Direction};
+
+    let (direction, local_dir, folder_id, args, permanently, export, acknowledge_abuse) =
+        match command {
+            SyncCommand::Up {
+                local_dir,
+                folder_id,
+                args,
+            } => (
+                Direction::Up,
+                local_dir,
+                folder_id,
+                args,
+                false,
+                None,
+                false,
+            ),
+            SyncCommand::Down {
+                folder_id,
+                local_dir,
+                args,
+                delete_permanently,
+                export,
+                acknowledge_abuse,
+            } => (
+                Direction::Down,
+                local_dir,
+                folder_id,
+                args,
+                delete_permanently,
+                export,
+                acknowledge_abuse,
+            ),
+        };
+    let delete = match (args.delete, permanently) {
+        (false, _) => None,
+        (true, false) => Some(DeleteMode::Trash),
+        (true, true) => Some(DeleteMode::Permanently),
+    };
+    Config {
+        direction,
+        local_dir,
+        folder_id,
+        dry_run: args.dry_run,
+        delete,
+        export,
+        acknowledge_abuse,
+        transfer: Options::new(args.jobs, args.continue_on_error),
+        progress: args.progress.mode(),
+        upload: transfer::upload::UploadOptions {
+            session_dir: transfer::upload::session::account_session_dir(),
+            session_identity: transfer::upload::session::account_session_identity(),
+            ..transfer::upload::UploadOptions::default()
+        },
+    }
 }
 
 #[tokio::main]
@@ -927,6 +1071,10 @@ async fn handle_files_command(
                 progress: progress.mode(),
             })
             .await?;
+        }
+
+        FileCommand::Sync { command } => {
+            files::sync(sync_config(command)).await?;
         }
 
         FileCommand::Update {

@@ -119,7 +119,7 @@ SSH tunnel, `gdrive account add --manual` (4.0.0), and unattended use in cron jo
 gdrive account      add, list, current, switch, remove, export, import
                     reauth, add --service-account, add --adc (4.0.0)
 gdrive files        list, info, download, upload, update, delete, mkdir, rename,
-                    move, copy, import, export
+                    move, copy, import, export, sync up, sync down (4.0.0)
 gdrive drives       list
 gdrive permissions  share, list, revoke
 gdrive about        information about gdrive
@@ -127,6 +127,9 @@ gdrive version      version information
 ```
 
 Run `gdrive <command> --help` for the options, for example `gdrive files list --help`.
+
+- One-way sync of a local directory and a Drive folder, with `--dry-run` and a `--delete` that only
+  moves things to a trash: [Sync a folder one way](docs/sync.md).
 
 - Service accounts and Application Default Credentials, for CI and servers:
   [Service accounts](docs/service_accounts.md).
@@ -217,10 +220,15 @@ Also in 4.0.0:
 - Short options: `-m`, `-q`, `-p`, `-r`, `-o`, `-d`.
 - Shell completions: `gdrive completions bash` (also zsh, fish, powershell, elvish).
 - `files info` prints `Trashed: yes` for a file in the trash.
+- `files sync up` and `files sync down` sync a local directory and a Drive folder one way: new and changed
+  files only, changed Drive files updated in place, `--dry-run`, and `--delete` that runs only after a
+  complete listing and a transfer without failures and moves extras to the Drive trash or
+  `.gdrive-trash/` ([docs/sync.md](docs/sync.md)).
 
 Planned, not done yet:
 
-- Sync and skip modes: `files sync` (in progress) and a mode that skips files that exist already.
+- A mode of `files download --recursive` that skips files that exist already (`files sync down` updates
+  them instead).
 - Download resume across runs; today a broken download resumes only within the same run.
 - From the roadmap's backlog: folder size, `.gdriveignore`, deleting local files after an upload,
   `--account` per command, raw access tokens, a credential store outside the config directory.

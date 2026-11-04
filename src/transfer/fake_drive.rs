@@ -17,6 +17,12 @@
 //! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
 //! last). Like Drive, a create fails with 404 when a parent does not exist yet.
 //!
+//! For syncs it answers multipart `files.update` of a stored file's content (a `PATCH` to the
+//! upload path, [`FakeDrive::updates`]), metadata `files.update` (a `PATCH` of JSON, such as
+//! `{"trashed": true}`, [`FakeDrive::patches`]) and records `files.delete`
+//! ([`FakeDrive::deletes`]). The stored files do not change: a listing after an update still
+//! returns what the test started the fake with.
+//!
 //! A test that checks how many requests were in flight at once does not rely on delays: the
 //! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
 //! listing until a download has started, so the overlap happens however slow the machine is.
@@ -265,6 +271,10 @@ pub(crate) struct Behavior {
     pub(crate) upload_delay: Duration,
     /// Creates of files with these names fail with 400.
     pub(crate) upload_rejected: HashSet<String>,
+    /// Content updates of these file ids fail with 400.
+    pub(crate) update_rejected: HashSet<String>,
+    /// Metadata updates (a trash, a rename) of these file ids fail with 403.
+    pub(crate) patch_rejected: HashSet<String>,
     /// How long every chunk of a resumable session takes before its reply.
     pub(crate) chunk_delay: Duration,
     /// The chunk of the file with this name that starts at this offset fails with 503 once,
@@ -278,6 +288,9 @@ pub(crate) struct Behavior {
     pub(crate) upload_rendezvous: usize,
     /// The first this many media downloads are held until all of them have arrived.
     pub(crate) media_rendezvous: usize,
+    /// Every media download and export waits for a permit of this semaphore before it is
+    /// answered (and takes it), so that a test acts while the request is in flight.
+    pub(crate) content_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// The first queries naming one of these folders, as many as there are folders, are held
     /// until all of them have arrived.
     pub(crate) list_rendezvous: HashSet<String>,
@@ -330,6 +343,8 @@ pub(crate) struct Chunk {
 #[derive(Debug)]
 struct Session {
     metadata: Value,
+    /// The stored file a resumable update replaces the content of; `None` for a create.
+    update: Option<String>,
     total: u64,
     received: Vec<u8>,
     /// See [`Created::arrived`].
@@ -372,7 +387,8 @@ impl ListRequest {
 }
 
 struct State {
-    files: Vec<FakeFile>,
+    /// The stored files; creates, content updates and metadata updates change them.
+    files: Mutex<Vec<FakeFile>>,
     behavior: Behavior,
     requests: Mutex<Vec<ListRequest>>,
     /// The ids of `files.get` requests.
@@ -393,6 +409,12 @@ struct State {
     last_list: Mutex<Option<Instant>>,
     /// Successful creates, in reply order.
     created: Mutex<Vec<Created>>,
+    /// Successful content updates: the file id and the new content.
+    updates: Mutex<Vec<(String, Vec<u8>)>>,
+    /// Metadata updates: the file id and the JSON body, also the rejected ones.
+    patches: Mutex<Vec<(String, Value)>>,
+    /// The ids of `files.delete` requests.
+    deletes: Mutex<Vec<String>>,
     /// Orders the arrivals and replies of creates.
     create_events: AtomicUsize,
     uploads_in_flight: AtomicUsize,
@@ -432,7 +454,7 @@ impl FakeDrive {
         let media_rendezvous = Rendezvous::new(behavior.media_rendezvous);
         let list_rendezvous = Rendezvous::new(behavior.list_rendezvous.len());
         let state = Arc::new(State {
-            files,
+            files: Mutex::new(files),
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
             behavior,
             requests: Mutex::new(Vec::new()),
@@ -446,6 +468,9 @@ impl FakeDrive {
             first_media: Mutex::new(None),
             last_list: Mutex::new(None),
             created: Mutex::new(Vec::new()),
+            updates: Mutex::new(Vec::new()),
+            patches: Mutex::new(Vec::new()),
+            deletes: Mutex::new(Vec::new()),
             create_events: AtomicUsize::new(0),
             uploads_in_flight: AtomicUsize::new(0),
             uploads_max_in_flight: AtomicUsize::new(0),
@@ -521,6 +546,27 @@ impl FakeDrive {
         self.state.created.lock().expect("created lock").clone()
     }
 
+    /// The successful content updates (`files.update` with media): file id and new content.
+    pub(crate) fn updates(&self) -> Vec<(String, Vec<u8>)> {
+        self.state.updates.lock().expect("updates lock").clone()
+    }
+
+    /// The metadata updates (`files.update` without media), rejected ones included: file id and
+    /// JSON body.
+    pub(crate) fn patches(&self) -> Vec<(String, Value)> {
+        self.state.patches.lock().expect("patches lock").clone()
+    }
+
+    /// The file ids of `files.delete` requests.
+    pub(crate) fn deletes(&self) -> Vec<String> {
+        self.state.deletes.lock().expect("deletes lock").clone()
+    }
+
+    /// How many ids `files.generateIds` handed out.
+    pub(crate) fn generated_ids(&self) -> usize {
+        self.state.generated.load(Ordering::SeqCst)
+    }
+
     /// The chunk and status requests of resumable sessions, in arrival order.
     pub(crate) fn chunks(&self) -> Vec<Chunk> {
         self.state.chunks.lock().expect("chunks lock").clone()
@@ -556,6 +602,17 @@ impl FakeDrive {
             *self.state.first_media.lock().expect("first media lock"),
             *self.state.last_list.lock().expect("last list lock"),
         )
+    }
+}
+
+impl State {
+    fn files(&self) -> std::sync::MutexGuard<'_, Vec<FakeFile>> {
+        self.files.lock().expect("files lock")
+    }
+
+    /// The stored file `id`.
+    fn file(&self, id: &str) -> Option<FakeFile> {
+        self.files().iter().find(|file| file.id == id).cloned()
     }
 }
 
@@ -608,10 +665,13 @@ async fn handle(
             .iter()
             .any(|(key, value)| key == "uploadType" && value == "resumable");
         return Ok(if resumable {
-            start_session(&state, request).await
+            start_session(&state, request, None).await
         } else {
             create(&state, request).await
         });
+    }
+    if matches!(*request.method(), Method::PATCH | Method::DELETE) {
+        return Ok(modify(&state, &path, request).await);
     }
     if request.method() == Method::PUT {
         if let Some(session) = path
@@ -633,7 +693,7 @@ async fn handle(
         .and_then(|id| id.strip_prefix('/'))
     {
         if let Some(id) = id.strip_suffix("/export") {
-            return Ok(export(&state, id, &params));
+            return Ok(export(&state, id, &params).await);
         }
         if params
             .iter()
@@ -756,7 +816,7 @@ fn finish_create(
                 && !created.iter().any(|folder| {
                     &folder.id == *parent && folder.mime_type == MIME_TYPE_DRIVE_FOLDER
                 })
-                && !state.files.iter().any(|file| &file.id == *parent)
+                && !state.files().iter().any(|file| &file.id == *parent)
         })
     };
     if let Some(parent) = missing_parent {
@@ -781,12 +841,164 @@ fn finish_create(
         "size": created.content.len().to_string(),
         "md5Checksum": format!("{:x}", md5::compute(&created.content)),
     });
+    state.files().push(FakeFile {
+        id: created.id.clone(),
+        name: created.name.clone(),
+        mime_type: created.mime_type.clone(),
+        parents: created.parents.clone(),
+        size: (!is_folder_type(&created.mime_type)).then_some(created.content.len() as u64),
+        md5: (!is_folder_type(&created.mime_type))
+            .then(|| format!("{:x}", md5::compute(&created.content))),
+        content: Some(String::from_utf8_lossy(&created.content).into_owned()),
+        ..FakeFile::default()
+    });
     state.created.lock().expect("created lock").push(created);
     json_response(StatusCode::OK, &reply)
 }
 
+fn is_folder_type(mime_type: &str) -> bool {
+    mime_type == MIME_TYPE_DRIVE_FOLDER
+}
+
+/// A `PATCH` (`files.update` of the content or of the metadata) or a `DELETE` of a file.
+async fn modify(state: &State, path: &str, request: hyper::Request<Incoming>) -> FakeResponse {
+    let id_after = |prefix: &str| {
+        path.strip_prefix(prefix)
+            .and_then(|id| id.strip_prefix('/'))
+            .map(String::from)
+    };
+    match (
+        request.method().clone(),
+        id_after(UPLOAD_PATH),
+        id_after(LIST_PATH),
+    ) {
+        (Method::PATCH, Some(id), _) => {
+            let resumable = request.uri().query().is_some_and(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .any(|(key, value)| key == "uploadType" && value == "resumable")
+            });
+            if resumable {
+                start_session(state, request, Some(id)).await
+            } else {
+                update(state, &id, request).await
+            }
+        }
+        (Method::PATCH, None, Some(id)) => patch(state, &id, request).await,
+        (Method::DELETE, None, Some(id)) => {
+            state.deletes.lock().expect("deletes lock").push(id);
+            hyper::Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()).boxed())
+                .expect("valid response")
+        }
+        _ => error(StatusCode::NOT_FOUND, "unexpected request"),
+    }
+}
+
+/// A multipart `files.update` of a stored file: its new content. A resumable update is a
+/// session ([`start_session`]).
+async fn update(state: &State, id: &str, request: hyper::Request<Incoming>) -> FakeResponse {
+    let multipart_upload = request.uri().query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes())
+            .any(|(key, value)| key == "uploadType" && value == "multipart")
+    });
+    if !multipart_upload {
+        return error(StatusCode::BAD_REQUEST, "only multipart updates");
+    }
+    let boundary = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("boundary="))
+        .map(|(_, boundary)| boundary.trim_matches('"').to_owned());
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let Some((_, content)) = boundary.and_then(|b| multipart(&body.to_bytes(), &b)) else {
+        return error(StatusCode::BAD_REQUEST, "not a multipart upload");
+    };
+    match apply_update(state, id, content) {
+        Ok(reply) => json_response(StatusCode::OK, &reply),
+        Err(response) => *response,
+    }
+}
+
+/// The new `content` of the stored file `id`, recorded and stored; the file resource, or the
+/// error reply.
+fn apply_update(state: &State, id: &str, content: Vec<u8>) -> Result<Value, Box<FakeResponse>> {
+    if state.behavior.update_rejected.contains(id) {
+        return Err(Box::new(error(StatusCode::BAD_REQUEST, "Invalid upload.")));
+    }
+    let mut files = state.files();
+    let Some(file) = files.iter_mut().find(|file| file.id == id) else {
+        let message = format!("File not found: {id}.");
+        return Err(Box::new(error(StatusCode::NOT_FOUND, &message)));
+    };
+    file.size = Some(content.len() as u64);
+    file.md5 = Some(format!("{:x}", md5::compute(&content)));
+    file.content = Some(String::from_utf8_lossy(&content).into_owned());
+    let reply = json!({
+        "kind": "drive#file",
+        "id": id,
+        "name": file.name,
+        "mimeType": file.mime_type,
+        "parents": file.parents,
+        "size": content.len().to_string(),
+        "md5Checksum": format!("{:x}", md5::compute(&content)),
+    });
+    drop(files);
+    state
+        .updates
+        .lock()
+        .expect("updates lock")
+        .push((id.to_owned(), content));
+    Ok(reply)
+}
+
+/// A metadata `files.update` (`PATCH` of JSON) of a stored file: `trashed` and `name` are
+/// stored.
+async fn patch(state: &State, id: &str, request: hyper::Request<Incoming>) -> FakeResponse {
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let metadata = serde_json::from_slice::<Value>(&body.to_bytes()).unwrap_or(Value::Null);
+    state
+        .patches
+        .lock()
+        .expect("patches lock")
+        .push((id.to_owned(), metadata.clone()));
+    if state.behavior.patch_rejected.contains(id) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "The user does not have sufficient permissions for this file.",
+        );
+    }
+    let mut files = state.files();
+    let Some(file) = files.iter_mut().find(|file| file.id == id) else {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
+    };
+    if let Some(trashed) = metadata["trashed"].as_bool() {
+        file.trashed = trashed;
+    }
+    if let Some(name) = metadata["name"].as_str() {
+        name.clone_into(&mut file.name);
+    }
+    let mut reply = file.to_json(true);
+    drop(files);
+    if let (Some(reply), Some(changes)) = (reply.as_object_mut(), metadata.as_object()) {
+        for (key, value) in changes {
+            reply.insert(key.clone(), value.clone());
+        }
+    }
+    json_response(StatusCode::OK, &reply)
+}
+
 /// `POST ...?uploadType=resumable`: a new session for the metadata in the body.
-async fn start_session(state: &State, request: hyper::Request<Incoming>) -> FakeResponse {
+async fn start_session(
+    state: &State,
+    request: hyper::Request<Incoming>,
+    update: Option<String>,
+) -> FakeResponse {
     let arrived = state.create_events.fetch_add(1, Ordering::SeqCst);
     let header = |name: &str| {
         request
@@ -822,6 +1034,7 @@ async fn start_session(state: &State, request: hyper::Request<Incoming>) -> Fake
         let mut sessions = state.sessions.lock().expect("sessions lock");
         sessions.push(Session {
             metadata,
+            update,
             total,
             received: Vec::new(),
             arrived,
@@ -905,31 +1118,12 @@ async fn session_request(
                 let metadata = this.metadata.clone();
                 let content = this.received.clone();
                 let arrived = this.arrived;
+                let update = this.update.clone();
                 drop(sessions);
-                let response = finish_create(state, &metadata, content, arrived);
-                if response.status() == StatusCode::OK {
-                    state.sessions_active.fetch_sub(1, Ordering::SeqCst);
-                    let created = state.created.lock().expect("created lock");
-                    let reply = created.last().map(|created| {
-                        json!({
-                            "kind": "drive#file",
-                            "id": created.id,
-                            "name": created.name,
-                            "mimeType": created.mime_type,
-                            "parents": created.parents,
-                            "size": created.content.len().to_string(),
-                            "md5Checksum": format!("{:x}", md5::compute(&created.content)),
-                        })
-                    });
-                    if let Some(this) = state
-                        .sessions
-                        .lock()
-                        .expect("sessions lock")
-                        .get_mut(session)
-                    {
-                        this.done = reply;
-                    }
-                }
+                let response = match update {
+                    Some(id) => finish_update(state, session, &id, content),
+                    None => finish_session_create(state, session, &metadata, content, arrived),
+                };
                 record_chunk(state, &name, Some(first), response.status());
                 return response;
             }
@@ -946,6 +1140,61 @@ async fn session_request(
         response.status(),
     );
     response
+}
+
+/// The last chunk of a resumable create arrived: the file is created.
+fn finish_session_create(
+    state: &State,
+    session: usize,
+    metadata: &Value,
+    content: Vec<u8>,
+    arrived: usize,
+) -> FakeResponse {
+    let response = finish_create(state, metadata, content, arrived);
+    if response.status() == StatusCode::OK {
+        let reply = state
+            .created
+            .lock()
+            .expect("created lock")
+            .last()
+            .map(|created| {
+                json!({
+                    "kind": "drive#file",
+                    "id": created.id,
+                    "name": created.name,
+                    "mimeType": created.mime_type,
+                    "parents": created.parents,
+                    "size": created.content.len().to_string(),
+                    "md5Checksum": format!("{:x}", md5::compute(&created.content)),
+                })
+            });
+        session_done(state, session, reply);
+    }
+    response
+}
+
+/// The last chunk of a resumable update arrived: the stored file gets `content`.
+fn finish_update(state: &State, session: usize, id: &str, content: Vec<u8>) -> FakeResponse {
+    match apply_update(state, id, content) {
+        Ok(reply) => {
+            session_done(state, session, Some(reply.clone()));
+            json_response(StatusCode::OK, &reply)
+        }
+        Err(response) => *response,
+    }
+}
+
+/// The session `session` completed with `reply`.
+fn session_done(state: &State, session: usize, reply: Option<Value>) {
+    state.sessions_active.fetch_sub(1, Ordering::SeqCst);
+    if let Some(this) = state
+        .sessions
+        .lock()
+        .expect("sessions lock")
+        .get_mut(session)
+    {
+        this.done = reply;
+    }
 }
 
 /// What a request of a session waits for before it is answered: [`Behavior::chunk_delay`]; a
@@ -1030,6 +1279,7 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         .get_or_insert_with(Instant::now);
     state.media_arrived.send_replace(true);
     state.media_rendezvous.join().await;
+    pass_gate(state).await;
 
     let behavior = &state.behavior;
     if let Some(delay) = behavior.media_missing.get(id) {
@@ -1038,7 +1288,7 @@ async fn media(state: &State, id: &str) -> FakeResponse {
     }
     tokio::time::sleep(behavior.media_delay).await;
     let content = state
-        .files
+        .files()
         .iter()
         .find(|file| file.id == id)
         .and_then(|file| file.content.clone());
@@ -1064,7 +1314,16 @@ async fn media(state: &State, id: &str) -> FakeResponse {
 }
 
 /// `files.export`: the document's content, sent in chunks without `Content-Length`.
-fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
+/// Waits for a permit of [`Behavior::content_gate`], if there is one.
+async fn pass_gate(state: &State) {
+    if let Some(gate) = &state.behavior.content_gate {
+        if let Ok(permit) = gate.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+async fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
     let mime_type = params
         .iter()
         .find(|(key, _)| key == "mimeType")
@@ -1075,6 +1334,7 @@ fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse 
         .lock()
         .expect("exports lock")
         .push((id.to_owned(), mime_type));
+    pass_gate(state).await;
 
     if state.behavior.export_too_large.contains(id) {
         let message = "This file is too large to be exported.";
@@ -1086,7 +1346,7 @@ fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse 
         return json_response(StatusCode::FORBIDDEN, &body);
     }
     let content = state
-        .files
+        .files()
         .iter()
         .find(|file| file.id == id && file.mime_type.starts_with("application/vnd.google-apps."))
         .and_then(|file| file.content.clone());
@@ -1160,8 +1420,8 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     let drive = (request.param("corpora") == Some("drive"))
         .then(|| request.param("driveId"))
         .flatten();
-    let matching = state
-        .files
+    let files = state.files();
+    let matching = files
         .iter()
         .filter(|file| file.parents.iter().any(|id| request.parents.contains(id)))
         .filter(|file| !(exclude_trashed && file.trashed))
@@ -1198,7 +1458,7 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
 
 /// `files.get`: the stored file with the top-level fields of the `fields` mask (all without one).
 fn get(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
-    let Some(file) = state.files.iter().find(|file| file.id == id) else {
+    let Some(file) = state.file(id) else {
         return error(StatusCode::NOT_FOUND, "File not found.");
     };
     let mut file = file.to_json(true);

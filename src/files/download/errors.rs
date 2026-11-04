@@ -260,6 +260,8 @@ pub(crate) enum SaveBodyToFile {
         actual: Digest,
     },
     RenameFile(io::Error),
+    /// Something took the place of a new file while it was downloaded; it is left alone.
+    DestinationAppeared(PathBuf),
 }
 
 impl Display for SaveBodyToFile {
@@ -281,6 +283,12 @@ impl Display for SaveBodyToFile {
                 )
             }
             SaveBodyToFile::RenameFile(_) => f.write_str("unable to rename file"),
+            SaveBodyToFile::DestinationAppeared(path) => write!(
+                f,
+                "'{}' appeared while the file was downloaded; it is left as it is and the \
+                download is discarded",
+                path.display()
+            ),
         }
     }
 }
@@ -290,7 +298,9 @@ impl Error for SaveBodyToFile {
         match self {
             SaveBodyToFile::ReadChunk(source) => Some(source),
             SaveBodyToFile::Request(source) => Some(source),
-            SaveBodyToFile::Md5Mismatch { .. } | SaveBodyToFile::SizeMismatch { .. } => None,
+            SaveBodyToFile::Md5Mismatch { .. }
+            | SaveBodyToFile::SizeMismatch { .. }
+            | SaveBodyToFile::DestinationAppeared(_) => None,
             SaveBodyToFile::CreateFile(source)
             | SaveBodyToFile::WriteChunk(source)
             | SaveBodyToFile::Flush(source)
