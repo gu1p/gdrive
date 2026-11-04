@@ -6,14 +6,14 @@ use std::{
     io::Cursor,
     path::PathBuf,
     sync::Mutex,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use hyper::{header::HeaderMap, Method, StatusCode};
 use serde_json::json;
 
 use super::{
-    mock_drive::{Faults, MockDrive},
+    mock_drive::{Faults, Logged, MockDrive},
     next_offset, upload_path, upload_reader, Failure, Step, UploadError, UploadOptions,
     UploadTarget, CHUNK_ALIGNMENT, FILE_FIELDS,
 };
@@ -59,6 +59,7 @@ fn options() -> UploadOptions {
         verify_md5: true,
         print_chunk_errors: true,
         print_chunk_info: true,
+        session_dir: None,
     }
 }
 
@@ -812,4 +813,282 @@ async fn an_upload_can_be_spawned() {
         None,
     );
     assert_send(&reader);
+}
+
+/// Session records in the `uploads` directory of a temporary account directory.
+struct Records {
+    _dir: tempfile::TempDir,
+    uploads: PathBuf,
+}
+
+impl Records {
+    fn new() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = dir.path().join("uploads");
+        Records { _dir: dir, uploads }
+    }
+
+    fn options(&self) -> UploadOptions {
+        UploadOptions {
+            session_dir: Some(self.uploads.clone()),
+            ..options()
+        }
+    }
+
+    fn files(&self) -> Vec<PathBuf> {
+        match std::fs::read_dir(&self.uploads) {
+            Ok(entries) => entries.map(|entry| entry.unwrap().path()).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    fn assert_none(&self) {
+        assert_eq!(self.files(), Vec::<PathBuf>::new(), "the record is deleted");
+    }
+
+    /// The one record there is.
+    fn record(&self) -> serde_json::Value {
+        let files = self.files();
+        assert_eq!(files.len(), 1, "{files:?}");
+        serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap()
+    }
+
+    fn rewrite(&self, change: impl FnOnce(&mut serde_json::Value)) {
+        let mut record = self.record();
+        change(&mut record);
+        std::fs::write(&self.files()[0], record.to_string()).unwrap();
+    }
+}
+
+/// A first run that loses the connection to Drive after `chunks` accepted chunks, and fails.
+async fn interrupted_run(fixture: &Fixture, records: &Records, chunks: u32) -> MockDrive {
+    let mock = MockDrive::start(Faults {
+        die_after_chunks: Some(chunks),
+        ..Faults::default()
+    })
+    .await;
+    let error = upload(&mock, fixture, &target(), &records.options())
+        .await
+        .expect_err("the first run is interrupted");
+    assert!(
+        matches!(
+            error,
+            UploadError::Failed {
+                reason: StopReason::GaveUp { .. },
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    mock.revive();
+    mock
+}
+
+#[tokio::test]
+async fn an_interrupted_upload_continues_in_the_next_run() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = interrupted_run(&fixture, &records, 2).await;
+
+    let record = records.record();
+    assert_eq!(record["offset"], 2 * CHUNK);
+    assert_eq!(record["chunk_size"], CHUNK);
+    assert_eq!(record["source"]["size"], SIZE);
+    assert_eq!(
+        record["source"]["path"],
+        std::fs::canonicalize(&fixture.path)
+            .unwrap()
+            .to_str()
+            .unwrap()
+    );
+    assert!(record["source"]["mtime"]["secs"].as_u64().unwrap() > 0);
+    assert_eq!(record["target"]["name"], "data.bin");
+    assert_eq!(record["target"]["parents"], json!(["folder-id"]));
+    assert_eq!(record["target"]["file_id"], "gen-id-1");
+    assert!(record["session_url"]
+        .as_str()
+        .unwrap()
+        .ends_with("/upload-session/0"));
+    let age = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - record["created"].as_u64().unwrap();
+    assert!(age < 60, "{age}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&records.files()[0])
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    let before = mock.state().log.len();
+    let reported = Mutex::new(Vec::new());
+    let progress = |offset| reported.lock().unwrap().push(offset);
+    let file = upload_with_progress(
+        &mock,
+        &fixture,
+        &target(),
+        &records.options(),
+        Some(&progress),
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{error}\n{}", mock.log()));
+
+    assert_eq!(file.id.as_deref(), Some("gen-id-1"));
+    let state = mock.state();
+    let second_run = &state.log[before..];
+    assert!(second_run[0].is_status_query(), "{}", mock_log(&state));
+    let starts: Vec<_> = second_run.iter().filter_map(Logged::chunk_start).collect();
+    assert_eq!(
+        starts,
+        [2 * CHUNK, 3 * CHUNK, 4 * CHUNK],
+        "only the rest is sent"
+    );
+    assert_eq!(state.sessions.len(), 1, "the session is continued");
+    assert_eq!(state.generated_ids, 1);
+    assert_eq!(state.files.len(), 1);
+    assert_eq!(state.files["gen-id-1"].content, fixture.data);
+    assert_eq!(
+        *reported.lock().unwrap(),
+        [2 * CHUNK, 3 * CHUNK, 4 * CHUNK, SIZE]
+    );
+    records.assert_none();
+}
+
+#[tokio::test]
+async fn a_changed_source_is_uploaded_from_the_start() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = interrupted_run(&fixture, &records, 2).await;
+
+    let changed: Vec<u8> = fixture
+        .data
+        .iter()
+        .map(|byte| byte.wrapping_add(1))
+        .collect();
+    std::fs::write(&fixture.path, &changed).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&fixture.path)
+        .unwrap()
+        .set_modified(SystemTime::now() + Duration::from_secs(60))
+        .unwrap();
+    let before = mock.state().log.len();
+
+    let file = upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    assert!(
+        state.log[before..]
+            .iter()
+            .all(|request| request.path != "/upload-session/0"),
+        "the old session is left alone"
+    );
+    assert_eq!(state.sessions.len(), 2);
+    assert_eq!(
+        state.sessions[1].received, changed,
+        "all of it, from byte 0"
+    );
+    assert_eq!(file.id.as_deref(), Some("gen-id-2"));
+    assert_eq!(state.files["gen-id-2"].content, changed);
+    records.assert_none();
+}
+
+#[tokio::test]
+async fn a_record_older_than_a_week_is_not_continued() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = interrupted_run(&fixture, &records, 2).await;
+    records.rewrite(|record| {
+        let created = record["created"].as_u64().unwrap();
+        record["created"] = (created - 8 * 24 * 60 * 60).into();
+    });
+    let before = mock.state().log.len();
+
+    upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    assert!(state.log[before..]
+        .iter()
+        .all(|request| request.path != "/upload-session/0"));
+    assert_eq!(state.sessions.len(), 2);
+    assert_eq!(state.sessions[1].received, fixture.data);
+    records.assert_none();
+}
+
+#[tokio::test]
+async fn a_session_that_is_gone_is_replaced_by_a_new_one() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = interrupted_run(&fixture, &records, 2).await;
+    mock.state().sessions[0].expired = true;
+
+    let file = upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    assert_eq!(state.sessions.len(), 2);
+    assert_eq!(state.sessions[1].received, fixture.data);
+    assert_eq!(
+        file.id.as_deref(),
+        Some("gen-id-1"),
+        "the new session creates the file with the same id"
+    );
+    assert_eq!(state.generated_ids, 1);
+    records.assert_none();
+}
+
+#[tokio::test]
+async fn a_session_that_completed_is_found_by_its_record() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    // The last chunk completes the session, but its reply is lost and so is the connection.
+    let mock = MockDrive::start(Faults {
+        die_after_chunks: Some(5),
+        cut_final_reply: true,
+        ..Faults::default()
+    })
+    .await;
+    upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .unwrap_err();
+    mock.revive();
+    assert_eq!(records.record()["offset"], 4 * CHUNK);
+    let before = mock.state().log.len();
+
+    let file = upload(&mock, &fixture, &target(), &records.options())
+        .await
+        .unwrap();
+
+    assert_eq!(file.id.as_deref(), Some("gen-id-1"));
+    let state = mock.state();
+    let second_run = &state.log[before..];
+    assert_eq!(second_run.len(), 1, "{}", mock_log(&state));
+    assert!(second_run[0].is_status_query());
+    assert_eq!(state.files.len(), 1);
+    records.assert_none();
+}
+
+#[tokio::test]
+async fn without_a_session_dir_nothing_is_recorded() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = MockDrive::start(Faults {
+        die_after_chunks: Some(2),
+        ..Faults::default()
+    })
+    .await;
+    upload(&mock, &fixture, &target(), &options())
+        .await
+        .unwrap_err();
+    assert!(!records.uploads.exists());
 }

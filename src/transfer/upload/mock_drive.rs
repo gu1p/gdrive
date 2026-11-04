@@ -657,6 +657,13 @@ impl MockDrive {
         self.state.lock().expect("mock state lock")
     }
 
+    /// The mock answers again after `die_after_chunks`, with the sessions it had.
+    pub(super) fn revive(&self) {
+        let mut state = self.state();
+        state.dead = false;
+        state.faults.die_after_chunks = None;
+    }
+
     /// The last requests, for failure messages.
     pub(super) fn log(&self) -> String {
         const LINES: usize = 40;

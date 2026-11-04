@@ -23,6 +23,8 @@
 //!   repeated, and a repeated create fails with 409 instead of making a second file.
 //! - The md5 of the content is computed while it is read, in order, and compared with the
 //!   `md5Checksum` Drive returns.
+//! - With [`UploadOptions::session_dir`], the session of a resumable upload is recorded there
+//!   (`session.rs`), and a later run of the same upload of the unchanged file continues it.
 //!
 //! Requests to the session URL carry no access token: the URL authorizes them, so an upload that
 //! outlasts the token does not depend on refreshing it.
@@ -30,6 +32,7 @@
 mod body;
 #[cfg(test)]
 mod mock_drive;
+pub(crate) mod session;
 #[cfg(test)]
 mod tests;
 
@@ -68,6 +71,7 @@ use crate::{
 };
 
 use body::{FileSource, Md5Progress, PipeBody, ReaderSource, Segment, Source};
+use session::{RecordFile, RecordTarget, SessionRecord, SourceIdentity};
 
 const MIB: u64 = 1 << 20;
 
@@ -127,6 +131,10 @@ pub(crate) struct UploadOptions {
     pub(crate) print_chunk_errors: bool,
     /// Print a line before each chunk is sent (`--print-chunk-info`).
     pub(crate) print_chunk_info: bool,
+    /// Where the sessions of resumable uploads are recorded, so that a later run continues an
+    /// interrupted one (`uploads/` in the account directory). `None`: an interrupted upload
+    /// starts over.
+    pub(crate) session_dir: Option<PathBuf>,
 }
 
 impl Default for UploadOptions {
@@ -137,6 +145,7 @@ impl Default for UploadOptions {
             verify_md5: true,
             print_chunk_errors: false,
             print_chunk_info: false,
+            session_dir: None,
         }
     }
 }
@@ -151,7 +160,8 @@ impl UploadOptions {
 
 /// Uploads the file at `source` to `target` and returns the Drive file. `progress`, if given, is
 /// called with the number of bytes Drive confirmed holding, after every chunk it accepted and
-/// at the end.
+/// at the end. With `opts.session_dir`, an upload of the same file to the same target that an
+/// earlier run left unfinished is continued.
 pub(crate) async fn upload_path(
     hub: &Hub,
     source: &Path,
@@ -173,7 +183,7 @@ pub(crate) async fn upload_path(
         .mime
         .clone()
         .unwrap_or_else(|| mime_guess::from_path(source).first_or_octet_stream());
-    let upload = Upload::new(
+    let mut upload = Upload::new(
         hub,
         hub.retrier().state(),
         target,
@@ -182,6 +192,9 @@ pub(crate) async fn upload_path(
         metadata.len(),
         media_type,
     );
+    if let Some(dir) = &opts.session_dir {
+        upload.record_in(dir, SourceIdentity::of(source, &metadata).await);
+    }
     upload.run(&mut FileSource::new(file)).await
 }
 
@@ -504,6 +517,23 @@ enum Started {
     Exists(Box<google_drive3::api::File>),
 }
 
+/// The session record of an upload.
+struct Recording {
+    file: RecordFile,
+    dir: PathBuf,
+    source: SourceIdentity,
+    /// The record of the current session, once there is one.
+    record: Option<SessionRecord>,
+}
+
+/// What an earlier run left.
+enum Resumed {
+    /// A session to continue, holding this many bytes.
+    Session(String, u64),
+    /// A session that completed.
+    Complete(Box<google_drive3::api::File>),
+}
+
 /// A final reply that could not be used.
 enum ReplyError {
     /// It broke off.
@@ -536,6 +566,8 @@ struct Upload<'a> {
     reported: Option<u64>,
     /// Where the previous chunk request started, for `--print-chunk-info`.
     previous_chunk: Option<u64>,
+    /// The session record, if sessions are recorded.
+    recording: Option<Recording>,
 }
 
 impl<'a> Upload<'a> {
@@ -569,6 +601,126 @@ impl<'a> Upload<'a> {
             high_water: 0,
             reported: None,
             previous_chunk: None,
+            recording: None,
+        }
+    }
+
+    /// Records the sessions of the upload of `source` in `dir`.
+    fn record_in(&mut self, dir: &Path, source: SourceIdentity) {
+        let file = RecordFile::new(dir, &source, &self.record_target());
+        self.recording = Some(Recording {
+            file,
+            dir: dir.to_path_buf(),
+            source,
+            record: None,
+        });
+    }
+
+    /// The target as a session record has it.
+    fn record_target(&self) -> RecordTarget {
+        RecordTarget {
+            parents: self.target.parents.clone(),
+            name: self.target.name.clone(),
+            mime: self.media_type.to_string(),
+            existing_file_id: self.target.existing_file_id.clone(),
+            convert_to: self.target.convert_to.as_ref().map(ToString::to_string),
+            file_id: self.file_id.clone(),
+        }
+    }
+
+    /// The session an earlier run of this upload recorded, if it can be continued: the
+    /// session's URL and the bytes it holds, or the file if it completed. A record that cannot
+    /// be used is deleted. The session's file id becomes this upload's.
+    async fn resume(&mut self) -> Result<Option<Resumed>, UploadError> {
+        let Some(recording) = &self.recording else {
+            return Ok(None);
+        };
+        let Some(record) = recording.file.load().await else {
+            return Ok(None);
+        };
+        if let Some(why) = record.mismatch(&recording.source, &self.record_target()) {
+            eprintln!(
+                "Warning: {}: not continuing the session of an earlier run, {why}",
+                self.label
+            );
+            self.forget().await;
+            return Ok(None);
+        }
+
+        if !self.is_update() {
+            self.file_id.clone_from(&record.target.file_id);
+        }
+        match self.query_status(&record.session_url).await {
+            Ok(Status::Incomplete(offset)) => {
+                eprintln!(
+                    "Continuing the {} from an earlier run at {} of {}",
+                    self.label,
+                    human_size(offset),
+                    human_size(self.total)
+                );
+                self.high_water = offset;
+                self.report(offset);
+                let url = record.session_url.clone();
+                if let Some(recording) = &mut self.recording {
+                    recording.record = Some(record);
+                }
+                Ok(Some(Resumed::Session(url, offset)))
+            }
+            Ok(Status::Complete(file)) => {
+                self.forget().await;
+                Ok(Some(Resumed::Complete(file)))
+            }
+            // The network or Drive is down: the next run tries again.
+            Err(
+                error @ (UploadError::Failed {
+                    reason: StopReason::GaveUp { .. },
+                    ..
+                }
+                | UploadError::Client(_)),
+            ) => Err(error),
+            // The session is gone, or answers what no session should: start again, with the
+            // same id. If that session had completed after all, the new one gets a 409 and
+            // the file is looked up.
+            Ok(Status::Gone) | Err(_) => {
+                self.forget().await;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Records the session just started at `url`.
+    async fn record_session(&mut self, url: &str) {
+        let target = self.record_target();
+        let chunk_size = self.options.chunk_len();
+        if let Some(recording) = &mut self.recording {
+            session::prune(&recording.dir).await;
+            let record =
+                SessionRecord::new(url.to_owned(), recording.source.clone(), target, chunk_size);
+            recording.file.save(&record).await;
+            recording.record = Some(record);
+        }
+    }
+
+    /// Records that the session holds `offset` bytes.
+    async fn checkpoint(&mut self, offset: u64) {
+        if let Some(Recording {
+            file,
+            record: Some(record),
+            ..
+        }) = &mut self.recording
+        {
+            if record.offset != offset {
+                record.offset = offset;
+                file.save(record).await;
+            }
+        }
+    }
+
+    /// Deletes the record: the session is over.
+    async fn forget(&mut self) {
+        if let Some(recording) = &mut self.recording {
+            recording.record = None;
+            recording.file.remove().await;
         }
     }
 
@@ -662,14 +814,15 @@ impl<'a> Upload<'a> {
             .map_err(|error| UploadError::Client(Box::new(error)))
     }
 
-    /// Tells `progress` that the server holds `offset` bytes, and starts a new retry budget if
-    /// that is more than it ever held.
-    fn accepted(&mut self, offset: u64) {
+    /// Tells `progress` and the session record that the server holds `offset` bytes, and
+    /// starts a new retry budget if that is more than it ever held.
+    async fn accepted(&mut self, offset: u64) {
         if offset > self.high_water {
             self.high_water = offset;
             self.retry.progress();
         }
         self.report(offset);
+        self.checkpoint(offset).await;
     }
 
     fn report(&mut self, offset: u64) {
@@ -760,15 +913,28 @@ impl<'a> Upload<'a> {
         &mut self,
         source: &mut S,
     ) -> Result<google_drive3::api::File, UploadError> {
+        let mut resumed = match self.resume().await? {
+            Some(Resumed::Complete(file)) => return Ok(*file),
+            Some(Resumed::Session(url, offset)) => Some((url, offset)),
+            None => None,
+        };
         self.ensure_id().await?;
         let mut sessions = 0;
         loop {
             sessions += 1;
-            let url = match self.start().await? {
-                Started::Session(url) => url,
-                Started::Exists(file) => return Ok(*file),
+            let (url, offset) = match resumed.take() {
+                Some(session) => session,
+                None => match self.start().await? {
+                    Started::Session(url) => {
+                        self.record_session(&url).await;
+                        (url, 0)
+                    }
+                    Started::Exists(file) => return Ok(*file),
+                },
             };
-            match self.send_chunks(source, &url, 0).await? {
+            let end = self.send_chunks(source, &url, offset).await?;
+            self.forget().await;
+            match end {
                 SessionEnd::Complete(file) => return Ok(*file),
                 SessionEnd::Gone => {}
             }
@@ -878,7 +1044,7 @@ impl<'a> Upload<'a> {
                     StatusCode::PERMANENT_REDIRECT => {
                         let next = self.next_offset(response.headers(), Step::Chunk)?;
                         if next > offset {
-                            self.accepted(next);
+                            self.accepted(next).await;
                             offset = next;
                             continue;
                         }
@@ -907,7 +1073,7 @@ impl<'a> Upload<'a> {
             if ask {
                 match self.query_status(url).await? {
                     Status::Incomplete(next) => {
-                        self.accepted(next);
+                        self.accepted(next).await;
                         offset = next;
                     }
                     Status::Complete(file) => return Ok(SessionEnd::Complete(file)),
