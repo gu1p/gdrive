@@ -21,6 +21,8 @@
 //!   cheap ([`DISCARD_LIMIT`]), else asked for again without `If-Range`. A source without an
 //!   md5 has nothing to prove that: it fails with [`RelayError::SourceChanged`], as does any
 //!   resume of a source with neither an md5 nor a strong `ETag`.
+//! - A file shared by link only is read with its `resourceKey` in every request
+//!   (`X-Goog-Drive-Resource-Keys`): metadata, content, resumes and exports.
 //! - The md5 Drive computes for the copy is compared with the source's `md5Checksum`, on top of
 //!   the uploader's own check of the bytes it sent.
 //! - The copy gets the source's `modifiedTime` and `createdTime`.
@@ -56,7 +58,7 @@ use crate::{
             DocType, MIME_TYPE_DOCX_MIME, MIME_TYPE_DRIVE_SHORTCUT, MIME_TYPE_PPTX_MIME,
             MIME_TYPE_XLSX_MIME,
         },
-        media_client::{MediaClient, MediaError},
+        media_client::{get_file, MediaClient, MediaError},
         parse_md5_digest,
         retry::{
             classify_body_error, retry_read, Decision, DisplayDuration, RetryReason, RetryState,
@@ -89,7 +91,8 @@ pub(crate) const EXPORT_LIMIT: u64 = 10 * MIB;
 const DISCARD_LIMIT: u64 = 4 * MIB;
 
 /// The fields of the source a relay uses, fetched when the listing lacks some.
-const SOURCE_FIELDS: &str = "id,name,mimeType,size,md5Checksum,modifiedTime,createdTime,version";
+const SOURCE_FIELDS: &str =
+    "id,name,mimeType,size,md5Checksum,modifiedTime,createdTime,version,resourceKey";
 
 const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
 
@@ -300,7 +303,8 @@ impl Error for RelayError {
 ///
 /// The md5 checks follow `opts.verify_md5`. A continued session is checked by the md5s alone,
 /// without reading the bytes it holds again; a source without `md5Checksum` is copied
-/// unchecked end to end, is never recorded, and is resumed only with a strong `ETag`.
+/// unchecked end to end, is never recorded, and is resumed only with a strong `ETag`. A
+/// `resourceKey` of `source_file` is sent with every request about it.
 pub(crate) async fn relay_file(
     source: &Hub,
     dest: &Hub,
@@ -317,9 +321,12 @@ pub(crate) async fn relay_file(
     let lacks_metadata = source_file.mime_type.is_none()
         || (listed == Plan::Blob
             && (source_file.size.is_none() || source_file.md5_checksum.is_none()));
+    let resource_key = source_file.resource_key.as_deref();
     let fetched;
     let file = if lacks_metadata {
-        fetched = fetch_metadata(source, id).await?;
+        fetched = get_file(source, id, SOURCE_FIELDS, resource_key)
+            .await
+            .map_err(RelayError::SourceMetadata)?;
         &fetched
     } else {
         source_file
@@ -337,6 +344,7 @@ pub(crate) async fn relay_file(
         dest,
         file,
         id,
+        resource_key,
         parents: &target.parents,
         name,
         new_file_id: target.new_file_id.as_deref(),
@@ -351,24 +359,6 @@ pub(crate) async fn relay_file(
         Plan::Blob => relay.blob(format!("download of '{shown}'")).await,
         Plan::Export(export) => relay.export(export, format!("export of '{shown}'")).await,
     }
-}
-
-/// The source's metadata with [`SOURCE_FIELDS`].
-async fn fetch_metadata(source: &Hub, id: &str) -> Result<google_drive3::api::File, RelayError> {
-    let (_, file) = retry_read(source.retrier(), "files.get", |mut delegate| async move {
-        source
-            .files()
-            .get(id)
-            .param("fields", SOURCE_FIELDS)
-            .supports_all_drives(true)
-            .add_scope(google_drive3::api::Scope::Full)
-            .delegate(&mut delegate)
-            .doit()
-            .await
-    })
-    .await
-    .map_err(|error| RelayError::SourceMetadata(Box::new(error)))?;
-    Ok(file)
 }
 
 /// The Google account `hub` acts as, as Drive names it.
@@ -401,6 +391,8 @@ struct Relay<'a> {
     dest: &'a Hub,
     file: &'a google_drive3::api::File,
     id: &'a str,
+    /// The source's `resourceKey`, named in every request about it.
+    resource_key: Option<&'a str>,
     parents: &'a [String],
     /// The name of the copy.
     name: Option<String>,
@@ -463,8 +455,14 @@ impl Relay<'_> {
             }
         }
 
-        let mut reader = DriveSource::new(self.source, self.file, self.id, size, label)
-            .map_err(RelayError::Source)?;
+        let mut reader = DriveSource::new(
+            self.source,
+            self.file,
+            (self.id, self.resource_key),
+            size,
+            label,
+        )
+        .map_err(RelayError::Source)?;
         // Boxed: the upload's state is large, and the relay's future stays small for callers
         // that hold many of them.
         let copy = Box::pin(upload.run(&mut reader))
@@ -523,7 +521,14 @@ impl Relay<'_> {
         export: Export,
         label: String,
     ) -> Result<google_drive3::api::File, RelayError> {
-        let content = read_export(self.source, self.id, export.format, &label).await?;
+        let content = read_export(
+            self.source,
+            self.id,
+            self.resource_key,
+            export.format,
+            &label,
+        )
+        .await?;
         let target = self.target(export.format.clone(), Some(export.doc_type.mime().clone()));
         let upload = Upload::new(
             self.dest,
@@ -544,11 +549,17 @@ impl Relay<'_> {
 /// The export of the Workspace file `id` as `format`, read into memory: at most
 /// [`EXPORT_LIMIT`] bytes, the reading stops as soon as more arrive. Exports ignore `Range`, so
 /// one that breaks off is requested again from the start, within the hub's retry policy.
-async fn read_export(hub: &Hub, id: &str, format: &Mime, label: &str) -> Result<Bytes, RelayError> {
+async fn read_export(
+    hub: &Hub,
+    id: &str,
+    resource_key: Option<&str>,
+    format: &Mime,
+    label: &str,
+) -> Result<Bytes, RelayError> {
     let too_large = || RelayError::ExportTooLarge {
         limit: EXPORT_LIMIT,
     };
-    let client = MediaClient::new(hub);
+    let client = MediaClient::new(hub).with_resource_key(id, resource_key);
     let url = client
         .drive_url(&["files", id, "export"], &[("mimeType", format.as_ref())])
         .map_err(RelayError::Source)?;
@@ -701,14 +712,16 @@ pub(super) struct DriveSource<'a> {
 }
 
 impl<'a> DriveSource<'a> {
+    /// The content of `file`, `size` bytes, with its id and resource key; warnings name the
+    /// transfer `label`.
     fn new(
         hub: &'a Hub,
         file: &google_drive3::api::File,
-        id: &str,
+        (id, resource_key): (&str, Option<&str>),
         size: u64,
         label: String,
     ) -> Result<Self, MediaError> {
-        let client = MediaClient::new(hub);
+        let client = MediaClient::new(hub).with_resource_key(id, resource_key);
         let url = client.drive_url(
             &["files", id],
             &[("alt", "media"), ("supportsAllDrives", "true")],
@@ -727,7 +740,7 @@ impl<'a> DriveSource<'a> {
                 url,
                 label: label.clone(),
             },
-            identity: Identity::new(hub, id, revision),
+            identity: Identity::new(hub, id, revision).with_resource_key(resource_key),
             has_md5,
             retry: hub.retrier().state(),
             size,

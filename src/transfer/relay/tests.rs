@@ -122,6 +122,8 @@ struct SourceFile {
     md5: Option<String>,
     version: i64,
     seed: u64,
+    /// The `resourceKey` of a file shared by link only: every request about it must name it.
+    resource_key: Option<String>,
 }
 
 impl SourceFile {
@@ -134,6 +136,7 @@ impl SourceFile {
             md5: Some(md5_of(0, size)),
             version: 1,
             seed: 0,
+            resource_key: None,
         }
     }
 
@@ -159,6 +162,7 @@ impl SourceFile {
             md5: None,
             version: 1,
             seed: 0,
+            resource_key: None,
         }
     }
 
@@ -185,6 +189,9 @@ impl SourceFile {
         }
         if let Some(md5) = &self.md5 {
             resource["md5Checksum"] = md5.clone().into();
+        }
+        if let Some(key) = &self.resource_key {
+            resource["resourceKey"] = key.clone().into();
         }
         resource
     }
@@ -238,6 +245,7 @@ struct SourceRequest {
     query: String,
     range: Option<String>,
     if_range: Option<String>,
+    resource_keys: Option<String>,
 }
 
 impl SourceRequest {
@@ -387,6 +395,9 @@ fn handle(
         query: request.uri().query().unwrap_or_default().to_owned(),
         range: header(hyper::header::RANGE),
         if_range: header(hyper::header::IF_RANGE),
+        resource_keys: header(hyper::header::HeaderName::from_static(
+            "x-goog-drive-resource-keys",
+        )),
     };
     let mut guard = state.lock().unwrap();
     guard.log.push(logged.clone());
@@ -406,6 +417,12 @@ fn handle(
     let Some(file) = guard.files.iter().find(|file| file.id == id).cloned() else {
         return error(StatusCode::NOT_FOUND, "File not found.");
     };
+    // Like Drive, a file shared by link only is not found without its resource key.
+    if let Some(key) = &file.resource_key {
+        if logged.resource_keys.as_deref() != Some(format!("{id}/{key}").as_str()) {
+            return error(StatusCode::NOT_FOUND, "File not found.");
+        }
+    }
 
     if logged.is_export() {
         let cut = guard.faults.cut_export && guard.export_replies == 0;
@@ -1350,6 +1367,77 @@ async fn a_source_without_md5_or_etag_is_not_resumed() {
     assert_eq!(media.len(), 2);
     assert_eq!(media[1].range.as_deref(), Some("bytes=600000-"));
     assert_eq!(media[1].if_range, None);
+}
+
+#[tokio::test]
+async fn a_file_shared_by_link_is_read_with_its_resource_key() {
+    let size = 3 * CHUNK;
+    let blob = SourceFile {
+        resource_key: Some(String::from("key-1")),
+        ..SourceFile::blob("blob", size)
+    };
+    let doc = SourceFile {
+        resource_key: Some(String::from("key-2")),
+        ..SourceFile::workspace("doc", MIME_TYPE_DRIVE_DOCUMENT, 10 * KIB)
+    };
+    let source = SourceDrive::start(
+        vec![blob.clone(), doc.clone()],
+        SourceFaults {
+            cut_at: Some(400_000),
+            ..SourceFaults::default()
+        },
+    );
+    let dest = MockDrive::start(Faults::default()).await;
+    let options = UploadOptions {
+        multipart_threshold: 100 * KIB,
+        ..options(CHUNK)
+    };
+
+    // The listing has no md5: the metadata is fetched as well as the content and a resume.
+    let listing = google_drive3::api::File {
+        md5_checksum: None,
+        ..blob.listing()
+    };
+    let result = relay(&source, &dest, &listing, &target(), &options, None).await;
+    assert_copied(&dest, result, size);
+    let copy = relay(&source, &dest, &doc.listing(), &target(), &options, None)
+        .await
+        .unwrap_or_else(|error| panic!("{error:?}\n{:?}", source.log()));
+    assert_eq!(
+        dest.state().files[copy.id.as_deref().unwrap()].content,
+        content(EXPORT_OFFSET, 10 * KIB)
+    );
+
+    let log = source.log();
+    let count = |what: fn(&SourceRequest) -> bool| log.iter().filter(|r| what(r)).count();
+    assert_eq!(count(SourceRequest::is_media), 2, "{log:?}");
+    assert_eq!(
+        count(SourceRequest::is_metadata),
+        2,
+        "a fetch and a check: {log:?}"
+    );
+    assert_eq!(count(SourceRequest::is_export), 1);
+    for request in &log {
+        let keys = if request.path.contains("/doc") {
+            "doc/key-2"
+        } else {
+            "blob/key-1"
+        };
+        assert_eq!(request.resource_keys.as_deref(), Some(keys), "{request:?}");
+    }
+
+    // Without its key, Drive does not find the file.
+    let keyless = google_drive3::api::File {
+        resource_key: None,
+        ..blob.listing()
+    };
+    let error = relay(&source, &dest, &keyless, &target(), &options, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        chain(&error),
+        "unable to read the source file: Drive answered 404 Not Found: File not found."
+    );
 }
 
 #[tokio::test]
