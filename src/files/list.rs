@@ -3,9 +3,12 @@ use std::{
     cmp::min,
     error,
     fmt::{self, Display, Formatter},
-    io,
+    io::{self, BufWriter, Write},
     str::FromStr,
 };
+
+use chrono::SecondsFormat;
+use serde::Serialize;
 
 use crate::{
     common::{
@@ -23,10 +26,25 @@ pub(crate) struct Config {
     pub(crate) query: ListQuery,
     pub(crate) order_by: ListSortOrder,
     pub(crate) max_files: usize,
-    pub(crate) skip_header: bool,
-    pub(crate) truncate_name: bool,
-    pub(crate) field_separator: String,
+    pub(crate) output: Output,
 }
+
+/// How `files list` prints the files.
+#[derive(Debug, Clone)]
+pub(crate) enum Output {
+    /// Aligned columns, the 3.9 format.
+    Table {
+        skip_header: bool,
+        truncate_name: bool,
+        field_separator: String,
+    },
+    /// The table's columns as tab-separated values with full, escaped names.
+    Tsv { skip_header: bool },
+    /// A JSON array with one object per file.
+    Json,
+}
+
+const HEADER: [&str; 5] = ["Id", "Name", "Type", "Size", "Created"];
 
 pub(crate) async fn list(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
@@ -40,46 +58,106 @@ pub(crate) async fn list(config: Config) -> Result<(), Error> {
     )
     .await?;
 
-    let mut values: Vec<[String; 5]> = vec![];
+    write_files(io::stdout(), &files, &config.output).map_err(Error::WriteOutput)
+}
 
-    for file in files {
-        let file_type = simplified_file_type(&file);
-        let file_name = format_file_name(&config, &file).into_owned();
+fn write_files(
+    writer: impl Write,
+    files: &[google_drive3::api::File],
+    output: &Output,
+) -> Result<(), io::Error> {
+    match output {
+        Output::Table {
+            skip_header,
+            truncate_name,
+            field_separator,
+        } => table::write(
+            writer,
+            Table {
+                header: HEADER,
+                values: table_rows(files, *truncate_name),
+            },
+            &table::DisplayConfig {
+                skip_header: *skip_header,
+                separator: field_separator,
+            },
+        ),
 
-        values.push([
-            file.id.unwrap_or_default(),
-            file_name,
-            file_type.to_owned(),
-            file.size
-                .map(|bytes| {
-                    files::info::DisplayBytes {
-                        bytes: bytes.try_into().unwrap_or(0),
-                        config: &DisplayConfig::default(),
-                    }
-                    .to_string()
-                })
-                .unwrap_or_default(),
-            file.created_time
-                .map(|created_time| files::info::format_date_time(created_time).to_string())
-                .unwrap_or_default(),
-        ]);
+        Output::Tsv { skip_header } => table::write_tsv(
+            writer,
+            &Table {
+                header: HEADER,
+                values: table_rows(files, false),
+            },
+            *skip_header,
+        ),
+
+        Output::Json => write_json(writer, files),
     }
+}
 
-    let table = Table {
-        header: ["Id", "Name", "Type", "Size", "Created"],
-        values,
-    };
+fn table_rows(files: &[google_drive3::api::File], truncate_name: bool) -> Vec<[String; 5]> {
+    files
+        .iter()
+        .map(|file| {
+            [
+                file.id.clone().unwrap_or_default(),
+                format_file_name(truncate_name, file).into_owned(),
+                simplified_file_type(file).to_owned(),
+                file.size
+                    .map(|bytes| {
+                        files::info::DisplayBytes {
+                            bytes: bytes.try_into().unwrap_or(0),
+                            config: &DisplayConfig::default(),
+                        }
+                        .to_string()
+                    })
+                    .unwrap_or_default(),
+                file.created_time
+                    .map(|created_time| files::info::format_date_time(created_time).to_string())
+                    .unwrap_or_default(),
+            ]
+        })
+        .collect()
+}
 
-    let _ = table::write(
-        io::stdout(),
-        table,
-        &table::DisplayConfig {
-            skip_header: config.skip_header,
-            separator: &config.field_separator,
-        },
-    );
+/// One element of the `--json` output. Every key is always present; missing values are `null`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct JsonFile<'a> {
+    id: Option<&'a str>,
+    name: Option<&'a str>,
+    /// The table's Type column: folder, regular, shortcut or document.
+    #[serde(rename = "type")]
+    file_type: &'static str,
+    mime_type: Option<&'a str>,
+    /// Size in bytes.
+    size: Option<i64>,
+    /// RFC 3339 in UTC with milliseconds, as Drive reports it.
+    created_time: Option<String>,
+}
 
-    Ok(())
+impl<'a> From<&'a google_drive3::api::File> for JsonFile<'a> {
+    fn from(file: &'a google_drive3::api::File) -> Self {
+        JsonFile {
+            id: file.id.as_deref(),
+            name: file.name.as_deref(),
+            file_type: simplified_file_type(file),
+            mime_type: file.mime_type.as_deref(),
+            size: file.size,
+            created_time: file
+                .created_time
+                .map(|time| time.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        }
+    }
+}
+
+fn write_json(writer: impl Write, files: &[google_drive3::api::File]) -> Result<(), io::Error> {
+    let files: Vec<JsonFile> = files.iter().map(JsonFile::from).collect();
+    let mut writer = BufWriter::new(writer);
+    serde_json::to_writer_pretty(&mut writer, &files)?;
+    writeln!(writer)?;
+    writer.flush()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -251,6 +329,7 @@ impl fmt::Display for ListSortOrder {
 pub(crate) enum Error {
     Hub(GetHubError),
     ListFiles(Box<google_drive3::Error>),
+    WriteOutput(io::Error),
 }
 
 impl Display for Error {
@@ -258,6 +337,7 @@ impl Display for Error {
         match self {
             Error::Hub(_) => f.write_str("unable to get drive hub"),
             Error::ListFiles(_) => f.write_str("unable to list files"),
+            Error::WriteOutput(_) => f.write_str("unable to write the file list to stdout"),
         }
     }
 }
@@ -267,6 +347,7 @@ impl error::Error for Error {
         match self {
             Error::Hub(source) => Some(source),
             Error::ListFiles(source) => Some(source),
+            Error::WriteOutput(source) => Some(source),
         }
     }
 }
@@ -283,10 +364,10 @@ fn simplified_file_type(file: &google_drive3::api::File) -> &'static str {
     }
 }
 
-fn format_file_name<'a>(config: &Config, file: &'a google_drive3::api::File) -> Cow<'a, str> {
+fn format_file_name(truncate_name: bool, file: &google_drive3::api::File) -> Cow<'_, str> {
     let file_name = file.name.as_ref();
 
-    if config.truncate_name {
+    if truncate_name {
         file_name.map_or(Cow::Borrowed(""), |s| truncate_middle(s, 41))
     } else {
         Cow::Borrowed(file_name.map(String::as_str).unwrap_or_default())
@@ -338,7 +419,206 @@ fn truncate_middle(s: &str, max_length: usize) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{quote, truncate_middle, ListQuery};
+    use std::io::{self, Write};
+
+    use chrono::{TimeZone, Utc};
+
+    use super::{quote, truncate_middle, write_files, ListQuery, Output};
+    use crate::{
+        common::drive_file::{MIME_TYPE_DRIVE_DOCUMENT, MIME_TYPE_DRIVE_FOLDER},
+        files::info::{format_date_time, DisplayBytes, DisplayConfig},
+    };
+
+    const LONG_NAME: &str = "a name that is much longer than forty-one characters.pdf";
+
+    fn sample_files() -> Vec<google_drive3::api::File> {
+        let created = Utc
+            .with_ymd_and_hms(2024, 5, 6, 7, 8, 9)
+            .single()
+            .expect("valid date")
+            + chrono::Duration::milliseconds(123);
+
+        vec![
+            google_drive3::api::File {
+                id: Some(String::from("folder1")),
+                name: Some(String::from("Projects")),
+                mime_type: Some(String::from(MIME_TYPE_DRIVE_FOLDER)),
+                created_time: Some(created),
+                ..Default::default()
+            },
+            google_drive3::api::File {
+                id: Some(String::from("file2")),
+                name: Some(String::from(LONG_NAME)),
+                mime_type: Some(String::from("application/pdf")),
+                md5_checksum: Some(String::from("d41d8cd98f00b204e9800998ecf8427e")),
+                size: Some(2_000_000),
+                created_time: Some(created),
+                ..Default::default()
+            },
+            google_drive3::api::File {
+                id: Some(String::from("doc3")),
+                name: Some(String::from("tab\there\nnew\rline")),
+                mime_type: Some(String::from(MIME_TYPE_DRIVE_DOCUMENT)),
+                ..Default::default()
+            },
+        ]
+    }
+
+    fn render(output: &Output) -> String {
+        let mut out = Vec::new();
+        write_files(&mut out, &sample_files(), output).expect("write to vec");
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    fn table(skip_header: bool, truncate_name: bool) -> Output {
+        Output::Table {
+            skip_header,
+            truncate_name,
+            field_separator: String::from("\t"),
+        }
+    }
+
+    #[test]
+    fn table_output_keeps_3_9_layout() {
+        let created = format_date_time(sample_files()[0].created_time.expect("set")).to_string();
+        let size = DisplayBytes {
+            bytes: 2_000_000,
+            config: &DisplayConfig::default(),
+        }
+        .to_string();
+        let rows = [
+            ["Id", "Name", "Type", "Size", "Created"],
+            ["folder1", "Projects", "folder", "", &created],
+            [
+                "file2",
+                "a name that is much …y-one characters.pdf",
+                "regular",
+                &size,
+                &created,
+            ],
+            ["doc3", "tab\there\nnew\rline", "document", "", ""],
+        ];
+        // TabWriter pads every column to its widest cell plus 3 spaces. The name with a tab and
+        // a newline breaks the alignment, as it did in 3.9.
+        let mut expected = Vec::new();
+        let mut tw = tabwriter::TabWriter::new(&mut expected).padding(3);
+        for row in rows {
+            writeln!(tw, "{}", row.join("\t")).expect("write to vec");
+        }
+        tw.flush().expect("flush");
+        drop(tw);
+
+        assert_eq!(
+            render(&table(false, true)),
+            String::from_utf8(expected).expect("utf-8")
+        );
+        assert!(render(&table(true, true)).starts_with("folder1 "));
+        assert!(render(&table(false, false)).contains(LONG_NAME));
+    }
+
+    #[test]
+    fn table_output_with_custom_separator_is_not_aligned() {
+        let output = Output::Table {
+            skip_header: false,
+            truncate_name: true,
+            field_separator: String::from(","),
+        };
+        let rendered = render(&output);
+        let mut lines = rendered.lines();
+        assert_eq!(lines.next(), Some("Id,Name,Type,Size,Created"));
+        assert!(lines
+            .next()
+            .expect("first row")
+            .starts_with("folder1,Projects,folder,,"));
+    }
+
+    #[test]
+    fn tsv_output_has_full_escaped_names_and_one_line_per_file() {
+        let rendered = render(&Output::Tsv { skip_header: false });
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(lines.len(), 4, "{rendered:?}");
+        assert_eq!(lines[0], "Id\tName\tType\tSize\tCreated");
+        for line in &lines {
+            assert_eq!(line.split('\t').count(), 5, "{line:?}");
+        }
+        assert!(lines[2].starts_with(&format!("file2\t{LONG_NAME}\tregular\t")));
+        assert_eq!(lines[3], "doc3\ttab\\there\\nnew\\rline\tdocument\t\t");
+
+        let without_header = render(&Output::Tsv { skip_header: true });
+        assert!(without_header.starts_with("folder1\tProjects\tfolder\t\t"));
+    }
+
+    #[test]
+    fn json_output_shape() {
+        let rendered = render(&Output::Json);
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("valid JSON");
+
+        assert_eq!(
+            value,
+            serde_json::json!([
+                {
+                    "id": "folder1",
+                    "name": "Projects",
+                    "type": "folder",
+                    "mimeType": MIME_TYPE_DRIVE_FOLDER,
+                    "size": null,
+                    "createdTime": "2024-05-06T07:08:09.123Z",
+                },
+                {
+                    "id": "file2",
+                    "name": LONG_NAME,
+                    "type": "regular",
+                    "mimeType": "application/pdf",
+                    "size": 2_000_000,
+                    "createdTime": "2024-05-06T07:08:09.123Z",
+                },
+                {
+                    "id": "doc3",
+                    "name": "tab\there\nnew\rline",
+                    "type": "document",
+                    "mimeType": MIME_TYPE_DRIVE_DOCUMENT,
+                    "size": null,
+                    "createdTime": null,
+                },
+            ])
+        );
+        assert!(value[1]["size"].is_u64());
+        assert!(rendered.ends_with("]\n"));
+    }
+
+    #[test]
+    fn json_output_of_no_files_is_an_empty_array() {
+        let mut out = Vec::new();
+        write_files(&mut out, &[], &Output::Json).expect("write to vec");
+        assert_eq!(out, b"[]\n");
+    }
+
+    /// A stdout whose reader has gone away.
+    struct BrokenPipe;
+
+    impl Write for BrokenPipe {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+
+    #[test]
+    fn write_errors_are_returned() {
+        for output in [
+            table(false, true),
+            Output::Tsv { skip_header: false },
+            Output::Json,
+        ] {
+            let err = write_files(BrokenPipe, &sample_files(), &output)
+                .expect_err("writing to a broken pipe should fail");
+            assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{output:?}");
+        }
+    }
 
     fn list_query(query: Option<&str>, parent: Option<&str>, drive: Option<&str>) -> ListQuery {
         ListQuery {

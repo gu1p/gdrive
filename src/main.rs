@@ -10,7 +10,10 @@ mod version;
 
 use std::{path::PathBuf, process::ExitCode};
 
-use clap::{Parser, Subcommand};
+use clap::{
+    builder::{StringValueParser, TypedValueParser},
+    Parser, Subcommand,
+};
 use common::{delegate::ChunkSize, permission};
 use error_trace::ErrorTrace;
 use files::list::{ListQuery, ListSortOrder};
@@ -104,8 +107,8 @@ enum DriveCommand {
         #[arg(long)]
         skip_header: bool,
 
-        /// Field separator
-        #[arg(long, default_value_t = String::from("\t"))]
+        /// Field separator. `\t` stands for a tab
+        #[arg(long, default_value_t = String::from("\t"), value_parser = field_separator_parser())]
         field_separator: String,
     },
 }
@@ -163,9 +166,24 @@ enum FileCommand {
         #[arg(long)]
         full_name: bool,
 
-        /// Field separator
-        #[arg(long, default_value_t = String::from("\t"))]
+        /// Field separator. `\t` stands for a tab
+        #[arg(long, default_value_t = String::from("\t"), value_parser = field_separator_parser())]
         field_separator: String,
+
+        /// Print tab-separated values for scripts
+        ///
+        /// Columns are not aligned, names are not truncated, and a tab, newline, carriage return
+        /// or backslash in a name is written as `\t`, `\n`, `\r` or `\\`.
+        #[arg(long, conflicts_with = "field_separator")]
+        tsv: bool,
+
+        /// Print a JSON array of files for scripts
+        ///
+        /// Each object has the keys id, name, type (as in the Type column), mimeType, size (in
+        /// bytes, null when Drive reports none, as for folders and shortcuts) and createdTime
+        /// (RFC 3339, UTC).
+        #[arg(long, conflicts_with_all = ["tsv", "field_separator", "skip_header"])]
+        json: bool,
     },
 
     /// Download file
@@ -370,8 +388,8 @@ enum PermissionCommand {
         #[arg(long)]
         skip_header: bool,
 
-        /// Field separator
-        #[arg(long, default_value_t = String::from("\t"))]
+        /// Field separator. `\t` stands for a tab
+        #[arg(long, default_value_t = String::from("\t"), value_parser = field_separator_parser())]
         field_separator: String,
     },
 
@@ -523,7 +541,21 @@ async fn handle_files_command(
             skip_header,
             full_name,
             field_separator,
+            tsv,
+            json,
         } => {
+            let output = if json {
+                files::list::Output::Json
+            } else if tsv {
+                files::list::Output::Tsv { skip_header }
+            } else {
+                files::list::Output::Table {
+                    skip_header,
+                    truncate_name: !full_name,
+                    field_separator,
+                }
+            };
+
             files::list(files::list::Config {
                 query: ListQuery {
                     query,
@@ -532,9 +564,7 @@ async fn handle_files_command(
                 },
                 order_by,
                 max_files: max,
-                skip_header,
-                truncate_name: !full_name,
-                field_separator,
+                output,
             })
             .await?;
         }
@@ -729,6 +759,11 @@ async fn handle_account_command(
     Ok(())
 }
 
+/// Reads `\t` in a field separator as a tab, so a tab can be passed without shell quoting.
+fn field_separator_parser() -> impl TypedValueParser<Value = String> {
+    StringValueParser::new().map(|s| s.replace(r"\t", "\t"))
+}
+
 /// Parses a count that must be at least 1.
 fn parse_positive_usize(s: &str) -> Result<usize, String> {
     match s.parse::<usize>() {
@@ -813,5 +848,71 @@ mod tests {
         assert_eq!(parse_max(&[]).expect("no flags"), None);
         assert_eq!(parse_max(&["--max", "250"]).expect("--max 250"), Some(250));
         assert!(parse_max(&["--max", "0"]).is_err());
+    }
+
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once(&"gdrive").chain(args))
+    }
+
+    fn files_list_flags(args: &[&str]) -> (String, bool, bool) {
+        let cli = parse(&[&["files", "list"], args].concat()).expect("arguments should parse");
+        let Command::Files {
+            command:
+                FileCommand::List {
+                    field_separator,
+                    tsv,
+                    json,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected files list");
+        };
+        (field_separator, tsv, json)
+    }
+
+    #[test]
+    fn field_separator_reads_backslash_t_as_tab() {
+        assert_eq!(files_list_flags(&[]).0, "\t");
+        assert_eq!(files_list_flags(&["--field-separator", r"\t"]).0, "\t");
+        assert_eq!(files_list_flags(&["--field-separator", r"a\tb"]).0, "a\tb");
+        assert_eq!(files_list_flags(&["--field-separator", ","]).0, ",");
+
+        let cli = parse(&["drives", "list", "--field-separator", r"\t"]).expect("parse");
+        let Command::Drives {
+            command: DriveCommand::List {
+                field_separator, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected drives list");
+        };
+        assert_eq!(field_separator, "\t");
+    }
+
+    #[test]
+    fn files_list_output_flags() {
+        assert_eq!(
+            files_list_flags(&["--tsv"]),
+            (String::from("\t"), true, false)
+        );
+        assert_eq!(
+            files_list_flags(&["--json"]),
+            (String::from("\t"), false, true)
+        );
+        assert!(parse(&["files", "list", "--tsv", "--skip-header", "--full-name"]).is_ok());
+        assert!(parse(&["files", "list", "--json", "--full-name", "--max", "5"]).is_ok());
+
+        for conflicting in [
+            &["--tsv", "--field-separator", ","][..],
+            &["--json", "--tsv"],
+            &["--json", "--field-separator", ","],
+            &["--json", "--skip-header"],
+        ] {
+            let err = parse(&[&["files", "list"], conflicting].concat())
+                .err()
+                .unwrap_or_else(|| panic!("{conflicting:?} should be rejected"));
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 }
