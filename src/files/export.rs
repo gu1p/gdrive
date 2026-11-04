@@ -52,28 +52,18 @@ pub(crate) async fn export(config: Config) -> Result<(), Error> {
     export_with_hub(&hub, config).await
 }
 
-/// Exports the document to `config.file_path`. Without `--overwrite`, an existing file is an
-/// error unless it is an unchanged export of the document ([`is_unchanged_export`]), which is
-/// left alone. The exported file gets the document's `modifiedTime` as its modification time.
+/// Exports the document to `config.file_path`. As in gdrive 3.9, an existing file is an error
+/// without `--overwrite`, and `--overwrite` always exports again: there is no unchanged check
+/// here (the recursive download has one, [`is_unchanged_export`]). The exported file gets the
+/// document's `modifiedTime` as its modification time.
 async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
-    let keep_existing =
-        config.file_path.exists() && config.existing_file_action == ExistingFileAction::Abort;
+    if config.file_path.exists() && config.existing_file_action == ExistingFileAction::Abort {
+        return Err(Error::FileExists(config.file_path));
+    }
 
     let file = files::info::get_file(hub, &config.file_id)
         .await
         .map_err(|err| Error::GetFile(Box::new(err)))?;
-
-    if keep_existing {
-        if is_unchanged_export(&config.file_path, file.modified_time).await {
-            println!(
-                "Skipping export of '{}': {} is up to date",
-                file.name.as_deref().unwrap_or_default().escape_debug(),
-                config.file_path.display()
-            );
-            return Ok(());
-        }
-        return Err(Error::FileExists(config.file_path));
-    }
 
     let drive_mime = file.mime_type.ok_or(Error::MissingDriveMime)?;
     let Some(doc_type) = DocType::from_mime_type(&drive_mime) else {
@@ -476,59 +466,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unchanged_export_is_kept_without_overwrite_and_replaced_with_it() {
-        let file = json!({
-            "id": "doc",
-            "name": "Notes",
-            "mimeType": MIME_TYPE_DRIVE_DOCUMENT,
-            "modifiedTime": "2024-05-06T07:08:09.123Z",
-        });
-        let server = MockServer::start(vec![
-            Response::json(200, &file),
-            Response::json(200, &file),
-            Response::raw(200, "fresh"),
-        ])
-        .await;
+    async fn an_existing_file_is_an_error_without_overwrite_even_with_the_documents_time() {
+        let server = MockServer::start(Vec::new()).await;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("notes.txt");
         std::fs::write(&path, "exported before").unwrap();
-        set_mtime(&path, "2024-05-06T07:08:09Z");
-        let config = |existing_file_action| Config {
-            file_id: String::from("doc"),
-            file_path: path.clone(),
-            existing_file_action,
-            format: None,
-        };
-
-        export_with_hub(&server.hub(), config(ExistingFileAction::Abort))
-            .await
-            .unwrap();
-        crate::files::download::assert_content(&path, "exported before");
-        assert_eq!(server.requests().len(), 1, "no export");
-
-        export_with_hub(&server.hub(), config(ExistingFileAction::Overwrite))
-            .await
-            .unwrap();
-        crate::files::download::assert_content(&path, "fresh");
-        assert_eq!(mtime_millis(&path), 1_714_979_289_123);
-    }
-
-    #[tokio::test]
-    async fn a_changed_export_is_not_replaced_without_overwrite() {
-        let server = MockServer::start(vec![Response::json(
-            200,
-            &json!({
-                "id": "doc",
-                "name": "Notes",
-                "mimeType": MIME_TYPE_DRIVE_DOCUMENT,
-                "modifiedTime": "2024-05-06T07:08:10Z",
-            }),
-        )])
-        .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("notes.txt");
-        std::fs::write(&path, "exported before").unwrap();
-        set_mtime(&path, "2024-05-06T07:08:09Z");
+        set_mtime(&path, "2024-05-06T07:08:09.123Z");
 
         let error = export_with_hub(
             &server.hub(),
@@ -549,6 +492,43 @@ mod tests {
             "{error}"
         );
         crate::files::download::assert_content(&path, "exported before");
+        assert_eq!(server.requests().len(), 0, "checked before any request");
+    }
+
+    #[tokio::test]
+    async fn overwrite_always_exports_again_and_sets_the_documents_time() {
+        let file = json!({
+            "id": "doc",
+            "name": "Notes",
+            "mimeType": MIME_TYPE_DRIVE_DOCUMENT,
+            "modifiedTime": "2024-05-06T07:08:09.123Z",
+        });
+        let server = MockServer::start(vec![
+            Response::json(200, &file),
+            Response::raw(200, "fresh"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "exported before").unwrap();
+        // The document's time already: an export is made all the same.
+        set_mtime(&path, "2024-05-06T07:08:09.123Z");
+
+        export_with_hub(
+            &server.hub(),
+            Config {
+                file_id: String::from("doc"),
+                file_path: path.clone(),
+                existing_file_action: ExistingFileAction::Overwrite,
+                format: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        crate::files::download::assert_content(&path, "fresh");
+        assert_eq!(server.requests().len(), 2);
+        assert_eq!(mtime_millis(&path), 1_714_979_289_123);
     }
 
     #[test]

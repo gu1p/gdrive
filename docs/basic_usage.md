@@ -381,9 +381,7 @@ gdrive files export <FILE_ID> notes --format md      # writes the file `notes`
 - `csv` and `tsv` contain only the first sheet. To keep all sheets, export to `xlsx` or `ods`
   ([upstream #98](https://github.com/glotlabs/gdrive/issues/98)).
 - Google limits an export to 10 MB. A larger export fails with an error that names the limit.
-- The exported file gets the document's last modification time on Drive. Without `--overwrite`, an
-  existing file at the path with exactly that time (to the second) is an up-to-date export: gdrive prints
-  `Skipping export of '<name>': <path> is up to date` and exits with status 0. Any other existing file is
+- The exported file gets the document's last modification time on Drive. An existing file at the path is
   an error without `--overwrite`; with it, gdrive always exports again.
 - To export every document of a folder, use
   [`--export` with a recursive download](#google-docs-in-a-recursive-download).
