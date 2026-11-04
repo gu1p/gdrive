@@ -742,8 +742,24 @@ where
                     // The original advanced `start` on every reply, so a chunk retried after a
                     // 5xx or 429 was skipped and the session got stuck.
                     if response.status() == StatusCode::PERMANENT_REDIRECT {
-                        start = next_offset_after_308(response.headers(), self.content_length)
+                        let next = next_offset_after_308(response.headers(), self.content_length)
                             .unwrap_or(start + request_size);
+                        // GDRIVE PATCH: a 308 that does not get past the start of this chunk
+                        // (the same Range again, or no Range at offset 0) made no progress.
+                        // Resending at once could loop forever, so it counts as a failed
+                        // attempt: the delegate decides, and its backoff applies.
+                        if next <= start {
+                            let (parts, body) = response.into_parts();
+                            let bytes = to_bytes(body).await.unwrap_or_default();
+                            let response = to_response(parts, bytes.into());
+                            if let Retry::After(d) = self.delegate.http_failure(&response, None) {
+                                sleep(d).await;
+                                start = next;
+                                continue;
+                            }
+                            return Some(Ok(response));
+                        }
+                        start = next;
                         continue;
                     }
 

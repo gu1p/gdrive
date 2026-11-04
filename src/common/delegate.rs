@@ -117,7 +117,11 @@ impl google_apis_common::Delegate for UploadDelegate<'_> {
 }
 
 fn should_retry(status: http::StatusCode) -> bool {
-    status.is_server_error() || status == http::StatusCode::TOO_MANY_REQUESTS
+    // A 308 Resume Incomplete reaches the delegate only when a chunk made no progress (see
+    // vendor/google-apis-common/GDRIVE-PATCHES.md): resend it like a 5xx, within the budget.
+    status.is_server_error()
+        || status == http::StatusCode::TOO_MANY_REQUESTS
+        || status == http::StatusCode::PERMANENT_REDIRECT
 }
 
 #[derive(Debug, Clone)]

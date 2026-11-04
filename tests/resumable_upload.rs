@@ -82,6 +82,9 @@ struct Faults {
     short_commit: Option<(u64, usize)>,
     /// Cut the body of the reply that completes the upload, after its status line and headers.
     cut_final_reply: bool,
+    /// Answer every chunk that starts at this offset with a 308 that repeats the current Range,
+    /// committing nothing (unlike the faults above, this one never goes away).
+    stall_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -92,6 +95,7 @@ struct MockState {
     received: Vec<u8>,
     complete: bool,
     session_methods: Vec<Method>,
+    stalled_chunks: u32,
     log: Vec<String>,
 }
 
@@ -142,6 +146,10 @@ impl MockState {
                 StatusCode::BAD_REQUEST,
                 "Content-Range does not match the body",
             );
+        }
+        if self.faults.stall_at == Some(first) {
+            self.stalled_chunks += 1;
+            return self.resume_incomplete();
         }
         if self.faults.fail_chunk_at == Some(first) {
             self.faults.fail_chunk_at = None;
@@ -326,8 +334,21 @@ impl MockServer {
     }
 
     fn log(&self) -> String {
-        self.state().log.join("\n")
+        tail(&self.state().log)
     }
+}
+
+/// The last lines of the mock's request log, for failure messages.
+fn tail(log: &[String]) -> String {
+    const LINES: usize = 40;
+    let skipped = log.len().saturating_sub(LINES);
+    let mut text = if skipped > 0 {
+        format!("({skipped} earlier requests not shown)\n")
+    } else {
+        String::new()
+    };
+    text.push_str(&log[skipped..].join("\n"));
+    text
 }
 
 fn delegate_config() -> UploadDelegateConfig {
@@ -396,7 +417,7 @@ fn assert_uploaded_once(server: &MockServer, data: &[u8], result: UploadResult) 
         "the server must hold the uploaded bytes unchanged: {} of {} bytes received\n{}",
         state.received.len(),
         data.len(),
-        state.log.join("\n"),
+        tail(&state.log),
     );
     assert_eq!(state.creates, 1, "exactly one file must be created");
     assert!(
@@ -407,6 +428,41 @@ fn assert_uploaded_once(server: &MockServer, data: &[u8], result: UploadResult) 
         "chunk and status requests must use PUT: {:?}",
         state.session_methods,
     );
+}
+
+#[tokio::test]
+async fn repeated_308_without_progress_fails_within_the_retry_budget() {
+    let data = test_data();
+    let server = MockServer::start(Faults {
+        stall_at: Some(MIB),
+        ..Faults::default()
+    })
+    .await;
+
+    let result = upload(&server, &data).await;
+
+    let err = result.expect_err("an upload that makes no progress must fail");
+    assert!(
+        matches!(&*err, google_drive3::Error::Failure(response)
+            if response.status() == StatusCode::PERMANENT_REDIRECT),
+        "{err}\n{}",
+        server.log()
+    );
+    let state = server.state();
+    let max_attempts = delegate_config().backoff_config.max_retries + 1;
+    assert!(
+        (2..=max_attempts).contains(&state.stalled_chunks),
+        "the stalled chunk must be resent with backoff, at most {max_attempts} times, was sent {} \
+         times\n{}",
+        state.stalled_chunks,
+        tail(&state.log),
+    );
+    assert_eq!(
+        state.committed(),
+        MIB,
+        "nothing past the stall is committed"
+    );
+    assert_eq!(state.creates, 1, "exactly one file must be created");
 }
 
 #[tokio::test]

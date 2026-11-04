@@ -52,6 +52,13 @@ Checked against Google's protocol description,
    asked for again (at most three times, one second apart).
 5. **PUT** for chunk and status requests, the method Google documents for both (the crate used POST,
    which Google also accepts today).
+6. **308 without progress** (`upload`). Following the 308 Range (change 3) means a server that keeps
+   answering with the same Range, or with no Range while the chunk starts at 0, would get the same
+   chunk resent at once, forever, without the delegate being asked. A 308 whose next offset is not
+   past the start of the chunk just sent now counts as a failed attempt: it goes to the delegate's
+   `http_failure`, whose `Retry::After` backoff applies before the resend, and `Retry::Abort` returns
+   the 308 as the result (google-drive3 reports it as a failure). gdrive's `UploadDelegate`
+   (`src/common/delegate.rs`) retries such a 308 like a 5xx, within the same retry budget.
 
 Not changed: after a 5xx or 429 the chunk is resent as in gdrive 3.9.1, without a status request first;
 transport errors (no reply at all) were already retried with the same chunk; seeks and reads of the
@@ -63,7 +70,9 @@ replace this helper, and the patch should be offered upstream for #438.
 `tests/resumable_upload.rs` runs gdrive's upload delegate and the `files.create` call of
 `src/files/upload.rs` against an in-process mock of the protocol: a 503 on the second chunk, a cut
 reply body on the final chunk, and a 308 whose Range covers only part of a chunk. All three fail with
-pristine 8.0.0 and pass with this patch.
+pristine 8.0.0 and pass with this patch. A fourth case answers every attempt at one chunk with the same
+308 Range and checks that the upload fails after a bounded number of attempts; without change 6 it
+never finishes.
 
 ## Updating
 
@@ -211,7 +220,7 @@ pass against it.
                          .header("Content-Range", range_header.header_value())
                          .header(CONTENT_TYPE, format!("{}", self.media_type))
                          .header(USER_AGENT, self.user_agent.to_string())
-@@ -710,15 +737,36 @@
+@@ -710,15 +737,52 @@
                  .await
              {
                  Ok(response) => {
@@ -222,8 +231,24 @@ pass against it.
 +                    // The original advanced `start` on every reply, so a chunk retried after a
 +                    // 5xx or 429 was skipped and the session got stuck.
                      if response.status() == StatusCode::PERMANENT_REDIRECT {
-+                        start = next_offset_after_308(response.headers(), self.content_length)
++                        let next = next_offset_after_308(response.headers(), self.content_length)
 +                            .unwrap_or(start + request_size);
++                        // GDRIVE PATCH: a 308 that does not get past the start of this chunk
++                        // (the same Range again, or no Range at offset 0) made no progress.
++                        // Resending at once could loop forever, so it counts as a failed
++                        // attempt: the delegate decides, and its backoff applies.
++                        if next <= start {
++                            let (parts, body) = response.into_parts();
++                            let bytes = to_bytes(body).await.unwrap_or_default();
++                            let response = to_response(parts, bytes.into());
++                            if let Retry::After(d) = self.delegate.http_failure(&response, None) {
++                                sleep(d).await;
++                                start = next;
++                                continue;
++                            }
++                            return Some(Ok(response));
++                        }
++                        start = next;
                          continue;
                      }
  
@@ -251,7 +276,7 @@ pass against it.
                      let error = if !success {
                          serde_json::from_str(&to_string(&bytes)).ok()
                      } else {
-@@ -731,6 +779,7 @@
+@@ -731,6 +795,7 @@
                              self.delegate.http_failure(&response, error.as_ref())
                          {
                              sleep(d).await;
