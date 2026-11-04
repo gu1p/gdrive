@@ -32,10 +32,25 @@ impl TestProxy {
     /// An HTTP proxy that opens CONNECT tunnels to loopback targets. With `required_auth`, a
     /// request without that `Proxy-Authorization` gets a 407.
     pub(crate) async fn connect(required_auth: Option<&str>) -> TestProxy {
+        Self::connect_with(required_auth, Reply::Tunnel).await
+    }
+
+    /// [`TestProxy::connect`] that sends its `200` answer in small pieces, with pauses between
+    /// them, as a slow proxy or network may.
+    pub(crate) async fn connect_fragmented() -> TestProxy {
+        Self::connect_with(None, Reply::FragmentedTunnel).await
+    }
+
+    /// An HTTP proxy that answers every CONNECT request with `answer` and closes.
+    pub(crate) async fn connect_answering(answer: &'static str) -> TestProxy {
+        Self::connect_with(None, Reply::Answer(answer)).await
+    }
+
+    async fn connect_with(required_auth: Option<&str>, reply: Reply) -> TestProxy {
         let required_auth = required_auth.map(str::to_owned);
         Self::start(move |stream, requests| {
             let required_auth = required_auth.clone();
-            async move { serve_connect(stream, &requests, required_auth.as_deref()).await }
+            async move { serve_connect(stream, &requests, required_auth.as_deref(), reply).await }
         })
         .await
     }
@@ -82,10 +97,19 @@ impl Drop for TestProxy {
     }
 }
 
+/// How the CONNECT proxy answers.
+#[derive(Debug, Clone, Copy)]
+enum Reply {
+    Tunnel,
+    FragmentedTunnel,
+    Answer(&'static str),
+}
+
 async fn serve_connect(
     mut client: TcpStream,
     requests: &Mutex<Vec<ProxyRequest>>,
     required_auth: Option<&str>,
+    reply: Reply,
 ) -> Option<()> {
     let mut head = Vec::new();
     let mut byte = [0; 1];
@@ -108,6 +132,10 @@ async fn serve_connect(
         auth: auth.clone(),
     });
 
+    if let Reply::Answer(answer) = reply {
+        client.write_all(answer.as_bytes()).await.ok()?;
+        return None;
+    }
     if method != "CONNECT" {
         client
             .write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
@@ -129,10 +157,27 @@ async fn serve_connect(
             .ok()?;
         return None;
     };
-    client
-        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
-        .await
-        .ok()?;
+    match reply {
+        Reply::FragmentedTunnel => {
+            client.set_nodelay(true).ok()?;
+            for piece in [
+                "HTTP/1.",
+                "1 2",
+                "00 Connection established\r",
+                "\nVia: 1.1 test-proxy\r\n",
+                "\r",
+                "\n",
+            ] {
+                client.write_all(piece.as_bytes()).await.ok()?;
+                client.flush().await.ok()?;
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+        _ => client
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .ok()?,
+    }
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
     Some(())
 }

@@ -9,8 +9,9 @@
 //! https:// destinations, `HTTP_PROXY` for http:// ones, `ALL_PROXY` for both when the specific
 //! one is not set, and `NO_PROXY` for the hosts to reach directly; the lowercase names work too,
 //! the uppercase name wins when both are set. hyper-util's `Matcher` applies these rules
-//! (including `NO_PROXY` domains, addresses and ranges), its `Tunnel` connector opens HTTP
-//! CONNECT tunnels and its `SocksV5` connector SOCKS5 ones:
+//! (including `NO_PROXY` domains, addresses and ranges) and its `SocksV5` connector opens SOCKS5
+//! tunnels. HTTP CONNECT tunnels are opened here: hyper-util 0.1.20's `Tunnel` fails when the
+//! first read of the proxy's answer does not hold its whole status line.
 //!
 //! - `http://[user:password@]host[:port]` (a value without a scheme means http) and
 //!   `https://...`, which talks TLS to the proxy too; the user and password are sent as
@@ -35,14 +36,11 @@ use std::{
     task::{Context, Poll},
 };
 
-use hyper::Uri;
+use hyper::{header::HeaderValue, Uri};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder, MaybeHttpsStream};
 use hyper_util::{
     client::{
-        legacy::connect::{
-            proxy::{SocksV5, Tunnel},
-            HttpConnector,
-        },
+        legacy::connect::{proxy::SocksV5, HttpConnector},
         proxy::matcher::{Intercept, Matcher},
     },
     rt::TokioIo,
@@ -314,7 +312,7 @@ impl Service<Uri> for ProxyConnector {
                 })
             }
             Some("https") => {
-                let Some(proxy_tls) = self
+                let Some(mut proxy_tls) = self
                     .routes
                     .as_ref()
                     .and_then(|routes| routes.proxy_tls.clone())
@@ -325,24 +323,174 @@ impl Service<Uri> for ProxyConnector {
                         )))))
                     });
                 };
-                let mut tunnel = Tunnel::new(proxy, proxy_tls);
-                if let Some(auth) = intercept.basic_auth() {
-                    tunnel = tunnel.with_auth(auth.clone());
-                }
-                let connecting = tunnel.call(dst);
-                Box::pin(async move { connecting.await.map_err(|error| through(Box::new(error))) })
+                let auth = intercept.basic_auth().cloned();
+                let connecting = proxy_tls.call(proxy);
+                Box::pin(async move {
+                    let stream = connecting.await.map_err(through)?;
+                    connect_tunnel(stream, &dst, auth.as_ref())
+                        .await
+                        .map_err(|error| through(Box::new(error)))
+                })
             }
             _ => {
-                let mut tunnel = Tunnel::new(proxy, self.http.clone());
-                if let Some(auth) = intercept.basic_auth() {
-                    tunnel = tunnel.with_auth(auth.clone());
-                }
-                let connecting = tunnel.call(dst);
+                let auth = intercept.basic_auth().cloned();
+                let connecting = self.http.call(proxy);
                 Box::pin(async move {
                     let stream = connecting.await.map_err(|error| through(Box::new(error)))?;
+                    let stream = connect_tunnel(stream, &dst, auth.as_ref())
+                        .await
+                        .map_err(|error| through(Box::new(error)))?;
                     Ok(MaybeHttpsStream::Http(stream))
                 })
             }
+        }
+    }
+}
+
+/// The longest answer to a CONNECT request gdrive reads.
+const MAX_CONNECT_ANSWER: usize = 16 * 1024;
+
+/// Opens an HTTP CONNECT tunnel to `dst` through `conn`, a connection to the proxy: sends the
+/// request, reads the answer up to the blank line that ends its header, however it arrives, and
+/// accepts any 2xx status.
+async fn connect_tunnel<T>(
+    mut conn: T,
+    dst: &Uri,
+    auth: Option<&HeaderValue>,
+) -> Result<T, TunnelError>
+where
+    T: hyper::rt::Read + hyper::rt::Write + Unpin,
+{
+    let (Some(host), Some(port)) = (dst.host(), dst.port_u16()) else {
+        return Err(TunnelError::NoHost);
+    };
+    let mut request =
+        format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n").into_bytes();
+    if let Some(auth) = auth {
+        request.extend_from_slice(b"Proxy-Authorization: ");
+        request.extend_from_slice(auth.as_bytes());
+        request.extend_from_slice(b"\r\n");
+    }
+    request.extend_from_slice(b"\r\n");
+    write_all(&mut conn, &request)
+        .await
+        .map_err(TunnelError::Io)?;
+
+    let mut answer = Vec::new();
+    let mut buf = [0; 1024];
+    let header_end = loop {
+        let read = read(&mut conn, &mut buf).await.map_err(TunnelError::Io)?;
+        if read == 0 {
+            return Err(TunnelError::Closed);
+        }
+        answer.extend_from_slice(&buf[..read]);
+        if let Some(position) = answer.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position + 4;
+        }
+        if answer.len() > MAX_CONNECT_ANSWER {
+            return Err(TunnelError::TooLong);
+        }
+    };
+
+    let status_line = answer
+        .split(|&byte| byte == b'\r')
+        .next()
+        .unwrap_or_default();
+    let (status, reason) = parse_status_line(status_line).ok_or(TunnelError::NotHttp)?;
+    match status {
+        // Nothing may come before the TLS handshake, which gdrive starts.
+        200..=299 if header_end < answer.len() => Err(TunnelError::EarlyData),
+        200..=299 => Ok(conn),
+        407 => Err(TunnelError::AuthRequired),
+        _ => Err(TunnelError::Refused { status, reason }),
+    }
+}
+
+/// The status code and reason phrase of an HTTP/1.x status line. The reason phrase keeps only
+/// printable ASCII, and at most 64 characters of it.
+fn parse_status_line(line: &[u8]) -> Option<(u16, String)> {
+    let line = std::str::from_utf8(line).ok()?;
+    let rest = line.strip_prefix("HTTP/1.")?;
+    let mut parts = rest.splitn(3, ' ');
+    let _minor = parts.next().filter(|minor| minor.len() == 1)?;
+    let code = parts.next()?;
+    if code.len() != 3 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let reason = parts
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(64)
+        .collect();
+    Some((code.parse().ok()?, reason))
+}
+
+async fn read<T: hyper::rt::Read + Unpin>(io: &mut T, buf: &mut [u8]) -> io::Result<usize> {
+    std::future::poll_fn(|cx| {
+        let mut read_buf = hyper::rt::ReadBuf::new(&mut *buf);
+        match Pin::new(&mut *io).poll_read(cx, read_buf.unfilled()) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Pending => Poll::Pending,
+        }
+    })
+    .await
+}
+
+async fn write_all<T: hyper::rt::Write + Unpin>(io: &mut T, mut data: &[u8]) -> io::Result<()> {
+    while !data.is_empty() {
+        let written = std::future::poll_fn(|cx| Pin::new(&mut *io).poll_write(cx, data)).await?;
+        if written == 0 {
+            return Err(io::ErrorKind::WriteZero.into());
+        }
+        data = &data[written..];
+    }
+    std::future::poll_fn(|cx| Pin::new(&mut *io).poll_flush(cx)).await
+}
+
+/// A CONNECT tunnel the proxy did not open.
+#[derive(Debug)]
+enum TunnelError {
+    NoHost,
+    Io(io::Error),
+    Closed,
+    TooLong,
+    NotHttp,
+    EarlyData,
+    AuthRequired,
+    Refused { status: u16, reason: String },
+}
+
+impl Display for TunnelError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            TunnelError::NoHost => f.write_str("the address has no host and port"),
+            TunnelError::Io(_) => f.write_str("the connection to the proxy failed"),
+            TunnelError::Closed => f.write_str("the proxy closed the connection without an answer"),
+            TunnelError::TooLong => f.write_str("the answer of the proxy is too long"),
+            TunnelError::NotHttp => f.write_str(
+                "the answer of the proxy is not HTTP; for a SOCKS proxy, use socks5:// or \
+                 socks5h://",
+            ),
+            TunnelError::EarlyData => f.write_str("the proxy sent data before the tunnel was used"),
+            TunnelError::AuthRequired => f.write_str(
+                "the proxy asks for authorization (407 Proxy Authentication Required): the user \
+                 name and password in the proxy URL are missing or wrong",
+            ),
+            TunnelError::Refused { status, reason } => {
+                write!(f, "the proxy refused the tunnel: {status} {reason}")
+            }
+        }
+    }
+}
+
+impl Error for TunnelError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            TunnelError::Io(source) => Some(source),
+            _ => None,
         }
     }
 }
@@ -705,6 +853,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_connect_answer_in_pieces_is_read_to_its_end() {
+        let drive = DriveServer::start(vec![me()]).await;
+        let proxy = TestProxy::connect_fragmented().await;
+        let value = format!("http://{}", proxy.addr());
+
+        let hub = Hub::for_mock_server_through(
+            &format!("http://{}/", drive.addr()),
+            connector(&[("HTTP_PROXY", &value)]),
+        )
+        .unwrap();
+        assert_eq!(
+            about(&hub).await.unwrap().as_deref(),
+            Some("me@example.com")
+        );
+        assert_eq!(proxy.requests()[0].target, drive.addr().to_string());
+    }
+
+    #[tokio::test]
+    async fn connect_answers_other_than_2xx_are_clean_errors() {
+        let cases = [
+            (
+                "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 4\r\n\r\nnope",
+                "the proxy refused the tunnel: 502 Bad Gateway",
+            ),
+            (
+                "HTTP/1.0 200 OK\r\n\r\nunexpected",
+                "the proxy sent data before the tunnel was used",
+            ),
+            (
+                "SSH-2.0-OpenSSH_9.6\r\n\r\n",
+                "the answer of the proxy is not HTTP; for a SOCKS proxy",
+            ),
+            (
+                "HTTP/1.1 200 OK\r\n",
+                "the proxy closed the connection without an answer",
+            ),
+        ];
+        for (answer, expected) in cases {
+            let drive = DriveServer::start(vec![me()]).await;
+            let proxy = TestProxy::connect_answering(answer).await;
+            let value = format!("http://{}", proxy.addr());
+            let hub = Hub::for_mock_server_through(
+                &format!("http://{}/", drive.addr()),
+                connector(&[("HTTP_PROXY", &value)]),
+            )
+            .unwrap();
+
+            let error = about(&hub).await.unwrap_err();
+            let message = crate::error_message(&*error);
+            assert!(
+                message.contains(&format!(
+                    "unable to connect through the proxy set in HTTP_PROXY: {expected}"
+                )),
+                "{answer:?}: {message}"
+            );
+            assert!(drive.requests().is_empty(), "{answer:?}");
+        }
+    }
+
+    #[test]
+    fn status_lines_are_parsed_strictly() {
+        assert_eq!(
+            parse_status_line(b"HTTP/1.1 200 Connection established"),
+            Some((200, String::from("Connection established")))
+        );
+        assert_eq!(
+            parse_status_line(b"HTTP/1.0 204"),
+            Some((204, String::new()))
+        );
+        assert_eq!(
+            parse_status_line("HTTP/1.1 403 Forbidden \u{1b}[31mred".as_bytes()),
+            Some((403, String::from("Forbidden [31mred")))
+        );
+        for line in [
+            &b"HTTP/2 200 OK"[..],
+            b"HTTP/1.1 20 OK",
+            b"HTTP/1.1 2000 OK",
+            b"HTTP/1.11 200 OK",
+            b"ICY 200 OK",
+            b"",
+        ] {
+            assert_eq!(parse_status_line(line), None, "{line:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn no_proxy_bypasses_the_proxy() {
         let drive = DriveServer::start(vec![me()]).await;
         let root_url = format!("http://{}/", drive.addr());
@@ -780,7 +1014,10 @@ mod tests {
         assert_eq!(proxy.requests()[0].target, "accounts.google.com:443");
         let message = crate::error_message(&error);
         assert!(
-            message.contains("unable to connect through the proxy set in HTTPS_PROXY: tunnel error: unsuccessful"),
+            message.contains(
+                "unable to connect through the proxy set in HTTPS_PROXY: the proxy refused the \
+                 tunnel: 403 Forbidden"
+            ),
             "{message}"
         );
         assert!(!message.contains("hunter2"), "{message}");
@@ -801,7 +1038,10 @@ mod tests {
         let error = about(&hub).await.unwrap_err();
         let message = crate::error_message(&*error);
         assert!(
-            message.contains("unable to connect through the proxy set in ALL_PROXY: tunnel error: proxy authorization required"),
+            message.contains(
+                "unable to connect through the proxy set in ALL_PROXY: the proxy asks for \
+                 authorization (407 Proxy Authentication Required)"
+            ),
             "{message}"
         );
         assert!(!message.contains("hunter2"), "{message}");
