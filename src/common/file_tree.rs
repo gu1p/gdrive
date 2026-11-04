@@ -2,6 +2,7 @@ pub(crate) mod errors;
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -18,6 +19,13 @@ pub(crate) struct FileTree {
 }
 
 impl FileTree {
+    /// Walks the local directory `path` for a recursive upload.
+    ///
+    /// Symlinks are followed, to files and to directories, so an upload contains what `cp -rL`
+    /// would copy, under the names of the links. A directory whose canonical path is one of the
+    /// directories being walked above it (a symlink cycle) is skipped with a warning. A broken
+    /// symlink, an entry whose metadata cannot be read, an unreadable file or directory and an
+    /// entry that is neither a file nor a directory are errors.
     pub(crate) async fn from_path(
         path: &Path,
         ids: &mut IdGen<'_>,
@@ -26,7 +34,8 @@ impl FileTree {
             .canonicalize()
             .map_err(errors::FileTree::Canonicalize)?;
 
-        let root = Folder::from_path(&canonical_path, None, ids)
+        let mut ancestors = HashSet::from([canonical_path.clone()]);
+        let root = Folder::from_path(&canonical_path, None, ids, &mut ancestors)
             .await
             .map_err(errors::FileTree::Folder)?;
         Ok(FileTree { root })
@@ -58,11 +67,13 @@ pub(crate) struct Folder {
 }
 
 impl Folder {
+    /// `ancestors` holds the canonical paths of `path` and of the directories above it.
     #[async_recursion]
     async fn from_path(
         path: &Path,
         parent: Option<&'async_recursion Folder>,
         ids: &mut IdGen<'_>,
+        ancestors: &mut HashSet<PathBuf>,
     ) -> Result<Folder, errors::Folder> {
         use errors::Folder as E;
 
@@ -90,8 +101,40 @@ impl Folder {
             let entry = e.map_err(E::ReadDirEntry)?;
             let path = entry.path();
 
-            if path.is_dir() {
-                let folder = match Folder::from_path(&path, Some(&folder), ids).await {
+            // fs::metadata follows symlinks: a link is uploaded as what it points to.
+            let metadata = match fs::metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(source) => {
+                    let is_symlink = entry.file_type().is_ok_and(|ty| ty.is_symlink());
+                    return Err(if is_symlink {
+                        E::BrokenSymlink { path, source }
+                    } else {
+                        E::Metadata { path, source }
+                    });
+                }
+            };
+
+            if metadata.is_dir() {
+                let canonical_path = match path.canonicalize() {
+                    Ok(canonical_path) => canonical_path,
+                    Err(source) => return Err(E::Canonicalize { path, source }),
+                };
+
+                if ancestors.contains(&canonical_path) {
+                    eprintln!(
+                        "Warning: Skipping directory '{}': it resolves to '{}', which contains \
+                        it (symlink cycle)",
+                        path.display(),
+                        canonical_path.display(),
+                    );
+                    continue;
+                }
+
+                ancestors.insert(canonical_path.clone());
+                let nested = Folder::from_path(&path, Some(&folder), ids, ancestors).await;
+                ancestors.remove(&canonical_path);
+
+                let folder = match nested {
                     Ok(folder) => folder,
                     Err(source) => {
                         return Err(E::Nested {
@@ -102,9 +145,7 @@ impl Folder {
                 };
                 let node = Node::Folder(folder);
                 children.push(node);
-            } else if path.is_symlink() {
-                return Err(E::IsSymlink(path));
-            } else if path.is_file() {
+            } else if metadata.is_file() {
                 let file = match File::from_path(&path, &folder, ids).await {
                     Ok(file) => file,
                     Err(source) => {
@@ -242,12 +283,230 @@ fn get_relative_path<'a>(path: &'a Path, folder_info: &FolderInfo) -> &'a Path {
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::{BTreeMap, BTreeSet},
         path::{Path, PathBuf},
         sync::Arc,
     };
 
-    use super::{File, Folder, Node};
-    use crate::common::{drive_file::MIME_TYPE_CSV_MIME, file_tree::FolderInfo, FolderLike};
+    use super::{errors, File, FileTree, Folder, Node};
+    use crate::common::{
+        drive_file::MIME_TYPE_CSV_MIME, file_tree::FolderInfo, id_gen::IdGen, FileTreeLike,
+        FolderLike,
+    };
+
+    struct Walked {
+        folders: BTreeSet<PathBuf>,
+        files: BTreeMap<PathBuf, u64>,
+    }
+
+    async fn walk(root: &Path) -> Result<Walked, errors::FileTree> {
+        let tree = FileTree::from_path(root, &mut IdGen::sequential()).await?;
+        let mut folders = BTreeSet::new();
+        let mut files = BTreeMap::new();
+        for folder in tree.folders() {
+            folders.insert(folder.relative_path().to_path_buf());
+            for file in folder.files() {
+                files.insert(file.relative_path().to_path_buf(), file.size);
+            }
+        }
+        Ok(Walked { folders, files })
+    }
+
+    fn paths<const N: usize>(paths: [&str; N]) -> BTreeSet<PathBuf> {
+        paths.into_iter().map(PathBuf::from).collect()
+    }
+
+    fn sizes<const N: usize>(entries: [(&str, u64); N]) -> BTreeMap<PathBuf, u64> {
+        entries
+            .into_iter()
+            .map(|(path, size)| (PathBuf::from(path), size))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn walks_plain_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("a.txt"), b"abc").unwrap();
+        std::fs::write(root.join("sub/b.txt"), b"b").unwrap();
+
+        let walked = walk(&root).await.unwrap();
+        assert_eq!(walked.folders, paths(["root", "root/sub"]));
+        assert_eq!(
+            walked.files,
+            sizes([("root/a.txt", 3), ("root/sub/b.txt", 1)])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn follows_symlinks_to_files_and_directories() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+        std::fs::write(root.join("real.txt"), b"hello").unwrap();
+        std::fs::write(root.join("dir/inner.txt"), b"inner").unwrap();
+        std::fs::write(tmp.path().join("outside/out.txt"), b"out!").unwrap();
+        symlink("real.txt", root.join("link.txt")).unwrap();
+        symlink("dir", root.join("linkdir")).unwrap();
+        symlink("../outside", root.join("outlink")).unwrap();
+
+        let walked = walk(&root).await.unwrap();
+        assert_eq!(
+            walked.folders,
+            paths(["root", "root/dir", "root/linkdir", "root/outlink"])
+        );
+        assert_eq!(
+            walked.files,
+            sizes([
+                ("root/dir/inner.txt", 5),
+                ("root/link.txt", 5),
+                ("root/linkdir/inner.txt", 5),
+                ("root/outlink/out.txt", 4),
+                ("root/real.txt", 5),
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_symlink_cycles() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/file.txt"), b"x").unwrap();
+        symlink(".", root.join("self")).unwrap();
+        symlink(".", root.join("a/again")).unwrap();
+        symlink("../..", root.join("a/b/up")).unwrap();
+        symlink(&root, root.join("a/b/absolute")).unwrap();
+
+        let walked = walk(&root).await.unwrap();
+        assert_eq!(walked.folders, paths(["root", "root/a", "root/a/b"]));
+        assert_eq!(walked.files, sizes([("root/a/file.txt", 1)]));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn directory_linked_twice_is_walked_twice() {
+        use std::os::unix::fs::symlink;
+
+        // Not a cycle: like `cp -rL`, each link gets its own copy.
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("x")).unwrap();
+        std::fs::write(root.join("x/f.txt"), b"f").unwrap();
+        symlink("x", root.join("y")).unwrap();
+        symlink("x", root.join("z")).unwrap();
+
+        let walked = walk(&root).await.unwrap();
+        assert_eq!(
+            walked.folders,
+            paths(["root", "root/x", "root/y", "root/z"])
+        );
+        assert_eq!(
+            walked.files,
+            sizes([
+                ("root/x/f.txt", 1),
+                ("root/y/f.txt", 1),
+                ("root/z/f.txt", 1)
+            ])
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broken_symlink_is_an_error() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        symlink("missing", root.join("dangling")).unwrap();
+
+        let err = walk(&root).await.err().unwrap();
+        assert!(
+            matches!(
+                &err,
+                errors::FileTree::Folder(errors::Folder::BrokenSymlink { path, .. })
+                    if path.ends_with("dangling")
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_loop_is_an_error() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        symlink("l2", root.join("sub/l1")).unwrap();
+        symlink("l1", root.join("sub/l2")).unwrap();
+
+        let err = walk(&root).await.err().unwrap();
+        assert!(
+            matches!(
+                &err,
+                errors::FileTree::Folder(errors::Folder::Nested { path, source })
+                    if path.ends_with("sub")
+                        && matches!(**source, errors::Folder::BrokenSymlink { .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unreadable_entries_are_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let locked = root.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Permissions do not apply to root; nothing to check then.
+        if std::fs::read_dir(&locked).is_ok() {
+            return;
+        }
+
+        let dir_err = walk(&root).await.err().unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            matches!(
+                &dir_err,
+                errors::FileTree::Folder(errors::Folder::Nested { path, source })
+                    if path.ends_with("locked")
+                        && matches!(**source, errors::Folder::ReadDir(_))
+            ),
+            "{dir_err:?}"
+        );
+
+        let secret = locked.join("secret.txt");
+        std::fs::write(&secret, b"s").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let file_err = walk(&locked).await.err().unwrap();
+        assert!(
+            matches!(
+                &file_err,
+                errors::FileTree::Folder(errors::Folder::File {
+                    path,
+                    source: errors::File::Open(_),
+                }) if path.ends_with("secret.txt")
+            ),
+            "{file_err:?}"
+        );
+    }
 
     #[test]
     fn folder_folders_recursive() {

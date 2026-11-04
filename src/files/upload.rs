@@ -274,7 +274,7 @@ async fn upload_directory(
             let os_file = match fs::File::open(&file.path) {
                 Ok(os_file) => os_file,
                 Err(err) => {
-                    return Err(Error::OpenFile(config.file_path, err));
+                    return Err(Error::OpenFile(file.path.clone(), err));
                 }
             };
 
