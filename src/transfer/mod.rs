@@ -5,10 +5,19 @@
 //! - [`scheduler`]: bounded concurrent jobs with typed outcomes, one printer and a summary.
 //! - [`progress`]: the events a progress display receives from the scheduler.
 //! - [`upload`]: gdrive's own uploader, resumable sessions and multipart requests.
+//! - [`relay`]: the copy of a Drive file to another account, streamed through the uploader.
 
 #[cfg(test)]
 pub(crate) mod fake_drive;
 pub(crate) mod progress;
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the engine of `files migrate`, whose command is on branch migrate-cmd"
+    )
+)]
+pub(crate) mod relay;
 pub(crate) mod scheduler;
 pub(crate) mod upload;
 pub(crate) mod walk;
