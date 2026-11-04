@@ -32,13 +32,12 @@ pub(crate) struct Config {
 
 impl Config {
     /// How the file goes up: as `files upload` does, with the selected chunk size and multipart
-    /// threshold, the sessions recorded in the account directory.
+    /// threshold. The sessions are not recorded; [`import`] records them in the account
+    /// directory.
     fn upload_options(&self) -> UploadOptions {
         UploadOptions {
             chunk_size: self.chunk_size.in_bytes(),
             multipart_threshold: self.multipart_threshold.in_bytes(),
-            session_dir: account_session_dir(),
-            session_identity: account_session_identity(),
             ..UploadOptions::default()
         }
     }
@@ -46,7 +45,11 @@ impl Config {
 
 pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-    let options = config.upload_options();
+    let options = UploadOptions {
+        session_dir: account_session_dir(),
+        session_identity: account_session_identity(),
+        ..config.upload_options()
+    };
 
     let (doc_type, source_mime_type) =
         import_types(&config.file_path).ok_or(Error::UnsupportedFileType)?;
@@ -388,5 +391,62 @@ mod tests {
         }
         let uploaded: usize = chunks.iter().map(|chunk| chunk.body.len()).sum();
         assert_eq!(uploaded, total);
+    }
+
+    /// `files import notes.md --multipart-threshold 0 --chunk-size 1`: a file far below the
+    /// default threshold goes up through a resumable session, in 1 MiB chunks.
+    #[tokio::test]
+    async fn the_selected_threshold_and_chunk_size_shape_the_upload() {
+        const MIB: usize = 1 << 20;
+        let content = vec![b'#'; 2 * MIB + 5];
+        let total = content.len();
+        let server = MockServer::start(vec![
+            Response::json(200, &serde_json::json!({}))
+                .with_header("Location", "{root}upload-session"),
+            Response::json(308, &serde_json::json!({}))
+                .with_header("Range", &format!("bytes=0-{}", MIB - 1)),
+            Response::json(308, &serde_json::json!({}))
+                .with_header("Range", &format!("bytes=0-{}", 2 * MIB - 1)),
+            Response::json(
+                200,
+                &serde_json::json!({"id": "new-id", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+            ),
+        ])
+        .await;
+        let (_dir, path) = notes(&content);
+        let (doc_type, source_mime_type) = import_types(&path).unwrap();
+        let target = import_target(
+            String::from("notes.md"),
+            Vec::new(),
+            doc_type,
+            source_mime_type,
+        );
+        let options = config("1", "0").upload_options();
+        assert!(
+            (total as u64) < UploadOptions::default().multipart_threshold,
+            "multipart without --multipart-threshold"
+        );
+
+        upload_path(&server.hub(), &path, &target, &options, None)
+            .await
+            .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].query_param("uploadType"), Some("resumable"));
+        let ranges: Vec<_> = requests[1..]
+            .iter()
+            .map(|chunk| chunk.header("content-range").unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ranges,
+            [
+                format!("bytes 0-{}/{total}", MIB - 1),
+                format!("bytes {MIB}-{}/{total}", 2 * MIB - 1),
+                format!("bytes {}-{}/{total}", 2 * MIB, total - 1),
+            ]
+        );
+        let sizes: Vec<_> = requests[1..].iter().map(|chunk| chunk.body.len()).collect();
+        assert_eq!(sizes, [MIB, MIB, 5]);
     }
 }
