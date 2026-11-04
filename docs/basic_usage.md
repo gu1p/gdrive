@@ -26,6 +26,10 @@ gdrive account import <ARCHIVE_PATH>
 The account name is the email address of the Google account. `account remove` only deletes the files on
 your machine. To revoke gdrive's access, remove your app at <https://myaccount.google.com/permissions>.
 
+For CI and servers, gdrive 4.0.0 also takes a service account key (`gdrive account add --service-account
+KEY_JSON`) or Application Default Credentials (`gdrive account add --adc`); see
+[Service accounts](service_accounts.md).
+
 ## Find file and folder ids
 
 Most commands take a file id or a folder id. An id is a string such as

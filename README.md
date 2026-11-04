@@ -115,7 +115,7 @@ SSH tunnel, `gdrive account add --manual` (4.0.0), and unattended use in cron jo
 
 ```text
 gdrive account      add, list, current, switch, remove, export, import
-                    reauth (4.0.0)
+                    reauth, add --service-account, add --adc (4.0.0)
 gdrive files        list, info, download, upload, update, delete, mkdir, rename,
                     move, copy, import, export
 gdrive drives       list
@@ -126,6 +126,11 @@ gdrive version      version information
 
 Run `gdrive <command> --help` for the options, for example `gdrive files list --help`.
 
+- Service accounts and Application Default Credentials, for CI and servers:
+  [Service accounts](docs/service_accounts.md).
+- Behind a proxy (`HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, SOCKS5):
+  [E. Behind a proxy](docs/remote_and_headless.md#e-behind-a-proxy).
+
 ## Credentials and security
 
 gdrive stores accounts under `~/.config/gdrive3/` (on Windows, `%USERPROFILE%\.config\gdrive3\`):
@@ -135,6 +140,8 @@ gdrive stores accounts under `~/.config/gdrive3/` (on Windows, `%USERPROFILE%\.c
 | `account.json` | The name of the current account |
 | `<account>/secret.json` | Your OAuth client ID and client secret |
 | `<account>/tokens.json` | Access token and refresh token |
+| `<account>/account.json` | Service accounts and ADC accounts only: the account type (4.0.0) |
+| `<account>/service_account.json` | Service accounts only: the service account's key (4.0.0) |
 
 Anyone who can read these files can read, change and delete everything in your Drive. Keep them private.
 Archives from `gdrive account export` contain the same secrets; delete them after the import.
@@ -181,13 +188,15 @@ series; the notes of each release say what it contains.
 Also in 4.0.0:
 
 - `gdrive account add --manual` for machines without a browser (from the authentication milestone).
+- Service accounts (`gdrive account add --service-account`, with `--subject` for domain-wide delegation)
+  and Application Default Credentials (`gdrive account add --adc`).
+- Proxy support through `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`, including SOCKS5.
 - Release archives for Linux x86_64 and ARM64, macOS ARM64 and Intel, and Windows, with `SHA256SUMS`.
 
 Planned, not done yet:
 
 - Faster transfers: several files at a time, resumable uploads that survive a restart, progress output,
   skip and sync modes, export of Google Docs during recursive download, download resume.
-- Service accounts, proxy support, PKCE for the login.
 - Shell completions; a Windows build without the Visual C++ runtime.
 - Trash and untrash, real TSV and JSON output, listing all shared drives, Markdown export and import,
   short options.
