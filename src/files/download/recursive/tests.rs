@@ -449,6 +449,53 @@ async fn the_cleanup_removes_the_files_it_created_and_no_other_file_of_these_nam
 }
 
 #[tokio::test]
+async fn a_temporary_file_replaced_right_away_under_its_name_is_left_alone() {
+    // ext4 gives the inode of a removed file to the next file created, and Windows may give a
+    // file created under a name that was just removed the old one's identity: compared without an
+    // open handle, the new file passed for the job's own.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("x.bin");
+    for round in 0..200 {
+        let partial = PartialFiles::new(target.clone(), "X");
+        let (temp, file) = super::super::create_temp_file(&target, "X").await.unwrap();
+        drop(partial.track(file));
+        assert_eq!(temp.file_name().unwrap(), ".gdrive-X.part");
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, "someone else's").unwrap();
+
+        partial.remove().await;
+
+        assert_eq!(
+            std::fs::read_to_string(&temp).unwrap(),
+            "someone else's",
+            "round {round}"
+        );
+        std::fs::remove_file(&temp).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_kept_handle_lets_the_download_rename_its_temporary_file_into_place() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("x.bin");
+    let partial = PartialFiles::new(target.clone(), "X");
+    let (temp, file) = super::super::create_temp_file(&target, "X").await.unwrap();
+    let mut file = partial.track(file);
+    file.write_all(b"content").await.unwrap();
+    file.flush().await.unwrap();
+    drop(file);
+
+    // As `save_to_file` does, while the cleanup still holds the file open.
+    tokio::fs::rename(&temp, &target).await.unwrap();
+    partial.remove().await;
+
+    assert_eq!(entries(dir.path()), ["x.bin"]);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "content");
+}
+
+#[tokio::test]
 async fn documents_and_shortcuts_are_counted_as_skipped() {
     let files = vec![
         FakeFile::blob("x", "x.txt", "root", "x"),
