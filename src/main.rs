@@ -8,6 +8,7 @@ mod drives;
 mod files;
 mod hub;
 mod permissions;
+mod proxy;
 mod version;
 
 use std::{path::PathBuf, process::ExitCode};

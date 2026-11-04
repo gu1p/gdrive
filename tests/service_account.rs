@@ -17,6 +17,11 @@ use std::{
 #[path = "../src/auth/test_support.rs"]
 mod test_support;
 
+#[allow(dead_code, reason = "the SOCKS5 test proxy is not used here")]
+#[path = "../src/proxy/test_servers.rs"]
+mod test_servers;
+
+use test_servers::TestProxy;
 use test_support::{service_account_key_json, verified_jwt_claims, MockServer, TEST_CLIENT_EMAIL};
 
 const TOKEN_RESPONSE: &str =
@@ -303,4 +308,54 @@ async fn adc_without_any_credentials_is_a_clear_error() {
     );
     assert!(message.contains("\nHint: "), "{message}");
     assert!(!account_dir(home, "ci").exists());
+}
+
+#[tokio::test]
+async fn token_requests_go_through_the_proxy_and_bad_proxies_are_clean_errors() {
+    let server = MockServer::start(vec![(200, String::from(TOKEN_RESPONSE))]).await;
+    let proxy = TestProxy::connect(None).await;
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    std::fs::write(
+        home.join("key.json"),
+        service_account_key_json(&server.url("/token")),
+    )
+    .unwrap();
+
+    // The key's token_uri is http://127.0.0.1:PORT/token, so HTTP_PROXY applies.
+    let proxy_url = format!("http://robot:hunter2@{}", proxy.addr());
+    let added = gdrive_with_env(
+        home,
+        &["account", "add", "--service-account", "key.json"],
+        &[("HTTP_PROXY", &proxy_url)],
+    )
+    .await;
+    assert!(added.status.success(), "{}", stderr(&added));
+    let requests = proxy.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].target, server.addr().to_string());
+    assert_eq!(server.requests().len(), 1);
+    assert!(!stdout(&added).contains("hunter2") && !stderr(&added).contains("hunter2"));
+
+    // PR #141 panicked on every command with a socks proxy it did not know.
+    for (var, value) in [
+        ("ALL_PROXY", "socks4://robot:hunter2@127.0.0.1:1080"),
+        ("HTTPS_PROXY", "ftp://robot:hunter2@127.0.0.1:21"),
+        ("https_proxy", "http://robot:hunt er2@127.0.0.1:3128"),
+    ] {
+        let listed = gdrive_with_env(home, &["files", "list"], &[(var, value)]).await;
+        assert_eq!(listed.status.code(), Some(1), "{var}={value}");
+        let message = stderr(&listed);
+        assert!(message.starts_with("Error: "), "{message}");
+        assert!(
+            message.contains(&format!("the proxy in {var} ")),
+            "{message}"
+        );
+        assert!(!message.contains("panicked"), "{message}");
+        assert!(
+            !message.contains("hunter2") && !message.contains("hunt er2"),
+            "{message}"
+        );
+        assert_eq!(stdout(&listed), "");
+    }
 }
