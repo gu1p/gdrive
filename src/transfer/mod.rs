@@ -2,14 +2,17 @@
 //! trees.
 //!
 //! - [`walk`]: an incremental, breadth-first listing of a Drive folder subtree as a stream.
+//! - [`scheduler`]: bounded concurrent jobs with typed outcomes, one printer and a summary.
+//! - [`progress`]: the events a progress display receives from the scheduler.
 
-// The scheduler workstream consumes the whole walk API; until it lands, the recursive download
-// (`common::file_tree_drive`) uses only part of it and the rest is exercised by the tests.
-#![cfg_attr(
-    not(test),
-    allow(dead_code, reason = "the scheduler will use the rest of the walk API")
+// The recursive download and upload use the scheduler from the next commits on.
+#![allow(
+    dead_code,
+    reason = "the recursive download and upload are not wired to the scheduler yet"
 )]
 
 #[cfg(test)]
 pub(crate) mod fake_drive;
+pub(crate) mod progress;
+pub(crate) mod scheduler;
 pub(crate) mod walk;
