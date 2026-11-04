@@ -69,6 +69,8 @@ pub(super) struct Faults {
     pub(super) fail_multipart: bool,
     /// Store the first multipart upload but cut the body of its reply.
     pub(super) cut_multipart_reply: bool,
+    /// Store the first multipart upload, then close the connection without any reply.
+    pub(super) drop_multipart_reply: bool,
     /// Answer every session start with this status and JSON error (never goes away).
     pub(super) reject_start: Option<(u16, Value)>,
 }
@@ -143,6 +145,8 @@ pub(super) struct State {
     pub(super) accepted_chunks: u32,
     pub(super) generated_ids: u32,
     next_file: u32,
+    /// Close the connection instead of sending the reply the request got.
+    drop_reply: bool,
 }
 
 impl State {
@@ -214,6 +218,9 @@ impl State {
                 &json!({"kind": "drive#generatedIds", "space": "drive", "ids": [id]}),
             );
         }
+        if *method == Method::GET && path == "/drive/v3/files" {
+            return self.list(query);
+        }
         if *method == Method::GET {
             if let Some(id) = path.strip_prefix("/drive/v3/files/") {
                 return match self.files.get(id) {
@@ -247,6 +254,29 @@ impl State {
         }
 
         text(StatusCode::NOT_FOUND, "unknown path")
+    }
+
+    /// `files.list` for the one query the uploader makes: the file with an upload marker,
+    /// `appProperties has { key='gdriveUploadId' and value='<marker>' } and ...`.
+    fn list(&self, query: &str) -> Response<MockBody> {
+        let q = url::form_urlencoded::parse(query.as_bytes())
+            .find(|(key, _)| key == "q")
+            .map(|(_, value)| value.into_owned())
+            .unwrap_or_default();
+        let Some(marker) = q
+            .split_once("key='gdriveUploadId' and value='")
+            .and_then(|(_, rest)| rest.split_once('\''))
+            .map(|(marker, _)| marker)
+        else {
+            return text(StatusCode::BAD_REQUEST, "unsupported query");
+        };
+        let files: Vec<Value> = self
+            .files
+            .iter()
+            .filter(|(_, file)| file.metadata["appProperties"]["gdriveUploadId"] == marker)
+            .map(|(id, file)| self.resource(id, file))
+            .collect();
+        json_reply(StatusCode::OK, &json!({ "files": files }))
     }
 
     /// The id of a new file: its pre-generated one, or the next mock id.
@@ -337,6 +367,7 @@ impl State {
         };
         let resource = self.resource(&id, &file);
         self.files.insert(id, file);
+        self.drop_reply = std::mem::take(&mut self.faults.drop_multipart_reply);
         let cut = std::mem::take(&mut self.faults.cut_multipart_reply);
         file_reply(&resource, cut)
     }
@@ -750,6 +781,10 @@ async fn handle(
         &body,
         &format!("http://{addr}/"),
     );
+    if std::mem::take(&mut state.drop_reply) {
+        log(&mut state, body, None);
+        return Err(io::Error::other("reply dropped by the mock server"));
+    }
     log(&mut state, body, Some(response.status()));
     Ok(response)
 }

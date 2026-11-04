@@ -18,9 +18,11 @@
 //!   final reply is resolved the same way: the finished session answers with the file.
 //! - A 404 or 410 from the session means it expired: a new session starts from byte 0, at most
 //!   [`MAX_SESSIONS`] in all.
-//! - A new file gets its id from `files.generateIds` before the upload starts (Drive does not
-//!   take one for a conversion). With it, a create whose reply is lost is looked up instead of
-//!   repeated, and a repeated create fails with 409 instead of making a second file.
+//! - A new file gets its id from `files.generateIds` before the upload starts. With it, a create
+//!   whose outcome is unknown (no reply, a reply that broke off, a 5xx) is looked up instead of
+//!   repeated, and a repeated create fails with 409 instead of making a second file. Drive takes
+//!   no id for a conversion: it gets a random marker in its `appProperties`
+//!   ([`UPLOAD_MARKER`]) instead, which is searched for in the same cases.
 //! - The md5 of the content is computed while it is read, in order, and compared with the
 //!   `md5Checksum` Drive returns.
 //! - With [`UploadOptions::session_dir`], the session of a resumable upload is recorded there
@@ -38,7 +40,7 @@ mod tests;
 
 use std::{
     error::Error,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Display, Formatter, Write},
     io::{self, Read, Seek},
     path::{Path, PathBuf},
 };
@@ -90,6 +92,10 @@ pub(crate) const MAX_SESSIONS: u32 = 4;
 /// The fields of the file resource an upload returns, the ones `files upload` prints.
 pub(crate) const FILE_FIELDS: &str = "id,name,size,createdTime,modifiedTime,md5Checksum,\
     mimeType,parents,shared,description,webContentLink,webViewLink";
+
+/// The `appProperties` key of the marker a conversion is created with, to find the file when
+/// the outcome of its upload is unknown.
+pub(crate) const UPLOAD_MARKER: &str = "gdriveUploadId";
 
 /// The most of a final reply (the file resource) that is read.
 const MAX_REPLY_BODY: usize = 1 << 20;
@@ -274,6 +280,18 @@ impl Failure {
         }
     }
 
+    /// Whether the request may have done what it asked although it failed: it may have
+    /// reached Drive (anything but a connection that could not be made) and got no reply, a
+    /// reply that broke off, or a 5xx.
+    fn may_have_succeeded(&self) -> bool {
+        match self {
+            Failure::Transport(error) => !error.is_connect(),
+            Failure::Status { status, .. } => status.is_server_error(),
+            Failure::BodyRead(_) => true,
+            Failure::NoProgress => false,
+        }
+    }
+
     fn classify(&self) -> Decision {
         match self {
             Failure::Transport(error) => classify_transport(error),
@@ -349,9 +367,6 @@ pub(crate) enum UploadError {
     },
     /// A reply that does not follow the protocol.
     InvalidReply { step: Step, problem: &'static str },
-    /// The reply to a conversion broke off: the file may have been created, and repeating the
-    /// request could create a second one.
-    LostReply,
     /// The upload sessions kept expiring.
     SessionsExpired { sessions: u32 },
     /// Looking up whether the file had been created failed.
@@ -435,10 +450,6 @@ impl Display for UploadError {
             UploadError::InvalidReply { step, problem } => {
                 write!(f, "{step}: unexpected reply, {problem}")
             }
-            UploadError::LostReply => f.write_str(
-                "the reply to the upload broke off; the file may have been created, check \
-                 with `gdrive files list` before uploading it again",
-            ),
             UploadError::SessionsExpired { sessions } => {
                 write!(f, "the upload session expired {sessions} times, giving up")
             }
@@ -488,7 +499,6 @@ impl Error for UploadError {
             },
             UploadError::NotAFile(_)
             | UploadError::InvalidReply { .. }
-            | UploadError::LostReply
             | UploadError::SessionsExpired { .. }
             | UploadError::SourceChanged { .. }
             | UploadError::Md5Mismatch { .. } => None,
@@ -577,6 +587,8 @@ struct Upload<'a> {
     media_type: Mime,
     /// The id of a new file (pre-generated), or of the file an update replaces.
     file_id: Option<String>,
+    /// The marker of a conversion (`appProperties`), which has no pre-generated id.
+    marker: Option<String>,
     /// The md5 of the content read so far, unless md5 verification is off.
     hasher: Option<Md5Progress>,
     /// The most bytes the server held so far: only bytes past it are progress.
@@ -605,6 +617,8 @@ impl<'a> Upload<'a> {
             .clone()
             .filter(|_| target.convert_to.is_none());
         let file_id = target.existing_file_id.clone().or(new_file_id);
+        let marker = (target.convert_to.is_some() && target.existing_file_id.is_none())
+            .then(|| format!("{:016x}{:016x}", fastrand::u64(..), fastrand::u64(..)));
         Upload {
             hub,
             client: MediaClient::new(hub),
@@ -616,6 +630,7 @@ impl<'a> Upload<'a> {
             total,
             media_type,
             file_id,
+            marker,
             hasher: options.verify_md5.then(Md5Progress::new),
             high_water: 0,
             reported: None,
@@ -644,6 +659,7 @@ impl<'a> Upload<'a> {
             existing_file_id: self.target.existing_file_id.clone(),
             convert_to: self.target.convert_to.as_ref().map(ToString::to_string),
             file_id: self.file_id.clone(),
+            marker: self.marker.clone(),
         }
     }
 
@@ -668,6 +684,7 @@ impl<'a> Upload<'a> {
 
         if !self.is_update() {
             self.file_id.clone_from(&record.target.file_id);
+            self.marker.clone_from(&record.target.marker);
         }
         match self.query_status(&record.session_url).await {
             Ok(Status::Incomplete(offset)) => {
@@ -781,13 +798,6 @@ impl<'a> Upload<'a> {
         }
     }
 
-    /// Whether a request whose reply was lost may be sent again: a create with an id (a
-    /// repeat fails with 409 instead of creating a second file) or an update (a repeat is one
-    /// more revision of the same content).
-    fn replay_safe(&self) -> bool {
-        self.is_update() || self.created_id().is_some()
-    }
-
     /// Gets an id for a new file from Drive, unless it has one or is a conversion.
     async fn ensure_id(&mut self) -> Result<(), UploadError> {
         if self.file_id.is_some() || self.target.convert_to.is_some() {
@@ -813,6 +823,12 @@ impl<'a> Upload<'a> {
             metadata.insert("mimeType".into(), mime_type.as_ref().into());
             if !self.target.parents.is_empty() {
                 metadata.insert("parents".into(), self.target.parents.clone().into());
+            }
+            if let Some(marker) = &self.marker {
+                metadata.insert(
+                    "appProperties".into(),
+                    serde_json::json!({ UPLOAD_MARKER: marker }),
+                );
             }
         }
         serde_json::Value::Object(metadata).to_string()
@@ -1206,10 +1222,7 @@ impl<'a> Upload<'a> {
                 Outcome::Reply(response) if response.status().is_success() => {
                     match read_file(response.into_body()).await {
                         Ok(file) => return Ok(file),
-                        Err(ReplyError::Broken(error)) if self.replay_safe() => {
-                            Failure::BodyRead(error)
-                        }
-                        Err(ReplyError::Broken(_)) => return Err(UploadError::LostReply),
+                        Err(ReplyError::Broken(error)) => Failure::BodyRead(error),
                         Err(ReplyError::Invalid) => {
                             return Err(UploadError::InvalidReply {
                                 step: Step::Multipart,
@@ -1228,12 +1241,23 @@ impl<'a> Upload<'a> {
                 }
                 Outcome::Transport(error) => Failure::Transport(error),
             };
+            let unknown_outcome = failure.may_have_succeeded();
             self.backoff(Step::Multipart, failure).await?;
+            // The file may exist: send it again only if it does not.
+            if unknown_outcome {
+                if let Some(file) = self.reconcile().await? {
+                    return Ok(file);
+                }
+            }
         }
     }
 
-    /// The new file, if an earlier attempt created it: looked up by its pre-generated id.
+    /// The new file, if an earlier attempt created it: looked up by its pre-generated id, or
+    /// searched for by the marker of a conversion. `None` for an update.
     async fn reconcile(&self) -> Result<Option<google_drive3::api::File>, UploadError> {
+        if let Some(marker) = &self.marker {
+            return self.find_marked(marker).await;
+        }
         let Some(id) = self.created_id() else {
             return Ok(None);
         };
@@ -1261,6 +1285,39 @@ impl<'a> Upload<'a> {
             }
             Err(error) => Err(UploadError::Reconcile(Box::new(error))),
         }
+    }
+
+    /// The file created with `marker` in its `appProperties`, if there is one.
+    async fn find_marked(
+        &self,
+        marker: &str,
+    ) -> Result<Option<google_drive3::api::File>, UploadError> {
+        let mut query = format!(
+            "appProperties has {{ key='{UPLOAD_MARKER}' and value='{marker}' }} and trashed = false"
+        );
+        if let Some(parent) = self.target.parents.first() {
+            let _ = write!(query, " and '{}' in parents", parent.replace('\'', "\\'"));
+        }
+        let fields = format!("files({FILE_FIELDS})");
+        let (query, fields) = (query.as_str(), fields.as_str());
+        let hub = self.hub;
+        let (_, list) = retry_read(hub.retrier(), "files.list", |mut delegate| async move {
+            hub.files()
+                .list()
+                .q(query)
+                .param("fields", fields)
+                .corpora("allDrives")
+                .include_items_from_all_drives(true)
+                .supports_all_drives(true)
+                .page_size(10)
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .doit()
+                .await
+        })
+        .await
+        .map_err(|error| UploadError::Reconcile(Box::new(error)))?;
+        Ok(list.files.and_then(|files| files.into_iter().next()))
     }
 
     /// Compares Drive's md5 of `file` with the md5 of the local content. Files without one

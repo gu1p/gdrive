@@ -587,10 +587,42 @@ async fn a_lost_multipart_reply_is_resolved_by_the_pre_generated_id() {
         [
             (Method::GET, Some(StatusCode::OK)),
             (Method::POST, Some(StatusCode::OK)),
-            (Method::POST, Some(StatusCode::CONFLICT)),
             (Method::GET, Some(StatusCode::OK)),
         ],
-        "generateIds, the upload whose reply broke off, its repeat, the lookup"
+        "generateIds, the upload whose reply broke off, the lookup by id"
+    );
+}
+
+/// A create whose id exists already gets a 409: the file is looked up, not created again.
+#[tokio::test]
+async fn a_repeated_create_is_resolved_by_its_id() {
+    let fixture = fixture(1000);
+    let mock = MockDrive::start(Faults::default()).await;
+    let target = UploadTarget {
+        new_file_id: Some(String::from("earlier-id")),
+        ..target()
+    };
+    upload(&mock, &fixture, &target, &UploadOptions::default())
+        .await
+        .unwrap();
+
+    let file = upload(&mock, &fixture, &target, &UploadOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(file.id.as_deref(), Some("earlier-id"));
+    let state = mock.state();
+    assert_eq!(state.files.len(), 1);
+    let statuses: Vec<_> = state.log.iter().map(|request| request.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            Some(StatusCode::OK),
+            Some(StatusCode::CONFLICT),
+            Some(StatusCode::OK)
+        ],
+        "{}",
+        state.log_text()
     );
 }
 
@@ -657,8 +689,15 @@ async fn a_conversion_asks_for_the_google_type_and_sends_the_source_type() {
     assert_eq!(state.generated_ids, 0, "Drive takes no id for a conversion");
     let start = state.uploads()[0];
     assert_eq!(start.header("x-upload-content-type"), Some("text/markdown"));
+    let mut metadata = serde_json::from_slice::<serde_json::Value>(&start.body).unwrap();
+    let marker = metadata
+        .as_object_mut()
+        .unwrap()
+        .remove("appProperties")
+        .expect("a conversion is marked");
+    assert_eq!(marker[super::UPLOAD_MARKER].as_str().unwrap().len(), 32);
     assert_eq!(
-        serde_json::from_slice::<serde_json::Value>(&start.body).unwrap(),
+        metadata,
         json!({"name": "notes.md", "mimeType": MIME_TYPE_DRIVE_DOCUMENT})
     );
     for request in state.session_log() {
@@ -1145,4 +1184,116 @@ async fn failure_logs_come_from_the_held_guard() {
     );
     drop(state);
     assert_eq!(mock.log(), text);
+}
+
+fn conversion() -> UploadTarget {
+    UploadTarget {
+        parents: vec![String::from("folder-id")],
+        name: String::from("notes.md"),
+        mime: Some("text/markdown".parse().unwrap()),
+        convert_to: Some(MIME_TYPE_DRIVE_DOCUMENT.parse().unwrap()),
+        ..UploadTarget::default()
+    }
+}
+
+/// A conversion has no pre-generated id: when Drive created it but the whole reply was lost, the
+/// file is found by its marker instead of being uploaded a second time.
+#[tokio::test]
+async fn a_conversion_whose_reply_is_lost_is_found_by_its_marker() {
+    let fixture = fixture(1000);
+    let mock = MockDrive::start(Faults {
+        drop_multipart_reply: true,
+        ..Faults::default()
+    })
+    .await;
+
+    let file = upload(&mock, &fixture, &conversion(), &UploadOptions::default())
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", mock.log()));
+
+    let state = mock.state();
+    assert_eq!(
+        state.files.len(),
+        1,
+        "no second document\n{}",
+        state.log_text()
+    );
+    let (id, stored) = state.files.iter().next().unwrap();
+    assert_eq!(file.id.as_ref(), Some(id));
+    let requests: Vec<_> = state
+        .log
+        .iter()
+        .map(|request| {
+            (
+                request.method.clone(),
+                request.path.as_str(),
+                request.status,
+            )
+        })
+        .collect();
+    assert_eq!(
+        requests,
+        [
+            (Method::POST, "/upload/drive/v3/files", None),
+            (Method::GET, "/drive/v3/files", Some(StatusCode::OK)),
+        ],
+        "the upload whose reply was dropped, then the search"
+    );
+    let search = state.log[1].query_param("q").unwrap();
+    let marker = stored.metadata["appProperties"][super::UPLOAD_MARKER]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        search,
+        format!(
+            "appProperties has {{ key='gdriveUploadId' and value='{marker}' }} and trashed = \
+             false and 'folder-id' in parents"
+        )
+    );
+}
+
+/// When the search finds nothing, the request did not create the file: it is sent again.
+#[tokio::test]
+async fn a_failed_conversion_is_sent_again_when_no_file_has_its_marker() {
+    let fixture = fixture(1000);
+    let mock = MockDrive::start(Faults {
+        fail_multipart: true,
+        ..Faults::default()
+    })
+    .await;
+
+    upload(&mock, &fixture, &conversion(), &UploadOptions::default())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    assert_eq!(state.files.len(), 1);
+    assert_eq!(state.uploads().len(), 2, "{}", state.log_text());
+    assert!(state
+        .log
+        .iter()
+        .any(|request| request.path == "/drive/v3/files"));
+}
+
+/// A resumable conversion whose session expired is searched for before a new session starts.
+#[tokio::test]
+async fn an_expired_conversion_session_is_replaced_once_its_marker_is_not_found() {
+    let fixture = fixture(SIZE);
+    let mock = MockDrive::start(Faults {
+        expire_session_at: Some(CHUNK),
+        ..Faults::default()
+    })
+    .await;
+
+    upload(&mock, &fixture, &conversion(), &options())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    assert_eq!(state.sessions.len(), 2);
+    assert_eq!(state.files.len(), 1);
+    assert_eq!(
+        state.sessions[0].metadata["appProperties"], state.sessions[1].metadata["appProperties"],
+        "the same marker in both sessions"
+    );
 }

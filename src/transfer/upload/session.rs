@@ -96,18 +96,25 @@ pub(crate) struct RecordTarget {
     /// The id of the file the session creates (pre-generated) or updates. Not part of the
     /// record's name: a later run of the same upload has no id yet and takes this one.
     pub(crate) file_id: Option<String>,
+    /// The marker a conversion is created with (`appProperties`); like the id, a later run
+    /// takes it over.
+    #[serde(default)]
+    pub(crate) marker: Option<String>,
 }
 
 impl RecordTarget {
-    /// Whether `self` and `other` are the same upload, whatever their file ids.
-    fn same_upload(&self, other: &RecordTarget) -> bool {
+    /// The upload without what a later run takes over from the record.
+    fn key(&self) -> RecordTarget {
         RecordTarget {
             file_id: None,
+            marker: None,
             ..self.clone()
-        } == RecordTarget {
-            file_id: None,
-            ..other.clone()
         }
+    }
+
+    /// Whether `self` and `other` are the same upload, whatever their file ids and markers.
+    fn same_upload(&self, other: &RecordTarget) -> bool {
+        self.key() == other.key()
     }
 }
 
@@ -206,10 +213,7 @@ impl RecordFile {
     /// The record of the upload of `source` to `target` in `dir`.
     #[must_use]
     pub(crate) fn new(dir: &Path, source: &SourceIdentity, target: &RecordTarget) -> Self {
-        let key = RecordTarget {
-            file_id: None,
-            ..target.clone()
-        };
+        let key = target.key();
         let mut hashed = source.path.as_os_str().as_encoded_bytes().to_vec();
         hashed.push(0);
         hashed.extend_from_slice(serde_json::to_string(&key).unwrap_or_default().as_bytes());
@@ -328,6 +332,7 @@ mod tests {
             existing_file_id: None,
             convert_to: None,
             file_id: Some(String::from("id-1")),
+            marker: None,
         }
     }
 

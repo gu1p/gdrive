@@ -304,8 +304,15 @@ mod tests {
             initiation.header("x-upload-content-type"),
             Some("text/markdown")
         );
+        let mut metadata = initiation.body_json();
+        let marker = metadata
+            .as_object_mut()
+            .unwrap()
+            .remove("appProperties")
+            .expect("an import is marked, to find it if its reply is lost");
+        assert!(marker["gdriveUploadId"].is_string(), "{marker}");
         assert_eq!(
-            initiation.body_json(),
+            metadata,
             serde_json::json!({"name": "notes.md", "mimeType": MIME_TYPE_DRIVE_DOCUMENT})
         );
 

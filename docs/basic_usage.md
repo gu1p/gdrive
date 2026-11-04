@@ -226,8 +226,9 @@ are sent, so a larger chunk size does not take more memory.
 - After the upload, gdrive compares the MD5 checksum Drive reports with the local file. If they differ,
   for example because the file changed during the upload, the command fails and names the uploaded file's
   id.
-- A new file, except an import, gets its id before the upload starts, so a reply that is lost at the very
-  end does not make a second copy: gdrive looks the file up instead.
+- A new file gets its id before the upload starts, so a reply that is lost at the very end does not make
+  a second copy: gdrive looks the file up instead. Drive takes no id for an import; it is marked with a
+  private app property (`gdriveUploadId`) and searched for by it.
 
 ## Update a file
 
