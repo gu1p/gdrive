@@ -15,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
 use yup_oauth2::storage::{TokenInfo, TokenStorage, TokenStorageError};
@@ -159,15 +160,14 @@ async fn replace_file<W>(path: &Path, content: &[u8], write: W) -> io::Result<()
 where
     W: AsyncFnOnce(&mut File, &[u8]) -> io::Result<()>,
 {
-    let temp_path = temp_path_for(path);
-    let result = async {
-        let mut file = open_new_file(&temp_path).await?;
-        write(&mut file, content).await?;
-        // Closed before the rename, which Windows refuses for an open file.
-        drop(file);
-        tokio::fs::rename(&temp_path, path).await
-    }
-    .await;
+    let (temp_path, mut file) = create_temp_file(path).await?;
+    let written = write(&mut file, content).await;
+    // Closed before the rename, which Windows refuses for an open file.
+    drop(file);
+    let result = match written {
+        Ok(()) => tokio::fs::rename(&temp_path, path).await,
+        Err(error) => Err(error),
+    };
     if result.is_err() {
         let _ = tokio::fs::remove_file(&temp_path).await;
     }
@@ -199,18 +199,52 @@ fn same_scopes(stored: &[String], requested: &[&str]) -> bool {
             .all(|stored| requested.iter().any(|requested| stored == requested))
 }
 
-fn temp_path_for(path: &Path) -> PathBuf {
-    let mut name = path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    name.push(format!(".{}.tmp", std::process::id()));
-    path.with_file_name(name)
+/// How many random names `create_temp_file` tries before it gives up.
+const TEMP_FILE_ATTEMPTS: usize = 8;
+
+/// Creates a new temporary file next to `path`, named `<file name>.<random>.tmp`.
+///
+/// The file is created exclusively (`create_new`): an existing file is never opened and a
+/// symlink is never followed. With a random name, two gdrive processes that share the config
+/// directory never write into the same file, even when they have the same PID (PID 1 in two
+/// containers). A name that exists already is skipped.
+async fn create_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
+    let random = SystemRandom::new();
+    let suffixes = std::iter::repeat_with(|| {
+        let mut bytes = [0; 8];
+        random
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("unable to get random bytes from the system"))?;
+        Ok(format!("{:016x}", u64::from_le_bytes(bytes)))
+    });
+    create_temp_file_named(path, suffixes).await
+}
+
+async fn create_temp_file_named(
+    path: &Path,
+    suffixes: impl Iterator<Item = io::Result<String>>,
+) -> io::Result<(PathBuf, File)> {
+    let mut clash = None;
+    for suffix in suffixes.take(TEMP_FILE_ATTEMPTS) {
+        let mut name = path
+            .file_name()
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_default();
+        name.push(format!(".{}.tmp", suffix?));
+        let temp_path = path.with_file_name(name);
+
+        match open_new_file(&temp_path).await {
+            Ok(file) => return Ok((temp_path, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => clash = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(clash.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
 }
 
 async fn open_new_file(path: &Path) -> io::Result<File> {
     let mut options = tokio::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
+    options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
     options.open(path).await
@@ -507,6 +541,73 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
 
         assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["tokens.json"]);
+    }
+
+    #[tokio::test]
+    async fn temp_files_never_reuse_an_existing_name_or_follow_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| Ok(name.to_string()))
+                .collect::<Vec<_>>()
+                .into_iter()
+        };
+
+        // Another process's temporary file.
+        let other = dir.path().join("tokens.json.aaaa.tmp");
+        tokio::fs::write(&other, "other process").await.unwrap();
+        // A symlink planted where a temporary file would go.
+        let victim = dir.path().join("victim");
+        tokio::fs::write(&victim, "victim").await.unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&victim, dir.path().join("tokens.json.bbbb.tmp")).unwrap();
+
+        let (temp_path, mut file) = create_temp_file_named(&path, names(&["aaaa", "bbbb", "cccc"]))
+            .await
+            .unwrap();
+        file.write_all(b"mine").await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let expected = if cfg!(unix) { "cccc" } else { "bbbb" };
+        assert_eq!(
+            temp_path,
+            dir.path().join(format!("tokens.json.{expected}.tmp"))
+        );
+        assert_eq!(tokio::fs::read(&other).await.unwrap(), b"other process");
+        assert_eq!(tokio::fs::read(&victim).await.unwrap(), b"victim");
+
+        let error = create_temp_file_named(&path, names(&["aaaa"]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn concurrent_saves_do_not_mix_their_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let files: Vec<_> = (0..16)
+            .map(|i| {
+                let access = format!("access-{i}-{}", "x".repeat(4096));
+                file(&[(&DRIVE_SCOPES, token(&access, Some("r"), Duration::hours(1)))])
+            })
+            .collect();
+
+        let results = futures::future::join_all(files.iter().map(|file| file.save(&path))).await;
+        for result in results {
+            result.unwrap();
+        }
+
+        let saved = TokenFile::load(&path).await.unwrap().unwrap();
+        assert!(files.contains(&saved));
         let names: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|entry| entry.unwrap().file_name())
