@@ -150,7 +150,7 @@ where
     }
 }
 
-type GetTokenOutput<'a> = Pin<
+pub(super) type GetTokenOutput<'a> = Pin<
     Box<
         dyn Future<Output = Result<Option<String>, Box<dyn error::Error + Send + Sync>>>
             + Send
@@ -246,6 +246,7 @@ mod tests {
         let json = serde_json::to_string(&[TokenEntry {
             scopes: DRIVE_SCOPES.map(str::to_owned).to_vec(),
             token,
+            credential: None,
         }])
         .unwrap();
         tokio::fs::write(&path, json).await.unwrap();

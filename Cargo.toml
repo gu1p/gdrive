@@ -25,7 +25,9 @@ http-body-util = "0.1.5"
 httpdate = "1.0.2"
 hyper = "1.5.2"
 hyper-rustls = { version = "0.27.9", default-features = false, features = ["http1"] }
-hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+# client-proxy: the HTTP(S)_PROXY / ALL_PROXY / NO_PROXY matcher and the SOCKS5 connector (adds
+# ipnet, for NO_PROXY address ranges).
+hyper-util = { version = "0.1.20", features = ["client", "client-legacy", "client-proxy", "http1", "http2", "tokio"] }
 md5 = "0.7.0"
 mime = "0.3.16"
 mime_guess = "2.0.4"
@@ -40,14 +42,18 @@ tar = "0.4.38"
 tempfile = "3.3.0"
 time = "0.3.7"
 tokio = { version = "1.23.0", features = ["full"] }
+# The `Service` trait of hyper's connectors, for the proxy connector (already a dependency of
+# hyper-util).
+tower-service = "0.3"
 unicode-normalization = "0.1.24"
 url = "2.5"
-yup-oauth2 = { version = "12.1.2", default-features = false }
+# service-account: ServiceAccountAuthenticator (JWT signed with ring) for `account add
+# --service-account` and Application Default Credentials. The other default features stay off.
+yup-oauth2 = { version = "12.1.2", default-features = false, features = ["service-account", "ring"] }
 
 [dev-dependencies]
 # The mock Google upload server in tests/ needs hyper's server side.
 hyper = { version = "1.5.2", features = ["server", "http1"] }
-tower-service = "0.3"
 # Paused clock for the retry and throttle tests.
 tokio = { version = "1.23.0", features = ["test-util"] }
 

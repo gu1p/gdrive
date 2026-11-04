@@ -142,6 +142,10 @@ impl MockServer {
         }
     }
 
+    pub(crate) fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
     /// A hub whose requests all go to this server, without credentials.
     pub(crate) fn hub(&self) -> Hub {
         Hub::for_mock_server(&format!("http://{}/", self.addr)).expect("create mock hub")

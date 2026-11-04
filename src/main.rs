@@ -8,6 +8,7 @@ mod drives;
 mod files;
 mod hub;
 mod permissions;
+mod proxy;
 mod transfer;
 mod version;
 
@@ -79,9 +80,17 @@ enum AccountCommand {
     /// Asks for the Client ID and Client Secret, then for your approval in a browser. By default
     /// gdrive receives the browser's redirect on port 8085 of localhost (see --port); on a remote
     /// or headless machine use --manual.
+    ///
+    /// With --service-account, adds a service account from its JSON key file instead, and with
+    /// --adc an account that uses Application Default Credentials; nothing is asked then. See
+    /// `docs/service_accounts.md`.
+    #[command(group(clap::ArgGroup::new("no_login").args(["service_account", "adc"])))]
     Add {
         #[command(flatten)]
         login: LoginArgs,
+
+        #[command(flatten)]
+        service: ServiceAccountArgs,
     },
 
     /// Authorize an existing account again
@@ -127,6 +136,40 @@ enum AccountCommand {
         /// Path to archive
         file_path: PathBuf,
     },
+}
+
+/// The accounts `account add` adds without a login.
+#[derive(clap::Args)]
+struct ServiceAccountArgs {
+    /// Add a service account from its JSON key file
+    ///
+    /// gdrive gets a token with the key to check it, then stores the key in the account's
+    /// directory. Service accounts have no Drive storage of their own: they work in shared drives
+    /// they are a member of and on files shared with them, or, with --subject, as a Google
+    /// Workspace user.
+    #[arg(long, value_name = "KEY_JSON", conflicts_with_all = ["manual", "port"])]
+    service_account: Option<PathBuf>,
+
+    /// Act for this Google Workspace user (domain-wide delegation, set up by an administrator)
+    #[arg(
+        long,
+        value_name = "EMAIL",
+        requires = "service_account",
+        conflicts_with = "adc"
+    )]
+    subject: Option<String>,
+
+    /// Use Application Default Credentials
+    ///
+    /// The service account key named by `GOOGLE_APPLICATION_CREDENTIALS`, the user credentials of
+    /// `gcloud auth application-default login`, or the metadata server of Google Cloud. gdrive
+    /// stores none of them and looks them up again on every run.
+    #[arg(long, conflicts_with_all = ["manual", "port"])]
+    adc: bool,
+
+    /// Name of the new account [default: the `client_email` of the key, or "adc"]
+    #[arg(long, value_name = "NAME", requires = "no_login")]
+    name: Option<String>,
 }
 
 /// How the login of `account add` and `account reauth` gets the authorization.
@@ -501,7 +544,12 @@ enum PermissionCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
-        eprintln!("{}", error_message(err.as_ref()));
+        let mut message = error_message(err.as_ref());
+        if let Some(hint) = common::hub_helper::account_hint(err.as_ref()) {
+            message.push('\n');
+            message.push_str(&hint);
+        }
+        eprintln!("{message}");
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -513,17 +561,23 @@ async fn main() -> ExitCode {
 /// the user which command to run next end the innermost message, on lines of their own.
 ///
 /// When the account has to be authorized again, only that error is printed: it names the command
-/// to run, and the layers around it add nothing.
+/// to run, and the layers around it add nothing. A message that the one before it contains already
+/// is left out: hyper's and yup-oauth2's errors put the message of their source into their own.
 fn error_message(err: &(dyn std::error::Error + 'static)) -> String {
     if let Some(reauth) = auth::find_reauth_required(err) {
         return format!("Error: {reauth}");
     }
 
-    let mut message = format!("Error: {}", err.to_string().trim_end());
+    let mut previous = err.to_string().trim_end().to_owned();
+    let mut message = format!("Error: {previous}");
     let mut source = err.source();
     while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(cause.to_string().trim_end());
+        let text = cause.to_string().trim_end().to_owned();
+        if !previous.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        previous = text;
         source = cause.source();
     }
     message
@@ -860,12 +914,23 @@ async fn handle_account_command(
     command: AccountCommand,
 ) -> Result<(), Box<dyn std::error::Error + 'static>> {
     match command {
-        AccountCommand::Add { login } => {
-            account::add(&account::add::Config {
-                mode: login.mode(),
-                port: login.port,
-            })
-            .await?;
+        AccountCommand::Add { login, service } => {
+            if service.adc {
+                account::add_adc(service.name).await?;
+            } else if let Some(key_path) = service.service_account {
+                account::add_service_account(&account::add_service::ServiceAccountConfig {
+                    key_path,
+                    subject: service.subject,
+                    name: service.name,
+                })
+                .await?;
+            } else {
+                account::add(&account::add::Config {
+                    mode: login.mode(),
+                    port: login.port,
+                })
+                .await?;
+            }
         }
 
         AccountCommand::List => {
@@ -942,6 +1007,43 @@ mod error_message_tests {
     }
 
     #[test]
+    fn error_message_leaves_out_messages_that_were_shown_already() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|layer| layer as _)
+            }
+        }
+        let layer = |text, inner| Some(Box::new(Layer(text, inner)));
+
+        // As yup-oauth2 and hyper's client nest a connection error.
+        let err = Layer(
+            "unable to refresh the access token",
+            layer(
+                "Connection failure: Hyper error: client error (Connect)",
+                layer(
+                    "Hyper error: client error (Connect)",
+                    layer(
+                        "client error (Connect)",
+                        layer("tcp connect error", layer("Connection refused", None)),
+                    ),
+                ),
+            ),
+        );
+        assert_eq!(
+            error_message(&err),
+            "Error: unable to refresh the access token: Connection failure: Hyper error: client \
+             error (Connect): tcp connect error: Connection refused"
+        );
+    }
+
+    #[test]
     fn error_message_trims_trailing_newlines_of_messages() {
         let err = google_drive3::Error::Cancelled;
 
@@ -990,7 +1092,10 @@ mod error_message_tests {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{parse_positive_usize, Cli, Command, DriveCommand, FileCommand, PermissionCommand};
+    use super::{
+        parse_positive_usize, AccountCommand, Cli, Command, DriveCommand, FileCommand,
+        PermissionCommand,
+    };
     use crate::files::list::ListQuery;
 
     #[test]
@@ -1069,6 +1174,76 @@ mod tests {
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once(&"gdrive").chain(args))
+    }
+
+    #[test]
+    fn account_add_takes_a_service_account_key_with_subject_and_name() {
+        let cli = parse(&[
+            "account",
+            "add",
+            "--service-account",
+            "key.json",
+            "--subject",
+            "user@example.com",
+            "--name",
+            "robot",
+        ])
+        .expect("arguments should parse");
+        let Command::Account {
+            command: AccountCommand::Add { login, service },
+        } = cli.command
+        else {
+            panic!("expected account add");
+        };
+        assert_eq!(
+            service.service_account.as_deref(),
+            Some(std::path::Path::new("key.json"))
+        );
+        assert_eq!(service.subject.as_deref(), Some("user@example.com"));
+        assert_eq!(service.name.as_deref(), Some("robot"));
+        assert!(!login.manual);
+
+        let cli = parse(&["account", "add", "--adc", "--name", "ci"]).expect("--adc --name");
+        let Command::Account {
+            command: AccountCommand::Add { service, .. },
+        } = cli.command
+        else {
+            panic!("expected account add");
+        };
+        assert!(service.adc);
+        assert_eq!(service.name.as_deref(), Some("ci"));
+
+        // The OAuth login still parses as before.
+        assert!(parse(&["account", "add"]).is_ok());
+        assert!(parse(&["account", "add", "--manual", "--port", "9000"]).is_ok());
+    }
+
+    #[test]
+    fn service_account_flags_do_not_mix_with_the_oauth_login() {
+        for args in [
+            &["account", "add", "--subject", "user@example.com"][..],
+            &["account", "add", "--name", "robot"],
+            &[
+                "account",
+                "add",
+                "--service-account",
+                "key.json",
+                "--manual",
+            ],
+            &[
+                "account",
+                "add",
+                "--service-account",
+                "key.json",
+                "--port",
+                "9000",
+            ],
+            &["account", "add", "--service-account", "key.json", "--adc"],
+            &["account", "add", "--adc", "--subject", "user@example.com"],
+            &["account", "add", "--adc", "--manual"],
+        ] {
+            assert!(parse(args).is_err(), "{args:?} should not parse");
+        }
     }
 
     fn files_list_flags(args: &[&str]) -> (String, bool, bool) {

@@ -354,9 +354,11 @@ pub(crate) enum LoadAccountWithSecret {
 impl Display for LoadAccountWithSecret {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LoadAccountWithSecret::InvalidName(name) => {
-                write!(f, "'{name}' is not a valid account name")
-            }
+            LoadAccountWithSecret::InvalidName(name) => write!(
+                f,
+                "'{name}' is not a valid account name: {}",
+                super::account_type::ACCOUNT_NAME_RULES
+            ),
             LoadAccountWithSecret::DefaultBasePath(_) => {
                 f.write_str("unable to get default base path")
             }

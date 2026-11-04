@@ -8,7 +8,7 @@ use yup_oauth2::storage::TokenInfo;
 
 use crate::{
     account::add::{authorized_email, token_hub},
-    app_config::{self, AppConfig},
+    app_config::{self, account_type::AccountType, AppConfig},
     auth::{self, login, store::TokenFile},
     hub::Hub,
 };
@@ -39,6 +39,14 @@ pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
         }
     };
 
+    if let Some(account_type) = non_user_account_type(&account_name) {
+        return Err(Error::NoLogin {
+            account: account_name,
+            account_type,
+        }
+        .into());
+    }
+
     // Only secret.json is needed: an account whose tokens.json is missing (which list_accounts
     // skips) is exactly one that needs a new authorization.
     let (app_cfg, secret) =
@@ -60,6 +68,15 @@ pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
     println!("Authorized account '{account_name}' again");
 
     Ok(())
+}
+
+/// The type of the account `account_name`, if it exists and does not log in with an OAuth client.
+fn non_user_account_type(account_name: &str) -> Option<AccountType> {
+    let base_path = AppConfig::default_base_path().ok()?;
+    let account_type = AppConfig::named_account_in(base_path, account_name)?
+        .account_type()
+        .ok()?;
+    (account_type != AccountType::User).then_some(account_type)
 }
 
 /// Replaces the tokens of `app_cfg` with `token`, after checking with `hub` (authorized by
@@ -108,9 +125,18 @@ pub(crate) enum Error {
     Login(login::LoginError),
     HubCreation(io::Error),
     About(Box<google_drive3::Error>),
-    OtherGoogleAccount { account: String, authorized: String },
-    UnknownGoogleAccount { account: String },
+    OtherGoogleAccount {
+        account: String,
+        authorized: String,
+    },
+    UnknownGoogleAccount {
+        account: String,
+    },
     SaveTokens(io::Error),
+    NoLogin {
+        account: String,
+        account_type: AccountType,
+    },
 }
 
 impl error::Error for Error {
@@ -123,7 +149,9 @@ impl error::Error for Error {
             Error::Login(source) => source.source(),
             Error::HubCreation(source) | Error::SaveTokens(source) => Some(source),
             Error::About(source) => Some(source),
-            Error::OtherGoogleAccount { .. } | Error::UnknownGoogleAccount { .. } => None,
+            Error::OtherGoogleAccount { .. }
+            | Error::UnknownGoogleAccount { .. }
+            | Error::NoLogin { .. } => None,
         }
     }
 }
@@ -154,6 +182,26 @@ impl Display for Error {
                  again, or add the account with 'gdrive account add'"
             ),
             Error::SaveTokens(_) => f.write_str("unable to save the new tokens"),
+            Error::NoLogin {
+                account,
+                account_type: AccountType::ServiceAccount { .. },
+            } => write!(
+                f,
+                "account '{account}' is a service account, which needs no authorization\n\
+                 To use a new key, run `gdrive account add --service-account KEY_JSON --name \
+                 {account}`."
+            ),
+            Error::NoLogin {
+                account,
+                account_type: AccountType::ApplicationDefaultCredentials,
+            } => write!(
+                f,
+                "account '{account}' uses Application Default Credentials, which gdrive looks \
+                 up on every run; there is nothing to authorize again"
+            ),
+            Error::NoLogin { account, .. } => {
+                write!(f, "account '{account}' does not log in with an OAuth client")
+            }
         }
     }
 }

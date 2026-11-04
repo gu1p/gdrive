@@ -26,6 +26,10 @@ gdrive account import <ARCHIVE_PATH>
 The account name is the email address of the Google account. `account remove` only deletes the files on
 your machine. To revoke gdrive's access, remove your app at <https://myaccount.google.com/permissions>.
 
+For CI and servers, gdrive 4.0.0 also takes a service account key (`gdrive account add --service-account
+KEY_JSON`) or Application Default Credentials (`gdrive account add --adc`); see
+[Service accounts](service_accounts.md).
+
 ## Find file and folder ids
 
 Most commands take a file id or a folder id. An id is a string such as
@@ -141,9 +145,10 @@ for them.
 
 A download that breaks off (a dropped connection, an HTTP/2 `GOAWAY`) continues where it stopped, with a
 `Warning:` line on stderr, but only if the file did not change on Drive meanwhile; a changed file is
-downloaded again from the start (with `--stdout`, the command fails instead). The file is checked against its MD5 checksum, or its size when Drive has no
-checksum, before it gets its final name; until then it is a hidden `.gdrive-<id>.part` file next to it,
-removed again if the download fails. Resuming works within one run of gdrive, not across runs.
+downloaded again from the start (with `--stdout`, the command fails instead). The file is checked against
+its MD5 checksum, or its size when Drive has no checksum, before it gets its final name; until then it is a
+hidden `.gdrive-<id>.part` file next to it, removed again if the download fails. Resuming works within one
+run of gdrive, not across runs.
 
 All commands retry rate limits (`429`, `403 rateLimitExceeded`), timeouts and server errors (`500`, `502`,
 `503`, `504`) with growing, randomized waits, and honor `Retry-After`. They give up after 10 attempts or 10
