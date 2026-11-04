@@ -5,10 +5,12 @@
 //! - [`scheduler`]: bounded concurrent jobs with typed outcomes, one printer and a summary.
 //! - [`progress`]: the events a progress display receives from the scheduler.
 //! - [`upload`]: gdrive's own uploader, resumable sessions and multipart requests.
+//! - [`relay`]: copies a file of one account into another account, streaming.
 
 #[cfg(test)]
 pub(crate) mod fake_drive;
 pub(crate) mod progress;
+pub(crate) mod relay;
 pub(crate) mod scheduler;
 pub(crate) mod upload;
 pub(crate) mod walk;
