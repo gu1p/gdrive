@@ -46,7 +46,7 @@ impl Display for Unsupported {
             Unsupported::NativeType(mime) => {
                 write!(
                     f,
-                    "Google Workspace files of type {mime} cannot be exported"
+                    "Google Workspace files of type {mime} cannot be migrated"
                 )
             }
         }
@@ -60,8 +60,10 @@ pub(crate) const EXPORT_LIMIT: u64 = 10 * 1024 * 1024;
 const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
 
 /// The Workspace type of a MIME type that is exported, and the format it is exported to.
+/// A Drawing exports only to images and PDF, which Drive does not convert back to a Drawing.
 fn export_format(mime: &str) -> Option<(DocType, &'static Mime)> {
-    let doc_type = DocType::from_mime_type(mime)?;
+    let doc_type =
+        DocType::from_mime_type(mime).filter(|&doc_type| doc_type != DocType::Drawing)?;
     let format = ExportFormats::DEFAULT.format(doc_type)?;
     Some((doc_type, format.get_export_mime()))
 }
