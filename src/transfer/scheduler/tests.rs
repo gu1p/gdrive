@@ -2,7 +2,7 @@
 //! fast and their timing is exact.
 
 use std::{
-    io::{self, Write},
+    io,
     num::NonZeroUsize,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -15,48 +15,10 @@ use futures::{future, stream, Stream, StreamExt};
 use tokio::{sync::Semaphore, time::sleep};
 
 use super::{
-    Counts, Job, JobKind, JobOutput, Options, Outcome, Printer, Report, Scheduler, SkipReason,
-    Subtree,
+    capture::output, Counts, Job, JobKind, JobOutput, Options, Outcome, Printer, Report, Scheduler,
+    SkipReason, Subtree,
 };
 use crate::transfer::progress::{JobId, ProgressEvent, ProgressSink};
-
-/// A `Write` into a shared buffer.
-#[derive(Clone, Default)]
-struct Captured(Arc<Mutex<Vec<u8>>>);
-
-impl Captured {
-    fn lines(&self) -> Vec<String> {
-        String::from_utf8(self.0.lock().unwrap().clone())
-            .unwrap()
-            .lines()
-            .map(String::from)
-            .collect()
-    }
-}
-
-impl Write for Captured {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-struct Output {
-    printer: Printer,
-    out: Captured,
-    err: Captured,
-}
-
-fn output() -> Output {
-    let out = Captured::default();
-    let err = Captured::default();
-    let printer = Printer::to(out.clone(), err.clone());
-    Output { printer, out, err }
-}
 
 fn options(jobs: usize, continue_on_error: bool) -> Options {
     Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error)

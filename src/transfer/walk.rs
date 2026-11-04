@@ -245,6 +245,13 @@ pub(crate) struct FolderKey(u64);
 impl FolderKey {
     /// The key of the walk's root folder.
     pub(crate) const ROOT: FolderKey = FolderKey(0);
+
+    /// Key number `key`, for tests that build walk items by hand.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_tests(key: u64) -> Self {
+        FolderKey(key)
+    }
 }
 
 /// What a listed Drive file is.
@@ -301,6 +308,13 @@ pub(crate) struct WalkEntry {
     /// 2 KB, most of it fields the mask leaves empty.
     pub(crate) file: Box<File>,
     /// `components.len()`: 1 for a child of the root.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the recursive download orders by listing, not by depth"
+        )
+    )]
     pub(crate) depth: usize,
     pub(crate) kind: EntryKind,
     /// The folder location whose listing returned this file.

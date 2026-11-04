@@ -1,11 +1,14 @@
-//! A fake Drive `files.list` endpoint for walk tests.
+//! A fake Drive `files.list` endpoint for walk tests, with media downloads for the recursive
+//! download.
 //!
 //! Unlike `common::mock_server`, which answers requests in order with canned responses, this
 //! server holds a set of files and answers every query from them, so it works however many
 //! requests are in flight and in whatever order they arrive. It understands the queries the walk
 //! sends: `'<id>' in parents` terms joined by `or`, and `trashed = false`. It also records every
 //! request and the most requests it had in flight at once. `files.get` of a stored file returns
-//! the fields its `fields` mask names, so a test can check what a metadata request asks for.
+//! the fields its `fields` mask names, so a test can check what a metadata request asks for;
+//! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
+//! the other requests.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,11 +22,12 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::Full;
+use futures::{stream, StreamExt};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::{body::Incoming, service::service_fn, Method, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Map, Value};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 
 use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 
@@ -44,6 +48,8 @@ pub(crate) struct FakeFile {
     pub(crate) shortcut_target: Option<(String, String)>,
     pub(crate) target_resource_key: Option<String>,
     pub(crate) resource_key: Option<String>,
+    /// What a media download of a blob returns.
+    pub(crate) content: Option<String>,
 }
 
 impl FakeFile {
@@ -66,6 +72,7 @@ impl FakeFile {
             parents: vec![parent.to_owned()],
             size: Some(content.len() as u64),
             md5: Some(format!("{:x}", md5::compute(content))),
+            content: Some(content.to_owned()),
             ..Self::default()
         }
     }
@@ -194,6 +201,14 @@ pub(crate) struct Behavior {
     pub(crate) unavailable_first: HashMap<String, usize>,
     /// The `Retry-After` (seconds) of those 503 replies.
     pub(crate) unavailable_retry_after: Option<u64>,
+    /// How long every media download takes before its reply.
+    pub(crate) media_delay: Duration,
+    /// Media downloads of these file ids fail with 404, after the given time instead of
+    /// `media_delay`.
+    pub(crate) media_missing: HashMap<String, Duration>,
+    /// Media downloads of these file ids send half of the content and then nothing more, like
+    /// a transfer that is still running.
+    pub(crate) media_stalled: HashSet<String>,
 }
 
 /// A list request as the fake saw it, with percent-decoded parameters.
@@ -225,6 +240,14 @@ struct State {
     unavailable_left: Mutex<HashMap<String, usize>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    /// The file ids of media downloads.
+    media: Mutex<Vec<String>>,
+    media_in_flight: AtomicUsize,
+    media_max_in_flight: AtomicUsize,
+    /// When the first media download arrived.
+    first_media: Mutex<Option<Instant>>,
+    /// When the last list reply was sent.
+    last_list: Mutex<Option<Instant>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -247,6 +270,11 @@ impl FakeDrive {
             gets: Mutex::new(Vec::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            media: Mutex::new(Vec::new()),
+            media_in_flight: AtomicUsize::new(0),
+            media_max_in_flight: AtomicUsize::new(0),
+            first_media: Mutex::new(None),
+            last_list: Mutex::new(None),
         });
 
         let server_state = Arc::clone(&state);
@@ -287,6 +315,24 @@ impl FakeDrive {
     pub(crate) fn max_in_flight(&self) -> usize {
         self.state.max_in_flight.load(Ordering::SeqCst)
     }
+
+    /// The file ids of the media downloads, in arrival order.
+    pub(crate) fn media(&self) -> Vec<String> {
+        self.state.media.lock().expect("media lock").clone()
+    }
+
+    /// The most media downloads that were being answered at the same time.
+    pub(crate) fn media_max_in_flight(&self) -> usize {
+        self.state.media_max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// When the first media download arrived and when the last list reply was sent.
+    pub(crate) fn first_media_and_last_list(&self) -> (Option<Instant>, Option<Instant>) {
+        (
+            *self.state.first_media.lock().expect("first media lock"),
+            *self.state.last_list.lock().expect("last list lock"),
+        )
+    }
 }
 
 impl Drop for FakeDrive {
@@ -296,29 +342,31 @@ impl Drop for FakeDrive {
 }
 
 /// Counts a request as in flight until dropped, also when the client goes away.
-struct InFlight<'a>(&'a State);
+struct InFlight<'a> {
+    now: &'a AtomicUsize,
+}
 
 impl<'a> InFlight<'a> {
-    fn new(state: &'a State) -> Self {
-        let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        state.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        Self(state)
+    fn new(now: &'a AtomicUsize, max: &AtomicUsize) -> Self {
+        let count = now.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(count, Ordering::SeqCst);
+        Self { now }
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.now.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-type FakeResponse = hyper::Response<Full<Bytes>>;
+type FakeResponse = hyper::Response<BoxBody<Bytes, Infallible>>;
 
 async fn handle(
     state: Arc<State>,
     request: hyper::Request<Incoming>,
 ) -> Result<FakeResponse, Infallible> {
-    let _in_flight = InFlight::new(&state);
+    let _in_flight = InFlight::new(&state.in_flight, &state.max_in_flight);
 
     let params = request
         .uri()
@@ -338,6 +386,12 @@ async fn handle(
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
+        if params
+            .iter()
+            .any(|(key, value)| key == "alt" && value == "media")
+        {
+            return Ok(media(&state, id).await);
+        }
         state.gets.lock().expect("gets lock").push(id.to_owned());
         return Ok(get(&state, id, &params));
     }
@@ -367,7 +421,51 @@ async fn handle(
 
     tokio::time::sleep(state.behavior.delay).await;
 
-    Ok(list(&state, &list_request, &q))
+    let response = list(&state, &list_request, &q);
+    *state.last_list.lock().expect("last list lock") = Some(Instant::now());
+    Ok(response)
+}
+
+/// `files.get?alt=media`: the content of a blob.
+async fn media(state: &State, id: &str) -> FakeResponse {
+    let _media = InFlight::new(&state.media_in_flight, &state.media_max_in_flight);
+    state.media.lock().expect("media lock").push(id.to_owned());
+    state
+        .first_media
+        .lock()
+        .expect("first media lock")
+        .get_or_insert_with(Instant::now);
+
+    let behavior = &state.behavior;
+    if let Some(delay) = behavior.media_missing.get(id) {
+        tokio::time::sleep(*delay).await;
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    }
+    tokio::time::sleep(behavior.media_delay).await;
+    let content = state
+        .files
+        .iter()
+        .find(|file| file.id == id)
+        .and_then(|file| file.content.clone());
+    let Some(content) = content else {
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    };
+
+    let length = content.len();
+    let body = if behavior.media_stalled.contains(id) {
+        let half = Bytes::from(content).slice(..length / 2);
+        let frames = stream::iter([Ok::<_, Infallible>(hyper::body::Frame::data(half))])
+            .chain(stream::pending());
+        BodyExt::boxed(StreamBody::new(frames))
+    } else {
+        Full::new(Bytes::from(content)).boxed()
+    };
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", length)
+        .body(body)
+        .expect("valid response")
 }
 
 fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
@@ -547,7 +645,7 @@ fn json_response(status: StatusCode, body: &Value) -> FakeResponse {
     hyper::Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
         .expect("valid response")
 }
 

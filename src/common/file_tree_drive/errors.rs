@@ -2,9 +2,10 @@ use std::{
     error::Error,
     fmt::{self, Display},
     num::TryFromIntError,
+    path::PathBuf,
 };
 
-use crate::{common::local_name::UnusableName, files};
+use crate::common::local_name::UnusableName;
 
 #[derive(Debug)]
 pub(crate) struct FileTreeDrive(pub(crate) Folder);
@@ -18,6 +19,25 @@ impl Display for FileTreeDrive {
 impl Error for FileTreeDrive {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         Some(&self.0)
+    }
+}
+
+/// A child of a folder that cannot be downloaded, with the local path of the folder.
+#[derive(Debug)]
+pub(crate) struct InFolder {
+    pub(crate) folder: PathBuf,
+    pub(crate) source: Folder,
+}
+
+impl Display for InFolder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "in folder '{}'", self.folder.display())
+    }
+}
+
+impl Error for InFolder {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -82,7 +102,6 @@ pub(crate) enum Folder {
     MissingFileName,
     NotDirectory,
     MissingFileId,
-    ListFiles(files::list::Error),
     File {
         identifier: FileIdentifier,
         source: File,
@@ -98,7 +117,6 @@ impl Display for Folder {
             Folder::MissingFileName => f.write_str("file name is missing"),
             Folder::NotDirectory => f.write_str("file is not a directory"),
             Folder::MissingFileId => f.write_str("file id is missing"),
-            Folder::ListFiles(_) => f.write_str("unable to list directory files"),
             Folder::File {
                 identifier,
                 source: _,
@@ -120,7 +138,6 @@ impl Error for Folder {
             | Folder::NotDirectory
             | Folder::MissingFileId
             | Folder::Cycle(_) => None,
-            Folder::ListFiles(error) => Some(error),
             Folder::File { source, .. } => Some(source),
             Folder::UnusableName(source) => Some(source),
         }

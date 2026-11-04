@@ -42,6 +42,8 @@
 //!   the order it receives them, so parallel jobs never interleave their lines.
 
 #[cfg(test)]
+pub(crate) mod capture;
+#[cfg(test)]
 mod tests;
 
 use std::{
@@ -71,7 +73,7 @@ use crate::common::human_size::human_size;
 pub(crate) type JobError = Box<dyn Error + Send + Sync + 'static>;
 
 /// What a job does, which decides the limit it counts against.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum JobKind {
     /// Transfers a file's content: limited by [`Options::jobs`]. Counted as a file.
     Media,
@@ -218,6 +220,13 @@ impl Job {
     }
 
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the recursive upload uses it from the next commit on"
+        )
+    )]
     pub(crate) fn with_subtree(mut self, subtree: Subtree) -> Job {
         self.subtree = subtree;
         self
