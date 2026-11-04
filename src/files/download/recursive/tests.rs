@@ -1086,3 +1086,45 @@ async fn an_unchanged_export_is_not_exported_again() {
         "2024-05-06T07:08:10Z"
     );
 }
+
+#[tokio::test]
+async fn an_edit_in_the_same_second_as_the_last_export_is_exported_again() {
+    let document = |modified: &str| {
+        vec![
+            FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, modified)
+                .modified(modified),
+        ]
+    };
+    let destination = tempfile::tempdir().unwrap();
+    let report = local(destination.path(), "Root/report.docx");
+    let overwrite = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..exporting(destination.path(), "default", false)
+    };
+
+    let first = FakeDrive::start(document("2024-05-06T07:08:09.123Z"), Behavior::default()).await;
+    download(&first, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    let modified = std::fs::metadata(&report).unwrap().modified().unwrap();
+    assert_eq!(
+        chrono::DateTime::<chrono::Utc>::from(modified),
+        chrono::DateTime::parse_from_rfc3339("2024-05-06T07:08:09.123Z").unwrap(),
+        "the export has the document's time to the millisecond"
+    );
+
+    let edited = FakeDrive::start(document("2024-05-06T07:08:09.456Z"), Behavior::default()).await;
+    let again = download(&edited, &overwrite, future::pending()).await;
+
+    again.result.unwrap();
+    assert_eq!(edited.exports().len(), 1, "exported again");
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "2024-05-06T07:08:09.456Z"
+    );
+    assert_eq!(
+        again.err.lines().last().unwrap(),
+        "Summary: 1 transferred (24 B), 0 unchanged, 0 skipped, 0 failed, 0 cancelled"
+    );
+}

@@ -231,11 +231,14 @@ Overrides apply on top of the profile, `default` when the spec starts with an ov
   `notes.md`). The name is made safe and unique in its folder like any other name, so a document `report`
   and a file `report.docx` in the same Drive folder do not overwrite each other: one of them gets a
   `~<8 hex digits>` suffix, with a `Warning:` line that says which.
-- **Modification time.** An exported file gets the document's last modification time on Drive. A local
-  file at the export's path with exactly that time (to the second) is up to date: the next run counts it
-  as unchanged and does not export it again, with or without `--overwrite`. Any other existing file there
-  fails without `--overwrite` and is replaced with it, as for other files. Files with content keep the
-  time of the download, as before.
+- **Modification time.** An exported file gets the document's last modification time on Drive, to the
+  millisecond. A local file at the export's path with exactly that time is up to date: the next run counts
+  it as unchanged and does not export it again, with or without `--overwrite`. The check compares only
+  that time, not the content; any edit of the document, also within the same second, changes it, and so
+  does a local edit of the file. On filesystems that keep coarser times (FAT, exFAT, HFS+) the times never
+  match and every run exports again. Any other existing file at the export's path fails without
+  `--overwrite` and is replaced with it, as for other files. Files with content keep the time of the
+  download, as before.
 - **Size limit.** Google exports at most 10 MB per file. A larger export fails with an error that says so
   (`the exported file would be larger than the 10 MB that the Drive API exports`); try another format, or
   download that file from drive.google.com. Like any failed file, it stops the download unless

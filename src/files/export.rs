@@ -195,11 +195,20 @@ impl error::Error for ExportTooLarge {
 }
 
 /// Whether the local file at `path` is an unchanged export of a document last modified at
-/// `modified_time` (Drive's `modifiedTime`): a regular file whose modification time is
-/// `modified_time`, to the second. gdrive gives every export that time, and an edit of the
-/// document changes `modifiedTime`. Compared to the second so that filesystems that keep
-/// coarser times than Drive's milliseconds (exFAT, HFS+) still match; on FAT, with two-second
-/// times, half the exports are simply exported again. `false` without `modified_time`.
+/// `modified_time` (Drive's `modifiedTime`), for `files download --recursive --export`: a
+/// regular file whose modification time is exactly `modified_time`.
+///
+/// The check rests on the modification time alone. gdrive gives every export the document's
+/// `modifiedTime` with its full precision ([`set_modified_time`]), and every edit of the document
+/// changes `modifiedTime`, also one in the same second. What that implies:
+/// - The times must be equal to the nanosecond. A filesystem that keeps coarser times than
+///   Drive's milliseconds (FAT, exFAT, HFS+) never matches, so there every run exports again:
+///   the safe side.
+/// - The content is not compared. A local edit changes the local time, so the file no longer
+///   counts as unchanged; only a file given back exactly the document's time would be kept.
+/// - The format is not compared either: it is part of the local name (the extension), so
+///   another format is another file.
+/// - Without `modified_time`, nothing is unchanged.
 pub(crate) async fn is_unchanged_export(path: &Path, modified_time: Option<DateTime<Utc>>) -> bool {
     let Some(modified_time) = modified_time else {
         return false;
@@ -208,14 +217,16 @@ pub(crate) async fn is_unchanged_export(path: &Path, modified_time: Option<DateT
         return false;
     };
     metadata.is_file()
-        && metadata.modified().is_ok_and(|local| {
-            DateTime::<Utc>::from(local).timestamp() == modified_time.timestamp()
-        })
+        && metadata
+            .modified()
+            .is_ok_and(|local| DateTime::<Utc>::from(local) == modified_time)
 }
 
-/// Sets the modification time of the file at `path` to `time`, the Drive file's `modifiedTime`.
+/// Sets the modification time of the file at `path` to `time`, the Drive file's `modifiedTime`,
+/// with all of its precision (Drive gives milliseconds; the filesystem may keep less).
 pub(crate) async fn set_modified_time(path: &Path, time: DateTime<Utc>) -> io::Result<()> {
     let path = path.to_owned();
+    // Seconds and nanoseconds: nothing of `time` is lost.
     let time = SystemTime::from(time);
     // As tokio::fs does: the blocking calls on the blocking pool. Windows needs write access to
     // change the time.
@@ -529,6 +540,27 @@ mod tests {
         crate::files::download::assert_content(&path, "fresh");
         assert_eq!(server.requests().len(), 2);
         assert_eq!(mtime_millis(&path), 1_714_979_289_123);
+    }
+
+    #[tokio::test]
+    async fn unchanged_means_the_exact_time_of_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.docx");
+        std::fs::write(&path, "exported").unwrap();
+        let time = |time: &str| Some(chrono::DateTime::parse_from_rfc3339(time).unwrap().to_utc());
+        super::set_modified_time(&path, time("2024-05-06T07:08:09.123Z").unwrap())
+            .await
+            .unwrap();
+
+        assert!(super::is_unchanged_export(&path, time("2024-05-06T07:08:09.123Z")).await);
+        // An edit in the same second is a change.
+        assert!(!super::is_unchanged_export(&path, time("2024-05-06T07:08:09.456Z")).await);
+        assert!(!super::is_unchanged_export(&path, time("2024-05-06T07:08:09Z")).await);
+        assert!(!super::is_unchanged_export(&path, None).await);
+        assert!(
+            !super::is_unchanged_export(dir.path(), time("2024-05-06T07:08:09.123Z")).await,
+            "a directory is not an export"
+        );
     }
 
     #[test]
