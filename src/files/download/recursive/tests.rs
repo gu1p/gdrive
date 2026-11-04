@@ -139,7 +139,8 @@ async fn three_levels_download_with_at_most_jobs_transfers_at_once() {
     let files = three_levels();
     let behavior = Behavior {
         delay: Duration::from_millis(10),
-        media_delay: Duration::from_millis(40),
+        // The first three downloads wait for each other: all three are in flight at once.
+        media_rendezvous: 3,
         ..Behavior::default()
     };
     let server = FakeDrive::start(files.clone(), behavior).await;
@@ -201,7 +202,9 @@ async fn three_levels_download_with_at_most_jobs_transfers_at_once() {
 #[tokio::test]
 async fn downloads_start_while_the_folder_is_still_being_listed() {
     let behavior = Behavior {
-        delay: Duration::from_millis(150),
+        // The listing of a1 waits for a download: it ends only if downloads start before the
+        // walk is done (else after a timeout, too late for the check below).
+        list_after_media: HashSet::from([String::from("a1")]),
         ..Behavior::default()
     };
     let server = FakeDrive::start(three_levels(), behavior).await;

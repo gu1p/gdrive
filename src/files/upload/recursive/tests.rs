@@ -151,8 +151,9 @@ fn shown(path: &str) -> String {
 async fn folders_exist_before_their_contents_and_uploads_are_bounded() {
     let (_dir, root) = local_tree();
     let behavior = Behavior {
-        // Long enough that two uploads overlap also on a busy machine.
-        upload_delay: Duration::from_millis(150),
+        // The first two uploads wait for each other, so both are in flight at once however slow
+        // the machine is.
+        upload_rendezvous: 2,
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
@@ -509,7 +510,9 @@ fn chunked() -> UploadOptions {
 async fn concurrent_multi_chunk_uploads_retry_a_failed_chunk() {
     let (_dir, root, files) = big_tree();
     let behavior = Behavior {
-        chunk_delay: Duration::from_millis(20),
+        // The first chunks of the first two sessions wait for each other: both sessions are open
+        // at once.
+        upload_rendezvous: 2,
         chunk_unavailable: std::collections::HashMap::from([(String::from("b.bin"), 262_144)]),
         ..Behavior::default()
     };
@@ -571,7 +574,9 @@ async fn concurrent_multi_chunk_uploads_retry_a_failed_chunk() {
 async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
     let (_dir, root, _files) = big_tree();
     let behavior = Behavior {
-        chunk_delay: Duration::from_millis(50),
+        // Every upload gets its first chunk on Drive and then hangs on the second, so no file
+        // can be completed before Ctrl-C, however slow the machine is.
+        chunks_stalled_from: Some(256 * 1024),
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
