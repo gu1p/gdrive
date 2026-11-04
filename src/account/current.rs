@@ -38,8 +38,8 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let s = match self {
             Error::List(_) => "unable to list available accounts",
-            Error::LoadCurrent(_) => "unable to load the current accont",
-            Error::NoAccounts => "no accounts found; use `gdrive account add` to add an account",
+            Error::LoadCurrent(_) => "unable to load the current account",
+            Error::NoAccounts => "no accounts found\nUse `gdrive account add` to add an account.",
         };
 
         f.write_str(s)

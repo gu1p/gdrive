@@ -5,7 +5,6 @@ mod media_tests;
 use std::path::{Path, PathBuf};
 
 use async_recursion::async_recursion;
-use bytesize::ByteSize;
 use error_trace::ErrorTrace;
 use futures::stream::StreamExt;
 use google_apis_common::Body;
@@ -13,7 +12,7 @@ use http_body_util::BodyExt;
 use md5::Digest;
 use tokio::{
     fs::{self, File},
-    io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
 };
 
 use crate::{
@@ -21,6 +20,7 @@ use crate::{
         drive_file,
         file_tree_drive::{self, errors::FileIdentifier, FileTreeDrive},
         hub_helper::get_hub,
+        human_size::human_size,
         local_name::{self, NameChange, UnusableName},
         md5_writer::Md5Writer,
         parse_md5_digest, FileTreeLike, FolderLike,
@@ -179,7 +179,7 @@ async fn download_directory(
         "Found {} files in {} directories with a total size of {}",
         tree_info.file_count,
         tree_info.folder_count,
-        ByteSize::b(tree_info.total_file_size).display().si(),
+        human_size(tree_info.total_file_size),
     );
 
     let root_path = config.canonical_destination_root()?;
@@ -223,7 +223,7 @@ async fn download_directory(
         "Downloaded {} files in {} directories with a total size of {}",
         tree_info.file_count,
         tree_info.folder_count,
-        ByteSize::b(tree_info.total_file_size).display().si()
+        human_size(tree_info.total_file_size)
     );
 
     Ok(())
@@ -262,9 +262,24 @@ pub(crate) async fn save_body_to_file(
     file_id: &str,
     expected_md5: Option<&Digest>,
 ) -> Result<(), errors::SaveBodyToFile> {
+    save_body_through(body, file_path, file_id, expected_md5, |file| file).await
+}
+
+/// [`save_body_to_file`] writing through `writer(temporary file)`; tests use it to inject write
+/// errors.
+async fn save_body_through<W>(
+    body: Body,
+    file_path: &Path,
+    file_id: &str,
+    expected_md5: Option<&Digest>,
+    writer: impl FnOnce(File) -> W,
+) -> Result<(), errors::SaveBodyToFile>
+where
+    W: AsyncWrite + Unpin,
+{
     let (tmp_file_path, file) = create_temp_file(file_path, file_id).await?;
 
-    let result = write_temp_file(body, file, &tmp_file_path, file_path, expected_md5).await;
+    let result = write_temp_file(body, writer(file), &tmp_file_path, file_path, expected_md5).await;
     if result.is_err() {
         remove_temp_file(&tmp_file_path).await;
     }
@@ -345,14 +360,22 @@ async fn remove_temp_file(path: &Path) {
     }
 }
 
-/// Streams `body` into the temporary file, checks the md5 and renames the file to `file_path`.
-async fn write_temp_file(
+/// Streams `body` into the temporary file, flushes and closes it, checks the md5 and renames the
+/// file to `file_path`.
+///
+/// The flush comes before the digest is taken: `tokio::fs::File` reports the error of a write only
+/// on the next write or flush, so without it a failure on the last chunk (a full disk, for
+/// example) would be lost and the incomplete file renamed as if it were complete.
+async fn write_temp_file<W>(
     body: Body,
-    file: File,
+    file: W,
     tmp_file_path: &Path,
     file_path: &Path,
     expected_md5: Option<&Digest>,
-) -> Result<(), errors::SaveBodyToFile> {
+) -> Result<(), errors::SaveBodyToFile>
+where
+    W: AsyncWrite + Unpin,
+{
     use errors::SaveBodyToFile as E;
 
     // Wrap file in writer that calculates md5
@@ -368,8 +391,12 @@ async fn write_temp_file(
         }
     }
 
-    // Check md5
+    writer.flush().await.map_err(E::Flush)?;
+
+    // Taking the digest closes the file, before it is renamed
     let md5_digest = writer.md5();
+
+    // Check md5
     if let Some(expected_md5) = expected_md5 {
         if *expected_md5 != md5_digest {
             return Err(E::Md5Mismatch {
@@ -400,6 +427,12 @@ async fn save_body_to_stdout(body: Body) -> Result<(), errors::SaveBodyToStdout>
                 .map_err(errors::SaveBodyToStdout::WriteChunk)?;
         }
     }
+
+    // Like a file, stdout reports the error of the last write only on flush
+    stdout
+        .flush()
+        .await
+        .map_err(errors::SaveBodyToStdout::WriteChunk)?;
 
     Ok(())
 }
@@ -519,15 +552,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        pin::Pin,
+        task::{Context, Poll},
+    };
 
     use bytes::Bytes;
     use google_apis_common::Body;
     use http_body_util::{BodyExt, Full};
 
     use super::{
-        create_temp_file, err_if_file_exists, err_if_local_file_exists, errors, save_body_to_file,
-        write_temp_file, Config, Destination, ExistingFileAction,
+        create_temp_file, err_if_file_exists, err_if_local_file_exists, errors, save_body_through,
+        save_body_to_file, write_temp_file, Config, Destination, ExistingFileAction,
     };
     use crate::common::{
         drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT},
@@ -923,5 +960,68 @@ mod tests {
         assert_eq!(std::fs::read(target.join("keep.txt")).unwrap(), b"keep");
         assert_eq!(dir_entries(dir.path()), ["a.bin"]);
         assert_eq!(dir_entries(&target), ["keep.txt"]);
+    }
+
+    /// Accepts every write, as `tokio::fs::File` does while the write runs in the background, and
+    /// reports the failure of that write on flush.
+    struct FailsOnFlush;
+
+    impl tokio::io::AsyncWrite for FailsOnFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Err(std::io::Error::other("no space left on device")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn write_error_reported_on_flush_fails_and_removes_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.bin");
+        std::fs::write(&target, b"old").unwrap();
+
+        let result =
+            save_body_through(body(b"new"), &target, "id-a", None, |_file| FailsOnFlush).await;
+
+        assert!(
+            matches!(result, Err(errors::SaveBodyToFile::Flush(_))),
+            "{result:?}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"old");
+        assert_eq!(dir_entries(dir.path()), ["a.bin"]);
+    }
+
+    /// The same with a real `tokio::fs::File`: every write to /dev/full fails with ENOSPC, but
+    /// tokio only reports it on the next write or flush.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn full_disk_on_the_last_chunk_fails_and_removes_temp_file() {
+        let Ok(full) = tokio::fs::File::options()
+            .write(true)
+            .open("/dev/full")
+            .await
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("a.bin");
+
+        let result = save_body_through(body(b"new"), &target, "id-a", None, |_file| full).await;
+
+        assert!(
+            matches!(result, Err(errors::SaveBodyToFile::Flush(_))),
+            "{result:?}"
+        );
+        assert_eq!(dir_entries(dir.path()), Vec::<String>::new());
     }
 }

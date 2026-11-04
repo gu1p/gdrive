@@ -9,7 +9,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::auth::store::TokenFile;
+use crate::{auth::store::TokenFile, common::json_error::RedactedJsonError};
 
 const SYSTEM_CONFIG_DIR_NAME: &str = ".config";
 const BASE_PATH_DIR_NAME: &str = "gdrive3";
@@ -223,9 +223,9 @@ impl AppConfig {
         };
         match serde_json::from_str(&content) {
             Ok(secret) => Ok(secret),
-            Err(source) => Err(errors::LoadSecret::Deserialize {
+            Err(error) => Err(errors::LoadSecret::Deserialize {
                 path: path.to_path_buf(),
-                source,
+                error: RedactedJsonError::from(&error),
             }),
         }
     }
@@ -428,17 +428,40 @@ mod tests {
         assert!(matches!(error, E::IncompleteSecret(_)), "{error:?}");
     }
 
+    const SECRET: &str = "GOCSPX-not-a-real-secret";
+
+    fn load_secret_from(content: &str) -> Result<Secret, errors::LoadSecret> {
+        let base_path = tempfile::tempdir().unwrap();
+        let config = AppConfig::new(base_path.path().to_path_buf(), Account::new("account"));
+        fs::create_dir_all(config.account_base_path()).unwrap();
+        fs::write(config.secret_path(), content).unwrap();
+        config.load_secret()
+    }
+
     #[test]
-    fn invalid_secret_json_is_reported_without_its_content() {
-        use error_trace::ErrorTrace;
+    fn malformed_secret_file_errors_do_not_print_the_secret() {
+        let contents = [
+            // serde_json quotes the string: invalid type: string "...", expected struct Secret
+            format!(r#""{SECRET}""#),
+            // ... and the number: invalid type: integer `...`, expected a string
+            r#"{"client_id": "id", "client_secret": 4815162342}"#.to_owned(),
+            format!(r#"{{"client_id": "id", "client_secret": "{SECRET}""#),
+            format!(r#"{{"client_id": "id", "client_secret": "{SECRET}"}} trailing"#),
+        ];
 
-        let dir = tempfile::tempdir().unwrap();
-        let config = AppConfig::new(dir.path().to_path_buf(), Account::new("me"));
-        config.create_account_dir().unwrap();
-        fs::write(config.secret_path(), r#"{"client_secret":"s3cr3t"}"#).unwrap();
+        for content in contents {
+            let err = crate::common::hub_helper::GetHubError::LoadSecret(
+                load_secret_from(&content).unwrap_err(),
+            );
+            let message = crate::error_message(&err);
 
-        let error = config.load_secret().unwrap_err();
-        assert!(matches!(error, errors::LoadSecret::Deserialize { .. }));
-        assert!(!error.trace().to_string().contains("s3cr3t"));
+            assert!(
+                message.contains("is not a valid client credentials file ("),
+                "{message}"
+            );
+            assert!(message.contains(" at line 1 column "), "{message}");
+            assert!(!message.contains(SECRET), "{message}");
+            assert!(!message.contains("4815162342"), "{message}");
+        }
     }
 }

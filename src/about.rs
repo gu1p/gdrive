@@ -5,7 +5,7 @@ pub(crate) fn about() {
         "For the latest information check out the project page: https://github.com/glotlabs/gdrive"
     );
     println!(
-        "You will also find link to the community chat and information on how to support the\
+        "You will also find link to the community chat and information on how to support the \
         project."
     );
 }

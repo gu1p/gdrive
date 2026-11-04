@@ -132,12 +132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
-name = "bytesize"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a3c8f83209414aacf0eeae3cf730b18d6981697fba62f200fcfb92b9f082acba"
-
-[[package]]
 name = "cc"
 version = "1.2.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -530,13 +524,12 @@ dependencies = [
 
 [[package]]
 name = "gdrive"
-version = "3.9.1"
+version = "4.0.0-alpha.1"
 dependencies = [
  "async-recursion",
  "async-trait",
  "base64",
  "bytes",
- "bytesize",
  "chrono",
  "clap",
  "clap_complete",
@@ -547,6 +540,7 @@ dependencies = [
  "google-drive3",
  "home",
  "http-body-util",
+ "human_bytes",
  "hyper",
  "hyper-rustls",
  "hyper-util",
@@ -584,8 +578,6 @@ dependencies = [
 [[package]]
 name = "google-apis-common"
 version = "8.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "020dd415ee200770d835d01674084400a4d11e6c108ae941f660e8264f49d4ca"
 dependencies = [
  "base64",
  "chrono",
@@ -719,6 +711,12 @@ name = "httpdate"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4a1e36c821dbe04574f602848a19f742f4fb3c98d40449f11bcad18d6b17421"
+
+[[package]]
+name = "human_bytes"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91f255a4535024abf7640cb288260811fc14794f62b063652ed349f9a6c2348e"
 
 [[package]]
 name = "hyper"

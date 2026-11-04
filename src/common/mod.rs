@@ -8,7 +8,9 @@ pub(crate) mod file_tree;
 pub(crate) mod file_tree_drive;
 pub(crate) mod file_tree_like;
 pub(crate) mod hub_helper;
+pub(crate) mod human_size;
 pub(crate) mod id_gen;
+pub(crate) mod json_error;
 pub(crate) mod local_name;
 pub(crate) mod md5_writer;
 #[cfg(test)]

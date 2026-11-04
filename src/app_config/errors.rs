@@ -5,6 +5,8 @@ use std::{
     path::PathBuf,
 };
 
+use crate::common::json_error::RedactedJsonError;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DefaultBasePath;
 
@@ -205,7 +207,11 @@ impl Display for LoadAccountConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LoadAccountConfig::DefaultBasePath(_) => f.write_str("unable to get default base path"),
-            LoadAccountConfig::AccountConfigMissing => f.write_str("account config is missing"),
+            LoadAccountConfig::AccountConfigMissing => f.write_str(
+                "no account has been selected\n\
+                 Use `gdrive account list` to show all accounts.\n\
+                 Use `gdrive account switch` to select an account.",
+            ),
             LoadAccountConfig::ReadAccountConfig { path, source: _ } => {
                 write!(f, "cannot read config from path '{}'", path.display())
             }
@@ -304,10 +310,11 @@ pub(crate) enum LoadSecret {
         path: PathBuf,
         source: io::Error,
     },
-    /// secret.json is not valid. Holds the path, never the content: it has the client secret.
+    /// secret.json is not valid. Holds neither the content nor the `serde_json` error, which can
+    /// quote it: the file has the client secret.
     Deserialize {
         path: PathBuf,
-        source: serde_json::Error,
+        error: RedactedJsonError,
     },
 }
 
@@ -317,13 +324,11 @@ impl Display for LoadSecret {
             LoadSecret::Read { path, source: _ } => {
                 write!(f, "unable to read the content of file '{}'", path.display())
             }
-            LoadSecret::Deserialize { path, source: _ } => {
-                write!(
-                    f,
-                    "'{}' is not a valid client credentials file",
-                    path.display()
-                )
-            }
+            LoadSecret::Deserialize { path, error } => write!(
+                f,
+                "'{}' is not a valid client credentials file ({error})",
+                path.display()
+            ),
         }
     }
 }
@@ -332,7 +337,7 @@ impl Error for LoadSecret {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             LoadSecret::Read { source, .. } => Some(source),
-            LoadSecret::Deserialize { source, .. } => Some(source),
+            LoadSecret::Deserialize { .. } => None,
         }
     }
 }

@@ -14,7 +14,6 @@ use std::{path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
 use common::{delegate::ChunkSize, permission};
-use error_trace::ErrorTrace;
 use files::list::{ListQuery, ListSortOrder};
 use mime::Mime;
 
@@ -501,15 +500,32 @@ enum PermissionCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
-        if let Some(reauth) = auth::find_reauth_required(err.as_ref()) {
-            eprintln!("Error: {reauth}");
-        } else {
-            eprintln!("{}", err.trace());
-        }
+        eprintln!("{}", error_message(err.as_ref()));
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// The message printed for a failed command, in the format of gdrive 3.x: `Error: ` and the
+/// message of the error, followed by the messages of its sources separated by `: `. Hints that tell
+/// the user which command to run next end the innermost message, on lines of their own.
+///
+/// When the account has to be authorized again, only that error is printed: it names the command
+/// to run, and the layers around it add nothing.
+fn error_message(err: &(dyn std::error::Error + 'static)) -> String {
+    if let Some(reauth) = auth::find_reauth_required(err) {
+        return format!("Error: {reauth}");
+    }
+
+    let mut message = format!("Error: {}", err.to_string().trim_end());
+    let mut source = err.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(cause.to_string().trim_end());
+        source = cause.source();
+    }
+    message
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error + 'static>> {
@@ -898,6 +914,74 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
     match s.parse::<usize>() {
         Ok(n) if n > 0 => Ok(n),
         _ => Err(String::from("expected a positive integer")),
+    }
+}
+
+#[cfg(test)]
+mod error_message_tests {
+    use super::*;
+    use crate::{
+        app_config::errors::{LoadAccountConfig, LoadCurrentAccount},
+        common::hub_helper::GetHubError,
+    };
+
+    #[test]
+    fn error_message_starts_with_error_and_ends_with_the_hint() {
+        let err = GetHubError::LoadCurrentAccount(LoadCurrentAccount::LoadAccountConfig(
+            LoadAccountConfig::AccountConfigMissing,
+        ));
+
+        assert_eq!(
+            error_message(&err),
+            "Error: unable to load current account: unable to load account config: \
+             no account has been selected\n\
+             Use `gdrive account list` to show all accounts.\n\
+             Use `gdrive account switch` to select an account."
+        );
+    }
+
+    #[test]
+    fn error_message_trims_trailing_newlines_of_messages() {
+        let err = google_drive3::Error::Cancelled;
+
+        assert_eq!(
+            error_message(&err),
+            "Error: Operation cancelled by delegate"
+        );
+    }
+
+    #[test]
+    fn account_errors_keep_the_hints_of_gdrive_3() {
+        assert_eq!(
+            error_message(&account::list::Error::NoAccounts),
+            "Error: no accounts found\nUse `gdrive account add` to add an account."
+        );
+        assert_eq!(
+            error_message(&account::current::Error::NoAccounts),
+            "Error: no accounts found\nUse `gdrive account add` to add an account."
+        );
+        assert_eq!(
+            error_message(&account::switch::Error::AccountNotFound(String::from(
+                "foo"
+            ))),
+            "Error: account 'foo' not found"
+        );
+    }
+
+    #[test]
+    fn error_message_prints_only_the_reauth_error_when_there_is_one() {
+        let reauth = auth::ReauthRequired {
+            account: String::from("me@example.com"),
+            reason: auth::ReauthReason::NoStoredToken,
+        };
+        let expected = format!("Error: {reauth}");
+        let err = google_drive3::Error::MissingToken(Box::new(reauth));
+
+        assert_eq!(error_message(&err), expected);
+        assert!(
+            expected.contains("gdrive account reauth me@example.com"),
+            "{expected}"
+        );
     }
 }
 

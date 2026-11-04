@@ -3,7 +3,6 @@ use std::{
     fmt::{self, Display, Formatter},
 };
 
-use bytesize::ByteSize;
 use chrono::{
     self,
     format::{DelayedFormat, StrftimeItems},
@@ -11,7 +10,10 @@ use chrono::{
 };
 
 use crate::{
-    common::hub_helper::{get_hub, GetHubError},
+    common::{
+        hub_helper::{get_hub, GetHubError},
+        human_size::human_size,
+    },
     files::FileResult,
     hub::Hub,
 };
@@ -145,7 +147,7 @@ impl Display for DisplayBytes<'_> {
         if config.size_in_bytes {
             write!(f, "{bytes}")
         } else {
-            write!(f, "{}", ByteSize::b(bytes).display().si())
+            f.write_str(&human_size(bytes))
         }
     }
 }
