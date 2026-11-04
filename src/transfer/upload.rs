@@ -109,8 +109,9 @@ const MAX_ERROR_BODY: usize = 64 * 1024;
 pub(crate) struct UploadTarget {
     /// The folders of a new file; none for the top folder of My Drive. Not used by an update.
     pub(crate) parents: Vec<String>,
-    /// The name of the file on Drive.
-    pub(crate) name: String,
+    /// The name of the file on Drive. `None`: no name is sent, so an update keeps the file's
+    /// name.
+    pub(crate) name: Option<String>,
     /// The media type of the content, which is also the type of the Drive file unless
     /// `convert_to` is set. `None`: guessed from the source's file name.
     pub(crate) mime: Option<Mime>,
@@ -656,7 +657,11 @@ impl<'a> Upload<'a> {
             target,
             options,
             progress,
-            label: format!("upload of '{}'", target.name),
+            label: match (&target.name, &target.existing_file_id) {
+                (Some(name), _) => format!("upload of '{name}'"),
+                (None, Some(id)) => format!("upload to {id}"),
+                (None, None) => String::from("upload"),
+            },
             total,
             media_type,
             file_id,
@@ -706,7 +711,7 @@ impl<'a> Upload<'a> {
     fn record_target(&self) -> RecordTarget {
         RecordTarget {
             parents: self.target.parents.clone(),
-            name: self.target.name.clone(),
+            name: self.target.name.clone().unwrap_or_default(),
             mime: self.media_type.to_string(),
             existing_file_id: self.target.existing_file_id.clone(),
             convert_to: self.target.convert_to.as_ref().map(ToString::to_string),
@@ -907,14 +912,16 @@ impl<'a> Upload<'a> {
         Ok(())
     }
 
-    /// The metadata JSON: the name for an update (the file keeps its type and folders), the
-    /// id, name, type and folders for a new file.
+    /// The metadata JSON: the name, if any, for an update (the file keeps its type and
+    /// folders), the id, name, type and folders for a new file.
     fn metadata(&self) -> String {
         let mut metadata = serde_json::Map::new();
         if let Some(id) = self.created_id() {
             metadata.insert("id".into(), id.into());
         }
-        metadata.insert("name".into(), self.target.name.as_str().into());
+        if let Some(name) = &self.target.name {
+            metadata.insert("name".into(), name.as_str().into());
+        }
         if !self.is_update() {
             let mime_type = self.target.convert_to.as_ref().unwrap_or(&self.media_type);
             metadata.insert("mimeType".into(), mime_type.as_ref().into());

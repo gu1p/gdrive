@@ -88,8 +88,11 @@ pub(crate) enum JobKind {
 /// Why an item is not transferred, and not a failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) enum SkipReason {
-    /// A Google Docs, Sheets, Slides, ... file: it has no content to download, only exports.
+    /// A Google Docs, Sheets, Slides, ... file: it has no content to download, only exports,
+    /// and none was asked for (no `--export`, or `skip` for its type).
     GoogleDocument,
+    /// A Google Workspace file of a type gdrive has no export format for (Forms, Sites, ...).
+    NotExportable,
     /// A shortcut, which a recursive download does not follow.
     Shortcut,
 }

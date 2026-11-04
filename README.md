@@ -195,6 +195,9 @@ Also in 4.0.0:
 - Recursive download and upload transfer 4 files at a time (`--jobs N`). A recursive download starts
   while it still lists the folder. `--continue-on-error` finishes the other files after a failure; every
   failure is reported and makes the command exit non-zero, and a summary line goes to stderr.
+- `files download --recursive --export default` exports Google Docs, Sheets, Slides and Drawings (to
+  docx, xlsx, pptx and png, or a format per type such as `--export md,sheets=ods`) instead of skipping
+  them, and does not export an unchanged document again.
 - Progress on stderr for downloads, uploads, updates, imports and exports: a bar with the rate and the
   time left, and for recursive transfers a line for the run and one per file. On by default on a
   terminal; `--progress`, `--no-progress` and `GDRIVE_PROGRESS` change that. See
@@ -202,8 +205,7 @@ Also in 4.0.0:
 
 Planned, not done yet:
 
-- Faster transfers: resumable uploads that survive a restart, skip and sync modes, export of Google Docs
-  during recursive download, download resume.
+- Faster transfers: resumable uploads that survive a restart, skip and sync modes, download resume.
 - Shell completions; a Windows build without the Visual C++ runtime.
 - Trash and untrash, real TSV and JSON output, listing all shared drives, Markdown export and import,
   short options.

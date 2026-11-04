@@ -17,6 +17,7 @@ use crate::{
         file_info::{self, FileInfo},
         file_tree,
         hub_helper::{get_hub, GetHubError},
+        local_name,
     },
     files::{self, info::DisplayConfig},
     hub::Hub,
@@ -36,6 +37,9 @@ use crate::{
 )]
 pub(crate) struct Config {
     pub(crate) file_path: Option<PathBuf>,
+    /// The name on Drive (`--name`): instead of the local file name, or of the random name of
+    /// an upload from stdin.
+    pub(crate) name: Option<String>,
     pub(crate) mime_type: Option<Mime>,
     pub(crate) parents: Option<Vec<String>>,
     pub(crate) chunk_size: ChunkSize,
@@ -57,6 +61,7 @@ impl Config {
     fn split(self) -> (CommonConfig, Option<PathBuf>, UploadOptions) {
         let Self {
             file_path,
+            name,
             mime_type,
             parents,
             chunk_size,
@@ -79,6 +84,7 @@ impl Config {
         };
         (
             CommonConfig {
+                name,
                 mime_type,
                 parents,
                 upload_directories,
@@ -156,6 +162,7 @@ impl FilePath {
 
 #[derive(Debug)]
 struct CommonConfig {
+    name: Option<String>,
     mime_type: Option<Mime>,
     parents: Option<Vec<String>>,
     upload_directories: bool,
@@ -186,6 +193,7 @@ async fn upload_regular(
         &file,
         file_info::Config {
             file_path: config.file_path.as_path(),
+            name: config.common.name.as_deref(),
             mime_type: config.common.mime_type.as_ref(),
             parents: config.common.parents,
         },
@@ -203,7 +211,7 @@ async fn upload_regular(
 
     let target = UploadTarget {
         parents: file_info.parents.unwrap_or_default(),
-        name: file_info.name.into_owned(),
+        name: Some(file_info.name.into_owned()),
         mime: Some(file_info.mime_type.into_owned()),
         ..UploadTarget::default()
     };
@@ -343,7 +351,7 @@ impl Display for Error {
             Error::CreateFileTree(_) => f.write_str("unable to create file tree"),
             Error::Mkdir(_) => f.write_str("unable to create directory"),
             Error::RecursiveItem { path, source: _ } => {
-                write!(f, "unable to upload '{}'", path.display())
+                write!(f, "unable to upload '{}'", local_name::tree_path(path))
             }
             Error::Incomplete(_) => f.write_str("the recursive upload is incomplete"),
             Error::WriteOutput(_) => {
@@ -358,8 +366,151 @@ impl Display for Error {
 mod tests {
     use std::path::PathBuf;
 
-    use super::Config;
-    use crate::transfer::scheduler;
+    use serde_json::json;
+
+    use super::{upload_regular, Config, FilePath, UploadRegularConfig};
+    use crate::{
+        common::mock_server::{MockServer, Response},
+        transfer::{scheduler, upload::UploadOptions},
+    };
+
+    /// The metadata part of a multipart upload body.
+    fn multipart_metadata(body: &str) -> serde_json::Value {
+        let start = body.find('{').expect("a metadata part");
+        let end = start
+            + body[start..]
+                .find("}\r\n")
+                .expect("the end of the metadata")
+            + 1;
+        serde_json::from_str(&body[start..end]).unwrap()
+    }
+
+    /// `gdrive files upload --print-only-id [--name NAME] [FILE_PATH]`, multipart up to 5 MiB.
+    fn single_file_config(file_path: Option<PathBuf>, name: Option<&str>) -> Config {
+        Config {
+            file_path,
+            name: name.map(String::from),
+            mime_type: None,
+            parents: None,
+            chunk_size: "1".parse().unwrap(),
+            multipart_threshold: "5".parse().unwrap(),
+            print_chunk_errors: false,
+            print_chunk_info: false,
+            upload_directories: false,
+            print_only_id: true,
+            transfer: scheduler::Options::default(),
+            progress: crate::transfer::progress::Mode::Never,
+        }
+    }
+
+    /// `printf hello | gdrive files upload --print-only-id [--name NAME]`: the metadata Drive
+    /// got, and the name of the spool of stdin.
+    async fn upload_from_stdin(name: Option<&str>) -> (serde_json::Value, String) {
+        let content = b"hello";
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({"kind": "drive#generatedIds", "ids": ["new-id"]}),
+            ),
+            Response::json(
+                200,
+                &json!({
+                    "id": "new-id",
+                    "size": "5",
+                    "md5Checksum": format!("{:x}", md5::compute(content)),
+                }),
+            ),
+        ])
+        .await;
+        let spool = mktemp::Temp::new_file().unwrap();
+        std::fs::write(&spool, content).unwrap();
+        let spool_name = spool.file_name().unwrap().to_string_lossy().into_owned();
+        let (common, file_path, options) = single_file_config(None, name).split();
+        assert_eq!(file_path, None);
+
+        upload_regular(
+            &server.hub(),
+            UploadRegularConfig {
+                file_path: FilePath::Temp(spool),
+                common,
+            },
+            &options,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "generateIds and the upload");
+        let upload = &requests[1];
+        assert_eq!(upload.path, "/upload/drive/v3/files");
+        assert_eq!(upload.query_param("uploadType"), Some("multipart"));
+        assert!(upload.body_text().contains("\r\n\r\nhello\r\n"));
+        (multipart_metadata(&upload.body_text()), spool_name)
+    }
+
+    #[tokio::test]
+    async fn an_upload_from_stdin_gets_the_name_given() {
+        let (metadata, _) = upload_from_stdin(Some("notes.txt")).await;
+        // The type follows the name, as the spool has no extension.
+        assert_eq!(
+            metadata,
+            json!({"id": "new-id", "name": "notes.txt", "mimeType": "text/plain"})
+        );
+    }
+
+    #[tokio::test]
+    async fn an_upload_from_stdin_without_a_name_gets_a_random_one() {
+        let (metadata, spool_name) = upload_from_stdin(None).await;
+        assert_eq!(
+            metadata,
+            json!({"id": "new-id", "name": spool_name, "mimeType": "application/octet-stream"})
+        );
+    }
+
+    #[tokio::test]
+    async fn the_name_given_replaces_the_local_file_name() {
+        let content = b"a,b\n";
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({"kind": "drive#generatedIds", "ids": ["new-id"]}),
+            ),
+            Response::json(
+                200,
+                &json!({
+                    "id": "new-id",
+                    "size": "4",
+                    "md5Checksum": format!("{:x}", md5::compute(content)),
+                }),
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("table.csv");
+        std::fs::write(&path, content).unwrap();
+        let (common, _, options) =
+            single_file_config(Some(path.clone()), Some("Q3 numbers")).split();
+
+        upload_regular(
+            &server.hub(),
+            UploadRegularConfig {
+                file_path: FilePath::Regular(path),
+                common,
+            },
+            &UploadOptions {
+                session_dir: None,
+                ..options
+            },
+        )
+        .await
+        .unwrap();
+
+        // The type still follows the local file.
+        assert_eq!(
+            multipart_metadata(&server.requests()[1].body_text()),
+            json!({"id": "new-id", "name": "Q3 numbers", "mimeType": "text/csv"})
+        );
+    }
 
     /// `files upload --recursive --multipart-threshold 0 --chunk-size 1`: the options the
     /// recursive upload gets.
@@ -367,6 +518,7 @@ mod tests {
     fn the_recursive_upload_gets_the_selected_chunk_size_and_threshold() {
         let (common, _, options) = Config {
             file_path: Some(PathBuf::from("dir")),
+            name: None,
             mime_type: None,
             parents: None,
             chunk_size: "1".parse().unwrap(),

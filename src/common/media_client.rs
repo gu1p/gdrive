@@ -31,6 +31,13 @@ const USER_AGENT_VALUE: &str = concat!("gdrive/", env!("CARGO_PKG_VERSION"));
 /// The most of an error reply that is read for its JSON error.
 const MAX_ERROR_BODY: usize = 64 * 1024;
 
+/// The 403 reason of a download of a file Google flagged as malware or spam.
+const ABUSIVE_FILE_REASON: &str = "cannotDownloadAbusiveFile";
+
+/// What to do about [`ABUSIVE_FILE_REASON`]: only the owner of the file, or an organizer of its
+/// shared drive, can acknowledge the risk.
+const ABUSIVE_FILE_HINT: &str = "; rerun with --acknowledge-abuse if you own the file";
+
 /// Sends requests with the hub's client and credentials.
 #[derive(Clone)]
 pub(crate) struct MediaClient<'a> {
@@ -277,14 +284,27 @@ impl Display for MediaError {
                 stop,
             } => {
                 write!(f, "Drive answered {status}")?;
+                let abusive = matches!(
+                    stop,
+                    Some(StopReason::Forbidden { reason: Some(reason) })
+                        if reason == ABUSIVE_FILE_REASON
+                );
                 if let Some(message) = message {
-                    write!(f, ": {}", message.trim_end())?;
+                    let message = message.trim_end();
+                    // The hint follows; Google's message ends with a period.
+                    let message = if abusive {
+                        message.trim_end_matches('.')
+                    } else {
+                        message
+                    };
+                    write!(f, ": {message}")?;
                 }
                 match stop {
                     Some(StopReason::Unauthorized) => {
                         write!(f, " ({})", StopReason::Unauthorized)
                     }
                     Some(reason @ StopReason::GaveUp { .. }) => write!(f, " ({reason})"),
+                    _ if abusive => f.write_str(ABUSIVE_FILE_HINT),
                     _ => Ok(()),
                 }
             }
@@ -420,6 +440,71 @@ mod tests {
                 "Drive answered 503 Service Unavailable: Busy (gave up after 4 attempts"
             ),
             "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_flagged_as_abusive_points_at_acknowledge_abuse() {
+        let server = MockServer::start(vec![Response::json(
+            403,
+            &json!({"error": {
+                "code": 403,
+                "message": "This file has been identified as malware or spam and cannot be \
+                            downloaded.",
+                "errors": [{
+                    "domain": "global",
+                    "reason": "cannotDownloadAbusiveFile",
+                    "message": "This file has been identified as malware or spam and cannot \
+                                be downloaded.",
+                }],
+            }}),
+        )])
+        .await;
+        let hub = server.hub();
+        let client = MediaClient::new(&hub);
+        let url = client
+            .drive_url(&["files", "x"], &[("alt", "media")])
+            .unwrap();
+        let mut retry = hub.retrier().state();
+
+        let error = client
+            .send_with_retry(&mut retry, "test", || get(&url))
+            .await
+            .unwrap_err();
+
+        assert_eq!(server.requests().len(), 1, "not retried");
+        assert_eq!(
+            error.to_string(),
+            "Drive answered 403 Forbidden: This file has been identified as malware or spam and \
+             cannot be downloaded; rerun with --acknowledge-abuse if you own the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_refusals_get_no_abuse_hint() {
+        let server = MockServer::start(vec![Response::json(
+            403,
+            &json!({"error": {
+                "code": 403,
+                "message": "The user does not have sufficient permissions for this file.",
+                "errors": [{"domain": "global", "reason": "insufficientFilePermissions"}],
+            }}),
+        )])
+        .await;
+        let hub = server.hub();
+        let client = MediaClient::new(&hub);
+        let url = client.drive_url(&["files", "x"], &[]).unwrap();
+        let mut retry = hub.retrier().state();
+
+        let error = client
+            .send_with_retry(&mut retry, "test", || get(&url))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Drive answered 403 Forbidden: The user does not have sufficient permissions for \
+             this file."
         );
     }
 

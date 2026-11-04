@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::common::local_name::UnusableName;
+use crate::common::local_name::{self, UnusableName};
 
 #[derive(Debug)]
 pub(crate) struct FileTreeDrive(pub(crate) Folder);
@@ -22,7 +22,8 @@ impl Error for FileTreeDrive {
     }
 }
 
-/// A child of a folder that cannot be downloaded, with the local path of the folder.
+/// A child of a folder that cannot be downloaded, with the path of the folder below the
+/// destination.
 #[derive(Debug)]
 pub(crate) struct InFolder {
     pub(crate) folder: PathBuf,
@@ -31,7 +32,7 @@ pub(crate) struct InFolder {
 
 impl Display for InFolder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "in folder '{}'", self.folder.display())
+        write!(f, "in folder '{}'", local_name::tree_path(&self.folder))
     }
 }
 

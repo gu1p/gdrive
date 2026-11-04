@@ -55,6 +55,8 @@ pub(crate) enum Unpack {
     Open(io::Error),
     #[expect(clippy::enum_variant_names)]
     Unpack(io::Error),
+    /// An entry whose path has `..` or a drive prefix.
+    UnsafePath(PathBuf),
 }
 
 impl Display for Unpack {
@@ -64,6 +66,7 @@ impl Display for Unpack {
             Unpack::DstDoesNotExist => "destination path does not exist",
             Unpack::Open(_) => "unable to open the archive file",
             Unpack::Unpack(_) => "unable to unpack the archive",
+            Unpack::UnsafePath(path) => return unsafe_path(f, path),
         };
 
         f.write_str(s)
@@ -73,10 +76,20 @@ impl Display for Unpack {
 impl Error for Unpack {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Unpack::ArchivePathDoesNotExist | Unpack::DstDoesNotExist => None,
+            Unpack::ArchivePathDoesNotExist | Unpack::DstDoesNotExist | Unpack::UnsafePath(_) => {
+                None
+            }
             Unpack::Open(source) | Unpack::Unpack(source) => Some(source),
         }
     }
+}
+
+fn unsafe_path(f: &mut fmt::Formatter<'_>, path: &std::path::Path) -> fmt::Result {
+    write!(
+        f,
+        "the archive holds '{}', which is not a path inside the account directory",
+        path.display()
+    )
 }
 
 #[derive(Debug)]
@@ -85,6 +98,8 @@ pub(crate) enum GetAccountName {
     ReadEntries(io::Error),
     NoDirectories,
     MultipleDirectories,
+    /// An entry whose path has `..` or a drive prefix.
+    UnsafePath(PathBuf),
 }
 
 impl Display for GetAccountName {
@@ -94,6 +109,7 @@ impl Display for GetAccountName {
             GetAccountName::ReadEntries(_) => "unable to read entries from archive",
             GetAccountName::NoDirectories => "archive contains no directories",
             GetAccountName::MultipleDirectories => "archive contains more than one directory",
+            GetAccountName::UnsafePath(path) => return unsafe_path(f, path),
         };
 
         f.write_str(s)
@@ -104,7 +120,9 @@ impl Error for GetAccountName {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             GetAccountName::Open(source) | GetAccountName::ReadEntries(source) => Some(source),
-            GetAccountName::NoDirectories | GetAccountName::MultipleDirectories => None,
+            GetAccountName::NoDirectories
+            | GetAccountName::MultipleDirectories
+            | GetAccountName::UnsafePath(_) => None,
         }
     }
 }

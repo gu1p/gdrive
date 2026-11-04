@@ -9,26 +9,35 @@
 //! an order a download can follow: the [`Action::CreateDir`] of a folder comes before the
 //! actions about anything in it.
 //!
-//! Only folders and files with content get local names, as before the walk existed: Google
-//! Docs and shortcuts are counted as skipped as they arrive. A child that cannot be mapped (an
-//! unusable or missing name, a folder that is its own ancestor) fails alone; a folder that
-//! fails (its listing, its name) cancels everything below it, whose local paths stay unknown.
+//! Folders and files with content get local names, as before the walk existed. Google Docs
+//! (and the other Workspace types) get local names only when they are exported
+//! ([`LocalTree::with_export`]): the name is the Drive name plus the format's extension
+//! ([`export_file_name`]), unique among the folder's children like any other name, so `report`
+//! exported as `report.docx` and a file `report.docx` next to it never take the same path.
+//! Otherwise they are counted as skipped as they arrive, as are shortcuts and the Workspace
+//! types that have no export format. A child that cannot be mapped (an unusable or missing
+//! name, a folder that is its own ancestor) fails alone; a folder that fails (its listing, its
+//! name) cancels everything below it, whose local paths stay unknown.
 
 pub(crate) mod errors;
 
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     mem,
     path::{Path, PathBuf},
 };
 
+use chrono::{DateTime, Utc};
+
 use crate::{
     common::{
-        drive_file,
+        drive_file::{self, DocType, FileExtension},
         file_tree_drive::errors::FileIdentifier,
         local_name::{self, NameChange, NameEntry, UnusableName},
         parse_md5_digest,
     },
+    files::export::{export_file_name, ExportFormats},
     transfer::{
         scheduler::{JobKind, Outcome, SkipReason},
         walk::{Children, EntryKind, FolderError, FolderKey, WalkEntry, WalkItem, WalkRoot},
@@ -42,6 +51,9 @@ pub(crate) enum Action {
     CreateDir(PathBuf),
     /// Download a file into its folder, which a [`Action::CreateDir`] before created.
     Download(PlannedFile),
+    /// Export a Workspace document into its folder, which a [`Action::CreateDir`] before
+    /// created.
+    Export(PlannedExport),
     /// An item that is not downloaded: skipped, failed or cancelled. `label` is its Drive path.
     Done {
         kind: JobKind,
@@ -61,11 +73,24 @@ pub(crate) struct PlannedFile {
     pub(crate) md5: Option<md5::Digest>,
 }
 
+/// A Workspace document with the local path of its export.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedExport {
+    pub(crate) path: PathBuf,
+    pub(crate) id: String,
+    pub(crate) doc_type: DocType,
+    pub(crate) format: FileExtension,
+    /// Drive's `modifiedTime`, which the exported file gets as its modification time.
+    pub(crate) modified_time: Option<DateTime<Utc>>,
+}
+
 /// What a walk found, once it ended. Before, the counts so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Totals {
-    /// Files with local paths.
+    /// Files with content with local paths.
     pub(crate) files: u64,
+    /// Workspace documents to export, with local paths.
+    pub(crate) exports: u64,
     /// Folders with local paths, the root included.
     pub(crate) folders: u64,
     /// The size of the files.
@@ -83,6 +108,8 @@ pub(crate) struct LocalTree {
     folders: HashMap<FolderKey, FolderState>,
     totals: Totals,
     actions: Vec<Action>,
+    /// The export formats; `None` skips every Workspace document.
+    export: Option<ExportFormats>,
 }
 
 /// A folder location of the walk.
@@ -141,6 +168,7 @@ impl LocalTree {
                 ..Totals::default()
             },
             actions,
+            export: None,
         };
         let root = WalkRoot {
             id,
@@ -149,6 +177,13 @@ impl LocalTree {
             resource_key: file.resource_key,
         };
         Ok((tree, root))
+    }
+
+    /// Exports the Workspace documents per `export` instead of skipping them; `None` skips them.
+    #[must_use]
+    pub(crate) fn with_export(mut self, export: Option<ExportFormats>) -> LocalTree {
+        self.export = export;
+        self
     }
 
     /// Takes the next item of the walk. The actions it releases are in [`Self::take_actions`].
@@ -192,16 +227,31 @@ impl LocalTree {
         let parent_failed = self.folders.get(&parent).is_some_and(|state| state.failed);
         let label = || format!("{}/{}", self.root_label, components.join("/"));
 
-        let reason = match kind {
-            EntryKind::Native => Some(SkipReason::GoogleDocument),
-            EntryKind::Shortcut => Some(SkipReason::Shortcut),
+        let export = match kind {
+            EntryKind::Native => match self.export_format(&file) {
+                Ok(export) => Some(export),
+                Err(reason) => {
+                    let label = label();
+                    if reason == SkipReason::NotExportable {
+                        let mime = file.mime_type.as_deref().unwrap_or("no MIME type");
+                        self.actions.push(Action::Warning(format!(
+                            "Warning: skipping '{}' ({mime}): gdrive has no export format for \
+                            this type",
+                            label.escape_debug()
+                        )));
+                    }
+                    self.done(JobKind::Media, label, Outcome::Skipped { reason });
+                    return;
+                }
+            },
+            EntryKind::Shortcut => {
+                let label = label();
+                let reason = SkipReason::Shortcut;
+                self.done(JobKind::Media, label, Outcome::Skipped { reason });
+                return;
+            }
             EntryKind::Folder | EntryKind::Blob => None,
         };
-        if let Some(reason) = reason {
-            let label = label();
-            self.done(JobKind::Media, label, Outcome::Skipped { reason });
-            return;
-        }
 
         if let Children::Listed(key) = children {
             let state = FolderState {
@@ -212,15 +262,36 @@ impl LocalTree {
             self.folders.insert(key, state);
         }
         if parent_failed {
-            if kind == EntryKind::Blob {
+            if matches!(kind, EntryKind::Blob | EntryKind::Native) {
                 let label = label();
                 self.done(JobKind::Media, label, Outcome::Cancelled);
             }
             return;
         }
-        if let Some(child) = Child::from_file(*file, kind, children) {
+        let child = match export {
+            Some((doc_type, format)) => Some(Child::export(*file, doc_type, format)),
+            None => Child::from_file(*file, kind, children),
+        };
+        if let Some(child) = child {
             self.folders.entry(parent).or_default().children.push(child);
         }
+    }
+
+    /// The type and export format of a Workspace document, or why it is skipped.
+    fn export_format(
+        &self,
+        file: &google_drive3::api::File,
+    ) -> Result<(DocType, FileExtension), SkipReason> {
+        let Some(formats) = &self.export else {
+            return Err(SkipReason::GoogleDocument);
+        };
+        let doc_type = file
+            .mime_type
+            .as_deref()
+            .and_then(DocType::from_mime_type)
+            .ok_or(SkipReason::NotExportable)?;
+        let format = formats.format(doc_type).ok_or(SkipReason::GoogleDocument)?;
+        Ok((doc_type, format))
     }
 
     fn folder_done(&mut self, key: FolderKey) {
@@ -270,7 +341,7 @@ impl LocalTree {
             for change in &listed.changes {
                 self.actions.push(Action::Warning(format!(
                     "Warning: In '{}': {change}",
-                    path.display()
+                    local_name::tree_path(&path)
                 )));
             }
 
@@ -299,6 +370,16 @@ impl LocalTree {
                             id: file.drive_id,
                             size: file.size,
                             md5: file.md5,
+                        }));
+                    }
+                    Ok(ListedChild::Export(export)) => {
+                        self.totals.exports += 1;
+                        self.actions.push(Action::Export(PlannedExport {
+                            path: local_name::safe_join(&path, &export.local_name),
+                            id: export.drive_id,
+                            doc_type: export.doc_type,
+                            format: export.format,
+                            modified_time: export.modified_time,
                         }));
                     }
                     Err(failed) => {
@@ -345,8 +426,11 @@ impl LocalTree {
                         folder: Some(Children::Listed(key)),
                         ..
                     }) => failed.push(key),
-                    Ok(ListedChild::File(file)) => {
-                        let label = format!("{label}/{}", file.name);
+                    Ok(
+                        ListedChild::File(ListedFile { name, .. })
+                        | ListedChild::Export(ListedExport { name, .. }),
+                    ) => {
+                        let label = format!("{label}/{name}");
                         self.done(JobKind::Media, label, Outcome::Cancelled);
                     }
                     Err(_) => {}
@@ -363,7 +447,7 @@ impl LocalTree {
             match child.kind {
                 ChildKind::Folder(Children::Listed(key)) => folders.push(key),
                 ChildKind::Folder(_) => {}
-                ChildKind::File { .. } => {
+                ChildKind::File { .. } | ChildKind::Export { .. } => {
                     let identifier = child.identifier();
                     let name = identifier.display_name();
                     self.done(
@@ -393,8 +477,8 @@ impl FileIdentifier {
     }
 }
 
-/// What the tree keeps of a child while its folder is being listed: only folders and files with
-/// content, and only the fields the download uses.
+/// What the tree keeps of a child while its folder is being listed: only folders, files with
+/// content and documents to export, and only the fields the download uses.
 #[derive(Debug, Clone)]
 struct Child {
     name: Option<String>,
@@ -408,6 +492,11 @@ enum ChildKind {
     File {
         size: Option<i64>,
         md5: Option<md5::Digest>,
+    },
+    Export {
+        doc_type: DocType,
+        format: FileExtension,
+        modified_time: Option<DateTime<Utc>>,
     },
 }
 
@@ -433,6 +522,29 @@ impl Child {
         })
     }
 
+    /// A Workspace document to export as `format`.
+    fn export(file: google_drive3::api::File, doc_type: DocType, format: FileExtension) -> Child {
+        Child {
+            name: file.name,
+            id: file.id,
+            kind: ChildKind::Export {
+                doc_type,
+                format,
+                modified_time: file.modified_time,
+            },
+        }
+    }
+
+    /// The name the child's local name is made from: the Drive name, with the format's
+    /// extension for an export.
+    fn local_source_name(&self) -> Option<Cow<'_, str>> {
+        let name = self.name.as_deref()?;
+        Some(match self.kind {
+            ChildKind::Export { format, .. } => Cow::Owned(export_file_name(name, format)),
+            ChildKind::Folder(_) | ChildKind::File { .. } => Cow::Borrowed(name),
+        })
+    }
+
     fn is_folder(&self) -> bool {
         matches!(self.kind, ChildKind::Folder(_))
     }
@@ -446,13 +558,15 @@ impl Child {
             name: self.identifier().display_name().to_owned(),
             folder: match self.kind {
                 ChildKind::Folder(children) => Some(children),
-                ChildKind::File { .. } => None,
+                ChildKind::File { .. } | ChildKind::Export { .. } => None,
             },
             error,
         }
     }
 
-    /// Checks that the child has a name and an id and that the name can be used locally.
+    /// Checks that the child has a name and an id and that the name can be used locally. The
+    /// Drive name of an export is checked before the extension is added, so a document named
+    /// `..` fails like a file of that name.
     fn check(self) -> Result<Child, ChildError> {
         match (self.name.as_deref(), self.id.as_deref()) {
             (Some(name), Some(id)) => match local_name::local_name(name, id) {
@@ -504,6 +618,18 @@ impl Child {
                     md5,
                 }))
             }
+            ChildKind::Export {
+                doc_type,
+                format,
+                modified_time,
+            } => Ok(ListedChild::Export(ListedExport {
+                name,
+                local_name,
+                drive_id: id,
+                doc_type,
+                format,
+                modified_time,
+            })),
         }
     }
 }
@@ -513,6 +639,7 @@ impl Child {
 enum ListedChild {
     Folder { local_name: String, key: FolderKey },
     File(ListedFile),
+    Export(ListedExport),
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +649,16 @@ struct ListedFile {
     size: u64,
     drive_id: String,
     md5: Option<md5::Digest>,
+}
+
+#[derive(Debug, Clone)]
+struct ListedExport {
+    name: String,
+    local_name: String,
+    drive_id: String,
+    doc_type: DocType,
+    format: FileExtension,
+    modified_time: Option<DateTime<Utc>>,
 }
 
 /// A child that cannot be downloaded.
@@ -556,14 +693,13 @@ impl ListedFolder {
             }
         }
 
-        let entries = checked
+        let names = checked
             .iter()
-            .filter_map(|child| {
-                Some(NameEntry {
-                    id: child.id.as_deref()?,
-                    name: child.name.as_deref()?,
-                })
-            })
+            .filter_map(|child| Some((child.id.as_deref()?, child.local_source_name()?)))
+            .collect::<Vec<_>>();
+        let entries = names
+            .iter()
+            .map(|(id, name)| NameEntry { id, name })
             .collect::<Vec<_>>();
         let unique = match local_name::unique_local_names(&entries) {
             Ok(unique) => unique,

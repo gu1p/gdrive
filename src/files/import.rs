@@ -9,6 +9,7 @@ use mime::Mime;
 
 use crate::{
     common::{
+        delegate::{ChunkSize, MultipartThreshold},
         drive_file::{DocType, FileExtension},
         file_info::{self, FileInfo},
         hub_helper::{get_hub, GetHubError},
@@ -28,8 +29,23 @@ pub(crate) struct Config {
     pub(crate) file_path: PathBuf,
     pub(crate) parents: Option<Vec<String>>,
     pub(crate) print_only_id: bool,
+    pub(crate) chunk_size: ChunkSize,
+    pub(crate) multipart_threshold: MultipartThreshold,
     /// Whether the import shows its progress on stderr.
     pub(crate) progress: progress::Mode,
+}
+
+impl Config {
+    /// How the file goes up: as `files upload` does, with the selected chunk size and multipart
+    /// threshold. The sessions are not recorded; [`import`] records them in the account
+    /// directory.
+    fn upload_options(&self) -> UploadOptions {
+        UploadOptions {
+            chunk_size: self.chunk_size.in_bytes(),
+            multipart_threshold: self.multipart_threshold.in_bytes(),
+            ..UploadOptions::default()
+        }
+    }
 }
 
 pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
@@ -37,7 +53,7 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
     let options = UploadOptions {
         session_dir: account_session_dir(),
         session_identity: account_session_identity(),
-        ..UploadOptions::default()
+        ..config.upload_options()
     };
 
     let (doc_type, source_mime_type) =
@@ -53,6 +69,7 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
         &file,
         file_info::Config {
             file_path: &config.file_path,
+            name: None,
             mime_type: Some(mime_type),
             parents: config.parents.clone(),
         },
@@ -105,7 +122,7 @@ fn import_target(
 ) -> UploadTarget {
     UploadTarget {
         parents,
-        name,
+        name: Some(name),
         mime: Some(source_mime_type.clone()),
         convert_to: Some(doc_type.mime().clone()),
         ..UploadTarget::default()
@@ -179,14 +196,52 @@ impl Display for Error {
 mod tests {
     use std::path::Path;
 
-    use super::{import_target, import_types};
+    use super::{import_target, import_types, Config};
     use crate::{
         common::{
+            delegate::{ChunkSize, MultipartThreshold},
             drive_file::{DocType, MIME_TYPE_DRIVE_DOCUMENT},
             mock_server::{MockServer, Response},
         },
         transfer::upload::{upload_path, UploadOptions},
     };
+
+    fn config(chunk_size: &str, multipart_threshold: &str) -> Config {
+        Config {
+            file_path: "notes.md".into(),
+            parents: None,
+            print_only_id: false,
+            chunk_size: chunk_size.parse().unwrap(),
+            multipart_threshold: multipart_threshold.parse().unwrap(),
+            progress: crate::transfer::progress::Mode::Never,
+        }
+    }
+
+    #[test]
+    fn the_import_gets_the_selected_chunk_size_and_threshold() {
+        // `files import notes.md --chunk-size 1 --multipart-threshold 0`
+        let options = config("1", "0").upload_options();
+        assert_eq!(options.chunk_size, 1 << 20);
+        assert_eq!(options.multipart_threshold, 0);
+        assert!(options.verify_md5);
+
+        let options = config("64", "16").upload_options();
+        assert_eq!(options.chunk_size, 64 << 20);
+        assert_eq!(options.multipart_threshold, 16 << 20);
+    }
+
+    #[test]
+    fn without_the_flags_the_import_uploads_as_before() {
+        let options = Config {
+            chunk_size: ChunkSize::default(),
+            multipart_threshold: MultipartThreshold::default(),
+            ..config("1", "0")
+        }
+        .upload_options();
+        let defaults = UploadOptions::default();
+        assert_eq!(options.chunk_size, defaults.chunk_size);
+        assert_eq!(options.multipart_threshold, defaults.multipart_threshold);
+    }
 
     #[test]
     fn markdown_is_imported_as_a_document_from_text_markdown() {
@@ -345,5 +400,62 @@ mod tests {
         }
         let uploaded: usize = chunks.iter().map(|chunk| chunk.body.len()).sum();
         assert_eq!(uploaded, total);
+    }
+
+    /// `files import notes.md --multipart-threshold 0 --chunk-size 1`: a file far below the
+    /// default threshold goes up through a resumable session, in 1 MiB chunks.
+    #[tokio::test]
+    async fn the_selected_threshold_and_chunk_size_shape_the_upload() {
+        const MIB: usize = 1 << 20;
+        let content = vec![b'#'; 2 * MIB + 5];
+        let total = content.len();
+        let server = MockServer::start(vec![
+            Response::json(200, &serde_json::json!({}))
+                .with_header("Location", "{root}upload-session"),
+            Response::json(308, &serde_json::json!({}))
+                .with_header("Range", &format!("bytes=0-{}", MIB - 1)),
+            Response::json(308, &serde_json::json!({}))
+                .with_header("Range", &format!("bytes=0-{}", 2 * MIB - 1)),
+            Response::json(
+                200,
+                &serde_json::json!({"id": "new-id", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+            ),
+        ])
+        .await;
+        let (_dir, path) = notes(&content);
+        let (doc_type, source_mime_type) = import_types(&path).unwrap();
+        let target = import_target(
+            String::from("notes.md"),
+            Vec::new(),
+            doc_type,
+            source_mime_type,
+        );
+        let options = config("1", "0").upload_options();
+        assert!(
+            (total as u64) < UploadOptions::default().multipart_threshold,
+            "multipart without --multipart-threshold"
+        );
+
+        upload_path(&server.hub(), &path, &target, &options, None)
+            .await
+            .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].query_param("uploadType"), Some("resumable"));
+        let ranges: Vec<_> = requests[1..]
+            .iter()
+            .map(|chunk| chunk.header("content-range").unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ranges,
+            [
+                format!("bytes 0-{}/{total}", MIB - 1),
+                format!("bytes {MIB}-{}/{total}", 2 * MIB - 1),
+                format!("bytes {}-{}/{total}", 2 * MIB, total - 1),
+            ]
+        );
+        let sizes: Vec<_> = requests[1..].iter().map(|chunk| chunk.body.len()).collect();
+        assert_eq!(sizes, [MIB, MIB, 5]);
     }
 }

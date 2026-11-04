@@ -12,7 +12,7 @@ use std::{
     collections::{hash_map, HashMap, HashSet},
     error,
     fmt::{self, Display, Formatter},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use unicode_normalization::{is_nfc, UnicodeNormalization};
@@ -330,6 +330,25 @@ fn safe_join_with(base: &Path, component: &str, rules: Rules) -> PathBuf {
     base.join(component.as_ref())
 }
 
+/// How warnings and errors show a path below the destination of a download or the top folder of
+/// an upload: the names joined with `/` on every platform, because such a path stands for a place
+/// in the Drive tree as much as for one on the local disk. A path with anything but plain names
+/// (an absolute path, for one) is a local path and keeps the platform's form.
+#[must_use]
+pub(crate) fn tree_path(path: &Path) -> String {
+    let mut shown = String::new();
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            return path.display().to_string();
+        };
+        if !shown.is_empty() {
+            shown.push('/');
+        }
+        shown.push_str(&name.to_string_lossy());
+    }
+    shown
+}
+
 /// Whether the local name differs from the Drive name by more than NFC normalization.
 #[must_use]
 pub(crate) fn is_renamed(drive_name: &str, local_name: &str) -> bool {
@@ -503,8 +522,8 @@ mod tests {
 
     use super::{
         id_tag, is_renamed, is_reserved_temp_name, local_name, safe_join, safe_join_with, sanitize,
-        temp_file_name, unique_local_names_with, InvalidName, NameChange, NameEntry, Rules,
-        UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
+        temp_file_name, tree_path, unique_local_names_with, InvalidName, NameChange, NameEntry,
+        Rules, UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
     };
 
     const UNIX: Rules = Rules {
@@ -757,6 +776,16 @@ mod tests {
         assert_eq!(safe_join(base, "."), base.join("_."));
         assert_eq!(safe_join(base, ""), base.join("_"));
         assert_eq!(safe_join(base, "/abs"), base.join("_abs"));
+    }
+
+    #[test]
+    fn tree_paths_use_slashes_on_every_platform() {
+        let joined = safe_join(&safe_join(Path::new(""), "Root"), "a/b");
+        assert_eq!(tree_path(&safe_join(&joined, "x.txt")), "Root/a_b/x.txt");
+        assert_eq!(tree_path(Path::new("Root")), "Root");
+        // Not a path below the destination: shown as the platform shows it.
+        let absolute = std::env::temp_dir().join("x.txt");
+        assert_eq!(tree_path(&absolute), absolute.display().to_string());
     }
 
     #[test]

@@ -49,6 +49,9 @@ pub(crate) struct Config {
     pub(crate) transfer: scheduler::Options,
     /// Whether the download shows its progress on stderr.
     pub(crate) progress: progress::Mode,
+    /// The formats a recursive download exports Google Docs files to (`--export`); `None`
+    /// skips them.
+    pub(crate) export: Option<files::export::ExportFormats>,
 }
 
 impl Config {
@@ -831,6 +834,7 @@ mod tests {
             acknowledge_abuse: false,
             transfer: crate::transfer::scheduler::Options::default(),
             progress: crate::transfer::progress::Mode::Never,
+            export: None,
         }
     }
 

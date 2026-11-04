@@ -32,6 +32,9 @@ use crate::{
 pub(crate) struct Config {
     pub(crate) file_id: String,
     pub(crate) file_path: Option<PathBuf>,
+    /// The new name of the file (`--name`). Without it the file is renamed to the local file
+    /// name, or keeps its name when the content comes from stdin.
+    pub(crate) name: Option<String>,
     pub(crate) mime_type: Option<Mime>,
     pub(crate) chunk_size: ChunkSize,
     pub(crate) multipart_threshold: MultipartThreshold,
@@ -72,14 +75,32 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
         }
     };
 
-    let drive_file = info::get_file(&hub, &config.file_id)
+    let (file, file_path) = file_helper.file_mut_and_path();
+    let file = update_content(&hub, &config, &options, file, file_path).await?;
+
+    println!("File successfully updated");
+
+    files::info::print_file_info(&file, &DisplayConfig::default());
+
+    Ok(())
+}
+
+/// Uploads the content of `file` at `content_path` as a new revision of `config.file_id`.
+/// Without `config.file_path`, `content_path` is a spool of stdin.
+async fn update_content(
+    hub: &Hub,
+    config: &Config,
+    options: &UploadOptions,
+    file: &std::fs::File,
+    content_path: &Path,
+) -> Result<google_drive3::api::File, Box<Error>> {
+    let drive_file = info::get_file(hub, &config.file_id)
         .await
         .map_err(Error::GetFile)?;
 
-    let (file, file_path) = file_helper.file_mut_and_path();
-
     let file_info_config = file_info::Config {
-        file_path,
+        file_path: content_path,
+        name: config.name.as_deref(),
         mime_type: config.mime_type.as_ref(),
         parents: drive_file.parents.clone(),
     };
@@ -88,34 +109,35 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
         Ok(file_info) => file_info,
         Err(source) => {
             return Err(Box::new(Error::FileInfo {
-                path: file_helper.into_path_buf(),
+                path: content_path.to_path_buf(),
                 source,
             }))
         }
     };
 
-    // The file keeps its folders: an update sends only the name and the content.
+    // The file keeps its folders: an update sends only the name and the content. The name of
+    // a spool of stdin means nothing, so without --name the file keeps its name.
+    let from_stdin = config.file_path.is_none();
+    let name = (config.name.is_some() || !from_stdin).then(|| file_info.name.into_owned());
     let target = UploadTarget {
-        name: file_info.name.into_owned(),
+        name,
         mime: Some(file_info.mime_type.into_owned()),
         existing_file_id: Some(config.file_id.clone()),
         ..UploadTarget::default()
     };
 
-    println!("Updating {} with {}", config.file_id, file_path.display());
+    println!(
+        "Updating {} with {}",
+        config.file_id,
+        content_path.display()
+    );
 
     let (display, progress) = ProgressDisplay::single(config.progress, false, Some(file_info.size));
     let confirmed = ConfirmedTotal::new(progress);
     let report = |held| confirmed.held(held);
-    let uploaded = upload_path(&hub, file_path, &target, &options, Some(&report)).await;
+    let uploaded = upload_path(hub, content_path, &target, options, Some(&report)).await;
     display.finish();
-    let file = uploaded.map_err(|err| Error::Update(Box::new(err)))?;
-
-    println!("File successfully updated");
-
-    files::info::print_file_info(&file, &DisplayConfig::default());
-
-    Ok(())
+    uploaded.map_err(|err| Box::new(Error::Update(Box::new(err))))
 }
 
 /// The upload reads the path as a seekable byte stream: a directory made the upload library
@@ -245,7 +267,108 @@ impl PatchFile {
 
 #[cfg(test)]
 mod tests {
-    use super::{err_if_not_regular_file, Error};
+    use std::path::{Path, PathBuf};
+
+    use serde_json::json;
+
+    use super::{err_if_not_regular_file, update_content, Config, Error};
+    use crate::{
+        common::mock_server::{MockServer, Response},
+        transfer::upload::UploadOptions,
+    };
+
+    /// `gdrive files update file-id [--name NAME] [FILE_PATH]` with `content_path` as the
+    /// content (a spool of stdin without `file_path`): the metadata of the upload.
+    async fn update_metadata_of(
+        file_path: Option<PathBuf>,
+        name: Option<&str>,
+        content_path: &Path,
+    ) -> serde_json::Value {
+        let content = std::fs::read(content_path).unwrap();
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({"id": "file-id", "name": "report.txt", "parents": ["folder-id"]}),
+            ),
+            Response::json(
+                200,
+                &json!({
+                    "id": "file-id",
+                    "name": "report.txt",
+                    "size": content.len().to_string(),
+                    "md5Checksum": format!("{:x}", md5::compute(&content)),
+                }),
+            ),
+        ])
+        .await;
+        let config = Config {
+            file_id: String::from("file-id"),
+            file_path,
+            name: name.map(String::from),
+            mime_type: None,
+            chunk_size: "1".parse().unwrap(),
+            multipart_threshold: "5".parse().unwrap(),
+            print_chunk_errors: false,
+            print_chunk_info: false,
+            progress: crate::transfer::progress::Mode::Never,
+        };
+        let file = std::fs::File::open(content_path).unwrap();
+
+        update_content(
+            &server.hub(),
+            &config,
+            &UploadOptions::default(),
+            &file,
+            content_path,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2, "files.get and the upload");
+        let upload = &requests[1];
+        assert_eq!(upload.method, "PATCH");
+        assert_eq!(upload.path, "/upload/drive/v3/files/file-id");
+        assert_eq!(upload.query_param("uploadType"), Some("multipart"));
+        let body = upload.body_text();
+        let start = body.find('{').unwrap();
+        let end = start + body[start..].find("}\r\n").unwrap() + 1;
+        serde_json::from_str(&body[start..end]).unwrap()
+    }
+
+    /// A spool of stdin: a file with a random name and no extension.
+    fn spool(dir: &Path) -> PathBuf {
+        let path = dir.join("5f0c4a3e-9d1b-4c47-8a51-2f6f9a0e7b13");
+        std::fs::write(&path, b"new content").unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn an_update_from_stdin_keeps_the_name_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = update_metadata_of(None, None, &spool(dir.path())).await;
+        assert_eq!(metadata, json!({}));
+    }
+
+    #[tokio::test]
+    async fn an_update_from_stdin_renames_the_file_to_the_name_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let metadata = update_metadata_of(None, Some("notes.txt"), &spool(dir.path())).await;
+        assert_eq!(metadata, json!({"name": "notes.txt"}));
+    }
+
+    #[tokio::test]
+    async fn an_update_from_a_file_takes_its_name_or_the_name_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local.txt");
+        std::fs::write(&path, b"new content").unwrap();
+
+        let metadata = update_metadata_of(Some(path.clone()), None, &path).await;
+        assert_eq!(metadata, json!({"name": "local.txt"}));
+
+        let metadata = update_metadata_of(Some(path.clone()), Some("Final"), &path).await;
+        assert_eq!(metadata, json!({"name": "Final"}));
+    }
 
     #[test]
     fn directory_is_rejected() {

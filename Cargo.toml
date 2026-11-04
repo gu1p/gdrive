@@ -40,6 +40,10 @@ mktemp = "0.5.0"
 pin-project-lite = "0.2.16"
 ring = "0.17.14"
 rustc_version_runtime = "0.2.1"
+# Which temporary files a cancelled recursive download created: an open handle per file, compared
+# by device and inode (Unix) or volume serial and file index (Windows). Tiny, no dependencies on
+# Unix, winapi-util on Windows (already in the tree).
+same-file = "1.0.6"
 serde = { version = "1.0.151", features = ["derive"] }
 serde_json = "1.0.89"
 tabwriter = "1.2.1"

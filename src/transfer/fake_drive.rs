@@ -8,12 +8,18 @@
 //! request and the most requests it had in flight at once. `files.get` of a stored file returns
 //! the fields its `fields` mask names, so a test can check what a metadata request asks for;
 //! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
-//! the other requests.
+//! the other requests. `files.export` of a Workspace document ([`FakeFile::native`]) returns its
+//! content in whatever format is asked for, without `Content-Length` as Drive sends exports, and
+//! records the format ([`FakeDrive::exports`]).
 //!
 //! For recursive uploads it answers `files.generateIds`, multipart `files.create` (the uploads
 //! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
 //! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
 //! last). Like Drive, a create fails with 404 when a parent does not exist yet.
+//!
+//! A test that checks how many requests were in flight at once does not rely on delays: the
+//! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
+//! listing until a download has started, so the overlap happens however slow the machine is.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,7 +38,12 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::{body::Incoming, service::service_fn, Method, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Map, Value};
-use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Barrier},
+    task::JoinHandle,
+    time::Instant,
+};
 
 use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 
@@ -56,8 +67,10 @@ pub(crate) struct FakeFile {
     pub(crate) shortcut_target: Option<(String, String)>,
     pub(crate) target_resource_key: Option<String>,
     pub(crate) resource_key: Option<String>,
-    /// What a media download of a blob returns.
+    /// What a media download of a blob, or an export of a Workspace document, returns.
     pub(crate) content: Option<String>,
+    /// `modifiedTime`, RFC 3339.
+    pub(crate) modified_time: Option<String>,
 }
 
 impl FakeFile {
@@ -93,6 +106,32 @@ impl FakeFile {
             mime_type: String::from("application/vnd.google-apps.document"),
             parents: vec![parent.to_owned()],
             ..Self::default()
+        }
+    }
+
+    /// A Workspace document of `mime_type` whose exports return `content`.
+    pub(crate) fn native(
+        id: &str,
+        name: &str,
+        parent: &str,
+        mime_type: &str,
+        content: &str,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            mime_type: mime_type.to_owned(),
+            parents: vec![parent.to_owned()],
+            content: Some(content.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// With `modifiedTime` (RFC 3339).
+    pub(crate) fn modified(self, time: &str) -> Self {
+        Self {
+            modified_time: Some(time.to_owned()),
+            ..self
         }
     }
 
@@ -167,6 +206,9 @@ impl FakeFile {
         if let Some(drive_id) = &self.drive_id {
             file.insert("driveId".into(), json!(drive_id));
         }
+        if let Some(modified_time) = &self.modified_time {
+            file.insert("modifiedTime".into(), json!(modified_time));
+        }
         if let Some(resource_key) = &self.resource_key {
             file.insert("resourceKey".into(), json!(resource_key));
         }
@@ -217,6 +259,8 @@ pub(crate) struct Behavior {
     /// Media downloads of these file ids send half of the content and then nothing more, like
     /// a transfer that is still running.
     pub(crate) media_stalled: HashSet<String>,
+    /// Exports of these file ids fail with Drive's 403 for exports over 10 MB.
+    pub(crate) export_too_large: HashSet<String>,
     /// How long the create of a file (not a folder) takes before its reply.
     pub(crate) upload_delay: Duration,
     /// Creates of files with these names fail with 400.
@@ -226,6 +270,49 @@ pub(crate) struct Behavior {
     /// The chunk of the file with this name that starts at this offset fails with 503 once,
     /// committing nothing.
     pub(crate) chunk_unavailable: HashMap<String, u64>,
+    /// Chunks that start at or after this offset get no reply, like a transfer that hangs.
+    pub(crate) chunks_stalled_from: Option<u64>,
+    /// The first this many file uploads (multipart creates of files, first chunks of resumable
+    /// sessions) are held until all of them have arrived, so they are in flight together.
+    pub(crate) upload_rendezvous: usize,
+    /// The first this many media downloads are held until all of them have arrived.
+    pub(crate) media_rendezvous: usize,
+    /// The first queries naming one of these folders, as many as there are folders, are held
+    /// until all of them have arrived.
+    pub(crate) list_rendezvous: HashSet<String>,
+    /// A query naming one of these folders is answered only once a media download has arrived.
+    pub(crate) list_after_media: HashSet<String>,
+}
+
+/// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
+/// Then it goes on, so that a test whose requests do not overlap fails on its check of what was
+/// in flight at once instead of hanging.
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Holds the first `parties` requests that join it until all of them have arrived; later ones
+/// pass. A test sees these requests in flight together without depending on how long anything
+/// takes.
+struct Rendezvous {
+    parties: usize,
+    joined: AtomicUsize,
+    barrier: Barrier,
+}
+
+impl Rendezvous {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            joined: AtomicUsize::new(0),
+            barrier: Barrier::new(parties),
+        }
+    }
+
+    async fn join(&self) {
+        if self.joined.fetch_add(1, Ordering::SeqCst) < self.parties {
+            // A party that gives up still counts: the others are not held longer.
+            let _ = tokio::time::timeout(RENDEZVOUS_TIMEOUT, self.barrier.wait()).await;
+        }
+    }
 }
 
 /// A chunk or status request of a resumable session, as the fake answered it.
@@ -295,6 +382,8 @@ struct State {
     max_in_flight: AtomicUsize,
     /// The file ids of media downloads.
     media: Mutex<Vec<String>>,
+    /// The file ids and MIME types of exports.
+    exports: Mutex<Vec<(String, String)>>,
     media_in_flight: AtomicUsize,
     media_max_in_flight: AtomicUsize,
     /// When the first media download arrived.
@@ -316,6 +405,11 @@ struct State {
     chunks: Mutex<Vec<Chunk>>,
     /// The faults of [`Behavior::chunk_unavailable`] still to inject.
     chunk_faults_left: Mutex<HashMap<String, u64>>,
+    upload_rendezvous: Rendezvous,
+    media_rendezvous: Rendezvous,
+    list_rendezvous: Rendezvous,
+    /// Whether a media download has arrived, for [`Behavior::list_after_media`].
+    media_arrived: watch::Sender<bool>,
 }
 
 pub(crate) struct FakeDrive {
@@ -331,6 +425,9 @@ impl FakeDrive {
             .expect("bind fake drive");
         let addr = listener.local_addr().expect("fake drive address");
         let behavior_chunk_faults = behavior.chunk_unavailable.clone();
+        let upload_rendezvous = Rendezvous::new(behavior.upload_rendezvous);
+        let media_rendezvous = Rendezvous::new(behavior.media_rendezvous);
+        let list_rendezvous = Rendezvous::new(behavior.list_rendezvous.len());
         let state = Arc::new(State {
             files,
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
@@ -340,6 +437,7 @@ impl FakeDrive {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             media: Mutex::new(Vec::new()),
+            exports: Mutex::new(Vec::new()),
             media_in_flight: AtomicUsize::new(0),
             media_max_in_flight: AtomicUsize::new(0),
             first_media: Mutex::new(None),
@@ -354,6 +452,10 @@ impl FakeDrive {
             sessions_max_active: AtomicUsize::new(0),
             chunks: Mutex::new(Vec::new()),
             chunk_faults_left: Mutex::new(behavior_chunk_faults),
+            upload_rendezvous,
+            media_rendezvous,
+            list_rendezvous,
+            media_arrived: watch::channel(false).0,
         });
 
         let server_state = Arc::clone(&state);
@@ -398,6 +500,11 @@ impl FakeDrive {
     /// The file ids of the media downloads, in arrival order.
     pub(crate) fn media(&self) -> Vec<String> {
         self.state.media.lock().expect("media lock").clone()
+    }
+
+    /// The file ids and requested MIME types of the exports, in arrival order.
+    pub(crate) fn exports(&self) -> Vec<(String, String)> {
+        self.state.exports.lock().expect("exports lock").clone()
     }
 
     /// The most media downloads that were being answered at the same time.
@@ -507,6 +614,9 @@ async fn handle(
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
+        if let Some(id) = id.strip_suffix("/export") {
+            return Ok(export(&state, id, &params));
+        }
         if params
             .iter()
             .any(|(key, value)| key == "alt" && value == "media")
@@ -540,6 +650,15 @@ async fn handle(
         .expect("requests lock")
         .push(list_request.clone());
 
+    let names = |set: &HashSet<String>| list_request.parents.iter().any(|id| set.contains(id));
+    if names(&state.behavior.list_rendezvous) {
+        state.list_rendezvous.join().await;
+    }
+    if names(&state.behavior.list_after_media) {
+        let mut media_arrived = state.media_arrived.subscribe();
+        let arrived = media_arrived.wait_for(|arrived| *arrived);
+        let _ = tokio::time::timeout(RENDEZVOUS_TIMEOUT, arrived).await;
+    }
     tokio::time::sleep(state.behavior.delay).await;
 
     let response = list(&state, &list_request, &q);
@@ -583,6 +702,7 @@ async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeRespons
     let _upload =
         (!is_folder).then(|| InFlight::new(&state.uploads_in_flight, &state.uploads_max_in_flight));
     if !is_folder {
+        state.upload_rendezvous.join().await;
         tokio::time::sleep(state.behavior.upload_delay).await;
     }
 
@@ -732,7 +852,7 @@ async fn session_request(
     if range != "*" && first.is_none() {
         return error(StatusCode::BAD_REQUEST, "malformed Content-Range");
     }
-    tokio::time::sleep(state.behavior.chunk_delay).await;
+    hold_chunk(state, first.map(|(first, _)| first)).await;
 
     let mut sessions = state.sessions.lock().expect("sessions lock");
     let Some(this) = sessions.get_mut(session) else {
@@ -810,6 +930,25 @@ async fn session_request(
     response
 }
 
+/// What a request of a session waits for before it is answered: [`Behavior::chunk_delay`]; a
+/// chunk from [`Behavior::chunks_stalled_from`] on, forever; and the first chunk of a session,
+/// for those of the others ([`Behavior::upload_rendezvous`]). `first` is the chunk's first byte.
+async fn hold_chunk(state: &State, first: Option<u64>) {
+    if let Some(first) = first {
+        if state
+            .behavior
+            .chunks_stalled_from
+            .is_some_and(|from| first >= from)
+        {
+            std::future::pending::<()>().await;
+        }
+        if first == 0 {
+            state.upload_rendezvous.join().await;
+        }
+    }
+    tokio::time::sleep(state.behavior.chunk_delay).await;
+}
+
 fn record_chunk(state: &State, name: &str, first: Option<u64>, status: StatusCode) {
     state.chunks.lock().expect("chunks lock").push(Chunk {
         name: name.to_owned(),
@@ -869,6 +1008,8 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         .lock()
         .expect("first media lock")
         .get_or_insert_with(Instant::now);
+    state.media_arrived.send_replace(true);
+    state.media_rendezvous.join().await;
 
     let behavior = &state.behavior;
     if let Some(delay) = behavior.media_missing.get(id) {
@@ -899,6 +1040,46 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         .header("content-type", "application/octet-stream")
         .header("content-length", length)
         .body(body)
+        .expect("valid response")
+}
+
+/// `files.export`: the document's content, sent in chunks without `Content-Length`.
+fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
+    let mime_type = params
+        .iter()
+        .find(|(key, _)| key == "mimeType")
+        .map(|(_, mime_type)| mime_type.clone())
+        .unwrap_or_default();
+    state
+        .exports
+        .lock()
+        .expect("exports lock")
+        .push((id.to_owned(), mime_type));
+
+    if state.behavior.export_too_large.contains(id) {
+        let message = "This file is too large to be exported.";
+        let body = json!({"error": {
+            "code": 403,
+            "message": message,
+            "errors": [{"domain": "global", "reason": "exportSizeLimitExceeded", "message": message}],
+        }});
+        return json_response(StatusCode::FORBIDDEN, &body);
+    }
+    let content = state
+        .files
+        .iter()
+        .find(|file| file.id == id && file.mime_type.starts_with("application/vnd.google-apps."))
+        .and_then(|file| file.content.clone());
+    let Some(content) = content else {
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    };
+    let frames = stream::iter([Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(
+        content,
+    )))]);
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .body(BodyExt::boxed(StreamBody::new(frames)))
         .expect("valid response")
 }
 

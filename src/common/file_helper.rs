@@ -85,14 +85,6 @@ enum FileKind<'a> {
 
 impl File<'_> {
     #[must_use]
-    pub(crate) fn into_path_buf(self) -> PathBuf {
-        match self.kind {
-            FileKind::Temp(temp) => temp.release(),
-            FileKind::File(path) => path.to_path_buf(),
-        }
-    }
-
-    #[must_use]
     pub(crate) fn file_mut_and_path(&mut self) -> (&mut fs::File, &Path) {
         (&mut self.inner, self.kind.path())
     }
