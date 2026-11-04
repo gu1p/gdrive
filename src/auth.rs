@@ -5,6 +5,7 @@
 //! only use and refresh the token saved in `tokens.json` and fails with [`ReauthRequired`]
 //! when that is not possible.
 
+pub(crate) mod login;
 pub(crate) mod store;
 pub(crate) mod stored;
 

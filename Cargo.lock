@@ -525,6 +525,7 @@ version = "3.9.1"
 dependencies = [
  "async-recursion",
  "async-trait",
+ "base64",
  "bytes",
  "bytesize",
  "chrono",
@@ -544,6 +545,7 @@ dependencies = [
  "mime_guess",
  "mktemp",
  "pin-project-lite",
+ "ring",
  "rustc_version_runtime",
  "serde",
  "serde_json",

@@ -3,53 +3,51 @@ use std::{
     error,
     fmt::{Display, Formatter},
     io::{self, Write},
-    path::Path,
 };
 
 use yup_oauth2::storage::TokenInfo;
 
 use crate::{
     app_config,
-    auth::{
-        self,
-        store::{self, TokenFile},
-    },
+    auth::{self, login, store::TokenFile},
     hub,
 };
 
-pub(crate) async fn add() -> Result<(), Box<Error>> {
+#[derive(Debug, Clone)]
+pub(crate) struct Config {
+    pub(crate) mode: login::Mode,
+    pub(crate) port: u16,
+}
+
+pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
+    let options = login::Options::new(config.mode, config.port, None);
+    options.check().map_err(Error::Login)?;
+
     println!("To add an account you need a Google Client ID and Client Secret.");
     println!(
-        "Instructions for how to create credentials can be found here:\
+        "Instructions for how to create credentials can be found here: \
         https://github.com/glotlabs/gdrive/blob/main/docs/create_google_api_credentials.md"
     );
-    println!(
-        "Note that if you are using gdrive on a remote server you should read this first:\
-        https://github.com/glotlabs/gdrive#using-gdrive-on-a-remote-server"
-    );
+    if config.mode == login::Mode::Browser {
+        println!(
+            "If the browser you will use runs on another machine (for example when gdrive runs \
+            on a remote server), use 'gdrive account add --manual' instead."
+        );
+    }
     println!();
 
     let secret = secret_prompt().map_err(Error::Prompt)?;
 
-    let tmp_dir = tempfile::tempdir().map_err(Error::Tempdir)?;
-    let tokens_path = tmp_dir.path().join("tokens.json");
-
-    let auth = hub::Auth::new(&secret, &tokens_path)
+    let token = login::login(&secret, &options)
         .await
-        .map_err(Error::Auth)?;
+        .map_err(Error::Login)?;
 
-    // Get access tokens
-    auth.token(&auth::DRIVE_SCOPES)
-        .await
-        .map_err(Error::AccessToken)?;
-
-    let hub = hub::Hub::new(auth.0).map_err(Error::HubCreation)?;
+    let hub = token_hub(&token).map_err(Error::HubCreation)?;
     let email = authorized_email(&hub)
         .await
         .map_err(|error| Error::About(*error))?
         .map_or(Cow::Borrowed("unknown"), Into::into);
 
-    let token = received_token(&tokens_path).await?;
     // When the account is added again with the same client, Google may leave out the refresh
     // token; keep the stored one then.
     let previous = app_config::AppConfig::load_account(&email)
@@ -69,7 +67,7 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
         app_cfg.base_path.display()
     );
     println!(
-        "Keep them safe! If someone gets access to them, they will also be able to access your\
+        "Keep them safe! If someone gets access to them, they will also be able to access your \
         Google Drive."
     );
 
@@ -80,13 +78,9 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
     Ok(())
 }
 
-/// The token the login flow saved in `tokens_path`.
-pub(super) async fn received_token(tokens_path: &Path) -> Result<TokenInfo, Box<Error>> {
-    store::TokenFile::load(tokens_path)
-        .await
-        .map_err(Error::ReadNewTokens)?
-        .and_then(|tokens| tokens.get(&auth::DRIVE_SCOPES).cloned())
-        .ok_or_else(|| Box::new(Error::NoTokenReceived))
+/// A Drive hub that uses the access token of a login that just happened.
+pub(super) fn token_hub(token: &TokenInfo) -> io::Result<hub::Hub> {
+    hub::Hub::new(token.access_token.clone().unwrap_or_default())
 }
 
 /// The email address of the Google account the hub is authorized for.
@@ -107,30 +101,22 @@ pub(super) async fn authorized_email(
 pub(crate) enum Error {
     HubCreation(io::Error),
     Prompt(io::Error),
-    Tempdir(io::Error),
-    Auth(io::Error),
-    ReadNewTokens(store::LoadError),
-    NoTokenReceived,
+    Login(login::LoginError),
     LoadAccount(app_config::errors::LoadAccount),
     AddAccount(app_config::errors::AddAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
-    AccessToken(yup_oauth2::Error),
     About(google_drive3::Error),
 }
 
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Error::HubCreation(error)
-            | Error::Prompt(error)
-            | Error::Tempdir(error)
-            | Error::Auth(error) => Some(error),
-            Error::ReadNewTokens(error) => Some(error),
-            Error::NoTokenReceived => None,
+            Error::HubCreation(error) | Error::Prompt(error) => Some(error),
+            // Shown as the login error itself, which says what to do.
+            Error::Login(error) => error.source(),
             Error::LoadAccount(error) => Some(error),
             Error::AddAccount(error) => Some(error),
             Error::SwitchAccount(error) => Some(error),
-            Error::AccessToken(error) => Some(error),
             Error::About(error) => Some(error),
         }
     }
@@ -139,16 +125,12 @@ impl error::Error for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let s = match self {
+            Error::Login(error) => return error.fmt(f),
             Error::HubCreation(_) => "unable to create a Google Drive hub",
             Error::Prompt(_) => "failed to get input from user",
-            Error::Tempdir(_) => "failed to create temporary directory",
-            Error::Auth(_) => "failed to authenticate",
-            Error::ReadNewTokens(_) => "unable to read the new tokens",
-            Error::NoTokenReceived => "the authorization returned no token",
             Error::LoadAccount(_) => "unable to load the account config",
             Error::AddAccount(_) => "unable to add account in the config",
             Error::SwitchAccount(_) => "unable to switch account in the config",
-            Error::AccessToken(_) => "failed to get access token",
             Error::About(_) => "failed to get user info",
         };
 

@@ -60,7 +60,14 @@ enum Command {
 #[derive(Subcommand)]
 enum AccountCommand {
     /// Add an account
-    Add,
+    ///
+    /// Asks for the Client ID and Client Secret, then for your approval in a browser. By default
+    /// gdrive receives the browser's redirect on port 8085 of localhost (see --port); on a remote
+    /// or headless machine use --manual.
+    Add {
+        #[command(flatten)]
+        login: LoginArgs,
+    },
 
     /// Authorize an existing account again
     ///
@@ -70,6 +77,9 @@ enum AccountCommand {
     Reauth {
         /// Account name [default: current account]
         account_name: Option<String>,
+
+        #[command(flatten)]
+        login: LoginArgs,
     },
 
     /// List all accounts
@@ -101,6 +111,36 @@ enum AccountCommand {
         /// Path to archive
         file_path: PathBuf,
     },
+}
+
+/// How the login of `account add` and `account reauth` gets the authorization.
+#[derive(clap::Args)]
+struct LoginArgs {
+    /// Paste the redirect URL instead of waiting for the browser (for remote and headless
+    /// machines)
+    ///
+    /// gdrive prints the authorization URL, which can be opened in a browser on any machine.
+    /// After the approval the browser lands on http://localhost:PORT/?code=...&state=...; that
+    /// page fails to load. Copy its full address from the address bar and paste it into gdrive.
+    #[arg(long, visible_alias = "no-browser")]
+    manual: bool,
+
+    /// Port of the redirect URI http://localhost:PORT
+    ///
+    /// Without --manual, gdrive listens on this port of 127.0.0.1 for the browser's redirect;
+    /// 0 picks a free port. Desktop app clients accept any port.
+    #[arg(long, value_name = "PORT", default_value_t = auth::login::DEFAULT_PORT)]
+    port: u16,
+}
+
+impl LoginArgs {
+    fn mode(&self) -> auth::login::Mode {
+        if self.manual {
+            auth::login::Mode::Manual
+        } else {
+            auth::login::Mode::Browser
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -693,8 +733,12 @@ async fn handle_account_command(
     command: AccountCommand,
 ) -> Result<(), Box<dyn std::error::Error + 'static>> {
     match command {
-        AccountCommand::Add => {
-            account::add().await?;
+        AccountCommand::Add { login } => {
+            account::add(&account::add::Config {
+                mode: login.mode(),
+                port: login.port,
+            })
+            .await?;
         }
 
         AccountCommand::List => {
@@ -709,8 +753,16 @@ async fn handle_account_command(
             account::switch(&account::switch::Config { account_name })?;
         }
 
-        AccountCommand::Reauth { account_name } => {
-            account::reauth(&account::reauth::Config { account_name }).await?;
+        AccountCommand::Reauth {
+            account_name,
+            login,
+        } => {
+            account::reauth(&account::reauth::Config {
+                account_name,
+                mode: login.mode(),
+                port: login.port,
+            })
+            .await?;
         }
 
         AccountCommand::Remove { account_name } => {
