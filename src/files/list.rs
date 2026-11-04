@@ -231,13 +231,15 @@ pub(crate) async fn list_files(
 /// Composition rules:
 /// - no `--query`: the non-trashed files directly in `--parent`, else at the top level of `--drive`,
 ///   else in My Drive's root (the 3.9 defaults);
-/// - `--query` alone: the query as given;
-/// - `--query` with `--parent`: `'<parent>' in parents and (<query>)`;
-/// - `--drive` searches the shared drive (`corpora=drive`, `driveId`) with the query above, so
-///   `--drive` with `--query` searches the whole drive rather than only its top level.
+/// - `--query` alone: the query as given (3.9);
+/// - `--query` with `--parent`: `'<parent>' in parents and trashed = false and (<query>)`;
+/// - `--query` with `--drive`: `trashed = false and (<query>)`, searched in the whole shared drive
+///   (`corpora=drive`, `driveId`) rather than only its top level; with `--parent` as well, the
+///   `--parent` form above.
 ///
-/// An empty `--query` adds no condition. The user query is passed through unchanged; only the ids
-/// are quoted.
+/// When composed, `trashed = false` is left out if the query itself refers to `trashed`, and an
+/// empty query adds no condition of its own. The user query is passed through unchanged; only the
+/// ids are quoted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ListQuery {
     /// `--query`; `None` selects the default listed above.
@@ -261,16 +263,33 @@ impl ListQuery {
     /// The `q` parameter of `files.list`. Empty means no filter.
     #[must_use]
     pub(crate) fn q(&self) -> String {
-        match (&self.query, &self.parent, &self.drive) {
-            (None, None, None) => String::from("'root' in parents and trashed = false"),
-            (None, Some(folder_id), _) | (None, None, Some(folder_id)) => {
-                format!("{} in parents and trashed = false", quote(folder_id))
-            }
-            (Some(query), Some(parent), _) if query.trim().is_empty() => {
-                format!("{} in parents", quote(parent))
-            }
-            (Some(query), Some(parent), _) => format!("{} in parents and ({query})", quote(parent)),
-            (Some(query), None, _) => query.clone(),
+        let Some(query) = &self.query else {
+            return match (&self.parent, &self.drive) {
+                (Some(folder_id), _) | (None, Some(folder_id)) => {
+                    format!("{} in parents and trashed = false", quote(folder_id))
+                }
+                (None, None) => String::from("'root' in parents and trashed = false"),
+            };
+        };
+
+        if self.parent.is_none() && self.drive.is_none() {
+            return query.clone();
+        }
+
+        let mut conditions = Vec::new();
+        if let Some(parent) = &self.parent {
+            conditions.push(format!("{} in parents", quote(parent)));
+        }
+        if !mentions_trashed(query) {
+            conditions.push(String::from("trashed = false"));
+        }
+
+        if query.trim().is_empty() {
+            conditions.join(" and ")
+        } else if conditions.is_empty() {
+            query.clone()
+        } else {
+            format!("{} and ({query})", conditions.join(" and "))
         }
     }
 
@@ -279,6 +298,44 @@ impl ListQuery {
     pub(crate) fn drive_id(&self) -> Option<&str> {
         self.drive.as_deref()
     }
+}
+
+/// Whether a query refers to the `trashed` field: the word `trashed` (any case) outside string
+/// literals, so `name contains 'trashed'` does not count.
+fn mentions_trashed(query: &str) -> bool {
+    let mut word = String::new();
+    let mut literal: Option<char> = None;
+    let mut escaped = false;
+
+    // The trailing space ends a word at the end of the query.
+    for c in query.chars().chain([' ']) {
+        if let Some(delimiter) = literal {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == delimiter {
+                literal = None;
+            }
+            continue;
+        }
+
+        if c.is_alphanumeric() || c == '_' {
+            word.push(c);
+            continue;
+        }
+
+        if word.eq_ignore_ascii_case("trashed") {
+            return true;
+        }
+        word.clear();
+
+        if c == '\'' || c == '"' {
+            literal = Some(c);
+        }
+    }
+
+    false
 }
 
 /// Quotes a value as a string literal of the Drive query language: `'` and `\` are escaped
@@ -428,8 +485,8 @@ mod tests {
     use chrono::{TimeZone, Utc};
 
     use super::{
-        list_files, list_to, quote, truncate_middle, write_files, Config, ListFilesConfig,
-        ListQuery, ListSortOrder, Output,
+        list_files, list_to, mentions_trashed, quote, truncate_middle, write_files, Config,
+        ListFilesConfig, ListQuery, ListSortOrder, Output,
     };
     use crate::{
         common::{
@@ -536,15 +593,20 @@ mod tests {
             ),
             (
                 list_query(Some("name contains 'x'"), Some("P"), None),
-                Some("'P' in parents and (name contains 'x')"),
+                Some("'P' in parents and trashed = false and (name contains 'x')"),
                 None,
             ),
             (
                 list_query(Some("name contains 'x'"), None, Some("D")),
-                Some("name contains 'x'"),
+                Some("trashed = false and (name contains 'x')"),
                 Some("D"),
             ),
-            (list_query(Some(""), None, Some("D")), None, Some("D")),
+            (
+                list_query(Some(""), None, Some("D")),
+                Some("trashed = false"),
+                Some("D"),
+            ),
+            (list_query(Some(""), None, None), None, None),
         ];
 
         for (query, expected_q, expected_drive) in cases {
@@ -798,14 +860,19 @@ mod tests {
             (
                 Some("P"),
                 None,
-                "'P' in parents and (name contains 'report')",
+                "'P' in parents and trashed = false and (name contains 'report')",
                 None,
             ),
-            (None, Some("D"), "name contains 'report'", Some("D")),
+            (
+                None,
+                Some("D"),
+                "trashed = false and (name contains 'report')",
+                Some("D"),
+            ),
             (
                 Some("P"),
                 Some("D"),
-                "'P' in parents and (name contains 'report')",
+                "'P' in parents and trashed = false and (name contains 'report')",
                 Some("D"),
             ),
         ];
@@ -827,7 +894,10 @@ mod tests {
     #[test]
     fn query_parenthesizes_user_query() {
         let query = list_query(Some("name = 'a' or name = 'b'"), Some("P"), None);
-        assert_eq!(query.q(), "'P' in parents and (name = 'a' or name = 'b')");
+        assert_eq!(
+            query.q(),
+            "'P' in parents and trashed = false and (name = 'a' or name = 'b')"
+        );
     }
 
     #[test]
@@ -836,21 +906,74 @@ mod tests {
         assert_eq!(list_query(Some(user), None, None).q(), user);
         assert_eq!(
             list_query(Some(user), Some("P"), Some("D")).q(),
-            format!("'P' in parents and ({user})")
+            format!("'P' in parents and trashed = false and ({user})")
         );
     }
 
     #[test]
-    fn empty_query_adds_no_condition() {
+    fn empty_query_keeps_only_the_defaults() {
         for user in ["", "  "] {
             assert_eq!(list_query(Some(user), None, None).q().trim(), "");
             assert_eq!(
                 list_query(Some(user), Some("P"), None).q(),
-                "'P' in parents"
+                "'P' in parents and trashed = false"
             );
             let on_drive = list_query(Some(user), None, Some("D"));
-            assert_eq!(on_drive.q().trim(), "");
+            assert_eq!(on_drive.q(), "trashed = false");
             assert_eq!(on_drive.drive_id(), Some("D"));
+        }
+    }
+
+    #[test]
+    fn composed_query_leaves_out_trashed_files_unless_it_asks_for_them() {
+        // Live files only: the user query says nothing about trashed.
+        assert_eq!(
+            list_query(Some("name = 'x'"), Some("P"), None).q(),
+            "'P' in parents and trashed = false and (name = 'x')"
+        );
+        // A literal containing the word is not a reference to the field.
+        assert_eq!(
+            list_query(Some("name contains 'trashed'"), Some("P"), None).q(),
+            "'P' in parents and trashed = false and (name contains 'trashed')"
+        );
+        // Trashed files on request: the user's own predicate replaces the default.
+        assert_eq!(
+            list_query(Some("trashed = true"), Some("P"), None).q(),
+            "'P' in parents and (trashed = true)"
+        );
+        assert_eq!(
+            list_query(Some("name = 'x' and Trashed=true"), Some("P"), Some("D")).q(),
+            "'P' in parents and (name = 'x' and Trashed=true)"
+        );
+        assert_eq!(
+            list_query(Some("trashed = true"), None, Some("D")).q(),
+            "trashed = true"
+        );
+        // --query alone stays as typed, as in 3.9.
+        assert_eq!(list_query(Some("name = 'x'"), None, None).q(), "name = 'x'");
+    }
+
+    #[test]
+    fn mentions_trashed_ignores_string_literals() {
+        for query in [
+            "trashed = true",
+            "trashed=false",
+            "TRASHED = true",
+            "name = 'a' and trashed = true",
+            "(trashed = true)",
+            "name = 'it\\'s' and trashed = true",
+        ] {
+            assert!(mentions_trashed(query), "{query:?}");
+        }
+        for query in [
+            "name contains 'trashed'",
+            "fullText contains \"trashed\"",
+            "name = 'it\\'s trashed'",
+            "untrashed = true",
+            "trashed_at > 1",
+            "",
+        ] {
+            assert!(!mentions_trashed(query), "{query:?}");
         }
     }
 
@@ -861,7 +984,7 @@ mod tests {
         assert_eq!(quote(r"a\b"), r"'a\\b'");
         assert_eq!(
             list_query(Some("starred"), Some("x'y"), None).q(),
-            r"'x\'y' in parents and (starred)"
+            r"'x\'y' in parents and trashed = false and (starred)"
         );
     }
 

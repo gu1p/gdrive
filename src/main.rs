@@ -134,8 +134,10 @@ enum FileCommand {
         /// Query. See <https://developers.google.com/workspace/drive/api/guides/search-files> [default: "'root' in parents and trashed = false"]
         ///
         /// With --parent, lists only the files in that folder that match:
-        /// `'<DIRECTORY_ID>' in parents and (<QUERY>)`. With --drive, searches the whole shared
-        /// drive instead of its top level. An empty query adds no condition.
+        /// `'<DIRECTORY_ID>' in parents and trashed = false and (<QUERY>)`. With --drive, searches
+        /// the whole shared drive instead of its top level: `trashed = false and (<QUERY>)`. In
+        /// both cases `trashed = false` is left out if the query mentions trashed, so
+        /// `--query 'trashed = true'` lists the trash.
         #[arg(long)]
         query: Option<String>,
 
@@ -146,7 +148,8 @@ enum FileCommand {
         /// List files in a specific folder
         ///
         /// Without --query, lists the files in the folder that are not trashed. With --query,
-        /// lists the files in the folder that match the query.
+        /// lists the files in the folder that match the query (not trashed, unless the query
+        /// mentions trashed).
         #[arg(long, value_name = "DIRECTORY_ID")]
         parent: Option<String>,
 
@@ -154,7 +157,7 @@ enum FileCommand {
         ///
         /// Without --query, lists the files that are not trashed at the top level of the drive,
         /// or in the --parent folder. With --query, searches the whole drive, or only the
-        /// --parent folder.
+        /// --parent folder (not trashed, unless the query mentions trashed).
         #[arg(long, value_name = "DRIVE_ID")]
         drive: Option<String>,
 
@@ -816,10 +819,13 @@ mod tests {
     #[test]
     fn files_list_query_is_not_dropped_by_parent_or_drive() {
         let query = parse_files_list(&["--query", "name = 'a'", "--parent", "P"]);
-        assert_eq!(query.q(), "'P' in parents and (name = 'a')");
+        assert_eq!(
+            query.q(),
+            "'P' in parents and trashed = false and (name = 'a')"
+        );
 
         let query = parse_files_list(&["--drive", "D", "--query", "name = 'a'"]);
-        assert_eq!(query.q(), "name = 'a'");
+        assert_eq!(query.q(), "trashed = false and (name = 'a')");
         assert_eq!(query.drive_id(), Some("D"));
     }
 
