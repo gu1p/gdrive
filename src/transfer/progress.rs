@@ -9,8 +9,19 @@
 //! [`ProgressEvent::Bytes`], and one [`ProgressEvent::Finished`]. [`ProgressEvent::SourceDone`]
 //! comes once, when no further job will be queued from the source (the walk ended): from then on
 //! the totals are final, apart from follow-up jobs (an upload's folder releasing its children).
+//! A run whose totals are known before its jobs are (a local tree, walked first) says so with
+//! [`ProgressEvent::Planned`], before the first job.
+//!
+//! [`render`] draws the events on stderr; [`terminal`] decides whether it does (`--progress`,
+//! `--no-progress`, `GDRIVE_PROGRESS`, a terminal on stderr) and keeps other output above the
+//! bars.
+
+pub(crate) mod render;
+pub(crate) mod terminal;
 
 use std::sync::Arc;
+
+pub(crate) use terminal::suspend;
 
 use super::scheduler::{JobKind, Outcome};
 
@@ -20,15 +31,17 @@ pub(crate) struct JobId(pub(crate) u64);
 
 /// What happened to a job. Borrowed: a sink copies what it keeps.
 #[derive(Debug)]
-// Only the tests read the fields until the progress display of milestone 2 item 5 does.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read by the progress display, which is not written yet"
-    )
-)]
 pub(crate) enum ProgressEvent<'a> {
+    /// The run will transfer `files` files of `bytes` bytes in all: the totals, known before
+    /// the jobs are.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the recursive upload sends it from the next commit on"
+        )
+    )]
+    Planned { files: u64, bytes: u64 },
     /// The job entered the scheduler's queue. `size` is the content size when known.
     Queued {
         job: JobId,
@@ -45,6 +58,13 @@ pub(crate) enum ProgressEvent<'a> {
     Finished {
         job: JobId,
         kind: JobKind,
+        #[cfg_attr(
+            not(test),
+            expect(
+                dead_code,
+                reason = "the display knows its jobs by id; for sinks that keep no record of them"
+            )
+        )]
         label: &'a str,
         outcome: &'a Outcome,
     },

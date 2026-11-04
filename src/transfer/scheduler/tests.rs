@@ -544,6 +544,7 @@ impl ProgressSink for Recorder {
                 outcome,
             } => format!("finished {job} {kind:?} {label} {outcome:?}"),
             ProgressEvent::SourceDone => String::from("source done"),
+            ProgressEvent::Planned { files, bytes } => format!("planned {files} {bytes}"),
         };
         self.0.lock().unwrap().push(text);
     }
