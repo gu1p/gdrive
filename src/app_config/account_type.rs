@@ -54,15 +54,26 @@ pub(super) fn is_account_dir(path: &Path) -> bool {
     path.join(TOKENS_CONFIG_NAME).exists() || path.join(ACCOUNT_CONFIG_NAME).is_file()
 }
 
+/// The names under the config root that gdrive uses itself: the file that names the current
+/// account and the staging directory. No account may have one of them, in any case (Windows and
+/// macOS file systems ignore it).
+const RESERVED_NAMES: [&str; 2] = [ACCOUNT_CONFIG_NAME, STAGING_DIR_NAME];
+
+/// What [`is_valid_account_name`] requires, for messages.
+pub(crate) const ACCOUNT_NAME_RULES: &str = "an account name must not be empty, '.' or '..', \
+     contain '/' or '\\', or be 'account.json' or '.staging', which gdrive uses itself";
+
 /// Whether `name` can be the name of an account: it becomes a directory under the config root,
-/// so it must be one plain path component, and not the name of gdrive's staging directory.
+/// so it must be one plain path component, and none of the [`RESERVED_NAMES`].
 pub(crate) fn is_valid_account_name(name: &str) -> bool {
     let mut components = Path::new(name).components();
     matches!(
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     ) && !name.contains(['/', '\\'])
-        && !name.eq_ignore_ascii_case(STAGING_DIR_NAME)
+        && !RESERVED_NAMES
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 impl AppConfig {
@@ -449,7 +460,18 @@ mod tests {
         ] {
             assert!(is_valid_account_name(name), "{name:?}");
         }
-        for name in ["", ".", "..", "../me", "a/b", "a\\b", "/abs"] {
+        for name in [
+            "",
+            ".",
+            "..",
+            "../me",
+            "a/b",
+            "a\\b",
+            "/abs",
+            "account.json",
+            "Account.JSON",
+            ".staging",
+        ] {
             assert!(!is_valid_account_name(name), "{name:?}");
             assert!(AppConfig::named_account_in(PathBuf::from("/base"), name).is_none());
         }

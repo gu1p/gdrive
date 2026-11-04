@@ -13,7 +13,7 @@ use hyper_util::client::legacy::{connect::Connect, Client};
 use crate::{
     app_config::{
         self,
-        account_type::{AccountType, InstallAccount},
+        account_type::{AccountType, InstallAccount, ACCOUNT_NAME_RULES},
         AppConfig,
     },
     auth::{
@@ -213,8 +213,7 @@ impl Display for Error {
             ),
             Error::InvalidName(name) => write!(
                 f,
-                "'{name}' cannot be an account name: it must not be empty, '.' or '..', or \
-                 contain '/' or '\\'"
+                "'{name}' cannot be an account name: {ACCOUNT_NAME_RULES}"
             ),
             Error::Credentials(_) => f.write_str("the service account key does not work"),
             Error::FindAdc(_) => f.write_str("unable to use the Application Default Credentials"),
@@ -361,14 +360,18 @@ mod tests {
             .join("robot/service_account.json")
             .is_file());
 
-        let error = add_service_account_in(
-            config_root(&setup),
-            http_client(),
-            &config(&setup, None, Some("../elsewhere")),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(*error, Error::InvalidName(_)), "{error:?}");
+        for name in ["../elsewhere", "account.json", ".staging"] {
+            let error = add_service_account_in(
+                config_root(&setup),
+                http_client(),
+                &config(&setup, None, Some(name)),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(*error, Error::InvalidName(_)), "{name}: {error:?}");
+            assert!(error.to_string().contains("'account.json'"), "{error}");
+        }
+        assert!(!config_root(&setup).join("account.json").exists());
     }
 
     #[tokio::test]

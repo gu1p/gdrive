@@ -397,3 +397,61 @@ async fn token_uris_and_metadata_hosts_that_would_panic_are_errors() {
         stderr(&added)
     );
 }
+
+#[tokio::test]
+async fn names_gdrive_uses_itself_cannot_become_accounts() {
+    let server = MockServer::start(vec![(200, String::from(TOKEN_RESPONSE))]).await;
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    std::fs::write(
+        home.join("key.json"),
+        service_account_key_json(&server.url("/token")),
+    )
+    .unwrap();
+    let root = home.join(".config").join("gdrive3");
+
+    for name in ["account.json", "ACCOUNT.JSON", ".staging"] {
+        let added = gdrive(
+            home,
+            &[
+                "account",
+                "add",
+                "--service-account",
+                "key.json",
+                "--name",
+                name,
+            ],
+        )
+        .await;
+        assert_eq!(added.status.code(), Some(1), "{name}");
+        assert!(
+            stderr(&added).starts_with(&format!("Error: '{name}' cannot be an account name")),
+            "{}",
+            stderr(&added)
+        );
+    }
+    assert!(server.requests().is_empty());
+    assert!(!root.join("account.json").exists());
+
+    // An archive whose account directory is named account.json is not unpacked.
+    let source = tempfile::tempdir().unwrap();
+    let account = source.path().join("account.json");
+    std::fs::create_dir(&account).unwrap();
+    std::fs::write(account.join("tokens.json"), "[]").unwrap();
+    let archive = home.join("evil.tar");
+    let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+    builder.append_dir_all("account.json", &account).unwrap();
+    builder.finish().unwrap();
+    drop(builder);
+
+    let imported = gdrive(home, &["account", "import", archive.to_str().unwrap()]).await;
+    assert_eq!(imported.status.code(), Some(1));
+    assert!(
+        stderr(&imported).starts_with(
+            "Error: the archive holds the account 'account.json', which cannot be imported"
+        ),
+        "{}",
+        stderr(&imported)
+    );
+    assert!(!root.join("account.json").exists());
+}

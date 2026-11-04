@@ -5,7 +5,7 @@ use std::{
 };
 
 use crate::{
-    app_config::{self, AppConfig},
+    app_config::{self, account_type, AppConfig},
     common::account_archive,
 };
 
@@ -17,6 +17,11 @@ pub(crate) struct Config {
 pub(crate) fn import(config: &Config) -> Result<(), Error> {
     let account_name =
         account_archive::get_account_name(&config.archive_path).map_err(Error::ReadAccountName)?;
+    // The directory is unpacked into the config root: it must not take the place of gdrive's own
+    // files there, such as account.json.
+    if !account_type::is_valid_account_name(&account_name) {
+        return Err(Error::InvalidName(account_name));
+    }
 
     let accounts = app_config::list_accounts().map_err(Error::ListAccounts)?;
     if accounts.contains(&account_name) {
@@ -42,6 +47,7 @@ pub(crate) enum Error {
     ReadAccountName(account_archive::errors::GetAccountName),
     ListAccounts(app_config::errors::ListAccounts),
     AccountExists(String),
+    InvalidName(String),
     DefaultBasePath(app_config::errors::DefaultBasePath),
     Unpack(account_archive::errors::Unpack),
     LoadAccount(app_config::errors::LoadAccount),
@@ -51,7 +57,7 @@ pub(crate) enum Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Error::AccountExists(_) => None,
+            Error::AccountExists(_) | Error::InvalidName(_) => None,
             Error::ReadAccountName(error) => Some(error),
             Error::Unpack(error) => Some(error),
             Error::ListAccounts(error) => Some(error),
@@ -68,6 +74,11 @@ impl Display for Error {
             Error::ReadAccountName(_) => f.write_str("unable to read the account name"),
             Error::ListAccounts(_) => f.write_str("unable to list accounts"),
             Error::AccountExists(name) => write!(f, "Account '{name}' already exists"),
+            Error::InvalidName(name) => write!(
+                f,
+                "the archive holds the account '{name}', which cannot be imported: {}",
+                account_type::ACCOUNT_NAME_RULES
+            ),
             Error::DefaultBasePath(_) => f.write_str("unable to get the default base path"),
             Error::Unpack(_) => f.write_str("unable to unpack account archive"),
             Error::LoadAccount(_) => f.write_str("unable to load account"),
