@@ -165,8 +165,8 @@ async fn download_regular(
         .map_err(|err| E::DownloadFile(Box::new(err)))?;
 
     if config.destination == Destination::Stdout {
-        let (display, _progress) = ProgressDisplay::single(config.progress, true, download.total());
-        let saved = save_to_stdout(download, first).await;
+        let (display, progress) = ProgressDisplay::single(config.progress, true, download.total());
+        let saved = save_to_stdout(download.with_progress(progress), first).await;
         display.finish();
         saved?;
     } else {
@@ -177,8 +177,8 @@ async fn download_regular(
 
         println!("Downloading {file_name}");
         let file_id = file.id.as_deref().unwrap_or(&config.file_id);
-        let (display, _progress) =
-            ProgressDisplay::single(config.progress, false, download.total());
+        let (display, progress) = ProgressDisplay::single(config.progress, false, download.total());
+        let download = download.with_progress(progress);
         let saved = save_to_file(download, first, &abs_file_path, file_id).await;
         display.finish();
         if let Err(source) = saved {

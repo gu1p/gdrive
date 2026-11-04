@@ -2,11 +2,11 @@
 //! downloads concurrently.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     future::{self, Future},
     num::NonZeroUsize,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -16,7 +16,7 @@ use crate::{
     files::download::{errors, Config, Destination, ExistingFileAction},
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
-        progress::{Mode, NoProgress},
+        progress::{JobId, Mode, NoProgress, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
             Options,
@@ -66,6 +66,16 @@ async fn download(
     config: &Config,
     cancel: impl Future<Output = ()> + Send,
 ) -> Downloaded {
+    download_reporting(server, config, Arc::new(NoProgress), cancel).await
+}
+
+/// [`download`], reporting to `progress`.
+async fn download_reporting(
+    server: &FakeDrive,
+    config: &Config,
+    progress: Arc<dyn ProgressSink>,
+    cancel: impl Future<Output = ()> + Send,
+) -> Downloaded {
     let output = output();
     let hub = server.hub();
     let run = download_directory(
@@ -73,7 +83,7 @@ async fn download(
         root_folder(),
         config,
         &output.printer,
-        Arc::new(NoProgress),
+        progress,
         cancel,
     );
     let result = tokio::time::timeout(Duration::from_secs(20), run)
@@ -589,4 +599,88 @@ async fn an_existing_local_file_fails_without_overwrite() {
     );
     assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "mine");
     assert_eq!(server.media(), Vec::<String>::new());
+}
+
+/// The bytes reported for each file of a recursive download, by label, and whether the file was
+/// in place already when they were.
+struct Written {
+    destination: PathBuf,
+    labels: Mutex<HashMap<JobId, String>>,
+    reports: Mutex<BTreeMap<String, Vec<(u64, bool)>>>,
+}
+
+impl ProgressSink for Written {
+    fn event(&self, event: &ProgressEvent<'_>) {
+        match event {
+            ProgressEvent::Queued { job, label, .. } => {
+                self.labels
+                    .lock()
+                    .unwrap()
+                    .insert(*job, (*label).to_owned());
+            }
+            ProgressEvent::Bytes { job, bytes } => {
+                let label = self.labels.lock().unwrap()[job].clone();
+                let renamed = self.destination.join(&label).exists();
+                let mut reports = self.reports.lock().unwrap();
+                reports.entry(label).or_default().push((*bytes, renamed));
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn downloaded_bytes_are_reported_as_they_are_written() {
+    let big = "0123456789".repeat(30_000);
+    let files = vec![
+        FakeFile::blob("big", "big.bin", "root", &big),
+        FakeFile::blob("small", "small.txt", "root", "small"),
+        FakeFile::blob("same", "same.txt", "root", "same"),
+    ];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+    let root = destination.path().join("Root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("same.txt"), "same").unwrap();
+    let config = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..config(destination.path(), 2, false)
+    };
+    let written = Arc::new(Written {
+        destination: destination.path().to_path_buf(),
+        labels: Mutex::default(),
+        reports: Mutex::default(),
+    });
+
+    let downloaded = download_reporting(
+        &server,
+        &config,
+        Arc::clone(&written) as Arc<dyn ProgressSink>,
+        future::pending(),
+    )
+    .await;
+
+    downloaded.result.unwrap();
+    let reports = written.reports.lock().unwrap();
+    let totals = reports
+        .iter()
+        .map(|(label, reports)| {
+            let bytes = reports.iter().map(|(bytes, _)| bytes).sum::<u64>();
+            (label.clone(), bytes)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        totals,
+        [
+            (shown("Root/big.bin"), big.len() as u64),
+            (shown("Root/small.txt"), 5),
+        ],
+        "an unchanged file transfers nothing"
+    );
+    for (label, reports) in reports.iter() {
+        assert!(
+            reports.iter().all(|(_, renamed)| !renamed),
+            "{label}: reported while it was written: {reports:?}"
+        );
+    }
 }

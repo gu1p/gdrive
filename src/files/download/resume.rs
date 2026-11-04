@@ -20,6 +20,10 @@
 //! - 416 means the range starts at the end or past it: complete when the size says so,
 //!   otherwise the content is requested again from the start.
 //!
+//! A download with a [`JobProgress`] ([`ResumableDownload::with_progress`]) reports each byte
+//! once, when it is written the first time: bytes written again after the content started over
+//! are not progress.
+//!
 //! Resume is in-process only.
 // TODO(sync): resume across runs: persist the received offset with the file's revision and
 // ETag (a sidecar next to the temporary file) and check both before continuing.
@@ -47,7 +51,7 @@ use crate::{
     },
     hub::Hub,
     // Warnings go above the progress bars.
-    transfer::progress::eprintln,
+    transfer::progress::{eprintln, JobProgress},
 };
 
 /// What a finished download is checked against.
@@ -241,8 +245,10 @@ pub(crate) struct ResumableDownload<'a> {
     /// Bytes of the content received in order: the next request starts here.
     received: u64,
     /// The furthest `received` has been. Only bytes past it are progress: after a restart, the
-    /// same bytes again do not renew the retry budget.
+    /// same bytes again do not renew the retry budget, nor count for `progress`.
     high_water: u64,
+    /// Told about the bytes past `high_water` as they are written.
+    progress: Option<JobProgress>,
     /// The md5 and size from Drive's metadata, if any; replaced when the file changes.
     expected: Expected,
     /// The size the server announced (`Content-Length` of a 200, the total of a 206).
@@ -264,6 +270,7 @@ impl<'a> ResumableDownload<'a> {
             retry,
             received: 0,
             high_water: 0,
+            progress: None,
             expected,
             server_total: None,
             etag: None,
@@ -277,6 +284,13 @@ impl<'a> ResumableDownload<'a> {
     #[must_use]
     pub(crate) fn with_identity(mut self, identity: Identity<'a>) -> Self {
         self.identity = Some(identity);
+        self
+    }
+
+    /// Reports the bytes written to `progress`, each byte once.
+    #[must_use]
+    pub(crate) fn with_progress(mut self, progress: JobProgress) -> Self {
+        self.progress = Some(progress);
         self
     }
 
@@ -407,6 +421,9 @@ impl<'a> ResumableDownload<'a> {
     pub(crate) fn advance(&mut self, bytes: u64) {
         self.received = self.received.saturating_add(bytes);
         if self.received > self.high_water {
+            if let Some(progress) = &self.progress {
+                progress.bytes(self.received - self.high_water);
+            }
             self.high_water = self.received;
             self.retry.progress();
         }

@@ -287,9 +287,11 @@ impl Files {
             ..Revision::default()
         };
         let identity = Identity::new(&self.hub, &file.id, revision);
+        // The bytes count as they are written.
         let mut download =
             ResumableDownload::new(source, self.hub.retrier().state(), revision.expected())
-                .with_identity(identity);
+                .with_identity(identity)
+                .with_progress(context.progress.clone());
         let first = download
             .next()
             .await
@@ -308,7 +310,6 @@ impl Files {
             path: abs_file_path.clone(),
             source,
         })?;
-        context.progress.bytes(file.size);
 
         Ok(Outcome::Transferred { bytes: file.size })
     }

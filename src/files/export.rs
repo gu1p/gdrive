@@ -93,7 +93,8 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
         config.file_path.display()
     );
 
-    let (display, _progress) = ProgressDisplay::single(config.progress, false, download.total());
+    let (display, progress) = ProgressDisplay::single(config.progress, false, download.total());
+    let download = download.with_progress(progress);
     let saved =
         files::download::save_to_file(download, first, &config.file_path, &config.file_id).await;
     display.finish();
