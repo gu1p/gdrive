@@ -5,6 +5,8 @@ use google_drive3::DriveHub;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 
+/// Cloning is cheap and shares the connection pool and the credentials (and so the token cache).
+#[derive(Clone)]
 pub(crate) struct Hub(DriveHub<HttpsConnector<HttpConnector>>);
 
 impl Deref for Hub {
@@ -32,6 +34,16 @@ impl Hub {
                 .build(create_connector()?);
 
         Ok(Hub(google_drive3::DriveHub::new(http_client, auth)))
+    }
+}
+
+impl Hub {
+    /// The Drive API base URL (`https://www.googleapis.com/drive/v3/` unless a test changed it),
+    /// for requests google-drive3 cannot build, such as ones with extra headers.
+    pub(crate) fn drive_base_url(&self) -> String {
+        // google-drive3 only has a setter, which returns the previous value; the clone shares
+        // the client and credentials and is dropped right away.
+        self.0.clone().base_url(String::new())
     }
 }
 
