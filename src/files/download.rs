@@ -80,13 +80,16 @@ pub(crate) enum ExistingFileAction {
     Overwrite,
 }
 
-#[async_recursion]
 pub(crate) async fn download(config: Config) -> Result<(), errors::Download> {
+    let hub = get_hub().await.map_err(errors::Download::Hub)?;
+    download_with_hub(&hub, config).await
+}
+
+#[async_recursion]
+async fn download_with_hub(hub: &Hub, config: Config) -> Result<(), errors::Download> {
     use errors::Download as E;
 
-    let hub = get_hub().await.map_err(E::Hub)?;
-
-    let file = files::info::get_file(&hub, &config.file_id)
+    let file = files::info::get_file(hub, &config.file_id)
         .await
         .map_err(|err| E::GetFile(Box::new(err)))?;
 
@@ -108,15 +111,15 @@ pub(crate) async fn download(config: Config) -> Result<(), errors::Download> {
         let file_id = target_file_id
             .ok_or_else(|| E::MissingShortcutTarget(FileIdentifier::new(name, id)))?;
 
-        download(Config { file_id, ..config }).await?;
+        download_with_hub(hub, Config { file_id, ..config }).await?;
     } else if drive_file::is_directory(&file) {
         if !config.download_directories {
             return Err(E::IsDirectory(FileIdentifier::from(file)));
         }
 
-        download_directory(&hub, file, &config).await?;
+        download_directory(hub, file, &config).await?;
     } else {
-        download_regular(&hub, &file, &config).await?;
+        download_regular(hub, &file, &config).await?;
     }
 
     Ok(())

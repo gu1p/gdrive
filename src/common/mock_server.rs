@@ -73,6 +73,15 @@ impl Response {
         }
     }
 
+    /// A response whose body is sent as is, e.g. file content for a media download.
+    pub(crate) fn raw(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            headers: Vec::new(),
+            body: body.to_owned(),
+        }
+    }
+
     /// `{root}` in `value` is replaced by the server's root URL (`http://127.0.0.1:PORT/`), for
     /// headers that point back at the server such as a resumable upload's `Location`.
     pub(crate) fn with_header(mut self, name: &str, value: &str) -> Self {
