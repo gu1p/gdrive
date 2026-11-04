@@ -114,6 +114,50 @@ impl AppConfig {
         Ok(AppConfig::new(base_path, account))
     }
 
+    /// The account `account_name` and its stored client credentials (secret.json). Unlike
+    /// [`list_accounts`], this does not need tokens.json, so an account whose tokens are missing
+    /// can still be authorized again.
+    pub(crate) fn load_account_with_secret(
+        account_name: &str,
+    ) -> Result<(AppConfig, Secret), errors::LoadAccountWithSecret> {
+        let base_path = AppConfig::default_base_path()
+            .map_err(errors::LoadAccountWithSecret::DefaultBasePath)?;
+        AppConfig::load_account_with_secret_in(base_path, account_name)
+    }
+
+    pub(crate) fn load_account_with_secret_in(
+        base_path: PathBuf,
+        account_name: &str,
+    ) -> Result<(AppConfig, Secret), errors::LoadAccountWithSecret> {
+        use errors::LoadAccountWithSecret as E;
+
+        // The name becomes a directory under the config root: one plain path component only.
+        let mut components = Path::new(account_name).components();
+        let single_component = matches!(
+            (components.next(), components.next()),
+            (Some(std::path::Component::Normal(_)), None)
+        );
+        if !single_component || account_name.contains(['/', '\\']) {
+            return Err(E::InvalidName(account_name.to_owned()));
+        }
+
+        let config = AppConfig::new(base_path, Account::new(account_name));
+        let secret = match config.load_secret() {
+            Ok(secret) => secret,
+            Err(errors::LoadSecret::Read { source, .. })
+                if source.kind() == io::ErrorKind::NotFound =>
+            {
+                return Err(E::NotFound(account_name.to_owned()));
+            }
+            Err(error) => return Err(E::LoadSecret(error)),
+        };
+        if secret.client_id.trim().is_empty() || secret.client_secret.trim().is_empty() {
+            return Err(E::IncompleteSecret(account_name.to_owned()));
+        }
+
+        Ok((config, secret))
+    }
+
     pub(crate) fn init_account(account_name: &str) -> Result<AppConfig, errors::InitAccount> {
         let base_path = AppConfig::default_base_path()?;
         let account = Account::new(account_name);
@@ -331,5 +375,53 @@ mod tests {
         let tokens = config.tokens_of_client("id").await.unwrap();
         assert_eq!(tokens.refresh_token(), Some("r"));
         assert!(config.tokens_of_client("other-id").await.is_none());
+    }
+
+    #[test]
+    fn account_with_secret_does_not_need_tokens() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let config = AppConfig::new(base.clone(), Account::new("me@example.com"));
+        config.create_account_dir().unwrap();
+        config
+            .save_secret(&Secret {
+                client_id: String::from("id"),
+                client_secret: String::from("secret"),
+            })
+            .unwrap();
+        // No tokens.json: list_accounts skips this account.
+        assert!(!config.tokens_path().exists());
+
+        let (loaded, secret) =
+            AppConfig::load_account_with_secret_in(base.clone(), "me@example.com").unwrap();
+        assert_eq!(loaded.tokens_path(), config.tokens_path());
+        assert_eq!(secret.client_id, "id");
+    }
+
+    #[test]
+    fn account_with_secret_rejects_unknown_accounts_bad_names_and_empty_credentials() {
+        use errors::LoadAccountWithSecret as E;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+
+        let error = AppConfig::load_account_with_secret_in(base.clone(), "nobody").unwrap_err();
+        assert!(matches!(&error, E::NotFound(name) if name == "nobody"));
+        assert!(error.to_string().contains("gdrive account list"));
+
+        for name in ["", ".", "..", "../me", "a/b", "a\\b", "/abs"] {
+            let error = AppConfig::load_account_with_secret_in(base.clone(), name).unwrap_err();
+            assert!(matches!(error, E::InvalidName(_)), "{name:?}: {error:?}");
+        }
+
+        let config = AppConfig::new(base.clone(), Account::new("empty"));
+        config.create_account_dir().unwrap();
+        fs::write(
+            config.secret_path(),
+            r#"{"client_id":"","client_secret":"s"}"#,
+        )
+        .unwrap();
+        let error = AppConfig::load_account_with_secret_in(base, "empty").unwrap_err();
+        assert!(matches!(error, E::IncompleteSecret(_)), "{error:?}");
     }
 }
