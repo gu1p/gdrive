@@ -10,9 +10,10 @@
 //! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
 //! the other requests.
 //!
-//! For recursive uploads it answers `files.generateIds` and multipart `files.create` (the
-//! uploads of files and the creation of folders, [`Created`]). Like Drive, a create fails with
-//! 404 when a parent does not exist yet.
+//! For recursive uploads it answers `files.generateIds`, multipart `files.create` (the uploads
+//! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
+//! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
+//! last). Like Drive, a create fails with 404 when a parent does not exist yet.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -38,6 +39,7 @@ use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 const LIST_PATH: &str = "/drive/v3/files";
 const GENERATE_IDS_PATH: &str = "/drive/v3/files/generateIds";
 const UPLOAD_PATH: &str = "/upload/drive/v3/files";
+const SESSION_PATH: &str = "/upload-session/";
 
 /// A file stored by the fake.
 #[derive(Debug, Clone, Default)]
@@ -219,6 +221,33 @@ pub(crate) struct Behavior {
     pub(crate) upload_delay: Duration,
     /// Creates of files with these names fail with 400.
     pub(crate) upload_rejected: HashSet<String>,
+    /// How long every chunk of a resumable session takes before its reply.
+    pub(crate) chunk_delay: Duration,
+    /// The chunk of the file with this name that starts at this offset fails with 503 once,
+    /// committing nothing.
+    pub(crate) chunk_unavailable: HashMap<String, u64>,
+}
+
+/// A chunk or status request of a resumable session, as the fake answered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Chunk {
+    /// The name of the file the session uploads.
+    pub(crate) name: String,
+    /// The first byte; `None` for a status request.
+    pub(crate) first: Option<u64>,
+    pub(crate) status: u16,
+}
+
+/// A resumable session.
+#[derive(Debug)]
+struct Session {
+    metadata: Value,
+    total: u64,
+    received: Vec<u8>,
+    /// See [`Created::arrived`].
+    arrived: usize,
+    /// The reply that completed the session.
+    done: Option<Value>,
 }
 
 /// A `files.create` the fake answered.
@@ -280,6 +309,13 @@ struct State {
     uploads_max_in_flight: AtomicUsize,
     /// Ids handed out by `files.generateIds`.
     generated: AtomicUsize,
+    sessions: Mutex<Vec<Session>>,
+    /// Sessions started and not completed, and the most at once.
+    sessions_active: AtomicUsize,
+    sessions_max_active: AtomicUsize,
+    chunks: Mutex<Vec<Chunk>>,
+    /// The faults of [`Behavior::chunk_unavailable`] still to inject.
+    chunk_faults_left: Mutex<HashMap<String, u64>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -294,6 +330,7 @@ impl FakeDrive {
             .await
             .expect("bind fake drive");
         let addr = listener.local_addr().expect("fake drive address");
+        let behavior_chunk_faults = behavior.chunk_unavailable.clone();
         let state = Arc::new(State {
             files,
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
@@ -312,6 +349,11 @@ impl FakeDrive {
             uploads_in_flight: AtomicUsize::new(0),
             uploads_max_in_flight: AtomicUsize::new(0),
             generated: AtomicUsize::new(0),
+            sessions: Mutex::new(Vec::new()),
+            sessions_active: AtomicUsize::new(0),
+            sessions_max_active: AtomicUsize::new(0),
+            chunks: Mutex::new(Vec::new()),
+            chunk_faults_left: Mutex::new(behavior_chunk_faults),
         });
 
         let server_state = Arc::clone(&state);
@@ -366,6 +408,16 @@ impl FakeDrive {
     /// The successful creates, in reply order.
     pub(crate) fn created(&self) -> Vec<Created> {
         self.state.created.lock().expect("created lock").clone()
+    }
+
+    /// The chunk and status requests of resumable sessions, in arrival order.
+    pub(crate) fn chunks(&self) -> Vec<Chunk> {
+        self.state.chunks.lock().expect("chunks lock").clone()
+    }
+
+    /// The most resumable sessions that were started and not completed at the same time.
+    pub(crate) fn sessions_max_active(&self) -> usize {
+        self.state.sessions_max_active.load(Ordering::SeqCst)
     }
 
     /// The most file uploads (creates of non-folders) that were being answered at once.
@@ -427,7 +479,22 @@ async fn handle(
 
     let path = request.uri().path().to_owned();
     if request.method() == Method::POST && path == UPLOAD_PATH {
-        return Ok(create(&state, request).await);
+        let resumable = params
+            .iter()
+            .any(|(key, value)| key == "uploadType" && value == "resumable");
+        return Ok(if resumable {
+            start_session(&state, request).await
+        } else {
+            create(&state, request).await
+        });
+    }
+    if request.method() == Method::PUT {
+        if let Some(session) = path
+            .strip_prefix(SESSION_PATH)
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            return Ok(session_request(&state, session, request).await);
+        }
     }
     if request.method() != Method::GET {
         return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
@@ -512,9 +579,25 @@ async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeRespons
     let Some((metadata, content)) = boundary.and_then(|b| multipart(&body.to_bytes(), &b)) else {
         return error(StatusCode::BAD_REQUEST, "not a multipart upload");
     };
+    let is_folder = metadata["mimeType"].as_str() == Some(MIME_TYPE_DRIVE_FOLDER);
+    let _upload =
+        (!is_folder).then(|| InFlight::new(&state.uploads_in_flight, &state.uploads_max_in_flight));
+    if !is_folder {
+        tokio::time::sleep(state.behavior.upload_delay).await;
+    }
+
+    finish_create(state, &metadata, content, arrived)
+}
+
+/// The end of a create with all its content: Drive's checks, the record, the file resource.
+fn finish_create(
+    state: &State,
+    metadata: &Value,
+    content: Vec<u8>,
+    arrived: usize,
+) -> FakeResponse {
     let text = |key: &str| metadata[key].as_str().unwrap_or_default().to_owned();
     let mime_type = text("mimeType");
-    let is_folder = mime_type == MIME_TYPE_DRIVE_FOLDER;
     let parents = metadata["parents"]
         .as_array()
         .map(|parents| {
@@ -524,13 +607,6 @@ async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeRespons
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-
-    let _upload =
-        (!is_folder).then(|| InFlight::new(&state.uploads_in_flight, &state.uploads_max_in_flight));
-    if !is_folder {
-        tokio::time::sleep(state.behavior.upload_delay).await;
-    }
-
     let name = text("name");
     if state.behavior.upload_rejected.contains(&name) {
         return error(StatusCode::BAD_REQUEST, "Invalid upload.");
@@ -565,9 +641,192 @@ async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeRespons
         "mimeType": created.mime_type,
         "parents": created.parents,
         "size": created.content.len().to_string(),
+        "md5Checksum": format!("{:x}", md5::compute(&created.content)),
     });
     state.created.lock().expect("created lock").push(created);
     json_response(StatusCode::OK, &reply)
+}
+
+/// `POST ...?uploadType=resumable`: a new session for the metadata in the body.
+async fn start_session(state: &State, request: hyper::Request<Incoming>) -> FakeResponse {
+    let arrived = state.create_events.fetch_add(1, Ordering::SeqCst);
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+    };
+    let (Some(host), Some(total)) = (
+        header("host"),
+        header("x-upload-content-length").and_then(|total| total.parse::<u64>().ok()),
+    ) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "no Host or X-Upload-Content-Length",
+        );
+    };
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let Ok(metadata) = serde_json::from_slice::<Value>(&body.to_bytes()) else {
+        return error(StatusCode::BAD_REQUEST, "no JSON metadata");
+    };
+    if state
+        .behavior
+        .upload_rejected
+        .contains(metadata["name"].as_str().unwrap_or_default())
+    {
+        return error(StatusCode::BAD_REQUEST, "Invalid upload.");
+    }
+
+    let session = {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        sessions.push(Session {
+            metadata,
+            total,
+            received: Vec::new(),
+            arrived,
+            done: None,
+        });
+        sessions.len() - 1
+    };
+    let active = state.sessions_active.fetch_add(1, Ordering::SeqCst) + 1;
+    state
+        .sessions_max_active
+        .fetch_max(active, Ordering::SeqCst);
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("location", format!("http://{host}{SESSION_PATH}{session}"))
+        .body(Full::new(Bytes::new()).boxed())
+        .expect("valid response")
+}
+
+/// A `PUT` to a session: a chunk at `Content-Range: bytes FIRST-LAST/TOTAL`, or a status
+/// request with `bytes */TOTAL`.
+async fn session_request(
+    state: &State,
+    session: usize,
+    request: hyper::Request<Incoming>,
+) -> FakeResponse {
+    let range = request
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|value| value.split_once('/'))
+        .map(|(range, _)| range.to_owned());
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let body = body.to_bytes();
+    let Some(range) = range else {
+        return error(StatusCode::BAD_REQUEST, "no Content-Range");
+    };
+    let first = (range != "*")
+        .then(|| {
+            let (first, last) = range.split_once('-')?;
+            Some((first.parse::<u64>().ok()?, last.parse::<u64>().ok()?))
+        })
+        .flatten();
+    if range != "*" && first.is_none() {
+        return error(StatusCode::BAD_REQUEST, "malformed Content-Range");
+    }
+    tokio::time::sleep(state.behavior.chunk_delay).await;
+
+    let mut sessions = state.sessions.lock().expect("sessions lock");
+    let Some(this) = sessions.get_mut(session) else {
+        return error(StatusCode::NOT_FOUND, "no such session");
+    };
+    let name = this.metadata["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let committed = this.received.len() as u64;
+    let response = if let Some(done) = &this.done {
+        json_response(StatusCode::OK, done)
+    } else if let Some((first, last)) = first {
+        let fault = {
+            let mut faults = state.chunk_faults_left.lock().expect("faults lock");
+            let fault = faults.get(&name) == Some(&first);
+            if fault {
+                faults.remove(&name);
+            }
+            fault
+        };
+        if first != committed || fault {
+            error(StatusCode::SERVICE_UNAVAILABLE, "Backend Error")
+        } else if last + 1 - first != body.len() as u64 {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Content-Range does not match the body",
+            )
+        } else {
+            this.received.extend_from_slice(&body);
+            if this.received.len() as u64 == this.total {
+                let metadata = this.metadata.clone();
+                let content = this.received.clone();
+                let arrived = this.arrived;
+                drop(sessions);
+                let response = finish_create(state, &metadata, content, arrived);
+                if response.status() == StatusCode::OK {
+                    state.sessions_active.fetch_sub(1, Ordering::SeqCst);
+                    let created = state.created.lock().expect("created lock");
+                    let reply = created.last().map(|created| {
+                        json!({
+                            "kind": "drive#file",
+                            "id": created.id,
+                            "name": created.name,
+                            "mimeType": created.mime_type,
+                            "parents": created.parents,
+                            "size": created.content.len().to_string(),
+                            "md5Checksum": format!("{:x}", md5::compute(&created.content)),
+                        })
+                    });
+                    if let Some(this) = state
+                        .sessions
+                        .lock()
+                        .expect("sessions lock")
+                        .get_mut(session)
+                    {
+                        this.done = reply;
+                    }
+                }
+                record_chunk(state, &name, Some(first), response.status());
+                return response;
+            }
+            resume_incomplete(this.received.len())
+        }
+    } else {
+        resume_incomplete(this.received.len())
+    };
+    drop(sessions);
+    record_chunk(
+        state,
+        &name,
+        first.map(|(first, _)| first),
+        response.status(),
+    );
+    response
+}
+
+fn record_chunk(state: &State, name: &str, first: Option<u64>, status: StatusCode) {
+    state.chunks.lock().expect("chunks lock").push(Chunk {
+        name: name.to_owned(),
+        first,
+        status: status.as_u16(),
+    });
+}
+
+/// A 308 for `committed` bytes: `Range: bytes=0-<last>`, none when nothing is committed.
+fn resume_incomplete(committed: usize) -> FakeResponse {
+    let mut response = hyper::Response::builder().status(StatusCode::PERMANENT_REDIRECT);
+    if committed > 0 {
+        response = response.header("range", format!("bytes=0-{}", committed - 1));
+    }
+    response
+        .body(Full::new(Bytes::new()).boxed())
+        .expect("valid response")
 }
 
 /// The JSON metadata and the content of a `multipart/related` body with two parts.

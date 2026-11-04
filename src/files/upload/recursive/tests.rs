@@ -150,7 +150,8 @@ fn shown(path: &str) -> String {
 async fn folders_exist_before_their_contents_and_uploads_are_bounded() {
     let (_dir, root) = local_tree();
     let behavior = Behavior {
-        upload_delay: Duration::from_millis(30),
+        // Long enough that two uploads overlap also on a busy machine.
+        upload_delay: Duration::from_millis(150),
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
@@ -480,4 +481,144 @@ async fn continue_on_error_uploads_everything_that_can_be_read() {
     } else {
         assert!(uploaded.error().ends_with("1 file failed"));
     }
+}
+
+/// `big` with three files of 600 KiB, each with its own content.
+fn big_tree() -> (tempfile::TempDir, PathBuf, Vec<(String, Vec<u8>)>) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("big");
+    std::fs::create_dir(&root).unwrap();
+    let files = ["a.bin", "b.bin", "c.bin"]
+        .iter()
+        .zip(1_u32..)
+        .map(|(name, seed)| {
+            let content = (0..600 * 1024_u32)
+                .map(|i| u8::try_from((i * seed + i / 7) % 251).unwrap())
+                .collect::<Vec<_>>();
+            std::fs::write(root.join(name), &content).unwrap();
+            ((*name).to_owned(), content)
+        })
+        .collect();
+    (dir, root, files)
+}
+
+/// Every upload resumable, in chunks of 256 KiB: three per file of [`big_tree`].
+fn chunked() -> UploadOptions {
+    UploadOptions {
+        chunk_size: 256 * 1024,
+        multipart_threshold: 0,
+        ..UploadOptions::default()
+    }
+}
+
+#[tokio::test]
+async fn concurrent_multi_chunk_uploads_retry_a_failed_chunk() {
+    let (_dir, root, files) = big_tree();
+    let behavior = Behavior {
+        chunk_delay: Duration::from_millis(20),
+        chunk_unavailable: std::collections::HashMap::from([(String::from("b.bin"), 262_144)]),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(Vec::new(), behavior).await;
+    let output = output();
+
+    let result = upload_with(
+        &server,
+        config(&root, 2, false),
+        &chunked(),
+        &output.printer,
+        future::pending(),
+    )
+    .await;
+
+    result.unwrap();
+    let created = server.created();
+    for (name, content) in &files {
+        let file = created.iter().find(|item| &item.name == name).unwrap();
+        assert!(file.content == *content, "{name} arrived whole");
+    }
+    assert_eq!(server.sessions_max_active(), 2, "two files at a time");
+
+    let chunks = server.chunks();
+    let of = |name: &str| {
+        chunks
+            .iter()
+            .filter(|chunk| chunk.name == name && chunk.first.is_some())
+            .map(|chunk| (chunk.first.unwrap(), chunk.status))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        of("a.bin"),
+        [(0, 308), (262_144, 308), (524_288, 200)],
+        "three chunks"
+    );
+    let b = of("b.bin");
+    let failed = b.iter().position(|chunk| *chunk == (262_144, 503)).unwrap();
+    assert!(
+        b[failed + 1..].contains(&(262_144, 308)),
+        "the chunk was sent again: {b:?}"
+    );
+    assert_eq!(b.last(), Some(&(524_288, 200)));
+
+    let total = files
+        .iter()
+        .map(|(_, content)| content.len() as u64)
+        .sum::<u64>();
+    assert_eq!(
+        output.err.lines().last().unwrap(),
+        &format!(
+            "Summary: 3 transferred ({}), 0 unchanged, 0 skipped, 0 failed, 0 cancelled",
+            crate::common::human_size::human_size(total)
+        )
+    );
+}
+
+#[tokio::test]
+async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
+    let (_dir, root, _files) = big_tree();
+    let behavior = Behavior {
+        chunk_delay: Duration::from_millis(50),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(Vec::new(), behavior).await;
+    let output = output();
+    // Ctrl-C once both running uploads have a chunk on Drive.
+    let cancel = async {
+        loop {
+            let started = server
+                .chunks()
+                .iter()
+                .filter(|chunk| chunk.status == 308)
+                .map(|chunk| chunk.name.clone())
+                .collect::<HashSet<_>>();
+            if started.len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+
+    let result = upload_with(
+        &server,
+        config(&root, 2, false),
+        &chunked(),
+        &output.printer,
+        cancel,
+    )
+    .await;
+
+    let error = crate::error_message(&result.unwrap_err());
+    assert_eq!(
+        error,
+        "Error: the recursive upload is incomplete: interrupted, 3 cancelled"
+    );
+    let created = created_paths(&server.created());
+    assert_eq!(created, ["big"], "no file was completed");
+    assert!(output.err.lines().contains(&String::from(
+        "Interrupted: cancelling the transfers in progress"
+    )));
+    // The aborted uploads send nothing more.
+    let sent = server.chunks().len();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.chunks().len(), sent);
 }
