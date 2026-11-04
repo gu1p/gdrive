@@ -133,7 +133,7 @@ Each account is a directory under `~/.config/gdrive3/` (see [Credentials and sec
 |---|---|
 | `<account>/account.json` | The account type: `{"type": "service_account", "subject": "..."}` or `{"type": "application_default_credentials"}` |
 | `<account>/service_account.json` | The key file as you gave it (service accounts only), mode 0600 |
-| `<account>/tokens.json` | Cached access tokens (service accounts only) |
+| `<account>/tokens.json` | Cached access tokens (service accounts only), each marked with a hash of the key and subject it was issued for |
 
 Accounts without `<account>/account.json` are accounts that log in with an OAuth client.
 

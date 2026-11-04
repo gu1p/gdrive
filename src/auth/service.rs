@@ -179,6 +179,8 @@ where
     auth: Authenticator<C>,
     identity: Arc<Identity>,
     timeout: Duration,
+    /// The credential of a service account key, which its cached tokens are bound to.
+    credential: Option<String>,
 }
 
 impl<C> ServiceCredentials<C>
@@ -209,6 +211,7 @@ where
             subject: subject.clone(),
             adc,
         });
+        let credential = credential_id(&key, subject.as_deref());
 
         let mut builder =
             ServiceAccountAuthenticator::with_client(key, CustomHyperClientBuilder::from(client));
@@ -221,8 +224,11 @@ where
                 .ok()
                 .flatten()
                 .unwrap_or_default();
-            builder =
-                builder.with_storage(Box::new(TokenStore::new(path.to_path_buf(), cached, None)));
+            builder = builder.with_storage(Box::new(TokenStore::for_credential(
+                path.to_path_buf(),
+                cached,
+                credential.clone(),
+            )));
         }
         // Parses the private key, which can fail.
         let auth = builder.build().await.map_err(|source| Error::PrivateKey {
@@ -234,6 +240,7 @@ where
             auth,
             identity,
             timeout: TOKEN_TIMEOUT,
+            credential: Some(credential),
         })
     }
 
@@ -290,6 +297,7 @@ where
             auth,
             identity,
             timeout,
+            credential: None,
         })
     }
 
@@ -343,19 +351,55 @@ where
     }
 }
 
-/// The tokens file for a token obtained when the account was added.
-pub(crate) fn token_file(token: &AccessToken) -> TokenFile {
-    let mut file = TokenFile::default();
-    file.set(
-        &SERVICE_SCOPES,
-        TokenInfo {
-            access_token: token.token().map(str::to_owned),
-            refresh_token: None,
-            expires_at: token.expiration_time(),
-            id_token: None,
-        },
-    );
-    file
+/// The identity a service account's cached tokens are bound to: a hash of the key's
+/// `client_email` and private key and of the subject. A replaced key or subject gets another one,
+/// so its tokens are never mixed up (see [`TokenEntry`](super::store::TokenEntry)). The private key
+/// cannot be recovered from it.
+pub(crate) fn credential_id(key: &ServiceAccountKey, subject: Option<&str>) -> String {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    // Each part present or not and length-prefixed, so that no two different triples hash the
+    // same input.
+    for part in [
+        Some(key.client_email.as_str()),
+        subject,
+        Some(key.private_key.as_str()),
+    ] {
+        match part {
+            Some(part) => {
+                context.update(&[1]);
+                context.update(&(part.len() as u64).to_le_bytes());
+                context.update(part.as_bytes());
+            }
+            None => context.update(&[0]),
+        }
+    }
+    let digest = context.finish();
+    let mut id = String::from("sa-sha256:");
+    for byte in &digest.as_ref()[..16] {
+        let _ = write!(id, "{byte:02x}");
+    }
+    id
+}
+
+impl<C> ServiceCredentials<C>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    /// The tokens file for a token obtained when the account was added, bound to this key.
+    pub(crate) fn token_file(&self, token: &AccessToken) -> TokenFile {
+        let mut file = TokenFile::default();
+        file.set_for(
+            self.credential.as_deref(),
+            &SERVICE_SCOPES,
+            TokenInfo {
+                access_token: token.token().map(str::to_owned),
+                refresh_token: None,
+                expires_at: token.expiration_time(),
+                id_token: None,
+            },
+        );
+        file
+    }
 }
 
 type GetTokenOutput<'a> = super::stored::GetTokenOutput<'a>;
@@ -720,6 +764,31 @@ mod tests {
     }
 
     #[test]
+    fn the_credential_id_changes_with_the_email_the_key_and_the_subject() {
+        let key = parse(&key_value("https://oauth2.googleapis.com/token")).unwrap();
+        let id = credential_id(&key, None);
+        assert_eq!(id, credential_id(&key.clone(), None));
+        assert!(
+            id.starts_with("sa-sha256:") && id.len() == "sa-sha256:".len() + 32,
+            "{id}"
+        );
+        assert!(!id.contains("PRIVATE"));
+
+        let mut other_email = key.clone();
+        other_email.client_email = String::from("other@gdrive-test.iam.gserviceaccount.com");
+        let mut other_key = key.clone();
+        other_key.private_key.push(' ');
+        for other in [
+            credential_id(&other_email, None),
+            credential_id(&other_key, None),
+            credential_id(&key, Some("user@example.com")),
+            credential_id(&key, Some("")),
+        ] {
+            assert_ne!(other, id);
+        }
+    }
+
+    #[test]
     fn a_console_key_file_is_accepted() {
         let key = parse(&key_value("https://oauth2.googleapis.com/token")).unwrap();
         assert_eq!(key.client_email, TEST_CLIENT_EMAIL);
@@ -908,8 +977,13 @@ mod tests {
             Some("first")
         );
         let saved = TokenFile::load(&tokens_path).await.unwrap().unwrap();
+        let credential = credential_id(&key(), None);
         assert_eq!(
-            saved.get(&SERVICE_SCOPES).unwrap().access_token.as_deref(),
+            saved
+                .get_for(Some(&credential), &SERVICE_SCOPES)
+                .unwrap()
+                .access_token
+                .as_deref(),
             Some("first")
         );
 

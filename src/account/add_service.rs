@@ -153,7 +153,7 @@ where
         .install(
             &account_type,
             Some(&content),
-            Some(&service::token_file(&token)),
+            Some(&credentials.token_file(&token)),
         )
         .await
         .map_err(Error::Install)?;
@@ -310,10 +310,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let key = service::parse_key(setup.key.as_bytes()).unwrap();
+        let credential = service::credential_id(&key, Some("user@example.com"));
         assert_eq!(
-            tokens.get(&SERVICE_SCOPES).unwrap().access_token.as_deref(),
+            tokens
+                .get_for(Some(&credential), &SERVICE_SCOPES)
+                .unwrap()
+                .access_token
+                .as_deref(),
             Some("ya29.added")
         );
+        // Bound to the key and subject: not a token of anything else.
+        assert!(tokens.get(&SERVICE_SCOPES).is_none());
+        assert!(tokens
+            .get_for(Some(&service::credential_id(&key, None)), &SERVICE_SCOPES)
+            .is_none());
 
         let requests = setup.server.requests();
         assert_eq!(requests.len(), 1);
@@ -418,6 +429,90 @@ mod tests {
         assert!(matches!(*error, Error::Subject(_)), "{error:?}");
 
         assert!(setup.server.requests().is_empty());
+    }
+
+    /// A key for another service account, `bob@...`, with the same throwaway private key.
+    fn bob_key(token_uri: &str) -> String {
+        let mut key: serde_json::Value =
+            serde_json::from_str(&service_account_key_json(token_uri)).unwrap();
+        key["client_email"] = serde_json::json!("bob@gdrive-test.iam.gserviceaccount.com");
+        key.to_string()
+    }
+
+    #[tokio::test]
+    async fn a_job_of_a_replaced_key_never_feeds_its_tokens_to_the_new_key() {
+        let setup = setup(vec![
+            // Alice's first token, which expires at once, then Bob's, then Alice's refresh.
+            (
+                200,
+                String::from(r#"{"access_token":"alice-1","expires_in":30,"token_type":"Bearer"}"#),
+            ),
+            (
+                200,
+                String::from(r#"{"access_token":"bob-1","expires_in":3599,"token_type":"Bearer"}"#),
+            ),
+            (
+                200,
+                String::from(
+                    r#"{"access_token":"alice-2","expires_in":3599,"token_type":"Bearer"}"#,
+                ),
+            ),
+        ])
+        .await;
+        let alice = add_service_account_in(
+            config_root(&setup),
+            http_client(),
+            &config(&setup, Some("alice@example.com"), Some("robot")),
+        )
+        .await
+        .unwrap();
+        // A long-running job of Alice's key, started before the replacement.
+        let alice_job = ServiceCredentials::load(
+            http_client(),
+            &alice,
+            Some(String::from("alice@example.com")),
+        )
+        .await
+        .unwrap();
+
+        // The account is replaced by Bob's key, without a subject.
+        let bob_key_path = setup.base.path().join("bob.json");
+        fs::write(&bob_key_path, bob_key(&setup.server.url("/token"))).unwrap();
+        let bob = add_service_account_in(
+            config_root(&setup),
+            http_client(),
+            &ServiceAccountConfig {
+                key_path: bob_key_path,
+                subject: None,
+                name: Some(String::from("robot")),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Alice's job refreshes its expired token and writes it into the account's cache.
+        assert_eq!(
+            alice_job.access_token().await.unwrap().token(),
+            Some("alice-2")
+        );
+        assert_eq!(setup.server.requests().len(), 3);
+
+        // Bob's next run gets Bob's cached token, not Alice's, and sends no request.
+        let bob_run = ServiceCredentials::load(http_client(), &bob, None)
+            .await
+            .unwrap();
+        assert_eq!(bob_run.access_token().await.unwrap().token(), Some("bob-1"));
+        assert_eq!(setup.server.requests().len(), 3);
+
+        // Both are in the file, each bound to its own credential.
+        let tokens = TokenFile::load(bob.tokens_path()).await.unwrap().unwrap();
+        let mut access: Vec<_> = tokens
+            .entries()
+            .iter()
+            .filter_map(|entry| entry.token.access_token.clone())
+            .collect();
+        access.sort();
+        assert_eq!(access, ["alice-2", "bob-1"]);
     }
 
     #[tokio::test]
