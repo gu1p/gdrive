@@ -1,6 +1,7 @@
 mod about;
 mod account;
 mod app_config;
+mod auth;
 mod common;
 mod drives;
 mod files;
@@ -60,6 +61,16 @@ enum Command {
 enum AccountCommand {
     /// Add an account
     Add,
+
+    /// Authorize an existing account again
+    ///
+    /// Use this when the stored authorization expired or was revoked. It runs the same login as
+    /// `account add`, with the client credentials stored for the account, and replaces the
+    /// account's tokens.
+    Reauth {
+        /// Account name [default: current account]
+        account_name: Option<String>,
+    },
 
     /// List all accounts
     List,
@@ -378,7 +389,11 @@ enum PermissionCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
-        eprintln!("{}", err.trace());
+        if let Some(reauth) = auth::find_reauth_required(err.as_ref()) {
+            eprintln!("Error: {reauth}");
+        } else {
+            eprintln!("{}", err.trace());
+        }
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
@@ -692,6 +707,10 @@ async fn handle_account_command(
 
         AccountCommand::Switch { account_name } => {
             account::switch(&account::switch::Config { account_name })?;
+        }
+
+        AccountCommand::Reauth { account_name } => {
+            account::reauth(&account::reauth::Config { account_name }).await?;
         }
 
         AccountCommand::Remove { account_name } => {

@@ -87,6 +87,7 @@ pub(crate) enum Error {
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
+            Error::Hub(source) => Some(source),
             Error::FileInfo { source, .. } => Some(source),
             // FIXME: correctly impl std::error::Error
             _ => None,
@@ -97,7 +98,7 @@ impl error::Error for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            Error::Hub(err) => write!(f, "{err}"),
+            Error::Hub(_) => f.write_str("unable to get drive hub"),
             Error::OpenFile(path, err) => {
                 write!(f, "Failed to open file '{}': {}", path.display(), err)
             }

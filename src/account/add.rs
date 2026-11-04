@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
 };
 
-use crate::{app_config, hub};
+use crate::{app_config, auth, hub};
 
 pub(crate) async fn add() -> Result<(), Box<Error>> {
     println!("To add an account you need a Google Client ID and Client Secret.");
@@ -29,25 +29,14 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
         .map_err(Error::Auth)?;
 
     // Get access tokens
-    auth.token(&[
-        "https://www.googleapis.com/auth/drive",
-        "https://www.googleapis.com/auth/drive.metadata.readonly",
-    ])
-    .await
-    .map_err(Error::AccessToken)?;
-
-    let hub = hub::Hub::new(auth).map_err(Error::HubCreation)?;
-    let (_, about) = hub
-        .about()
-        .get()
-        .param("fields", "user")
-        .doit()
+    auth.token(&auth::DRIVE_SCOPES)
         .await
-        .map_err(Error::About)?;
+        .map_err(Error::AccessToken)?;
 
-    let email = about
-        .user
-        .and_then(|u| u.email_address)
+    let hub = hub::Hub::new(auth.0).map_err(Error::HubCreation)?;
+    let email = authorized_email(&hub)
+        .await
+        .map_err(|error| Error::About(*error))?
         .map_or(Cow::Borrowed("unknown"), Into::into);
 
     let app_cfg =
@@ -68,6 +57,20 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
     println!("Logged in as {}", app_cfg.account.name);
 
     Ok(())
+}
+
+/// The email address of the Google account the hub is authorized for.
+pub(super) async fn authorized_email(
+    hub: &hub::Hub,
+) -> Result<Option<String>, Box<google_drive3::Error>> {
+    let (_, about) = hub
+        .about()
+        .get()
+        .param("fields", "user")
+        .doit()
+        .await
+        .map_err(Box::new)?;
+    Ok(about.user.and_then(|user| user.email_address))
 }
 
 #[derive(Debug)]

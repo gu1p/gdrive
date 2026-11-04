@@ -524,6 +524,7 @@ name = "gdrive"
 version = "3.9.1"
 dependencies = [
  "async-recursion",
+ "async-trait",
  "bytes",
  "bytesize",
  "chrono",
@@ -549,7 +550,10 @@ dependencies = [
  "tabwriter",
  "tar",
  "tempfile",
+ "time",
  "tokio",
+ "tower-service",
+ "url",
  "yup-oauth2",
 ]
 
