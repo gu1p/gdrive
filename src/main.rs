@@ -121,11 +121,11 @@ enum FileCommand {
     /// List files
     List {
         /// Max files to list
-        #[arg(long, default_value_t = 30)]
+        #[arg(short, long, default_value_t = 30)]
         max: usize,
 
         /// Query. See <https://developers.google.com/drive/search-parameters>
-        #[arg(long, default_value_t = ListQuery::default())]
+        #[arg(short, long, default_value_t = ListQuery::default())]
         query: ListQuery,
 
         /// Order by. See <https://developers.google.com/drive/api/v3/reference/files/list>
@@ -133,7 +133,7 @@ enum FileCommand {
         order_by: ListSortOrder,
 
         /// List files in a specific folder
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<String>,
 
         /// List files on a shared drive
@@ -159,7 +159,7 @@ enum FileCommand {
         file_id: String,
 
         /// Overwrite existing files and folders
-        #[arg(long)]
+        #[arg(short, long)]
         overwrite: bool,
 
         /// Follow shortcut and download target file (does not work with recursive download)
@@ -167,11 +167,11 @@ enum FileCommand {
         follow_shortcuts: bool,
 
         /// Download directories
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
 
         /// Path where the file/directory should be downloaded to
-        #[arg(long, value_name = "PATH")]
+        #[arg(short, long, value_name = "PATH")]
         destination: Option<PathBuf>,
 
         /// Write file to stdout
@@ -189,11 +189,11 @@ enum FileCommand {
         mime: Option<Mime>,
 
         /// Upload to an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
 
         /// Upload directories. Note that this will always create a new directory on drive and will not update existing directories with the same name
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
 
         /// Set chunk size in MB, must be a power of two.
@@ -244,7 +244,7 @@ enum FileCommand {
         file_id: String,
 
         /// Delete directory and all it's content
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
     },
 
@@ -254,7 +254,7 @@ enum FileCommand {
         file_id: String,
 
         /// Trash directory and all its content
-        #[arg(long)]
+        #[arg(short, long)]
         recursive: bool,
     },
 
@@ -270,7 +270,7 @@ enum FileCommand {
         name: String,
 
         /// Create in an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
 
         /// Print only id of folder
@@ -312,7 +312,7 @@ enum FileCommand {
         file_path: PathBuf,
 
         /// Upload to an existing directory
-        #[arg(long, value_name = "DIRECTORY_ID")]
+        #[arg(short, long, value_name = "DIRECTORY_ID")]
         parent: Option<Vec<String>>,
 
         /// Print only id of file
@@ -329,7 +329,7 @@ enum FileCommand {
         file_path: PathBuf,
 
         /// Overwrite existing files
-        #[arg(long)]
+        #[arg(short, long)]
         overwrite: bool,
     },
 }
@@ -752,7 +752,11 @@ mod tests {
 
     use clap::CommandFactory;
 
-    use super::Cli;
+    use std::path::PathBuf;
+
+    use clap::Parser;
+
+    use super::{Cli, Command, FileCommand};
     use crate::common::drive_file::DocType;
 
     fn words(text: &str) -> HashSet<&str> {
@@ -767,6 +771,116 @@ mod tests {
             .and_then(|files| files.find_subcommand(name))
             .cloned()
             .unwrap_or_else(|| panic!("files {name} should exist"))
+    }
+
+    #[test]
+    fn cli_definition_is_valid() {
+        // Catches duplicated short or long flags, which clap only reports at runtime.
+        Cli::command().debug_assert();
+    }
+
+    fn all_commands(command: &clap::Command) -> Vec<&clap::Command> {
+        let mut out = vec![command];
+        for sub in command.get_subcommands() {
+            out.extend(all_commands(sub));
+        }
+        out
+    }
+
+    #[test]
+    fn short_s_is_reserved() {
+        // -s is kept free for a future sync flag.
+        let cli = Cli::command();
+        for command in all_commands(&cli) {
+            for arg in command.get_arguments() {
+                assert_ne!(
+                    arg.get_short(),
+                    Some('s'),
+                    "{} {:?} uses -s",
+                    command.get_name(),
+                    arg.get_id(),
+                );
+            }
+        }
+    }
+
+    fn parse(args: &[&str]) -> FileCommand {
+        let cli = Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied()))
+            .unwrap_or_else(|err| panic!("{args:?}: {err}"));
+        match cli.command {
+            Command::Files { command } => command,
+            _ => panic!("{args:?} should be a files command"),
+        }
+    }
+
+    #[test]
+    fn short_flags_parse() {
+        let FileCommand::List {
+            max, query, parent, ..
+        } = parse(&["files", "list", "-m", "5", "-q", "name = 'a'", "-p", "dir"])
+        else {
+            panic!("expected list");
+        };
+        assert_eq!(max, 5);
+        assert_eq!(query.to_string(), "name = 'a'");
+        assert_eq!(parent.as_deref(), Some("dir"));
+
+        let FileCommand::Download {
+            overwrite,
+            recursive,
+            destination,
+            ..
+        } = parse(&["files", "download", "id", "-o", "-r", "-d", "out"])
+        else {
+            panic!("expected download");
+        };
+        assert!(overwrite && recursive);
+        assert_eq!(destination, Some(PathBuf::from("out")));
+
+        let FileCommand::Upload {
+            parent, recursive, ..
+        } = parse(&["files", "upload", "path", "-p", "dir", "-r"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(parent, Some(vec![String::from("dir")]));
+        assert!(recursive);
+
+        assert!(matches!(
+            parse(&["files", "delete", "id", "-r"]),
+            FileCommand::Delete {
+                recursive: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "trash", "id", "-r"]),
+            FileCommand::Trash {
+                recursive: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "mkdir", "name", "-p", "dir"]),
+            FileCommand::Mkdir {
+                parent: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "import", "a.md", "-p", "dir"]),
+            FileCommand::Import {
+                parent: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&["files", "export", "id", "a.md", "-o"]),
+            FileCommand::Export {
+                overwrite: true,
+                ..
+            }
+        ));
     }
 
     #[test]
