@@ -24,13 +24,21 @@ use crate::{
 /// refreshed, the error is a [`auth::ReauthRequired`] that tells the user to log in again.
 pub(crate) async fn get_hub() -> Result<Hub, GetHubError> {
     let app_cfg = AppConfig::load_current_account().map_err(GetHubError::LoadCurrentAccount)?;
+    get_hub_for(&app_cfg).await
+}
+
+/// A Drive hub for the account `app_cfg`, of any type: a user's stored token, a service account
+/// or Application Default Credentials, with the same checks as [`get_hub`]. The token is got (or
+/// refreshed) before the command starts working, so that an expired or revoked authorization is
+/// reported up front; an interactive authorization is never started.
+pub(crate) async fn get_hub_for(app_cfg: &AppConfig) -> Result<Hub, GetHubError> {
     match app_cfg
         .account_type()
         .map_err(GetHubError::LoadAccountType)?
     {
         AccountType::User => {}
         AccountType::ServiceAccount { subject } => {
-            return service_account_hub(&app_cfg, subject).await;
+            return service_account_hub(app_cfg, subject).await;
         }
         AccountType::ApplicationDefaultCredentials => return adc_hub().await,
     }
