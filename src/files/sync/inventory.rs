@@ -87,7 +87,52 @@ pub(crate) struct LocalNode {
     pub(crate) path: PathBuf,
     /// The entry itself is a symlink (followed by the walk).
     pub(crate) symlink: bool,
+    /// The identity of the entry itself (not followed), where the platform tells it.
+    pub(crate) id: Option<FileId>,
     pub(crate) kind: LocalKind,
+}
+
+/// What identifies a local file or directory while it exists: its device and inode on Unix.
+/// Elsewhere it is unknown (`None`), and only the type, size and modification time are compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileId {
+    device: u64,
+    inode: u64,
+}
+
+impl FileId {
+    #[must_use]
+    #[cfg_attr(
+        unix,
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "`None` on the platforms without device and inode numbers"
+        )
+    )]
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Option<FileId> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Some(FileId {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = metadata;
+            None
+        }
+    }
+
+    /// Whether `a` and `b` may be the same entry: equal, or unknown on either side.
+    #[must_use]
+    pub(crate) fn same(a: Option<FileId>, b: Option<FileId>) -> bool {
+        match (a, b) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -336,7 +381,7 @@ fn walk_local(root: &Path) -> Result<Walked, errors::Sync> {
         }));
         let node = node(
             path,
-            false,
+            None,
             LocalKind::Unreadable {
                 is_dir: entry.is_dir,
             },
@@ -344,7 +389,7 @@ fn walk_local(root: &Path) -> Result<Walked, errors::Sync> {
         insert(&mut children, &canonical_root, node);
     }
     for path in tree.cycles {
-        let node = node(path, true, LocalKind::Cycle);
+        let node = node(path, Some(true), LocalKind::Cycle);
         insert(&mut children, &canonical_root, node);
     }
     Ok(Walked { children, problems })
@@ -358,22 +403,17 @@ fn convert_children(children: Vec<Node<crate::common::file_tree::Folder>>) -> Ve
                 let modified = std::fs::metadata(&file.path)
                     .and_then(|metadata| metadata.modified())
                     .ok();
-                let symlink = is_symlink(&file.path);
-                node(
-                    file.path,
-                    symlink,
-                    LocalKind::File {
-                        size: file.size,
-                        modified,
-                    },
-                )
+                let kind = LocalKind::File {
+                    size: file.size,
+                    modified,
+                };
+                node(file.path, None, kind)
             }
             Node::Folder(folder) => {
                 let path = folder.info.path.clone();
-                let symlink = is_symlink(&path);
                 node(
                     path,
-                    symlink,
+                    None,
                     LocalKind::Dir(convert_children(folder.children)),
                 )
             }
@@ -381,17 +421,20 @@ fn convert_children(children: Vec<Node<crate::common::file_tree::Folder>>) -> Ve
         .collect()
 }
 
-fn is_symlink(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
-}
-
-fn node(path: PathBuf, symlink: bool, kind: LocalKind) -> LocalNode {
+/// The node of the entry at `path`; `symlink` overrides what the entry says it is.
+fn node(path: PathBuf, symlink: Option<bool>, kind: LocalKind) -> LocalNode {
+    let itself = std::fs::symlink_metadata(&path).ok();
     let file_name = path.file_name().unwrap_or_default();
     LocalNode {
         name: file_name.to_string_lossy().into_owned(),
         utf8: file_name.to_str().is_some(),
+        symlink: symlink.unwrap_or_else(|| {
+            itself
+                .as_ref()
+                .is_some_and(|metadata| metadata.file_type().is_symlink())
+        }),
+        id: itself.as_ref().and_then(FileId::of),
         path,
-        symlink,
         kind,
     }
 }

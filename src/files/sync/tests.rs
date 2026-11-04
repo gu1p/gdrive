@@ -1,5 +1,6 @@
 //! `files sync` against the fake Drive and temporary directories.
 
+mod deletion;
 mod safety;
 
 use std::{

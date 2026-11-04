@@ -54,8 +54,8 @@ use chrono::{DateTime, Utc};
 use unicode_normalization::UnicodeNormalization;
 
 use super::inventory::{
-    same_time, Inventory, Listing, LocalKind, LocalNode, RemoteFolder, RemoteKind, RemoteNode,
-    LOCAL_TRASH,
+    same_time, FileId, Inventory, Listing, LocalKind, LocalNode, RemoteFolder, RemoteKind,
+    RemoteNode, LOCAL_TRASH,
 };
 use crate::{
     common::{
@@ -242,14 +242,20 @@ pub(crate) enum ExtraTarget {
     },
 }
 
-/// A local entry as the inventory found it, checked again before it is removed.
+/// A local entry as the inventory found it, checked again before it is removed: a directory with
+/// all its entries, each with its identity, and a file with its size and modification time too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Snapshot {
     File {
         size: u64,
         modified: Option<SystemTime>,
+        id: Option<FileId>,
     },
-    Dir(Vec<(PathBuf, Snapshot)>),
+    Dir {
+        id: Option<FileId>,
+        /// Every entry of the directory, by path.
+        children: Vec<(PathBuf, Snapshot)>,
+    },
 }
 
 /// Builds the plan of `inventory`; `export` only applies to `down`.
@@ -1086,20 +1092,28 @@ fn local_deletable(local: &LocalNode) -> bool {
         }
 }
 
-fn snapshot(local: &LocalNode) -> Snapshot {
+/// The snapshot of a deletable local entry.
+#[must_use]
+pub(crate) fn snapshot(local: &LocalNode) -> Snapshot {
     match &local.kind {
         LocalKind::File { size, modified } => Snapshot::File {
             size: *size,
             modified: *modified,
+            id: local.id,
         },
-        LocalKind::Dir(children) => Snapshot::Dir(
-            children
+        LocalKind::Dir(children) => Snapshot::Dir {
+            id: local.id,
+            children: children
                 .iter()
                 .map(|child| (child.path.clone(), snapshot(child)))
                 .collect(),
-        ),
-        // Not deletable, never asked for.
-        LocalKind::Unreadable { .. } | LocalKind::Cycle => Snapshot::Dir(Vec::new()),
+        },
+        // Not deletable, never asked for: a directory that never matches.
+        LocalKind::Unreadable { .. } | LocalKind::Cycle => Snapshot::File {
+            size: u64::MAX,
+            modified: None,
+            id: None,
+        },
     }
 }
 

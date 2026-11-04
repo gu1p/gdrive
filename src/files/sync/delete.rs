@@ -5,16 +5,34 @@
 //!   `files.delete`; a folder goes with everything in it, which the plan made sure are all
 //!   extras.
 //! - Local: an extra is moved to `<LOCAL_DIR>/.gdrive-trash/<time of the run>/`, under its path
-//!   below the local root, after checking that it is still what the inventory found (the type,
-//!   and for a file the size and modification time). Nothing is moved over an existing entry,
-//!   and nothing through a `.gdrive-trash` that is not a plain directory.
-//! - Local with `--delete-permanently`: the files the inventory found are removed one by one,
-//!   each checked as above, and then their directories, which must be empty by then: anything
-//!   that appeared since the inventory stays.
+//!   below the local root, after checking that it is still exactly what the inventory found
+//!   (see below). Nothing is moved over an existing entry, and nothing into a `.gdrive-trash`
+//!   that is not a plain directory.
+//! - Local with `--delete-permanently`: after the same check, the files the inventory found are
+//!   removed one by one, each checked again just before, and then their directories, each when
+//!   it is empty.
+//!
+//! # Local checks
+//!
+//! Every local path is reached from the local root, one component at a time, with
+//! `symlink_metadata`: each directory on the way must be a directory and not a symlink, so a
+//! directory that was replaced by a symlink after the inventory (to a place outside the root)
+//! stops the removal before anything below it is touched. The root itself must be the directory
+//! phase 3 started with. Symlinks are never followed and never removed.
+//!
+//! Before an extra goes, its whole tree is compared with the inventory: the same entries in
+//! every directory (nothing added, nothing missing), each of the same type and identity (device
+//! and inode on Unix), and each file of the same size and modification time. Any difference
+//! leaves the extra in place and fails it: something changed it since the inventory, and only a
+//! new run can tell what it is now.
+//!
+//! What remains is the race of a check and the operation after it: a process that swaps a
+//! directory for a symlink in the instant between them. std offers no `openat`-style removal
+//! below a directory handle; the window is one system call wide.
 
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -28,7 +46,7 @@ use tokio::{fs, sync::OnceCell};
 
 use super::{
     errors::{self, ItemError},
-    inventory::LOCAL_TRASH,
+    inventory::{FileId, LOCAL_TRASH},
     plan::{Extra, ExtraTarget, Snapshot},
 };
 use crate::{
@@ -68,7 +86,7 @@ pub(crate) async fn run(
     let shared = Arc::new(Shared {
         hub: hub.clone(),
         mode,
-        trash: LocalTrash::new(local_root),
+        trash: LocalTrash::new(LocalRoot::new(local_root)),
         removed: AtomicU64::new(0),
     });
     let jobs = extras
@@ -112,7 +130,7 @@ impl Shared {
                         snapshot,
                     } => match shared.mode {
                         Mode::Trash => shared.trash.take(&path, &rel, &snapshot).await,
-                        Mode::Permanently => remove(&path, &snapshot).await,
+                        Mode::Permanently => shared.trash.root.remove(&path, &snapshot).await,
                     },
                 };
                 match removed {
@@ -127,19 +145,165 @@ impl Shared {
     }
 }
 
+/// The local root of a sync, the only way phase 3 reaches a local path; see the module
+/// documentation.
+struct LocalRoot {
+    path: PathBuf,
+    /// The identity of the root when phase 3 started.
+    id: OnceCell<Option<FileId>>,
+}
+
+impl LocalRoot {
+    fn new(path: &Path) -> Self {
+        LocalRoot {
+            path: path.to_path_buf(),
+            id: OnceCell::new(),
+        }
+    }
+
+    /// The metadata of the entry at `path` itself (not followed), reached from the root: every
+    /// directory on the way is a plain directory, and the root is the one phase 3 started with.
+    async fn reach(&self, path: &Path) -> Result<std::fs::Metadata, ItemError> {
+        let changed = || ItemError::Changed(path.to_path_buf());
+        let root = fs::symlink_metadata(&self.path)
+            .await
+            .map_err(|_| changed())?;
+        if !root.is_dir() {
+            return Err(changed());
+        }
+        let first = *self.id.get_or_init(|| async { FileId::of(&root) }).await;
+        if !FileId::same(first, FileId::of(&root)) {
+            return Err(changed());
+        }
+
+        let rel = path.strip_prefix(&self.path).map_err(|_| changed())?;
+        let mut current = self.path.clone();
+        let mut components = rel.components().peekable();
+        while let Some(component) = components.next() {
+            let Component::Normal(name) = component else {
+                return Err(changed());
+            };
+            current.push(name);
+            let metadata = fs::symlink_metadata(&current)
+                .await
+                .map_err(|_| changed())?;
+            if components.peek().is_none() {
+                return Ok(metadata);
+            }
+            // A symlink is not a directory to symlink_metadata.
+            if !metadata.is_dir() {
+                return Err(changed());
+            }
+        }
+        // The root itself is never removed.
+        Err(changed())
+    }
+
+    /// Checks that the entry at `path` is what `snapshot` says, reached from the root.
+    async fn check(&self, path: &Path, snapshot: &Snapshot) -> Result<(), ItemError> {
+        let metadata = self.reach(path).await?;
+        if matches(&metadata, snapshot) {
+            Ok(())
+        } else {
+            Err(ItemError::Changed(path.to_path_buf()))
+        }
+    }
+
+    /// Checks the whole tree at `path` against `snapshot`: every entry, directory before its
+    /// contents, and the names in each directory.
+    async fn check_tree(&self, path: &Path, snapshot: &Snapshot) -> Result<(), ItemError> {
+        let mut pending = vec![(path.to_path_buf(), snapshot)];
+        while let Some((path, snapshot)) = pending.pop() {
+            self.check(&path, snapshot).await?;
+            let Snapshot::Dir { children, .. } = snapshot else {
+                continue;
+            };
+            let mut found = Vec::new();
+            let mut entries = fs::read_dir(&path)
+                .await
+                .map_err(|_| ItemError::Changed(path.clone()))?;
+            while let Some(entry) = entries
+                .next_entry()
+                .await
+                .map_err(|_| ItemError::Changed(path.clone()))?
+            {
+                found.push(entry.path());
+            }
+            let mut expected = children
+                .iter()
+                .map(|(child, _)| child.clone())
+                .collect::<Vec<_>>();
+            found.sort();
+            expected.sort();
+            if found != expected {
+                return Err(ItemError::Changed(path));
+            }
+            pending.extend(
+                children
+                    .iter()
+                    .map(|(child, snapshot)| (child.clone(), snapshot)),
+            );
+        }
+        Ok(())
+    }
+
+    /// Removes what the inventory found at `path`, once the whole tree is checked: files first,
+    /// each checked again, then their directories, each when it is empty.
+    async fn remove(&self, path: &Path, snapshot: &Snapshot) -> Result<(), ItemError> {
+        self.check_tree(path, snapshot).await?;
+        // Depth first, each directory after its contents.
+        let mut order = Vec::new();
+        let mut pending = vec![(path.to_path_buf(), snapshot, false)];
+        while let Some((path, snapshot, expanded)) = pending.pop() {
+            match snapshot {
+                Snapshot::Dir { children, .. } if !expanded => {
+                    pending.push((path, snapshot, true));
+                    for (child, child_snapshot) in children {
+                        pending.push((child.clone(), child_snapshot, false));
+                    }
+                }
+                _ => order.push((path, snapshot)),
+            }
+        }
+        for (path, snapshot) in order {
+            self.check(&path, snapshot).await?;
+            let removed = match snapshot {
+                Snapshot::File { .. } => fs::remove_file(&path).await,
+                Snapshot::Dir { .. } => fs::remove_dir(&path).await,
+            };
+            removed.map_err(|err| ItemError::Remove(path.clone(), err))?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether `metadata` (of the entry itself, not followed) is the entry of `snapshot`. A symlink
+/// is never.
+fn matches(metadata: &std::fs::Metadata, snapshot: &Snapshot) -> bool {
+    match snapshot {
+        Snapshot::File { size, modified, id } => {
+            metadata.is_file()
+                && metadata.len() == *size
+                && metadata.modified().ok() == *modified
+                && FileId::same(*id, FileId::of(metadata))
+        }
+        Snapshot::Dir { id, .. } => metadata.is_dir() && FileId::same(*id, FileId::of(metadata)),
+    }
+}
+
 /// The local trash of one run, `<root>/.gdrive-trash/<time>/`, created when the first extra
 /// goes there.
 struct LocalTrash {
-    root: PathBuf,
+    root: LocalRoot,
     /// `20261104T102030Z`: sortable, and valid on every filesystem.
     stamp: String,
     dir: OnceCell<PathBuf>,
 }
 
 impl LocalTrash {
-    fn new(root: &Path) -> Self {
+    fn new(root: LocalRoot) -> Self {
         LocalTrash {
-            root: root.to_path_buf(),
+            root,
             stamp: DateTime::<Utc>::from(SystemTime::now())
                 .format("%Y%m%dT%H%M%SZ")
                 .to_string(),
@@ -152,8 +316,8 @@ impl LocalTrash {
     }
 
     async fn create(&self) -> Result<PathBuf, ItemError> {
-        let trash = self.root.join(LOCAL_TRASH);
-        plain_dir(&trash).await?;
+        let trash = self.root.path.join(LOCAL_TRASH);
+        self.plain_dir(&trash).await?;
         // A run in the same second gets `-1`, `-2`, ...: a run's trash is its own.
         for attempt in 0_u32.. {
             let name = if attempt == 0 {
@@ -171,20 +335,48 @@ impl LocalTrash {
         unreachable!("the loop returns")
     }
 
-    /// Moves the extra at `path` to its place in the trash, `rel` below the run's directory.
+    /// Makes sure `path`, below the root, is a plain directory, creating it if it is missing.
+    async fn plain_dir(&self, path: &Path) -> Result<(), ItemError> {
+        let not_a_dir = || ItemError::TrashNotADirectory(path.to_path_buf());
+        match self.root.reach(path).await {
+            Ok(metadata) if metadata.is_dir() => return Ok(()),
+            Ok(_) => return Err(not_a_dir()),
+            Err(_) => {}
+        }
+        if let Err(err) = fs::create_dir(path).await {
+            if err.kind() != io::ErrorKind::AlreadyExists {
+                return Err(ItemError::CreateDir(path.to_path_buf(), err));
+            }
+        }
+        match self.root.reach(path).await {
+            Ok(metadata) if metadata.is_dir() => Ok(()),
+            _ => Err(not_a_dir()),
+        }
+    }
+
+    /// Moves the extra at `path` to its place in the trash, `rel` below the run's directory,
+    /// once its whole tree is checked.
     async fn take(&self, path: &Path, rel: &Path, snapshot: &Snapshot) -> Result<(), ItemError> {
-        check(path, snapshot).await?;
-        let dir = self.dir().await?;
+        self.root.check_tree(path, snapshot).await?;
+        let dir = self.dir().await?.clone();
         let to = dir.join(rel);
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)
-                .await
-                .map_err(|err| ItemError::CreateDir(parent.to_path_buf(), err))?;
+        // The directories of `rel` in the trash, each a plain directory.
+        let mut parent = dir.clone();
+        if let Some(parents) = rel.parent() {
+            for component in parents.components() {
+                let Component::Normal(name) = component else {
+                    return Err(ItemError::Changed(path.to_path_buf()));
+                };
+                parent.push(name);
+                self.plain_dir(&parent).await?;
+            }
         }
         // rename replaces an existing file on Unix: never move over anything.
         if fs::symlink_metadata(&to).await.is_ok() {
             return Err(ItemError::TrashTaken(to));
         }
+        // Just before: the extra itself, reached from the root, is still the one checked.
+        self.root.check(path, snapshot).await?;
         fs::rename(path, &to)
             .await
             .map_err(|source| ItemError::MoveToTrash {
@@ -193,73 +385,4 @@ impl LocalTrash {
                 source,
             })
     }
-}
-
-/// Makes sure `path` is a directory and not a symlink, creating it if it is missing.
-async fn plain_dir(path: &Path) -> Result<(), ItemError> {
-    match fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.is_dir() => Ok(()),
-        Ok(_) => Err(ItemError::TrashNotADirectory(path.to_path_buf())),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => match fs::create_dir(path).await {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(path)
-                    .await
-                    .map_err(|err| ItemError::CreateDir(path.to_path_buf(), err))?;
-                if metadata.is_dir() {
-                    Ok(())
-                } else {
-                    Err(ItemError::TrashNotADirectory(path.to_path_buf()))
-                }
-            }
-            Err(err) => Err(ItemError::CreateDir(path.to_path_buf(), err)),
-        },
-        Err(err) => Err(ItemError::CreateDir(path.to_path_buf(), err)),
-    }
-}
-
-/// Whether the entry at `path` is still what the inventory found: the same type (never a
-/// symlink), and for a file the same size and modification time.
-async fn check(path: &Path, snapshot: &Snapshot) -> Result<(), ItemError> {
-    let changed = || ItemError::Changed(path.to_path_buf());
-    let metadata = fs::symlink_metadata(path).await.map_err(|_| changed())?;
-    let same = match snapshot {
-        Snapshot::File { size, modified } => {
-            metadata.is_file() && metadata.len() == *size && metadata.modified().ok() == *modified
-        }
-        Snapshot::Dir(_) => metadata.is_dir(),
-    };
-    if same {
-        Ok(())
-    } else {
-        Err(changed())
-    }
-}
-
-/// Removes what the inventory found at `path`: files after checking them, then their
-/// directories, which must be empty by then.
-async fn remove(path: &Path, snapshot: &Snapshot) -> Result<(), ItemError> {
-    // Depth first, each directory after its contents.
-    let mut order = Vec::new();
-    let mut pending = vec![(path.to_path_buf(), snapshot, false)];
-    while let Some((path, snapshot, expanded)) = pending.pop() {
-        match snapshot {
-            Snapshot::Dir(children) if !expanded => {
-                pending.push((path, snapshot, true));
-                for (child, child_snapshot) in children {
-                    pending.push((child.clone(), child_snapshot, false));
-                }
-            }
-            _ => order.push((path, snapshot)),
-        }
-    }
-    for (path, snapshot) in order {
-        check(&path, snapshot).await?;
-        let removed = match snapshot {
-            Snapshot::File { .. } => fs::remove_file(&path).await,
-            Snapshot::Dir(_) => fs::remove_dir(&path).await,
-        };
-        removed.map_err(|err| ItemError::Remove(path.clone(), err))?;
-    }
-    Ok(())
 }
