@@ -10,6 +10,8 @@ pub(crate) mod file_tree_like;
 pub(crate) mod hub_helper;
 pub(crate) mod id_gen;
 pub(crate) mod md5_writer;
+#[cfg(test)]
+pub(crate) mod mock_server;
 pub(crate) mod paginate;
 pub(crate) mod permission;
 #[cfg(test)]

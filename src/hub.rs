@@ -122,3 +122,20 @@ impl InstalledFlowDelegate for AuthDelegate {
         })
     }
 }
+
+#[cfg(test)]
+impl Hub {
+    /// Hub that sends every request to the server at `root_url` (for example
+    /// `http://127.0.0.1:1234/`) with a dummy bearer token. Used with `common::mock_server`.
+    pub(crate) fn for_mock_server(root_url: &str) -> io::Result<Hub> {
+        let http_client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(create_connector()?);
+
+        // Not a credential: google-drive3 refuses resumable uploads without some token.
+        let mut hub = DriveHub::new(http_client, String::from("mock-token"));
+        hub.root_url(root_url.to_owned());
+        hub.base_url(format!("{root_url}drive/v3/"));
+        Ok(Hub(hub))
+    }
+}

@@ -1,3 +1,4 @@
+pub(crate) mod batch;
 pub(crate) mod copy;
 pub(crate) mod delete;
 pub(crate) mod download;
@@ -9,6 +10,7 @@ pub(crate) mod list;
 pub(crate) mod mkdir;
 pub(crate) mod mv;
 pub(crate) mod rename;
+pub(crate) mod trash;
 pub(crate) mod update;
 pub(crate) mod upload;
 
@@ -23,6 +25,7 @@ pub(crate) use list::list;
 pub(crate) use mkdir::mkdir;
 pub(crate) use mv::mv;
 pub(crate) use rename::rename;
+pub(crate) use trash::trash;
 pub(crate) use update::update;
 pub(crate) use upload::upload;
 

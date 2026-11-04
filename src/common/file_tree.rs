@@ -215,6 +215,7 @@ impl File {
             name: Cow::Borrowed(&self.name),
             size: self.size,
             mime_type: Cow::Borrowed(&self.mime_type),
+            source_mime_type: None,
             parents,
         }
     }
