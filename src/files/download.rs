@@ -1,4 +1,6 @@
 pub(crate) mod errors;
+#[cfg(test)]
+mod media_tests;
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +34,8 @@ pub(crate) struct Config {
     pub(crate) follow_shortcuts: bool,
     pub(crate) download_directories: bool,
     pub(crate) destination: Destination,
+    /// Download files Google flagged as malware or spam (owner or shared drive organizer only).
+    pub(crate) acknowledge_abuse: bool,
 }
 
 impl Config {
@@ -125,7 +129,7 @@ async fn download_regular(
 ) -> Result<(), errors::Download> {
     use errors::Download as E;
 
-    let body = download_file(hub, &config.file_id)
+    let body = download_file(hub, &config.file_id, config.acknowledge_abuse)
         .await
         .map_err(E::DownloadFile)?;
 
@@ -192,7 +196,7 @@ async fn download_directory(
                 continue;
             }
 
-            let body = download_file(hub, &file.drive_id)
+            let body = download_file(hub, &file.drive_id, config.acknowledge_abuse)
                 .await
                 .map_err(E::DownloadFile)?;
 
@@ -216,11 +220,16 @@ async fn download_directory(
     Ok(())
 }
 
-async fn download_file(hub: &Hub, file_id: &str) -> Result<Body, Box<google_drive3::Error>> {
+async fn download_file(
+    hub: &Hub,
+    file_id: &str,
+    acknowledge_abuse: bool,
+) -> Result<Body, Box<google_drive3::Error>> {
     let (response, _) = hub
         .files()
         .get(file_id)
         .supports_all_drives(true)
+        .acknowledge_abuse(acknowledge_abuse)
         .param("alt", "media")
         .add_scope(google_drive3::api::Scope::Full)
         .doit()

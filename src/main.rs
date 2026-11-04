@@ -177,6 +177,10 @@ enum FileCommand {
         /// Write file to stdout
         #[arg(long)]
         stdout: bool,
+
+        /// Download files that Google flagged as malware or spam. Only the owner of a file, or an organizer of its shared drive, can do this
+        #[arg(long)]
+        acknowledge_abuse: bool,
     },
 
     /// Upload file
@@ -545,6 +549,7 @@ async fn handle_files_command(
             recursive,
             destination,
             stdout,
+            acknowledge_abuse,
         } => {
             let existing_file_action = if overwrite {
                 files::download::ExistingFileAction::Overwrite
@@ -566,6 +571,7 @@ async fn handle_files_command(
                 follow_shortcuts,
                 download_directories: recursive,
                 destination: dst,
+                acknowledge_abuse,
             })
             .await?;
         }
