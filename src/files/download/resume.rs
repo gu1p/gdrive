@@ -46,6 +46,8 @@ use crate::{
         },
     },
     hub::Hub,
+    // Warnings go above the progress bars.
+    transfer::progress::eprintln,
 };
 
 /// What a finished download is checked against.

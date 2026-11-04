@@ -42,6 +42,7 @@ use crate::{
     },
     hub::Hub,
     transfer::{
+        progress::ProgressSink,
         scheduler::{
             plural, Job, JobContext, JobKind, Outcome, Printer, Report, Scheduler, SkipReason,
         },
@@ -49,13 +50,14 @@ use crate::{
     },
 };
 
-/// Downloads the folder `file` into the destination of `config`, printing through `printer`,
-/// until every file is done or `cancel` resolves.
+/// Downloads the folder `file` into the destination of `config`, printing through `printer` and
+/// reporting to `progress`, until every file is done or `cancel` resolves.
 pub(super) async fn download_directory(
     hub: &Hub,
     file: google_drive3::api::File,
     config: &Config,
     printer: &Printer,
+    progress: Arc<dyn ProgressSink>,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<(), errors::Download> {
     use errors::Download as E;
@@ -84,6 +86,7 @@ pub(super) async fn download_directory(
         totals: Arc::clone(&totals),
     };
     let report = Scheduler::new(config.transfer, printer.clone())
+        .with_progress(progress)
         .run(source.into_stream(), cancel)
         .await;
 

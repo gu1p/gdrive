@@ -22,6 +22,8 @@ use crate::{
         RetryState, StopReason,
     },
     hub::Hub,
+    // Warnings go above the progress bars.
+    transfer::progress::eprintln,
 };
 
 const USER_AGENT_VALUE: &str = concat!("gdrive/", env!("CARGO_PKG_VERSION"));

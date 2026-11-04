@@ -19,9 +19,13 @@
 pub(crate) mod render;
 pub(crate) mod terminal;
 
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 
-pub(crate) use terminal::suspend;
+pub(crate) use render::ProgressDisplay;
+pub(crate) use terminal::{eprintln, println, suspend, Mode};
 
 use super::scheduler::{JobKind, Outcome};
 
@@ -108,5 +112,67 @@ impl JobProgress {
                 bytes,
             });
         }
+    }
+}
+
+/// Turns the running total that an uploader reports (the bytes Drive holds) into the increments
+/// of a [`JobProgress`]: only what is past the largest total so far is new, so a byte is counted
+/// once, also when a session starts over.
+pub(crate) struct ConfirmedTotal {
+    progress: JobProgress,
+    total: AtomicU64,
+}
+
+impl ConfirmedTotal {
+    #[must_use]
+    pub(crate) fn new(progress: JobProgress) -> Self {
+        ConfirmedTotal {
+            progress,
+            total: AtomicU64::new(0),
+        }
+    }
+
+    /// Drive holds `total` bytes of the content.
+    pub(crate) fn held(&self, total: u64) {
+        let before = self.total.fetch_max(total, Ordering::SeqCst);
+        self.progress.bytes(total.saturating_sub(before));
+    }
+
+    /// The largest total reported.
+    #[must_use]
+    pub(crate) fn total(&self) -> u64 {
+        self.total.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{ConfirmedTotal, JobId, JobProgress, ProgressEvent, ProgressSink};
+
+    #[derive(Default)]
+    struct Bytes(Mutex<Vec<u64>>);
+
+    impl ProgressSink for Bytes {
+        fn event(&self, event: &ProgressEvent<'_>) {
+            if let ProgressEvent::Bytes { bytes, .. } = event {
+                self.0.lock().unwrap().push(*bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn a_confirmed_total_counts_each_byte_once() {
+        let sink = Arc::new(Bytes::default());
+        let confirmed = ConfirmedTotal::new(JobProgress::new(JobId(0), sink.clone()));
+
+        // A session that starts over reports 0 and then the same bytes again.
+        for total in [0, 256, 512, 512, 0, 256, 768] {
+            confirmed.held(total);
+        }
+
+        assert_eq!(*sink.0.lock().unwrap(), [256, 256, 256]);
+        assert_eq!(confirmed.total(), 768);
     }
 }

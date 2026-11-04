@@ -10,12 +10,8 @@ pub(crate) struct FileInfo<'a> {
     pub(crate) name: Cow<'a, str>,
     pub(crate) mime_type: Cow<'a, mime::Mime>,
     pub(crate) parents: Option<Vec<String>>,
-    /// The size when the file was looked at. The upload does not use it: it measures the file
-    /// when it opens it, as a file can change in between.
-    #[expect(
-        dead_code,
-        reason = "nothing shows it yet; the uploader measures the file itself"
-    )]
+    /// The size when the file was looked at, which the progress display starts from. The upload
+    /// does not use it: it measures the file when it opens it, as a file can change in between.
     pub(crate) size: u64,
 }
 

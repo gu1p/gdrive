@@ -6,6 +6,7 @@ use std::{
     future,
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,6 +16,7 @@ use crate::{
     files::upload::{CommonConfig, Error, UploadDirectoryConfig},
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
+        progress::{Mode, NoProgress},
         scheduler::{
             capture::{output, Captured},
             Options, Printer,
@@ -59,6 +61,7 @@ fn config(path: &Path, jobs: usize, continue_on_error: bool) -> UploadDirectoryC
             upload_directories: true,
             print_only_id: false,
             transfer: Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error),
+            progress: Mode::Never,
         },
     }
 }
@@ -111,7 +114,7 @@ async fn upload_with(
     cancel: impl std::future::Future<Output = ()> + Send,
 ) -> Result<(), Error> {
     let hub = server.hub();
-    let run = upload_directory(&hub, config, options, printer, cancel);
+    let run = upload_directory(&hub, config, options, printer, Arc::new(NoProgress), cancel);
     tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the upload should end")

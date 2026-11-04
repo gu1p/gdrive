@@ -27,7 +27,11 @@ use crate::{
     },
     files,
     hub::Hub,
-    transfer::scheduler::{self, Printer},
+    // Warnings go above the progress bars.
+    transfer::{
+        progress::{self, eprintln, println, ProgressDisplay},
+        scheduler::{self, Printer},
+    },
 };
 pub(crate) use resume::Expected;
 use resume::{copy_body, BodyError, Identity, MediaSource, Next, ResumableDownload, Revision};
@@ -43,6 +47,8 @@ pub(crate) struct Config {
     /// How many files a recursive download transfers at once, and whether it goes on after a
     /// failure.
     pub(crate) transfer: scheduler::Options,
+    /// Whether the download shows its progress on stderr.
+    pub(crate) progress: progress::Mode,
 }
 
 impl Config {
@@ -159,7 +165,10 @@ async fn download_regular(
         .map_err(|err| E::DownloadFile(Box::new(err)))?;
 
     if config.destination == Destination::Stdout {
-        save_to_stdout(download, first).await?;
+        let (display, _progress) = ProgressDisplay::single(config.progress, true, download.total());
+        let saved = save_to_stdout(download, first).await;
+        display.finish();
+        saved?;
     } else {
         let file_name = local_file_name(file, config)?;
         warn_if_renamed(file, config, &file_name);
@@ -168,7 +177,11 @@ async fn download_regular(
 
         println!("Downloading {file_name}");
         let file_id = file.id.as_deref().unwrap_or(&config.file_id);
-        if let Err(source) = save_to_file(download, first, &abs_file_path, file_id).await {
+        let (display, _progress) =
+            ProgressDisplay::single(config.progress, false, download.total());
+        let saved = save_to_file(download, first, &abs_file_path, file_id).await;
+        display.finish();
+        if let Err(source) = saved {
             return Err(E::SaveBodyToFile {
                 path: abs_file_path,
                 source,
@@ -188,7 +201,18 @@ async fn download_directory(
     config: &Config,
 ) -> Result<(), errors::Download> {
     let printer = Printer::stdio();
-    recursive::download_directory(hub, file, config, &printer, scheduler::ctrl_c()).await
+    let display = ProgressDisplay::recursive(config.progress, config.transfer.jobs);
+    let downloaded = recursive::download_directory(
+        hub,
+        file,
+        config,
+        &printer,
+        display.sink(),
+        scheduler::ctrl_c(),
+    )
+    .await;
+    display.finish();
+    downloaded
 }
 
 /// The content of a Drive file: `files.get?alt=media`, which supports `Range` requests.
@@ -806,6 +830,7 @@ mod tests {
             destination: Destination::Path(destination.to_path_buf()),
             acknowledge_abuse: false,
             transfer: crate::transfer::scheduler::Options::default(),
+            progress: crate::transfer::progress::Mode::Never,
         }
     }
 

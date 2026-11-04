@@ -6,6 +6,7 @@ use std::{
     future::{self, Future},
     num::NonZeroUsize,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -15,6 +16,7 @@ use crate::{
     files::download::{errors, Config, Destination, ExistingFileAction},
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
+        progress::{Mode, NoProgress},
         scheduler::{
             capture::{output, Captured},
             Options,
@@ -31,6 +33,7 @@ fn config(destination: &Path, jobs: usize, continue_on_error: bool) -> Config {
         destination: Destination::Path(destination.to_path_buf()),
         acknowledge_abuse: false,
         transfer: Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error),
+        progress: Mode::Never,
     }
 }
 
@@ -65,7 +68,14 @@ async fn download(
 ) -> Downloaded {
     let output = output();
     let hub = server.hub();
-    let run = download_directory(&hub, root_folder(), config, &output.printer, cancel);
+    let run = download_directory(
+        &hub,
+        root_folder(),
+        config,
+        &output.printer,
+        Arc::new(NoProgress),
+        cancel,
+    );
     let result = tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the download should end");

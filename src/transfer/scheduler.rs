@@ -540,14 +540,8 @@ impl Scheduler {
         self
     }
 
+    /// Reports the run's events to `progress`, a display for example.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "for the progress display, which is not written yet"
-        )
-    )]
     pub(crate) fn with_progress(mut self, progress: Arc<dyn ProgressSink>) -> Self {
         self.progress = progress;
         self

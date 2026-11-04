@@ -7,8 +7,10 @@
 //! - [`Mode`]: `--progress`, `--no-progress`, `GDRIVE_PROGRESS`, or automatic: on when stderr is
 //!   a terminal.
 //! - [`Drawing`]: what a mode means on the process's terminal ([`Terminal`]).
-//! - [`suspend`]: while a display draws, a line printed to stdout or stderr goes above the bars,
-//!   whole. The run's [`Printer`](crate::transfer::scheduler::Printer) writes through it.
+//! - [`suspend`], and the [`eprintln!`] and [`println!`] that use it: while a display draws, a
+//!   line printed to stdout or stderr goes above the bars, whole. The run's
+//!   [`Printer`](crate::transfer::scheduler::Printer) writes through it; code that prints while a
+//!   transfer runs imports these macros in place of the standard ones.
 
 use std::{
     ffi::OsStr,
@@ -292,6 +294,22 @@ pub(super) fn activate(bars: &MultiProgress) {
 pub(super) fn deactivate() {
     *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = None;
 }
+
+/// `std::eprintln!`, printed above the progress bars (see [`suspend`]).
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        $crate::transfer::progress::suspend(|| ::std::eprintln!($($arg)*))
+    };
+}
+
+/// `std::println!`, printed above the progress bars (see [`suspend`]).
+macro_rules! println {
+    ($($arg:tt)*) => {
+        $crate::transfer::progress::suspend(|| ::std::println!($($arg)*))
+    };
+}
+
+pub(crate) use {eprintln, println};
 
 #[cfg(test)]
 mod tests {

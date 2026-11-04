@@ -22,6 +22,7 @@ use crate::{
         },
     },
     hub::Hub,
+    transfer::progress::{self, ProgressDisplay},
 };
 
 #[derive(Clone, Debug)]
@@ -29,6 +30,8 @@ pub(crate) struct Config {
     pub(crate) file_id: String,
     pub(crate) file_path: PathBuf,
     pub(crate) existing_file_action: ExistingFileAction,
+    /// Whether the export shows its progress on stderr.
+    pub(crate) progress: progress::Mode,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -90,9 +93,11 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
         config.file_path.display()
     );
 
-    files::download::save_to_file(download, first, &config.file_path, &config.file_id)
-        .await
-        .map_err(Error::SaveFile)?;
+    let (display, _progress) = ProgressDisplay::single(config.progress, false, download.total());
+    let saved =
+        files::download::save_to_file(download, first, &config.file_path, &config.file_id).await;
+    display.finish();
+    saved.map_err(Error::SaveFile)?;
 
     println!("Successfully exported {}", config.file_path.display());
 
@@ -188,7 +193,7 @@ impl error::Error for Error {
 mod tests {
     use serde_json::json;
 
-    use super::{export_with_hub, Config, ExistingFileAction};
+    use super::{export_with_hub, progress, Config, ExistingFileAction};
     use crate::common::{
         drive_file::MIME_TYPE_DRIVE_DOCUMENT,
         mock_server::{MockServer, Response},
@@ -216,6 +221,7 @@ mod tests {
                 file_id: String::from("doc"),
                 file_path: path.clone(),
                 existing_file_action: ExistingFileAction::Abort,
+                progress: progress::Mode::Never,
             },
         )
         .await

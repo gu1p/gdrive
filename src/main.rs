@@ -336,6 +336,9 @@ enum FileCommand {
         /// With --recursive: when a file fails, go on with the others instead of stopping. The command still exits with an error
         #[arg(long)]
         continue_on_error: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
 
     /// Upload file
@@ -382,6 +385,9 @@ enum FileCommand {
         /// With --recursive: when a file or folder fails, go on with the others instead of stopping. The command still exits with an error
         #[arg(long)]
         continue_on_error: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
 
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
@@ -411,6 +417,9 @@ enum FileCommand {
         /// Print details about each chunk
         #[arg(long, value_name = "", default_value_t = false)]
         print_chunk_info: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
 
     /// Delete file
@@ -496,6 +505,9 @@ enum FileCommand {
         /// Print only id of file
         #[arg(long, default_value_t = false)]
         print_only_id: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
 
     /// Export google document to file
@@ -509,7 +521,29 @@ enum FileCommand {
         /// Overwrite existing files
         #[arg(short, long)]
         overwrite: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
     },
+}
+
+/// `--progress` and `--no-progress` of the commands that transfer files.
+#[derive(clap::Args, Debug, Clone, Copy, PartialEq, Eq)]
+struct ProgressArgs {
+    /// Show transfer progress on stderr, also when stderr is not a terminal. By default it shows only on a terminal; `GDRIVE_PROGRESS=1` or `GDRIVE_PROGRESS=0` changes the default
+    #[arg(long, overrides_with = "no_progress")]
+    progress: bool,
+
+    /// Do not show transfer progress
+    #[arg(long, overrides_with = "progress")]
+    no_progress: bool,
+}
+
+impl ProgressArgs {
+    /// The mode of the flags, else of `GDRIVE_PROGRESS`.
+    fn mode(self) -> transfer::progress::Mode {
+        transfer::progress::Mode::from_flags(self.progress, self.no_progress)
+    }
 }
 
 #[derive(Subcommand)]
@@ -799,6 +833,7 @@ async fn handle_files_command(
             acknowledge_abuse,
             jobs,
             continue_on_error,
+            progress,
         } => {
             let existing_file_action = if overwrite {
                 files::download::ExistingFileAction::Overwrite
@@ -822,6 +857,7 @@ async fn handle_files_command(
                 destination: dst,
                 acknowledge_abuse,
                 transfer: Options::new(jobs, continue_on_error),
+                progress: progress.mode(),
             })
             .await?;
         }
@@ -838,6 +874,7 @@ async fn handle_files_command(
             print_only_id,
             jobs,
             continue_on_error,
+            progress,
         } => {
             files::upload(files::upload::Config {
                 file_path,
@@ -850,6 +887,7 @@ async fn handle_files_command(
                 upload_directories: recursive,
                 print_only_id,
                 transfer: Options::new(jobs, continue_on_error),
+                progress: progress.mode(),
             })
             .await?;
         }
@@ -862,6 +900,7 @@ async fn handle_files_command(
             multipart_threshold,
             print_chunk_errors,
             print_chunk_info,
+            progress,
         } => {
             files::update(files::update::Config {
                 file_id,
@@ -871,6 +910,7 @@ async fn handle_files_command(
                 multipart_threshold,
                 print_chunk_errors,
                 print_chunk_info,
+                progress: progress.mode(),
             })
             .await?;
         }
@@ -939,11 +979,13 @@ async fn handle_files_command(
             file_path,
             parent,
             print_only_id,
+            progress,
         } => {
             files::import(files::import::Config {
                 file_path,
                 parents: parent,
                 print_only_id,
+                progress: progress.mode(),
             })
             .await?;
         }
@@ -952,6 +994,7 @@ async fn handle_files_command(
             file_id,
             file_path,
             overwrite,
+            progress,
         } => {
             let existing_file_action = if overwrite {
                 files::export::ExistingFileAction::Overwrite
@@ -963,6 +1006,7 @@ async fn handle_files_command(
                 file_id,
                 file_path,
                 existing_file_action,
+                progress: progress.mode(),
             })
             .await?;
         }
@@ -1502,6 +1546,37 @@ mod flag_tests {
         match cli.command {
             Command::Files { command } => command,
             _ => panic!("{args:?} should be a files command"),
+        }
+    }
+
+    #[test]
+    fn transfer_commands_take_progress_flags_and_the_last_one_wins() {
+        let transfers: [&[&str]; 5] = [
+            &["files", "download", "id"],
+            &["files", "upload", "path"],
+            &["files", "update", "id", "path"],
+            &["files", "import", "a.md"],
+            &["files", "export", "id", "a.pdf"],
+        ];
+        for command in transfers {
+            let progress = |flags: &[&str]| {
+                let args = command.iter().chain(flags).copied().collect::<Vec<_>>();
+                match parse(&args) {
+                    FileCommand::Download { progress, .. }
+                    | FileCommand::Upload { progress, .. }
+                    | FileCommand::Update { progress, .. }
+                    | FileCommand::Import { progress, .. }
+                    | FileCommand::Export { progress, .. } => {
+                        (progress.progress, progress.no_progress)
+                    }
+                    _ => panic!("{args:?} should be a transfer"),
+                }
+            };
+            assert_eq!(progress(&[]), (false, false), "{command:?}");
+            assert_eq!(progress(&["--progress"]), (true, false), "{command:?}");
+            assert_eq!(progress(&["--no-progress"]), (false, true), "{command:?}");
+            assert_eq!(progress(&["--progress", "--no-progress"]), (false, true));
+            assert_eq!(progress(&["--no-progress", "--progress"]), (true, false));
         }
     }
 

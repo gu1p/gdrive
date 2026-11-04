@@ -64,6 +64,7 @@ fn config(file_id: &str, destination: &std::path::Path) -> Config {
         destination: Destination::Path(destination.to_owned()),
         acknowledge_abuse: true,
         transfer: crate::transfer::scheduler::Options::default(),
+        progress: crate::transfer::progress::Mode::Never,
     }
 }
 
