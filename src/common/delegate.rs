@@ -4,9 +4,12 @@ use std::{
     time::Duration,
 };
 
-use bytesize::ByteSize;
 use error_trace::ErrorTrace;
 use hyper::{self, http};
+
+// `super::` rather than `crate::common::`, so that tests/resumable_upload.rs can compile this
+// module next to human_size.rs.
+use super::human_size::human_size;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UploadDelegateConfig {
@@ -54,7 +57,7 @@ impl<'a> UploadDelegate<'a> {
                 println!(
                     "Info: {} {} chunk ({}-{} of {})",
                     action,
-                    ByteSize::b(chunk_size).display().si(),
+                    human_size(chunk_size),
                     range.first,
                     range.last,
                     chunk.total_length

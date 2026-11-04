@@ -7,7 +7,6 @@ use std::{
     time::Duration,
 };
 
-use bytesize::ByteSize;
 use mime::Mime;
 
 use crate::{
@@ -17,6 +16,7 @@ use crate::{
         file_info::{self, FileInfo},
         file_tree::{self, FileTree},
         hub_helper::{get_hub, GetHubError},
+        human_size::human_size,
         id_gen::IdGen,
         FileTreeLike, FolderLike,
     },
@@ -226,7 +226,7 @@ async fn upload_directory(
             "Found {} files in {} directories with a total size of {}",
             tree_info.file_count,
             tree_info.folder_count,
-            ByteSize::b(tree_info.total_file_size).display().si(),
+            human_size(tree_info.total_file_size),
         );
     }
 
@@ -309,7 +309,7 @@ async fn upload_directory(
             "Uploaded {} files in {} directories with a total size of {}",
             tree_info.file_count,
             tree_info.folder_count,
-            ByteSize::b(tree_info.total_file_size).display().si(),
+            human_size(tree_info.total_file_size),
         );
     }
 

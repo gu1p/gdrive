@@ -3,7 +3,6 @@ pub(crate) mod errors;
 use std::path::{Path, PathBuf};
 
 use async_recursion::async_recursion;
-use bytesize::ByteSize;
 use error_trace::ErrorTrace;
 use futures::stream::StreamExt;
 use google_apis_common::Body;
@@ -19,6 +18,7 @@ use crate::{
         drive_file,
         file_tree_drive::{self, errors::FileIdentifier, FileTreeDrive},
         hub_helper::get_hub,
+        human_size::human_size,
         md5_writer::Md5Writer,
         parse_md5_digest, FileTreeLike, FolderLike,
     },
@@ -170,7 +170,7 @@ async fn download_directory(
         "Found {} files in {} directories with a total size of {}",
         tree_info.file_count,
         tree_info.folder_count,
-        ByteSize::b(tree_info.total_file_size).display().si(),
+        human_size(tree_info.total_file_size),
     );
 
     let root_path = config.canonical_destination_root()?;
@@ -210,7 +210,7 @@ async fn download_directory(
         "Downloaded {} files in {} directories with a total size of {}",
         tree_info.file_count,
         tree_info.folder_count,
-        ByteSize::b(tree_info.total_file_size).display().si()
+        human_size(tree_info.total_file_size)
     );
 
     Ok(())

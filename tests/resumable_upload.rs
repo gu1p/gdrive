@@ -53,6 +53,8 @@ use tokio::net::TcpListener;
 )]
 #[path = "../src/common/delegate.rs"]
 mod delegate;
+#[path = "../src/common/human_size.rs"]
+mod human_size;
 
 use delegate::{BackoffConfig, ChunkSize, UploadDelegate, UploadDelegateConfig};
 
