@@ -30,7 +30,7 @@ mod source;
 mod tests;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     error,
     fmt::{self, Display, Formatter, Write as _},
     future::Future,
@@ -224,7 +224,9 @@ async fn run(
     let listing_jobs = settings.transfer.metadata_jobs.get();
     let mut roots = Vec::new();
     let mut totals = Totals::default();
-    for id in &settings.file_ids {
+    // An id given twice would be copied twice: both copies compare with the same listing.
+    let mut seen = HashSet::new();
+    for id in settings.file_ids.iter().filter(|&id| seen.insert(id)) {
         let root = source::discover(source, id, listing_jobs, printer).await;
         match &root {
             Ok(node) => totals.add(node),

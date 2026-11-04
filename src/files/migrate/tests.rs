@@ -261,6 +261,18 @@ async fn a_folder_tree_is_migrated_with_its_structure_and_content() {
 }
 
 #[tokio::test]
+async fn an_id_given_twice_is_migrated_once() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, settings(&["photos", "photos"])).await;
+
+    migrated.assert_ok();
+    assert_eq!(created_tree(&dest), migrated_tree());
+    assert_eq!(dest.created().len(), migrated_tree().len());
+}
+
+#[tokio::test]
 async fn files_and_folders_go_into_the_into_folder() {
     let mut files = source_tree();
     files.push(FakeFile::blob("notes", "notes.txt", "root", "n"));
