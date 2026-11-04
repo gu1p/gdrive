@@ -731,7 +731,10 @@ async fn a_conversion_asks_for_the_google_type_and_sends_the_source_type() {
 fn after_first_chunk(path: PathBuf, change: fn(&std::fs::File)) -> impl Fn(u64) + Send + Sync {
     move |offset| {
         if offset == CHUNK {
-            let file = std::fs::File::options().append(true).open(&path).unwrap();
+            // Open for writing rather than appending: Windows refuses set_len on an
+            // append-only handle. Seek to the end so writes still append.
+            let mut file = std::fs::File::options().write(true).open(&path).unwrap();
+            std::io::Seek::seek(&mut file, std::io::SeekFrom::End(0)).unwrap();
             change(&file);
         }
     }

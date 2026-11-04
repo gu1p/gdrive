@@ -1,7 +1,6 @@
 pub(crate) mod errors;
 
 use std::{
-    borrow::Cow,
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
@@ -11,11 +10,25 @@ use std::{
 use async_recursion::async_recursion;
 
 use super::{FileLike, FileTreeLike, FolderInfoLike, FolderLike};
-use crate::common::{file_info::FileInfo, file_tree_like, id_gen::IdGen};
+use crate::common::{file_tree_like, id_gen::IdGen};
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct FileTree {
     pub(crate) root: Folder,
+    /// The entries below the root that cannot be uploaded, in walk order. The tree holds the
+    /// rest.
+    pub(crate) unreadable: Vec<Unreadable>,
+}
+
+/// An entry of the local tree that cannot be uploaded: the walk goes on without it, and a
+/// recursive upload reports it as failed.
+#[derive(Debug)]
+pub(crate) struct Unreadable {
+    /// Relative to the parent of the walked directory, like [`File::relative_path`].
+    pub(crate) relative_path: PathBuf,
+    /// A directory (its contents are unknown), else a file or an entry of unknown type.
+    pub(crate) is_dir: bool,
+    pub(crate) error: errors::Folder,
 }
 
 impl FileTree {
@@ -25,7 +38,9 @@ impl FileTree {
     /// would copy, under the names of the links. A directory whose canonical path is one of the
     /// directories being walked above it (a symlink cycle) is skipped with a warning. A broken
     /// symlink, an entry whose metadata cannot be read, an unreadable file or directory and an
-    /// entry that is neither a file nor a directory are errors.
+    /// entry that is neither a file nor a directory are left out and listed in
+    /// [`FileTree::unreadable`]. Only a root that cannot be read and a failure to get Drive ids
+    /// are errors.
     pub(crate) async fn from_path(
         path: &Path,
         ids: &mut IdGen<'_>,
@@ -34,11 +49,35 @@ impl FileTree {
             .canonicalize()
             .map_err(errors::FileTree::Canonicalize)?;
 
-        let mut ancestors = HashSet::from([canonical_path.clone()]);
-        let root = Folder::from_path(&canonical_path, None, ids, &mut ancestors)
+        let mut walk = Walk {
+            ancestors: HashSet::from([canonical_path.clone()]),
+            unreadable: Vec::new(),
+        };
+        let root = Folder::from_path(&canonical_path, None, ids, &mut walk)
             .await
             .map_err(errors::FileTree::Folder)?;
-        Ok(FileTree { root })
+        Ok(FileTree {
+            root,
+            unreadable: walk.unreadable,
+        })
+    }
+}
+
+/// The state of one walk of a local tree.
+struct Walk {
+    /// The canonical paths of the directory being walked and of the directories above it.
+    ancestors: HashSet<PathBuf>,
+    unreadable: Vec<Unreadable>,
+}
+
+impl Walk {
+    /// Notes an entry of `folder` that cannot be uploaded.
+    fn unreadable(&mut self, folder: &Folder, path: &Path, is_dir: bool, error: errors::Folder) {
+        self.unreadable.push(Unreadable {
+            relative_path: get_relative_path(path, &folder.info).to_path_buf(),
+            is_dir,
+            error,
+        });
     }
 }
 
@@ -67,13 +106,15 @@ pub(crate) struct Folder {
 }
 
 impl Folder {
-    /// `ancestors` holds the canonical paths of `path` and of the directories above it.
+    /// Walks the directory `path`. Its entries that cannot be uploaded go to
+    /// [`Walk::unreadable`]; the errors are about the directory itself (it cannot be read, or no
+    /// Drive id could be had), which the caller notes or returns.
     #[async_recursion]
     async fn from_path(
         path: &Path,
         parent: Option<&'async_recursion Folder>,
         ids: &mut IdGen<'_>,
-        ancestors: &mut HashSet<PathBuf>,
+        walk: &mut Walk,
     ) -> Result<Folder, errors::Folder> {
         use errors::Folder as E;
 
@@ -82,6 +123,7 @@ impl Folder {
             .map(|s| s.to_string_lossy().into_owned())
             .ok_or(E::InvalidPath)?;
 
+        let entries = fs::read_dir(path).map_err(E::ReadDir)?;
         let drive_id = ids.next().await.map_err(E::GenerateId)?;
 
         let mut folder = Folder {
@@ -94,11 +136,14 @@ impl Folder {
             children: Vec::new(),
         };
 
-        let entries = fs::read_dir(path).map_err(E::ReadDir)?;
-        let mut children = Vec::new();
-
         for e in entries {
-            let entry = e.map_err(E::ReadDirEntry)?;
+            let entry = match e {
+                Ok(entry) => entry,
+                Err(source) => {
+                    walk.unreadable(&folder, path, true, E::ReadDirEntry(source));
+                    continue;
+                }
+            };
             let path = entry.path();
 
             // fs::metadata follows symlinks: a link is uploaded as what it points to.
@@ -106,21 +151,36 @@ impl Folder {
                 Ok(metadata) => metadata,
                 Err(source) => {
                     let is_symlink = entry.file_type().is_ok_and(|ty| ty.is_symlink());
-                    return Err(if is_symlink {
-                        E::BrokenSymlink { path, source }
+                    let error = if is_symlink {
+                        E::BrokenSymlink {
+                            path: path.clone(),
+                            source,
+                        }
                     } else {
-                        E::Metadata { path, source }
-                    });
+                        E::Metadata {
+                            path: path.clone(),
+                            source,
+                        }
+                    };
+                    walk.unreadable(&folder, &path, false, error);
+                    continue;
                 }
             };
 
             if metadata.is_dir() {
                 let canonical_path = match path.canonicalize() {
                     Ok(canonical_path) => canonical_path,
-                    Err(source) => return Err(E::Canonicalize { path, source }),
+                    Err(source) => {
+                        let error = E::Canonicalize {
+                            path: path.clone(),
+                            source,
+                        };
+                        walk.unreadable(&folder, &path, true, error);
+                        continue;
+                    }
                 };
 
-                if ancestors.contains(&canonical_path) {
+                if walk.ancestors.contains(&canonical_path) {
                     eprintln!(
                         "Warning: Skipping directory '{}': it resolves to '{}', which contains \
                         it (symlink cycle)",
@@ -130,36 +190,39 @@ impl Folder {
                     continue;
                 }
 
-                ancestors.insert(canonical_path.clone());
-                let nested = Folder::from_path(&path, Some(&folder), ids, ancestors).await;
-                ancestors.remove(&canonical_path);
+                walk.ancestors.insert(canonical_path.clone());
+                let nested = Folder::from_path(&path, Some(&folder), ids, walk).await;
+                walk.ancestors.remove(&canonical_path);
 
-                let folder = match nested {
-                    Ok(folder) => folder,
-                    Err(source) => {
+                match nested {
+                    Ok(nested) => folder.children.push(Node::Folder(nested)),
+                    // Without Drive ids nothing can be uploaded.
+                    Err(source @ E::GenerateId(_)) => {
                         return Err(E::Nested {
                             path,
                             source: Box::new(source),
                         });
                     }
-                };
-                let node = Node::Folder(folder);
-                children.push(node);
+                    Err(error) => walk.unreadable(&folder, &path, true, error),
+                }
             } else if metadata.is_file() {
-                let file = match File::from_path(&path, &folder, ids).await {
-                    Ok(file) => file,
-                    Err(source) => {
+                match File::from_path(&path, &folder, ids).await {
+                    Ok(file) => folder.children.push(Node::File(file)),
+                    Err(source @ errors::File::GenerateId(_)) => {
                         return Err(E::File { path, source });
                     }
-                };
-                let node = Node::File(file);
-                children.push(node);
+                    Err(source) => {
+                        let error = E::File {
+                            path: path.clone(),
+                            source,
+                        };
+                        walk.unreadable(&folder, &path, false, error);
+                    }
+                }
             } else {
-                return Err(E::UnknownFileType(path));
+                walk.unreadable(&folder, &path, false, E::UnknownFileType(path.clone()));
             }
         }
-
-        folder.children = children;
 
         Ok(folder)
     }
@@ -249,17 +312,6 @@ impl File {
     pub(crate) fn relative_path(&self) -> &Path {
         get_relative_path(&self.path, &self.parent)
     }
-
-    #[must_use]
-    pub(crate) fn info(&self, parents: Option<Vec<String>>) -> FileInfo<'_> {
-        FileInfo {
-            name: Cow::Borrowed(&self.name),
-            size: self.size,
-            mime_type: Cow::Borrowed(&self.mime_type),
-            source_mime_type: None,
-            parents,
-        }
-    }
 }
 
 impl FileLike for File {
@@ -298,6 +350,7 @@ mod tests {
     struct Walked {
         folders: BTreeSet<PathBuf>,
         files: BTreeMap<PathBuf, u64>,
+        unreadable: Vec<super::Unreadable>,
     }
 
     async fn walk(root: &Path) -> Result<Walked, errors::FileTree> {
@@ -310,7 +363,21 @@ mod tests {
                 files.insert(file.relative_path().to_path_buf(), file.size);
             }
         }
-        Ok(Walked { folders, files })
+        Ok(Walked {
+            folders,
+            files,
+            unreadable: tree.unreadable,
+        })
+    }
+
+    impl Walked {
+        /// The relative paths of the unreadable entries, with whether they are directories.
+        fn unreadable(&self) -> BTreeMap<PathBuf, bool> {
+            self.unreadable
+                .iter()
+                .map(|entry| (entry.relative_path.clone(), entry.is_dir))
+                .collect()
+        }
     }
 
     fn paths<const N: usize>(paths: [&str; N]) -> BTreeSet<PathBuf> {
@@ -422,57 +489,68 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn broken_symlink_is_an_error() {
+    async fn a_broken_symlink_is_left_out_and_reported() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.txt"), b"ok").unwrap();
         symlink("missing", root.join("dangling")).unwrap();
 
-        let err = walk(&root).await.err().unwrap();
+        let walked = walk(&root).await.unwrap();
+        assert_eq!(walked.files, sizes([("root/ok.txt", 2)]));
+        assert_eq!(
+            walked.unreadable(),
+            BTreeMap::from([(PathBuf::from("root/dangling"), false)])
+        );
         assert!(
             matches!(
-                &err,
-                errors::FileTree::Folder(errors::Folder::BrokenSymlink { path, .. })
-                    if path.ends_with("dangling")
+                &walked.unreadable[0].error,
+                errors::Folder::BrokenSymlink { path, .. } if path.ends_with("dangling")
             ),
-            "{err:?}"
+            "{:?}",
+            walked.unreadable
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn symlink_loop_is_an_error() {
+    async fn a_symlink_loop_is_left_out_and_reported() {
         use std::os::unix::fs::symlink;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::write(root.join("sub/f.txt"), b"f").unwrap();
         symlink("l2", root.join("sub/l1")).unwrap();
         symlink("l1", root.join("sub/l2")).unwrap();
 
-        let err = walk(&root).await.err().unwrap();
-        assert!(
-            matches!(
-                &err,
-                errors::FileTree::Folder(errors::Folder::Nested { path, source })
-                    if path.ends_with("sub")
-                        && matches!(**source, errors::Folder::BrokenSymlink { .. })
-            ),
-            "{err:?}"
+        let walked = walk(&root).await.unwrap();
+        assert_eq!(walked.folders, paths(["root", "root/sub"]));
+        assert_eq!(walked.files, sizes([("root/sub/f.txt", 1)]));
+        assert_eq!(
+            walked.unreadable(),
+            BTreeMap::from([
+                (PathBuf::from("root/sub/l1"), false),
+                (PathBuf::from("root/sub/l2"), false)
+            ])
         );
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn unreadable_entries_are_errors() {
+    async fn unreadable_entries_are_left_out_and_reported() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("root");
         let locked = root.join("locked");
         std::fs::create_dir_all(&locked).unwrap();
+        std::fs::write(root.join("ok.txt"), b"ok").unwrap();
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, b"s").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
 
         // Permissions do not apply to root; nothing to check then.
@@ -480,32 +558,56 @@ mod tests {
             return;
         }
 
-        let dir_err = walk(&root).await.err().unwrap();
+        let walked = walk(&root).await;
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(
-            matches!(
-                &dir_err,
-                errors::FileTree::Folder(errors::Folder::Nested { path, source })
-                    if path.ends_with("locked")
-                        && matches!(**source, errors::Folder::ReadDir(_))
-            ),
-            "{dir_err:?}"
+        let walked = walked.unwrap();
+
+        assert_eq!(walked.folders, paths(["root"]));
+        assert_eq!(walked.files, sizes([("root/ok.txt", 2)]));
+        assert_eq!(
+            walked.unreadable(),
+            BTreeMap::from([
+                (PathBuf::from("root/locked"), true),
+                (PathBuf::from("root/secret.txt"), false)
+            ])
         );
+        for entry in &walked.unreadable {
+            assert!(
+                matches!(
+                    &entry.error,
+                    errors::Folder::ReadDir(_)
+                        | errors::Folder::File {
+                            source: errors::File::Open(_),
+                            ..
+                        }
+                ),
+                "{entry:?}"
+            );
+        }
+    }
 
-        let secret = locked.join("secret.txt");
-        std::fs::write(&secret, b"s").unwrap();
-        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_root_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
 
-        let file_err = walk(&locked).await.err().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&root).is_ok() {
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let walked = walk(&root).await;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(
             matches!(
-                &file_err,
-                errors::FileTree::Folder(errors::Folder::File {
-                    path,
-                    source: errors::File::Open(_),
-                }) if path.ends_with("secret.txt")
+                walked.err(),
+                Some(errors::FileTree::Folder(errors::Folder::ReadDir(_)))
             ),
-            "{file_err:?}"
+            "the root cannot be left out"
         );
     }
 

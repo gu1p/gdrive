@@ -1,11 +1,19 @@
-//! A fake Drive `files.list` endpoint for walk tests.
+//! A fake Drive `files.list` endpoint for walk tests, with media downloads for the recursive
+//! download.
 //!
 //! Unlike `common::mock_server`, which answers requests in order with canned responses, this
 //! server holds a set of files and answers every query from them, so it works however many
 //! requests are in flight and in whatever order they arrive. It understands the queries the walk
 //! sends: `'<id>' in parents` terms joined by `or`, and `trashed = false`. It also records every
 //! request and the most requests it had in flight at once. `files.get` of a stored file returns
-//! the fields its `fields` mask names, so a test can check what a metadata request asks for.
+//! the fields its `fields` mask names, so a test can check what a metadata request asks for;
+//! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
+//! the other requests.
+//!
+//! For recursive uploads it answers `files.generateIds`, multipart `files.create` (the uploads
+//! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
+//! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
+//! last). Like Drive, a create fails with 404 when a parent does not exist yet.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -19,15 +27,19 @@ use std::{
 };
 
 use bytes::Bytes;
-use http_body_util::Full;
+use futures::{stream, StreamExt};
+use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::{body::Incoming, service::service_fn, Method, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Map, Value};
-use tokio::{net::TcpListener, task::JoinHandle};
+use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
 
 use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 
 const LIST_PATH: &str = "/drive/v3/files";
+const GENERATE_IDS_PATH: &str = "/drive/v3/files/generateIds";
+const UPLOAD_PATH: &str = "/upload/drive/v3/files";
+const SESSION_PATH: &str = "/upload-session/";
 
 /// A file stored by the fake.
 #[derive(Debug, Clone, Default)]
@@ -44,6 +56,8 @@ pub(crate) struct FakeFile {
     pub(crate) shortcut_target: Option<(String, String)>,
     pub(crate) target_resource_key: Option<String>,
     pub(crate) resource_key: Option<String>,
+    /// What a media download of a blob returns.
+    pub(crate) content: Option<String>,
 }
 
 impl FakeFile {
@@ -66,6 +80,7 @@ impl FakeFile {
             parents: vec![parent.to_owned()],
             size: Some(content.len() as u64),
             md5: Some(format!("{:x}", md5::compute(content))),
+            content: Some(content.to_owned()),
             ..Self::default()
         }
     }
@@ -194,6 +209,59 @@ pub(crate) struct Behavior {
     pub(crate) unavailable_first: HashMap<String, usize>,
     /// The `Retry-After` (seconds) of those 503 replies.
     pub(crate) unavailable_retry_after: Option<u64>,
+    /// How long every media download takes before its reply.
+    pub(crate) media_delay: Duration,
+    /// Media downloads of these file ids fail with 404, after the given time instead of
+    /// `media_delay`.
+    pub(crate) media_missing: HashMap<String, Duration>,
+    /// Media downloads of these file ids send half of the content and then nothing more, like
+    /// a transfer that is still running.
+    pub(crate) media_stalled: HashSet<String>,
+    /// How long the create of a file (not a folder) takes before its reply.
+    pub(crate) upload_delay: Duration,
+    /// Creates of files with these names fail with 400.
+    pub(crate) upload_rejected: HashSet<String>,
+    /// How long every chunk of a resumable session takes before its reply.
+    pub(crate) chunk_delay: Duration,
+    /// The chunk of the file with this name that starts at this offset fails with 503 once,
+    /// committing nothing.
+    pub(crate) chunk_unavailable: HashMap<String, u64>,
+}
+
+/// A chunk or status request of a resumable session, as the fake answered it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Chunk {
+    /// The name of the file the session uploads.
+    pub(crate) name: String,
+    /// The first byte; `None` for a status request.
+    pub(crate) first: Option<u64>,
+    pub(crate) status: u16,
+}
+
+/// A resumable session.
+#[derive(Debug)]
+struct Session {
+    metadata: Value,
+    total: u64,
+    received: Vec<u8>,
+    /// See [`Created::arrived`].
+    arrived: usize,
+    /// The reply that completed the session.
+    done: Option<Value>,
+}
+
+/// A `files.create` the fake answered.
+#[derive(Debug, Clone)]
+pub(crate) struct Created {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) mime_type: String,
+    pub(crate) parents: Vec<String>,
+    pub(crate) content: Vec<u8>,
+    /// The position of the request's arrival among all arrivals and replies of creates.
+    pub(crate) arrived: usize,
+    /// The position of its reply.
+    pub(crate) answered: usize,
 }
 
 /// A list request as the fake saw it, with percent-decoded parameters.
@@ -225,6 +293,29 @@ struct State {
     unavailable_left: Mutex<HashMap<String, usize>>,
     in_flight: AtomicUsize,
     max_in_flight: AtomicUsize,
+    /// The file ids of media downloads.
+    media: Mutex<Vec<String>>,
+    media_in_flight: AtomicUsize,
+    media_max_in_flight: AtomicUsize,
+    /// When the first media download arrived.
+    first_media: Mutex<Option<Instant>>,
+    /// When the last list reply was sent.
+    last_list: Mutex<Option<Instant>>,
+    /// Successful creates, in reply order.
+    created: Mutex<Vec<Created>>,
+    /// Orders the arrivals and replies of creates.
+    create_events: AtomicUsize,
+    uploads_in_flight: AtomicUsize,
+    uploads_max_in_flight: AtomicUsize,
+    /// Ids handed out by `files.generateIds`.
+    generated: AtomicUsize,
+    sessions: Mutex<Vec<Session>>,
+    /// Sessions started and not completed, and the most at once.
+    sessions_active: AtomicUsize,
+    sessions_max_active: AtomicUsize,
+    chunks: Mutex<Vec<Chunk>>,
+    /// The faults of [`Behavior::chunk_unavailable`] still to inject.
+    chunk_faults_left: Mutex<HashMap<String, u64>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -239,6 +330,7 @@ impl FakeDrive {
             .await
             .expect("bind fake drive");
         let addr = listener.local_addr().expect("fake drive address");
+        let behavior_chunk_faults = behavior.chunk_unavailable.clone();
         let state = Arc::new(State {
             files,
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
@@ -247,6 +339,21 @@ impl FakeDrive {
             gets: Mutex::new(Vec::new()),
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
+            media: Mutex::new(Vec::new()),
+            media_in_flight: AtomicUsize::new(0),
+            media_max_in_flight: AtomicUsize::new(0),
+            first_media: Mutex::new(None),
+            last_list: Mutex::new(None),
+            created: Mutex::new(Vec::new()),
+            create_events: AtomicUsize::new(0),
+            uploads_in_flight: AtomicUsize::new(0),
+            uploads_max_in_flight: AtomicUsize::new(0),
+            generated: AtomicUsize::new(0),
+            sessions: Mutex::new(Vec::new()),
+            sessions_active: AtomicUsize::new(0),
+            sessions_max_active: AtomicUsize::new(0),
+            chunks: Mutex::new(Vec::new()),
+            chunk_faults_left: Mutex::new(behavior_chunk_faults),
         });
 
         let server_state = Arc::clone(&state);
@@ -287,6 +394,44 @@ impl FakeDrive {
     pub(crate) fn max_in_flight(&self) -> usize {
         self.state.max_in_flight.load(Ordering::SeqCst)
     }
+
+    /// The file ids of the media downloads, in arrival order.
+    pub(crate) fn media(&self) -> Vec<String> {
+        self.state.media.lock().expect("media lock").clone()
+    }
+
+    /// The most media downloads that were being answered at the same time.
+    pub(crate) fn media_max_in_flight(&self) -> usize {
+        self.state.media_max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The successful creates, in reply order.
+    pub(crate) fn created(&self) -> Vec<Created> {
+        self.state.created.lock().expect("created lock").clone()
+    }
+
+    /// The chunk and status requests of resumable sessions, in arrival order.
+    pub(crate) fn chunks(&self) -> Vec<Chunk> {
+        self.state.chunks.lock().expect("chunks lock").clone()
+    }
+
+    /// The most resumable sessions that were started and not completed at the same time.
+    pub(crate) fn sessions_max_active(&self) -> usize {
+        self.state.sessions_max_active.load(Ordering::SeqCst)
+    }
+
+    /// The most file uploads (creates of non-folders) that were being answered at once.
+    pub(crate) fn uploads_max_in_flight(&self) -> usize {
+        self.state.uploads_max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// When the first media download arrived and when the last list reply was sent.
+    pub(crate) fn first_media_and_last_list(&self) -> (Option<Instant>, Option<Instant>) {
+        (
+            *self.state.first_media.lock().expect("first media lock"),
+            *self.state.last_list.lock().expect("last list lock"),
+        )
+    }
 }
 
 impl Drop for FakeDrive {
@@ -296,29 +441,31 @@ impl Drop for FakeDrive {
 }
 
 /// Counts a request as in flight until dropped, also when the client goes away.
-struct InFlight<'a>(&'a State);
+struct InFlight<'a> {
+    now: &'a AtomicUsize,
+}
 
 impl<'a> InFlight<'a> {
-    fn new(state: &'a State) -> Self {
-        let now = state.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        state.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        Self(state)
+    fn new(now: &'a AtomicUsize, max: &AtomicUsize) -> Self {
+        let count = now.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(count, Ordering::SeqCst);
+        Self { now }
     }
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+        self.now.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
-type FakeResponse = hyper::Response<Full<Bytes>>;
+type FakeResponse = hyper::Response<BoxBody<Bytes, Infallible>>;
 
 async fn handle(
     state: Arc<State>,
     request: hyper::Request<Incoming>,
 ) -> Result<FakeResponse, Infallible> {
-    let _in_flight = InFlight::new(&state);
+    let _in_flight = InFlight::new(&state.in_flight, &state.max_in_flight);
 
     let params = request
         .uri()
@@ -330,14 +477,42 @@ async fn handle(
         })
         .unwrap_or_default();
 
-    let path = request.uri().path();
+    let path = request.uri().path().to_owned();
+    if request.method() == Method::POST && path == UPLOAD_PATH {
+        let resumable = params
+            .iter()
+            .any(|(key, value)| key == "uploadType" && value == "resumable");
+        return Ok(if resumable {
+            start_session(&state, request).await
+        } else {
+            create(&state, request).await
+        });
+    }
+    if request.method() == Method::PUT {
+        if let Some(session) = path
+            .strip_prefix(SESSION_PATH)
+            .and_then(|n| n.parse::<usize>().ok())
+        {
+            return Ok(session_request(&state, session, request).await);
+        }
+    }
     if request.method() != Method::GET {
         return Ok(error(StatusCode::NOT_FOUND, "unexpected request"));
     }
+    if path == GENERATE_IDS_PATH {
+        return Ok(generate_ids(&state, &params));
+    }
     if let Some(id) = path
+        .as_str()
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
+        if params
+            .iter()
+            .any(|(key, value)| key == "alt" && value == "media")
+        {
+            return Ok(media(&state, id).await);
+        }
         state.gets.lock().expect("gets lock").push(id.to_owned());
         return Ok(get(&state, id, &params));
     }
@@ -367,7 +542,364 @@ async fn handle(
 
     tokio::time::sleep(state.behavior.delay).await;
 
-    Ok(list(&state, &list_request, &q))
+    let response = list(&state, &list_request, &q);
+    *state.last_list.lock().expect("last list lock") = Some(Instant::now());
+    Ok(response)
+}
+
+/// `files.generateIds`: `count` ids that no other call returned.
+fn generate_ids(state: &State, params: &[(String, String)]) -> FakeResponse {
+    let count = params
+        .iter()
+        .find(|(key, _)| key == "count")
+        .and_then(|(_, count)| count.parse::<usize>().ok())
+        .unwrap_or(10);
+    let first = state.generated.fetch_add(count, Ordering::SeqCst);
+    let ids = (first..first + count)
+        .map(|n| format!("gen-{n}"))
+        .collect::<Vec<_>>();
+    json_response(
+        StatusCode::OK,
+        &json!({"kind": "drive#generatedIds", "space": "drive", "ids": ids}),
+    )
+}
+
+/// A multipart `files.create`: the metadata part and the content part.
+async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeResponse {
+    let arrived = state.create_events.fetch_add(1, Ordering::SeqCst);
+    let boundary = request
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once("boundary="))
+        .map(|(_, boundary)| boundary.trim_matches('"').to_owned());
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let Some((metadata, content)) = boundary.and_then(|b| multipart(&body.to_bytes(), &b)) else {
+        return error(StatusCode::BAD_REQUEST, "not a multipart upload");
+    };
+    let is_folder = metadata["mimeType"].as_str() == Some(MIME_TYPE_DRIVE_FOLDER);
+    let _upload =
+        (!is_folder).then(|| InFlight::new(&state.uploads_in_flight, &state.uploads_max_in_flight));
+    if !is_folder {
+        tokio::time::sleep(state.behavior.upload_delay).await;
+    }
+
+    finish_create(state, &metadata, content, arrived)
+}
+
+/// The end of a create with all its content: Drive's checks, the record, the file resource.
+fn finish_create(
+    state: &State,
+    metadata: &Value,
+    content: Vec<u8>,
+    arrived: usize,
+) -> FakeResponse {
+    let text = |key: &str| metadata[key].as_str().unwrap_or_default().to_owned();
+    let mime_type = text("mimeType");
+    let parents = metadata["parents"]
+        .as_array()
+        .map(|parents| {
+            parents
+                .iter()
+                .filter_map(|parent| parent.as_str().map(String::from))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let name = text("name");
+    if state.behavior.upload_rejected.contains(&name) {
+        return error(StatusCode::BAD_REQUEST, "Invalid upload.");
+    }
+    let missing_parent = {
+        let created = state.created.lock().expect("created lock");
+        parents.iter().find(|parent| {
+            parent.as_str() != "root"
+                && !created.iter().any(|folder| {
+                    &folder.id == *parent && folder.mime_type == MIME_TYPE_DRIVE_FOLDER
+                })
+                && !state.files.iter().any(|file| &file.id == *parent)
+        })
+    };
+    if let Some(parent) = missing_parent {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {parent}."));
+    }
+
+    let created = Created {
+        id: text("id"),
+        name,
+        mime_type,
+        parents,
+        content,
+        arrived,
+        answered: state.create_events.fetch_add(1, Ordering::SeqCst),
+    };
+    let reply = json!({
+        "kind": "drive#file",
+        "id": created.id,
+        "name": created.name,
+        "mimeType": created.mime_type,
+        "parents": created.parents,
+        "size": created.content.len().to_string(),
+        "md5Checksum": format!("{:x}", md5::compute(&created.content)),
+    });
+    state.created.lock().expect("created lock").push(created);
+    json_response(StatusCode::OK, &reply)
+}
+
+/// `POST ...?uploadType=resumable`: a new session for the metadata in the body.
+async fn start_session(state: &State, request: hyper::Request<Incoming>) -> FakeResponse {
+    let arrived = state.create_events.fetch_add(1, Ordering::SeqCst);
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(String::from)
+    };
+    let (Some(host), Some(total)) = (
+        header("host"),
+        header("x-upload-content-length").and_then(|total| total.parse::<u64>().ok()),
+    ) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "no Host or X-Upload-Content-Length",
+        );
+    };
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let Ok(metadata) = serde_json::from_slice::<Value>(&body.to_bytes()) else {
+        return error(StatusCode::BAD_REQUEST, "no JSON metadata");
+    };
+    if state
+        .behavior
+        .upload_rejected
+        .contains(metadata["name"].as_str().unwrap_or_default())
+    {
+        return error(StatusCode::BAD_REQUEST, "Invalid upload.");
+    }
+
+    let session = {
+        let mut sessions = state.sessions.lock().expect("sessions lock");
+        sessions.push(Session {
+            metadata,
+            total,
+            received: Vec::new(),
+            arrived,
+            done: None,
+        });
+        sessions.len() - 1
+    };
+    let active = state.sessions_active.fetch_add(1, Ordering::SeqCst) + 1;
+    state
+        .sessions_max_active
+        .fetch_max(active, Ordering::SeqCst);
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("location", format!("http://{host}{SESSION_PATH}{session}"))
+        .body(Full::new(Bytes::new()).boxed())
+        .expect("valid response")
+}
+
+/// A `PUT` to a session: a chunk at `Content-Range: bytes FIRST-LAST/TOTAL`, or a status
+/// request with `bytes */TOTAL`.
+async fn session_request(
+    state: &State,
+    session: usize,
+    request: hyper::Request<Incoming>,
+) -> FakeResponse {
+    let range = request
+        .headers()
+        .get("content-range")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|value| value.split_once('/'))
+        .map(|(range, _)| range.to_owned());
+    let Ok(body) = request.into_body().collect().await else {
+        return error(StatusCode::BAD_REQUEST, "unreadable body");
+    };
+    let body = body.to_bytes();
+    let Some(range) = range else {
+        return error(StatusCode::BAD_REQUEST, "no Content-Range");
+    };
+    let first = (range != "*")
+        .then(|| {
+            let (first, last) = range.split_once('-')?;
+            Some((first.parse::<u64>().ok()?, last.parse::<u64>().ok()?))
+        })
+        .flatten();
+    if range != "*" && first.is_none() {
+        return error(StatusCode::BAD_REQUEST, "malformed Content-Range");
+    }
+    tokio::time::sleep(state.behavior.chunk_delay).await;
+
+    let mut sessions = state.sessions.lock().expect("sessions lock");
+    let Some(this) = sessions.get_mut(session) else {
+        return error(StatusCode::NOT_FOUND, "no such session");
+    };
+    let name = this.metadata["name"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let committed = this.received.len() as u64;
+    let response = if let Some(done) = &this.done {
+        json_response(StatusCode::OK, done)
+    } else if let Some((first, last)) = first {
+        let fault = {
+            let mut faults = state.chunk_faults_left.lock().expect("faults lock");
+            let fault = faults.get(&name) == Some(&first);
+            if fault {
+                faults.remove(&name);
+            }
+            fault
+        };
+        if first != committed || fault {
+            error(StatusCode::SERVICE_UNAVAILABLE, "Backend Error")
+        } else if last + 1 - first != body.len() as u64 {
+            error(
+                StatusCode::BAD_REQUEST,
+                "Content-Range does not match the body",
+            )
+        } else {
+            this.received.extend_from_slice(&body);
+            if this.received.len() as u64 == this.total {
+                let metadata = this.metadata.clone();
+                let content = this.received.clone();
+                let arrived = this.arrived;
+                drop(sessions);
+                let response = finish_create(state, &metadata, content, arrived);
+                if response.status() == StatusCode::OK {
+                    state.sessions_active.fetch_sub(1, Ordering::SeqCst);
+                    let created = state.created.lock().expect("created lock");
+                    let reply = created.last().map(|created| {
+                        json!({
+                            "kind": "drive#file",
+                            "id": created.id,
+                            "name": created.name,
+                            "mimeType": created.mime_type,
+                            "parents": created.parents,
+                            "size": created.content.len().to_string(),
+                            "md5Checksum": format!("{:x}", md5::compute(&created.content)),
+                        })
+                    });
+                    if let Some(this) = state
+                        .sessions
+                        .lock()
+                        .expect("sessions lock")
+                        .get_mut(session)
+                    {
+                        this.done = reply;
+                    }
+                }
+                record_chunk(state, &name, Some(first), response.status());
+                return response;
+            }
+            resume_incomplete(this.received.len())
+        }
+    } else {
+        resume_incomplete(this.received.len())
+    };
+    drop(sessions);
+    record_chunk(
+        state,
+        &name,
+        first.map(|(first, _)| first),
+        response.status(),
+    );
+    response
+}
+
+fn record_chunk(state: &State, name: &str, first: Option<u64>, status: StatusCode) {
+    state.chunks.lock().expect("chunks lock").push(Chunk {
+        name: name.to_owned(),
+        first,
+        status: status.as_u16(),
+    });
+}
+
+/// A 308 for `committed` bytes: `Range: bytes=0-<last>`, none when nothing is committed.
+fn resume_incomplete(committed: usize) -> FakeResponse {
+    let mut response = hyper::Response::builder().status(StatusCode::PERMANENT_REDIRECT);
+    if committed > 0 {
+        response = response.header("range", format!("bytes=0-{}", committed - 1));
+    }
+    response
+        .body(Full::new(Bytes::new()).boxed())
+        .expect("valid response")
+}
+
+/// The JSON metadata and the content of a `multipart/related` body with two parts.
+fn multipart(body: &[u8], boundary: &str) -> Option<(Value, Vec<u8>)> {
+    let delimiter = format!("--{boundary}");
+    let mut parts = split(body, delimiter.as_bytes()).into_iter().skip(1);
+    let mut part = || -> Option<Vec<u8>> {
+        let part = parts.next()?;
+        let part = part.strip_prefix(b"\r\n")?;
+        let start = part.windows(4).position(|window| window == b"\r\n\r\n")? + 4;
+        let content = &part[start..];
+        Some(content.strip_suffix(b"\r\n").unwrap_or(content).to_vec())
+    };
+    let metadata = serde_json::from_slice(&part()?).ok()?;
+    let content = part()?;
+    Some((metadata, content))
+}
+
+/// `haystack` split at every `delimiter`.
+fn split<'a>(haystack: &'a [u8], delimiter: &[u8]) -> Vec<&'a [u8]> {
+    let mut pieces = Vec::new();
+    let mut rest = haystack;
+    while let Some(at) = rest
+        .windows(delimiter.len())
+        .position(|window| window == delimiter)
+    {
+        pieces.push(&rest[..at]);
+        rest = &rest[at + delimiter.len()..];
+    }
+    pieces.push(rest);
+    pieces
+}
+
+/// `files.get?alt=media`: the content of a blob.
+async fn media(state: &State, id: &str) -> FakeResponse {
+    let _media = InFlight::new(&state.media_in_flight, &state.media_max_in_flight);
+    state.media.lock().expect("media lock").push(id.to_owned());
+    state
+        .first_media
+        .lock()
+        .expect("first media lock")
+        .get_or_insert_with(Instant::now);
+
+    let behavior = &state.behavior;
+    if let Some(delay) = behavior.media_missing.get(id) {
+        tokio::time::sleep(*delay).await;
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    }
+    tokio::time::sleep(behavior.media_delay).await;
+    let content = state
+        .files
+        .iter()
+        .find(|file| file.id == id)
+        .and_then(|file| file.content.clone());
+    let Some(content) = content else {
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    };
+
+    let length = content.len();
+    let body = if behavior.media_stalled.contains(id) {
+        let half = Bytes::from(content).slice(..length / 2);
+        let frames = stream::iter([Ok::<_, Infallible>(hyper::body::Frame::data(half))])
+            .chain(stream::pending());
+        BodyExt::boxed(StreamBody::new(frames))
+    } else {
+        Full::new(Bytes::from(content)).boxed()
+    };
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", length)
+        .body(body)
+        .expect("valid response")
 }
 
 fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
@@ -547,7 +1079,7 @@ fn json_response(status: StatusCode, body: &Value) -> FakeResponse {
     hyper::Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
         .expect("valid response")
 }
 

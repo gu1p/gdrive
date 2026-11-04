@@ -111,26 +111,27 @@
 //! header, so those requests are built on the hub's client and credentials with the same
 //! parameters and error mapping; requests without keys go through google-drive3.
 //!
-//! # TODO for the scheduler
+//! # Consumers
 //!
-//! - Fields: a download needs `id`, `size`, `md5Checksum` (verification, skip checks) and
-//!   `mimeType` ([`EntryKind`]); skip and update modes need `modifiedTime`; local paths come
-//!   from [`WalkEntry::components`] through `local_name::unique_local_names`, per
-//!   [`WalkEntry::parent`], once [`WalkItem::FolderDone`] says all names of the folder are
-//!   known. Native documents need an export format before they can be transferred. A file with
-//!   a `resourceKey` (shared by link only) must be downloaded with the [`RESOURCE_KEYS_HEADER`]
-//!   naming it, as the walk does for folders. Add `capabilities/canDownload` to [`FIELDS`] when
-//!   a transfer needs it.
+//! The recursive download (`files::download::recursive`, through `common::file_tree_drive`)
+//! consumes the walk while the scheduler ([`super::scheduler`]) transfers: local names are
+//! assigned per folder on [`WalkItem::FolderDone`], a [`FolderError`] is a failed outcome that
+//! cancels only that folder's subtree (unknown, not empty), an [`IncompleteSearch`] is a
+//! warning and a non-zero exit, and the walk lists with its own `listing_jobs` while the
+//! scheduler's bounded queue paces it.
+//!
+//! Still to do:
+//!
+//! - A file with a `resourceKey` (shared by link only) must be downloaded with the
+//!   [`RESOURCE_KEYS_HEADER`] naming it, as the walk does for folders. Add
+//!   `capabilities/canDownload` to [`FIELDS`] when a transfer needs it. Skip and update modes
+//!   need `modifiedTime`. Native documents need an export format before they can be
+//!   transferred.
 //! - Shortcuts to files are not resolved: the shortcut entry carries `shortcutDetails` (target
-//!   id, MIME type and resource key); the scheduler gets the target's metadata with `files.get`
-//!   and the same fields, within the listing limit, when it follows shortcuts.
-//! - Errors: a [`FolderError`] is a failed outcome for that folder, and its subtree is unknown,
-//!   not empty: count it, continue with the other folders and exit non-zero at the end. An
-//!   [`IncompleteSearch`] marks the inventories of its folders incomplete. Either one must
-//!   suppress any deletion or sync phase for those folders and their ancestors.
-//! - Concurrency: give the walk its own `listing_jobs`, separate from the transfer jobs, and
-//!   poll it while transfers run (it only lists while the consumer makes room). Keep the
-//!   buffer bounded; a consumer that stops reading pauses the walk, which is intended.
+//!   id, MIME type and resource key); a consumer that follows shortcuts gets the target's
+//!   metadata with `files.get` and the same fields, within the listing limit.
+//! - A [`FolderError`] or an [`IncompleteSearch`] must suppress any deletion or sync phase for
+//!   those folders and their ancestors.
 
 #[cfg(test)]
 mod tests;
@@ -245,6 +246,13 @@ pub(crate) struct FolderKey(u64);
 impl FolderKey {
     /// The key of the walk's root folder.
     pub(crate) const ROOT: FolderKey = FolderKey(0);
+
+    /// Key number `key`, for tests that build walk items by hand.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn for_tests(key: u64) -> Self {
+        FolderKey(key)
+    }
 }
 
 /// What a listed Drive file is.
@@ -301,6 +309,13 @@ pub(crate) struct WalkEntry {
     /// 2 KB, most of it fields the mask leaves empty.
     pub(crate) file: Box<File>,
     /// `components.len()`: 1 for a child of the root.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the recursive download orders by listing, not by depth"
+        )
+    )]
     pub(crate) depth: usize,
     pub(crate) kind: EntryKind,
     /// The folder location whose listing returned this file.

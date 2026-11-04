@@ -9,17 +9,12 @@ use std::{
 pub(crate) struct FileInfo<'a> {
     pub(crate) name: Cow<'a, str>,
     pub(crate) mime_type: Cow<'a, mime::Mime>,
-    /// Media type of the uploaded content when it differs from `mime_type`, the type the file
-    /// gets on Drive. Import sets it: content sent as e.g. `text/markdown` with a Google Docs
-    /// `mime_type` is what makes Drive convert the file.
-    pub(crate) source_mime_type: Option<&'a mime::Mime>,
     pub(crate) parents: Option<Vec<String>>,
     /// The size when the file was looked at. The upload does not use it: it measures the file
     /// when it opens it, as a file can change in between.
     #[expect(
         dead_code,
-        reason = "the recursive upload's file tree still fills it in; the scheduler workstream \
-                  owns that code"
+        reason = "nothing shows it yet; the uploader measures the file itself"
     )]
     pub(crate) size: u64,
 }
@@ -64,7 +59,6 @@ impl<'a> FileInfo<'a> {
         Ok(FileInfo {
             name: file_name,
             mime_type,
-            source_mime_type: None,
             parents: config.parents,
             size: file_size,
         })

@@ -63,6 +63,7 @@ fn config(file_id: &str, destination: &std::path::Path) -> Config {
         download_directories: false,
         destination: Destination::Path(destination.to_owned()),
         acknowledge_abuse: true,
+        transfer: crate::transfer::scheduler::Options::default(),
     }
 }
 
