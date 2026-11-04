@@ -2099,6 +2099,109 @@ mod flag_tests {
     }
 
     #[test]
+    fn migrate_takes_ids_accounts_and_the_transfer_flags() {
+        let FileCommand::Migrate {
+            file_id,
+            to,
+            from,
+            into,
+            jobs,
+            continue_on_error,
+            dry_run,
+            trash_source,
+            chunk_size,
+            multipart_threshold,
+            print_chunk_errors,
+            print_chunk_info,
+            progress,
+        } = parse(&[
+            "files",
+            "migrate",
+            "a",
+            "b",
+            "--to",
+            "new@example.com",
+            "--from",
+            "old@example.com",
+            "--into",
+            "folder",
+            "--jobs",
+            "8",
+            "--continue-on-error",
+            "--dry-run",
+            "--trash-source",
+            "--chunk-size",
+            "1",
+            "--multipart-threshold",
+            "0",
+            "--print-chunk-errors",
+            "--print-chunk-info",
+            "--progress",
+            "--no-progress",
+        ])
+        else {
+            panic!("expected migrate");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+        assert_eq!(to, "new@example.com");
+        assert_eq!(from.as_deref(), Some("old@example.com"));
+        assert_eq!(into.as_deref(), Some("folder"));
+        assert_eq!(jobs.get(), 8);
+        assert!(continue_on_error && dry_run && trash_source);
+        assert_eq!(chunk_size.in_bytes(), 1 << 20);
+        assert_eq!(multipart_threshold.in_bytes(), 0);
+        assert!(print_chunk_errors && print_chunk_info);
+        assert_eq!((progress.progress, progress.no_progress), (false, true));
+    }
+
+    #[test]
+    fn migrate_defaults_to_the_current_account_and_my_drive() {
+        let FileCommand::Migrate {
+            from,
+            into,
+            jobs,
+            continue_on_error,
+            dry_run,
+            trash_source,
+            chunk_size,
+            multipart_threshold,
+            progress,
+            ..
+        } = parse(&["files", "migrate", "id", "--to", "new@example.com"])
+        else {
+            panic!("expected migrate");
+        };
+        assert_eq!((from, into), (None, None));
+        assert_eq!(jobs.get(), 4);
+        assert!(!continue_on_error && !dry_run && !trash_source);
+        assert_eq!((progress.progress, progress.no_progress), (false, false));
+        // The same defaults as upload.
+        let FileCommand::Upload {
+            chunk_size: upload_chunk_size,
+            multipart_threshold: upload_multipart_threshold,
+            ..
+        } = parse(&["files", "upload", "a.md"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(chunk_size.in_bytes(), upload_chunk_size.in_bytes());
+        assert_eq!(multipart_threshold, upload_multipart_threshold);
+
+        for args in [
+            &["files", "migrate", "id"][..],
+            &["files", "migrate", "--to", "new@example.com"],
+            &["files", "migrate", "id", "--to"],
+            &["files", "migrate", "id", "--to", "x", "--jobs", "0"],
+            &["files", "migrate", "id", "--to", "x", "--chunk-size", "3"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
+                "{args:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
     fn upload_and_update_take_a_name() {
         let FileCommand::Upload { name, .. } = parse(&["files", "upload", "--name", "a b.txt"])
         else {

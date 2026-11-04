@@ -26,6 +26,8 @@
 //! unsupported item, an incomplete listing) stays, and so do its ancestors.
 
 mod source;
+#[cfg(test)]
+mod tests;
 
 use std::{
     collections::HashMap,

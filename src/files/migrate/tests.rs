@@ -1,0 +1,1056 @@
+//! `files migrate` between two fake Drives: the source answers listings, `files.get`, media
+//! downloads, exports and the patches that trash; the destination answers listings, creates and
+//! `files.generateIds`, and refuses a create into a folder that does not exist yet.
+
+use std::{
+    collections::{BTreeMap, HashMap, HashSet},
+    future,
+    num::NonZeroUsize,
+    sync::Arc,
+    time::Duration,
+};
+
+use serde_json::json;
+
+use super::{run, Error, Settings};
+use crate::{
+    common::drive_file::MIME_TYPE_DRIVE_FOLDER,
+    transfer::{
+        fake_drive::{Behavior, Created, FakeDrive, FakeFile},
+        progress::{NoProgress, ProgressDisplay},
+        scheduler::{
+            capture::{output, Captured},
+            Options,
+        },
+        upload::UploadOptions,
+    },
+};
+
+/// `photos` in the source's My Drive, with 4 files on three levels and an empty folder:
+///
+/// ```text
+/// photos/a.txt b.txt  photos/2024/d.txt  photos/2024/jan/f.txt  photos/empty/
+/// ```
+fn source_tree() -> Vec<FakeFile> {
+    vec![
+        FakeFile::folder("photos", "photos", "root"),
+        FakeFile::blob("a", "a.txt", "photos", "aaaa"),
+        FakeFile::blob("b", "b.txt", "photos", "bb"),
+        FakeFile::folder("y2024", "2024", "photos"),
+        FakeFile::blob("d", "d.txt", "y2024", "dddd"),
+        FakeFile::folder("jan", "jan", "y2024"),
+        FakeFile::blob("f", "f.txt", "jan", "ffffff"),
+        FakeFile::folder("empty", "empty", "photos"),
+    ]
+}
+
+/// What [`source_tree`] becomes in the destination: folders end with `/`, files have their
+/// content.
+fn migrated_tree() -> BTreeMap<String, String> {
+    [
+        ("photos/", ""),
+        ("photos/a.txt", "aaaa"),
+        ("photos/b.txt", "bb"),
+        ("photos/2024/", ""),
+        ("photos/2024/d.txt", "dddd"),
+        ("photos/2024/jan/", ""),
+        ("photos/2024/jan/f.txt", "ffffff"),
+        ("photos/empty/", ""),
+    ]
+    .into_iter()
+    .map(|(path, content)| (path.to_owned(), content.to_owned()))
+    .collect()
+}
+
+fn settings(file_ids: &[&str]) -> Settings {
+    Settings {
+        file_ids: file_ids.iter().map(|&id| id.to_owned()).collect(),
+        into: None,
+        dry_run: false,
+        trash_source: false,
+        transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
+    }
+}
+
+fn continuing(settings: Settings) -> Settings {
+    Settings {
+        transfer: Options::new(settings.transfer.jobs, true),
+        ..settings
+    }
+}
+
+struct Migrated {
+    result: Result<(), Error>,
+    out: Captured,
+    err: Captured,
+}
+
+impl Migrated {
+    fn error(&self) -> String {
+        match &self.result {
+            Ok(()) => panic!("the migration should fail; stderr: {}", self.err.text()),
+            Err(error) => crate::error_message(error),
+        }
+    }
+
+    fn assert_ok(&self) {
+        assert!(
+            self.result.is_ok(),
+            "{:?}\nstdout:\n{}\nstderr:\n{}",
+            self.result,
+            self.out.text(),
+            self.err.text()
+        );
+    }
+
+    fn summary(&self) -> String {
+        self.err.lines().last().cloned().unwrap_or_default()
+    }
+
+    /// The lines of stdout, sorted: parallel jobs print in any order.
+    fn sorted_out(&self) -> Vec<String> {
+        let mut lines = self.out.lines();
+        lines.sort();
+        lines
+    }
+}
+
+async fn migrate(source: &FakeDrive, dest: &FakeDrive, settings: Settings) -> Migrated {
+    let output = output();
+    let (source, dest) = (source.hub(), dest.hub());
+    let options = UploadOptions::default();
+    let run = run(
+        &source,
+        &dest,
+        &settings,
+        &options,
+        &output.printer,
+        ProgressDisplay::reporting_to(Arc::new(NoProgress)),
+        future::pending(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the migration should end");
+    Migrated {
+        result,
+        out: output.out,
+        err: output.err,
+    }
+}
+
+/// A file or folder of the destination, created by the run or there before.
+struct Node {
+    name: String,
+    parent: String,
+    folder: bool,
+    content: String,
+}
+
+/// The destination below its top folder (and below the folders of `stop`): what the run
+/// created, placed in the folders of `before` (what was there before) and of the run.
+fn tree_below(created: &[Created], before: &[FakeFile], stop: &[&str]) -> BTreeMap<String, String> {
+    let mut nodes = HashMap::new();
+    for file in before {
+        nodes.insert(
+            file.id.clone(),
+            Node {
+                name: file.name.clone(),
+                parent: file.parents.first().cloned().unwrap_or_default(),
+                folder: file.mime_type == MIME_TYPE_DRIVE_FOLDER,
+                content: file.content.clone().unwrap_or_default(),
+            },
+        );
+    }
+    for file in created {
+        nodes.insert(
+            file.id.clone(),
+            Node {
+                name: file.name.clone(),
+                parent: file.parents.first().cloned().unwrap_or_default(),
+                folder: file.mime_type == MIME_TYPE_DRIVE_FOLDER,
+                content: String::from_utf8_lossy(&file.content).into_owned(),
+            },
+        );
+    }
+    let path = |id: &str| {
+        let mut names = Vec::new();
+        let mut current = id.to_owned();
+        while let Some(node) = nodes.get(&current) {
+            names.push(node.name.clone());
+            if stop.contains(&node.parent.as_str()) {
+                break;
+            }
+            current = node.parent.clone();
+        }
+        names.reverse();
+        names.join("/")
+    };
+    created
+        .iter()
+        .map(|file| {
+            let node = &nodes[&file.id];
+            if node.folder {
+                (format!("{}/", path(&file.id)), String::new())
+            } else {
+                (path(&file.id), node.content.clone())
+            }
+        })
+        .collect()
+}
+
+/// What the run created in the destination, by path below the top of My Drive.
+fn created_tree(dest: &FakeDrive) -> BTreeMap<String, String> {
+    tree_below(&dest.created(), &[], &["root"])
+}
+
+fn assert_no_secrets(migrated: &Migrated) {
+    for text in [migrated.out.text(), migrated.err.text()] {
+        for secret in ["mock-token", "upload-session", "Bearer"] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_folder_tree_is_migrated_with_its_structure_and_content() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, settings(&["photos"])).await;
+
+    migrated.assert_ok();
+    assert_eq!(created_tree(&dest), migrated_tree());
+    let created = dest.created();
+    let photos = created.iter().find(|file| file.name == "photos").unwrap();
+    assert_eq!(photos.parents, ["root"]);
+    for file in created
+        .iter()
+        .filter(|file| file.mime_type != MIME_TYPE_DRIVE_FOLDER)
+    {
+        assert_eq!(file.mime_type, "text/plain", "{}", file.name);
+    }
+    assert_eq!(
+        migrated.out.lines().first().map(String::as_str),
+        Some("Found 4 files in 4 folders with a total size of 16 B")
+    );
+    let mut expected = vec![
+        "Found 4 files in 4 folders with a total size of 16 B",
+        "create photos/",
+        "create photos/2024/",
+        "create photos/2024/jan/",
+        "create photos/empty/",
+        "create photos/a.txt (4 B)",
+        "create photos/b.txt (2 B)",
+        "create photos/2024/d.txt (4 B)",
+        "create photos/2024/jan/f.txt (6 B)",
+    ];
+    expected.sort_unstable();
+    assert_eq!(migrated.sorted_out(), expected);
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 4 migrated (16 B), 0 already there, 0 skipped (unsupported), 0 failed, \
+         0 cancelled; 4 folders created, 0 reused"
+    );
+    // The source is only read.
+    assert_eq!(source.patches(), []);
+    assert!(source.created().is_empty());
+    let mut media = source.media();
+    media.sort();
+    assert_eq!(media, ["a", "b", "d", "f"]);
+    assert_no_secrets(&migrated);
+}
+
+#[tokio::test]
+async fn files_and_folders_go_into_the_into_folder() {
+    let mut files = source_tree();
+    files.push(FakeFile::blob("notes", "notes.txt", "root", "n"));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let target = FakeFile::folder("target", "Archive", "root");
+    let dest = FakeDrive::start(vec![target.clone()], Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            into: Some(String::from("target")),
+            ..settings(&["notes", "photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    let mut expected = migrated_tree()
+        .into_iter()
+        .map(|(path, content)| (format!("Archive/{path}"), content))
+        .collect::<BTreeMap<_, _>>();
+    expected.insert(String::from("Archive/notes.txt"), String::from("n"));
+    assert_eq!(tree_below(&dest.created(), &[target], &["root"]), expected);
+    assert_eq!(dest.gets(), ["target"], "--into is checked to be a folder");
+}
+
+#[tokio::test]
+async fn into_must_be_a_folder_of_the_destination() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(
+        vec![FakeFile::blob("file", "file.txt", "root", "x")],
+        Behavior::default(),
+    )
+    .await;
+
+    for (into, expected) in [
+        (
+            "file",
+            "Error: 'file' is not a folder of the destination account; --into takes a folder id",
+        ),
+        (
+            "missing",
+            "Error: unable to get the destination folder 'missing'",
+        ),
+    ] {
+        let migrated = migrate(
+            &source,
+            &dest,
+            Settings {
+                into: Some(into.to_owned()),
+                ..settings(&["photos"])
+            },
+        )
+        .await;
+        assert!(
+            migrated.error().starts_with(expected),
+            "{}",
+            migrated.error()
+        );
+    }
+    assert!(dest.created().is_empty());
+}
+
+#[tokio::test]
+async fn folders_are_created_before_what_goes_into_them() {
+    let mut files = source_tree();
+    for n in 0..6 {
+        files.push(FakeFile::blob(
+            &format!("j{n}"),
+            &format!("j{n}.txt"),
+            "jan",
+            "j",
+        ));
+    }
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            upload_delay: Duration::from_millis(5),
+            ..Behavior::default()
+        },
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, settings(&["photos"])).await;
+
+    migrated.assert_ok();
+    let created = dest.created();
+    let by_id = created
+        .iter()
+        .map(|file| (file.id.as_str(), file))
+        .collect::<HashMap<_, _>>();
+    for file in &created {
+        let parent = &file.parents[0];
+        if parent == "root" {
+            continue;
+        }
+        let folder = by_id[parent.as_str()];
+        assert!(
+            folder.answered < file.arrived,
+            "'{}' arrived before its folder '{}' was created",
+            file.name,
+            folder.name
+        );
+    }
+    // Breadth-first: a folder's subfolders are created before the folders below them.
+    let position = |name: &str| created.iter().position(|file| file.name == name).unwrap();
+    assert!(position("photos") < position("2024"));
+    assert!(position("2024") < position("jan"));
+    assert_eq!(created.len(), 4 + 4 + 6);
+}
+
+#[tokio::test]
+async fn a_second_run_finds_everything_already_there() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    let created = dest.created().len();
+
+    let again = migrate(&source, &dest, settings(&["photos"])).await;
+
+    again.assert_ok();
+    assert_eq!(dest.created().len(), created, "nothing is created twice");
+    assert_eq!(
+        again.summary(),
+        "Summary: 0 migrated (0 B), 4 already there, 0 skipped (unsupported), 0 failed, \
+         0 cancelled; 0 folders created, 4 reused"
+    );
+    let lines = again.sorted_out();
+    assert!(
+        lines.contains(&String::from("reuse photos/2024/jan/")),
+        "{lines:?}"
+    );
+    assert!(
+        lines.contains(&String::from("already-there photos/2024/jan/f.txt")),
+        "{lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn existing_folders_are_reused_and_identical_files_skipped() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let before = vec![
+        FakeFile::folder("old-photos", "photos", "root"),
+        FakeFile::blob("old-a", "a.txt", "old-photos", "aaaa"),
+        FakeFile::folder("old-2024", "2024", "old-photos"),
+        // A folder of the same name is no file of that name.
+        FakeFile::folder("old-d", "d.txt", "old-2024"),
+        // Not the same name: `photos/b.txt` is created.
+        FakeFile::blob("old-b", "B.txt", "old-photos", "bb"),
+    ];
+    let dest = FakeDrive::start(before.clone(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, settings(&["photos"])).await;
+
+    migrated.assert_ok();
+    let created = dest.created();
+    assert!(!created.iter().any(|file| file.name == "photos"));
+    assert!(!created.iter().any(|file| file.name == "2024"));
+    assert!(!created.iter().any(|file| file.name == "a.txt"));
+    let mut expected = migrated_tree();
+    for reused in ["photos/", "photos/a.txt", "photos/2024/"] {
+        expected.remove(reused);
+    }
+    assert_eq!(tree_below(&created, &before, &["root"]), expected);
+    let b = created.iter().find(|file| file.name == "b.txt").unwrap();
+    assert_eq!(b.parents, ["old-photos"]);
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 3 migrated (12 B), 1 already there, 0 skipped (unsupported), 0 failed, \
+         0 cancelled; 2 folders created, 2 reused"
+    );
+    let lines = migrated.sorted_out();
+    for line in [
+        "reuse photos/",
+        "reuse photos/2024/",
+        "already-there photos/a.txt",
+    ] {
+        assert!(lines.contains(&line.to_owned()), "{line}: {lines:?}");
+    }
+}
+
+/// The destination of the conflict tests: `photos/a.txt` with other content than the source's.
+fn conflicting_destination() -> Vec<FakeFile> {
+    vec![
+        FakeFile::folder("old-photos", "photos", "root"),
+        FakeFile::blob("old-a", "a.txt", "old-photos", "not a"),
+    ]
+}
+
+const CONFLICT: &str = "Error: unable to migrate 'photos/a.txt': it exists in the destination \
+    with different content";
+
+#[tokio::test]
+async fn a_file_with_other_content_in_the_destination_fails_and_stops_the_run() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(conflicting_destination(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            transfer: Options::new(NonZeroUsize::new(1).unwrap(), false),
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    let error = migrated.error();
+    assert!(
+        error.starts_with("Error: the migration is incomplete: 1 file failed"),
+        "{error}"
+    );
+    assert!(error.contains("use --continue-on-error"), "{error}");
+    assert!(migrated.err.lines().contains(&CONFLICT.to_owned()));
+    assert!(!dest.created().iter().any(|file| file.name == "a.txt"));
+    assert!(
+        migrated.summary().contains("1 failed"),
+        "{}",
+        migrated.summary()
+    );
+}
+
+#[tokio::test]
+async fn with_continue_on_error_a_conflict_fails_alone() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let before = conflicting_destination();
+    let dest = FakeDrive::start(before.clone(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+    let error = migrated.error();
+    assert_eq!(error, "Error: the migration is incomplete: 1 file failed");
+    assert!(migrated.err.lines().contains(&CONFLICT.to_owned()));
+    let mut expected = migrated_tree();
+    expected.remove("photos/");
+    expected.remove("photos/a.txt");
+    assert_eq!(tree_below(&dest.created(), &before, &["root"]), expected);
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 3 migrated (12 B), 0 already there, 0 skipped (unsupported), 1 failed, \
+         0 cancelled; 3 folders created, 1 reused"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_reads_the_destination_and_writes_nothing() {
+    let mut files = source_tree();
+    files.push(FakeFile::native(
+        "budget",
+        "Budget",
+        "photos",
+        "application/vnd.google-apps.spreadsheet",
+        "a,b",
+    ));
+    files.push(FakeFile::shortcut(
+        "link",
+        "link",
+        "photos",
+        "a",
+        "text/plain",
+    ));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old-a", "a.txt", "old-photos", "aaaa"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    // Only the listings of the top folder and of the folder that exists.
+    assert!(dest.created().is_empty());
+    assert_eq!(dest.generated_ids(), 0);
+    assert!(dest.patches().is_empty() && dest.updates().is_empty() && dest.deletes().is_empty());
+    assert_eq!(dest.chunks(), []);
+    assert_eq!(dest.gets(), Vec::<String>::new());
+    let mut listed = dest
+        .requests()
+        .into_iter()
+        .flat_map(|request| request.parents)
+        .collect::<Vec<_>>();
+    listed.sort();
+    assert_eq!(listed, ["old-photos", "root"]);
+    // The source is only listed.
+    assert!(source.media().is_empty() && source.exports().is_empty());
+    assert_eq!(source.patches(), []);
+
+    let mut expected = vec![
+        "Found 6 files in 4 folders with a total size of 16 B",
+        "reuse photos/",
+        "already-there photos/a.txt",
+        "create photos/b.txt (2 B)",
+        "convert photos/Budget",
+        "skip photos/link: shortcuts have no content",
+        "create photos/2024/",
+        "create photos/2024/d.txt (4 B)",
+        "create photos/2024/jan/",
+        "create photos/2024/jan/f.txt (6 B)",
+        "create photos/empty/",
+        "trash photos/a.txt",
+        "trash photos/b.txt",
+        "trash photos/Budget",
+        "trash photos/2024/d.txt",
+        "trash photos/2024/jan/f.txt",
+        "trash photos/2024/jan/",
+        "trash photos/2024/",
+        "trash photos/empty/",
+    ];
+    expected.sort_unstable();
+    assert_eq!(migrated.sorted_out(), expected);
+    assert_eq!(
+        migrated.summary(),
+        "Dry run, nothing was changed. Summary: 4 to migrate (12 B, 1 Google Workspace file to \
+         convert), 1 already there, 1 skipped (unsupported), 0 failed, 0 cancelled; 3 folders to \
+         create, 1 reused; 8 to move to the trash in the source"
+    );
+}
+
+#[tokio::test]
+async fn a_dry_run_reports_a_conflict_as_the_run_would() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(conflicting_destination(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            dry_run: true,
+            ..settings(&["photos"])
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 file failed"
+    );
+    assert!(migrated.err.lines().contains(&CONFLICT.to_owned()));
+    assert!(dest.created().is_empty());
+}
+
+#[tokio::test]
+async fn shortcuts_and_workspace_types_without_export_are_skipped_and_listed() {
+    let mut files = source_tree();
+    files.push(FakeFile::shortcut(
+        "link",
+        "link to a",
+        "photos",
+        "a",
+        "text/plain",
+    ));
+    files.push(FakeFile::native(
+        "form",
+        "Survey",
+        "y2024",
+        "application/vnd.google-apps.form",
+        "",
+    ));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, settings(&["photos"])).await;
+
+    migrated.assert_ok();
+    assert_eq!(created_tree(&dest), migrated_tree());
+    let lines = migrated.sorted_out();
+    assert!(
+        lines.contains(&String::from(
+            "skip photos/link to a: shortcuts have no content"
+        )),
+        "{lines:?}"
+    );
+    let err = migrated.err.lines();
+    let at = err
+        .iter()
+        .position(|line| line == "Skipped 2 unsupported items, which cannot be migrated:")
+        .unwrap_or_else(|| panic!("{err:?}"));
+    assert_eq!(
+        err[at + 1],
+        "  photos/2024/Survey: Google Workspace files of type application/vnd.google-apps.form \
+         cannot be exported"
+    );
+    assert_eq!(err[at + 2], "  photos/link to a: shortcuts have no content");
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 4 migrated (16 B), 0 already there, 2 skipped (unsupported), 0 failed, \
+         0 cancelled; 4 folders created, 0 reused"
+    );
+    assert_eq!(source.exports(), []);
+}
+
+#[tokio::test]
+async fn google_docs_are_exported_and_converted_back() {
+    let files = vec![
+        FakeFile::folder("docs", "docs", "root"),
+        FakeFile::native(
+            "report",
+            "Report",
+            "docs",
+            "application/vnd.google-apps.document",
+            "the report",
+        ),
+    ];
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, settings(&["docs"])).await;
+
+    migrated.assert_ok();
+    let docx = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+    assert_eq!(
+        source.exports(),
+        [(String::from("report"), docx.to_owned())]
+    );
+    let created = dest.created();
+    let report = created.iter().find(|file| file.name == "Report").unwrap();
+    assert_eq!(report.mime_type, "application/vnd.google-apps.document");
+    assert_eq!(report.content, b"the report");
+    assert!(migrated
+        .out
+        .lines()
+        .contains(&String::from("convert docs/Report")));
+    assert!(
+        migrated
+            .summary()
+            .starts_with("Summary: 1 migrated (10 B, 1 Google Workspace file converted),"),
+        "{}",
+        migrated.summary()
+    );
+
+    // Again: a Workspace file of the same name and type is there.
+    let again = migrate(&source, &dest, settings(&["docs"])).await;
+    again.assert_ok();
+    assert_eq!(dest.created().len(), created.len());
+    assert!(again
+        .out
+        .lines()
+        .contains(&String::from("already-there docs/Report")));
+}
+
+#[tokio::test]
+async fn an_export_over_the_limit_is_a_failed_item() {
+    let files = vec![
+        FakeFile::folder("docs", "docs", "root"),
+        FakeFile::native(
+            "big",
+            "Big",
+            "docs",
+            "application/vnd.google-apps.document",
+            "x",
+        ),
+        FakeFile::blob("small", "small.txt", "docs", "s"),
+    ];
+    let source = FakeDrive::start(
+        files,
+        Behavior {
+            export_too_large: HashSet::from([String::from("big")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["docs"]))).await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 file failed"
+    );
+    let err = migrated.err.text();
+    assert!(
+        err.contains("Error: unable to migrate 'docs/Big': the export is larger than the"),
+        "{err}"
+    );
+    assert!(dest.created().iter().any(|file| file.name == "small.txt"));
+    assert!(!dest.created().iter().any(|file| file.name == "Big"));
+}
+
+#[tokio::test]
+async fn trash_source_trashes_each_file_and_then_its_folders() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert_eq!(created_tree(&dest), migrated_tree());
+    let patches = source.patches();
+    for (_, body) in &patches {
+        assert_eq!(body, &json!({"trashed": true}));
+    }
+    let order = patches
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .collect::<Vec<_>>();
+    let mut trashed = order.clone();
+    trashed.sort_unstable();
+    assert_eq!(
+        trashed,
+        ["a", "b", "d", "empty", "f", "jan", "photos", "y2024"]
+    );
+    let at = |id: &str| order.iter().position(|&trashed| trashed == id).unwrap();
+    assert!(at("f") < at("jan"));
+    assert!(at("d") < at("y2024") && at("jan") < at("y2024"));
+    for child in ["a", "b", "y2024", "empty"] {
+        assert!(at(child) < at("photos"), "{child} after photos: {order:?}");
+    }
+    assert!(
+        migrated
+            .summary()
+            .ends_with("; 8 moved to the trash in the source"),
+        "{}",
+        migrated.summary()
+    );
+    // Never deleted for good.
+    assert_eq!(source.deletes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_folder_with_anything_not_migrated_stays_in_the_source() {
+    let mut files = source_tree();
+    files.push(FakeFile::shortcut(
+        "link",
+        "link",
+        "y2024",
+        "a",
+        "text/plain",
+    ));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let dest = FakeDrive::start(conflicting_destination(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        }),
+    )
+    .await;
+
+    // `photos/a.txt` conflicts and `photos/2024/link` is skipped: neither folder goes, nor
+    // the conflicting file; everything else does.
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 file failed"
+    );
+    let mut trashed = source
+        .patches()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    trashed.sort();
+    assert_eq!(trashed, ["b", "d", "empty", "f", "jan"]);
+}
+
+#[tokio::test]
+async fn a_failed_trash_fails_the_item_and_keeps_its_folder() {
+    let source = FakeDrive::start(
+        source_tree(),
+        Behavior {
+            patch_rejected: HashSet::from([String::from("f")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 file failed"
+    );
+    let err = migrated.err.text();
+    assert!(
+        err.contains(
+            "Error: unable to migrate 'photos/2024/jan/f.txt': it is in the destination, but it \
+             could not be moved to the trash in the source"
+        ),
+        "{err}"
+    );
+    // The file is in the destination all the same.
+    assert_eq!(created_tree(&dest), migrated_tree());
+    let mut trashed = source
+        .patches()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    trashed.sort();
+    assert_eq!(trashed, ["a", "b", "d", "empty", "f"], "f was tried");
+}
+
+#[tokio::test]
+async fn a_relay_error_is_a_failed_item() {
+    let source = FakeDrive::start(
+        source_tree(),
+        Behavior {
+            media_missing: HashMap::from([(String::from("b"), Duration::ZERO)]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            upload_rejected: HashSet::from([String::from("d.txt")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 2 files failed"
+    );
+    let err = migrated.err.lines();
+    assert!(
+        err.iter().any(|line| line.starts_with(
+            "Error: unable to migrate 'photos/b.txt': unable to read the source file: Drive \
+             answered 404 Not Found"
+        )),
+        "{err:?}"
+    );
+    assert!(
+        err.iter().any(|line| line.starts_with(
+            "Error: unable to migrate 'photos/2024/d.txt': unable to upload the file to the \
+             destination"
+        )),
+        "{err:?}"
+    );
+    let mut expected = migrated_tree();
+    expected.remove("photos/b.txt");
+    expected.remove("photos/2024/d.txt");
+    assert_eq!(created_tree(&dest), expected);
+    assert_no_secrets(&migrated);
+}
+
+#[tokio::test]
+async fn a_missing_source_id_is_a_failed_item() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["nothing", "photos"]))).await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 file failed"
+    );
+    let err = migrated.err.text();
+    assert!(
+        err.contains(
+            "Error: unable to migrate 'nothing': unable to get 'nothing' from the source account"
+        ),
+        "{err}"
+    );
+    assert_eq!(created_tree(&dest), migrated_tree());
+}
+
+#[tokio::test]
+async fn an_incomplete_listing_fails_the_run_and_keeps_the_folder_in_the_source() {
+    let source = FakeDrive::start(
+        source_tree(),
+        Behavior {
+            incomplete: HashSet::from([String::from("jan")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    assert!(
+        migrated
+            .error()
+            .starts_with("Error: Drive did not search everything while listing the source"),
+        "{}",
+        migrated.error()
+    );
+    assert!(migrated.err.lines().contains(&String::from(
+        "Warning: Drive did not search everything while listing 'photos/2024/jan', some files \
+         may be missing"
+    )));
+    assert_eq!(created_tree(&dest), migrated_tree());
+    let mut trashed = source
+        .patches()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    trashed.sort();
+    assert_eq!(trashed, ["a", "b", "d", "empty", "f"]);
+}
+
+#[tokio::test]
+async fn an_unlisted_source_folder_fails_with_what_is_below_it() {
+    let source = FakeDrive::start(
+        source_tree(),
+        Behavior {
+            unreadable: HashSet::from([String::from("y2024")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 folder failed"
+    );
+    let err = migrated.err.text();
+    assert!(
+        err.contains("Error: unable to migrate 'photos/2024': unable to list folder '2024'"),
+        "{err}"
+    );
+    let created = created_tree(&dest);
+    assert!(created.contains_key("photos/b.txt"));
+    assert!(!created.keys().any(|path| path.starts_with("photos/2024")));
+}
+
+#[test]
+fn account_errors_name_the_account_and_the_commands_to_run() {
+    use crate::common::hub_helper::GetHubError;
+
+    let message = crate::error_message(&Error::DestinationAccount {
+        account: String::from("new@example.com"),
+        source: GetHubError::AccountNotFound(String::from("new@example.com")),
+    });
+    assert_eq!(
+        message,
+        "Error: unable to use the destination account 'new@example.com': account \
+         'new@example.com' not found; run 'gdrive account list' to see the accounts, or 'gdrive \
+         account add' to add one"
+    );
+    let message = crate::error_message(&Error::SourceAccount {
+        account: Some(String::from("old@example.com")),
+        source: GetHubError::AccountNotFound(String::from("old@example.com")),
+    });
+    assert!(
+        message.starts_with("Error: unable to use the source account 'old@example.com': account"),
+        "{message}"
+    );
+    assert_eq!(
+        crate::error_message(&Error::SameAccount(String::from("me@example.com"))),
+        "Error: 'me@example.com' is both the source and the destination account; --to must name \
+         another account, see 'gdrive account list'"
+    );
+}
