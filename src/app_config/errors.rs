@@ -308,8 +308,9 @@ pub(crate) enum LoadSecret {
         path: PathBuf,
         source: io::Error,
     },
+    /// Holds the path, not the content: the file contains the OAuth client secret.
     Deserialize {
-        content: String,
+        path: PathBuf,
         source: serde_json::Error,
     },
 }
@@ -320,8 +321,8 @@ impl Display for LoadSecret {
             LoadSecret::Read { path, source: _ } => {
                 write!(f, "unable to read the content of file '{}'", path.display())
             }
-            LoadSecret::Deserialize { content, source: _ } => {
-                write!(f, "unable to serialize the content '{content}'")
+            LoadSecret::Deserialize { path, source: _ } => {
+                write!(f, "unable to parse the secret in '{}'", path.display())
             }
         }
     }

@@ -174,7 +174,10 @@ impl AppConfig {
         };
         match serde_json::from_str(&content) {
             Ok(secret) => Ok(secret),
-            Err(source) => Err(errors::LoadSecret::Deserialize { content, source }),
+            Err(source) => Err(errors::LoadSecret::Deserialize {
+                path: path.to_path_buf(),
+                source,
+            }),
         }
     }
 
