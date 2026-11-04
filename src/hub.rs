@@ -68,10 +68,33 @@ impl Auth {
         .persist_tokens_to_disk(tokens_path)
         .flow_delegate(delegate)
         .build()
-        .await?;
+        .await
+        .map_err(|err| without_token_content(err, tokens_path))?;
 
         Ok(Auth(auth))
     }
+}
+
+/// yup-oauth2 reports a tokens file it cannot parse with the `serde_json` error, which quotes the
+/// input it rejects ("invalid type: string \"ya29...\""), so it can contain a token. Keep only
+/// the position.
+fn without_token_content(err: io::Error, tokens_path: &Path) -> io::Error {
+    let Some(json_error) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<serde_json::Error>())
+    else {
+        return err;
+    };
+
+    io::Error::new(
+        err.kind(),
+        format!(
+            "unable to parse the tokens in '{}' at line {} column {}",
+            tokens_path.display(),
+            json_error.line(),
+            json_error.column()
+        ),
+    )
 }
 
 fn oauth2_secret(config: &app_config::Secret) -> yup_oauth2::ApplicationSecret {
@@ -106,5 +129,44 @@ impl InstalledFlowDelegate for AuthDelegate {
             println!("{url}");
             Ok(String::new())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_parse_errors_do_not_print_the_token() {
+        let content =
+            r#"[{"scopes": ["https://www.googleapis.com/auth/drive"], "token": "ya29.secret"}]"#;
+        // How yup-oauth2 12 reports it (storage.rs, JSONTokens::load_from_file)
+        let json_error =
+            serde_json::from_str::<Vec<std::collections::HashMap<String, Vec<String>>>>(content)
+                .unwrap_err();
+        assert!(
+            json_error.to_string().contains("ya29.secret"),
+            "{json_error}"
+        );
+        let err = io::Error::new(io::ErrorKind::InvalidData, json_error);
+
+        let err = without_token_content(err, Path::new("/config/account/tokens.json"));
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(
+            err.to_string(),
+            "unable to parse the tokens in '/config/account/tokens.json' at line 1 column 77"
+        );
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    #[test]
+    fn other_errors_are_kept() {
+        let err = io::Error::new(io::ErrorKind::NotFound, "no such file");
+
+        let err = without_token_content(err, Path::new("tokens.json"));
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(err.to_string(), "no such file");
     }
 }
