@@ -244,8 +244,9 @@ enum FileCommand {
 
     /// Delete file
     Delete {
-        /// File id
-        file_id: String,
+        /// File id. Several ids are deleted one after another; the command fails if any of them fails
+        #[arg(required = true)]
+        file_id: Vec<String>,
 
         /// Delete directory and all it's content
         #[arg(short, long)]
@@ -254,8 +255,9 @@ enum FileCommand {
 
     /// Move file/directory to the trash. A shortcut is trashed itself, not its target
     Trash {
-        /// File id
-        file_id: String,
+        /// File id. Several ids are trashed one after another; the command fails if any of them fails
+        #[arg(required = true)]
+        file_id: Vec<String>,
 
         /// Trash directory and all its content
         #[arg(short, long)]
@@ -264,8 +266,9 @@ enum FileCommand {
 
     /// Restore file/directory from the trash
     Untrash {
-        /// File id
-        file_id: String,
+        /// File id. Several ids are restored one after another; the command fails if any of them fails
+        #[arg(required = true)]
+        file_id: Vec<String>,
     },
 
     /// Create directory
@@ -620,7 +623,7 @@ async fn handle_files_command(
 
         FileCommand::Delete { file_id, recursive } => {
             files::delete(files::delete::Config {
-                file_id,
+                file_ids: file_id,
                 delete_directories: recursive,
             })
             .await?;
@@ -628,7 +631,7 @@ async fn handle_files_command(
 
         FileCommand::Trash { file_id, recursive } => {
             files::trash(files::trash::Config {
-                file_id,
+                file_ids: file_id,
                 action: files::trash::Action::Trash,
                 trash_directories: recursive,
             })
@@ -637,7 +640,7 @@ async fn handle_files_command(
 
         FileCommand::Untrash { file_id } => {
             files::trash(files::trash::Config {
-                file_id,
+                file_ids: file_id,
                 action: files::trash::Action::Untrash,
                 trash_directories: false,
             })
@@ -887,6 +890,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn delete_and_trash_take_several_ids() {
+        let FileCommand::Delete { file_id, .. } = parse(&["files", "delete", "a", "b", "-r"])
+        else {
+            panic!("expected delete");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+
+        let FileCommand::Trash { file_id, .. } = parse(&["files", "trash", "a", "b"]) else {
+            panic!("expected trash");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+
+        let FileCommand::Untrash { file_id } = parse(&["files", "untrash", "a", "b"]) else {
+            panic!("expected untrash");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+
+        for command in ["delete", "trash", "untrash"] {
+            assert!(
+                Cli::try_parse_from(["gdrive", "files", command]).is_err(),
+                "files {command} needs at least one id"
+            );
+        }
     }
 
     #[test]

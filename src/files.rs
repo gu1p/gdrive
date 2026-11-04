@@ -1,3 +1,4 @@
+pub(crate) mod batch;
 pub(crate) mod copy;
 pub(crate) mod delete;
 pub(crate) mod download;

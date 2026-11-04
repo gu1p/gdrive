@@ -13,7 +13,11 @@ use crate::{
         file_tree_drive::errors::FileIdentifier,
         hub_helper::{get_hub, GetHubError},
     },
-    files::{self, update::PatchFile},
+    files::{
+        self,
+        batch::{Batch, BatchError},
+        update::PatchFile,
+    },
     hub::Hub,
 };
 
@@ -44,25 +48,28 @@ impl Action {
 }
 
 pub(crate) struct Config {
-    pub(crate) file_id: String,
+    /// Processed one after another; see [`Batch`] for how failures are reported.
+    pub(crate) file_ids: Vec<String>,
     pub(crate) action: Action,
     /// Allow trashing a directory together with its content. Untrash ignores it.
     pub(crate) trash_directories: bool,
 }
 
-pub(crate) async fn trash(config: Config) -> Result<(), Error> {
+pub(crate) async fn trash(config: Config) -> Result<(), BatchError<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
-
-    trash_file(
-        &hub,
-        &config.file_id,
-        config.action,
-        config.trash_directories,
-    )
-    .await
+    trash_files(&hub, &config).await
 }
 
-pub(crate) async fn trash_file(
+async fn trash_files(hub: &Hub, config: &Config) -> Result<(), BatchError<Error>> {
+    let mut batch = Batch::new(config.action.verb(), config.file_ids.len());
+    for file_id in &config.file_ids {
+        let result = trash_file(hub, file_id, config.action, config.trash_directories).await;
+        batch.record(file_id, result);
+    }
+    batch.finish()
+}
+
+async fn trash_file(
     hub: &Hub,
     file_id: &str,
     action: Action,
@@ -214,10 +221,13 @@ mod tests {
     use google_drive3::api::{File, FileCapabilities};
     use serde_json::json;
 
-    use super::{check, trash_file, Action, Check, Error};
-    use crate::common::{
-        drive_file::MIME_TYPE_DRIVE_FOLDER,
-        mock_server::{MockServer, Response},
+    use super::{check, trash_file, trash_files, Action, Check, Config, Error};
+    use crate::{
+        common::{
+            drive_file::MIME_TYPE_DRIVE_FOLDER,
+            mock_server::{MockServer, Response},
+        },
+        files::batch::BatchError,
     };
 
     fn my_file() -> File {
@@ -433,5 +443,53 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::SharedDriveRoot(_)));
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn several_ids_continue_after_a_failure() {
+        let not_found = Response::json(
+            404,
+            &json!({"error": {"code": 404, "message": "File not found"}}),
+        );
+        let server = MockServer::start(vec![
+            metadata(false),
+            Response::json(200, &json!({"id": "file-id"})),
+            not_found,
+            metadata(false),
+            Response::json(200, &json!({"id": "file-id"})),
+        ])
+        .await;
+
+        let config = Config {
+            file_ids: vec!["a".to_owned(), "missing".to_owned(), "c".to_owned()],
+            action: Action::Trash,
+            trash_directories: false,
+        };
+        let err = trash_files(&server.hub(), &config).await.unwrap_err();
+        assert!(matches!(
+            err,
+            BatchError::Failed {
+                verb: "trash",
+                failed: 1,
+                total: 3
+            }
+        ));
+
+        let requests: Vec<_> = server
+            .requests()
+            .into_iter()
+            .map(|request| (request.method, request.path))
+            .collect();
+        assert_eq!(
+            requests,
+            [
+                ("GET", "/drive/v3/files/a"),
+                ("PATCH", "/drive/v3/files/a"),
+                ("GET", "/drive/v3/files/missing"),
+                ("GET", "/drive/v3/files/c"),
+                ("PATCH", "/drive/v3/files/c"),
+            ]
+            .map(|(method, path)| (method.to_owned(), path.to_owned()))
+        );
     }
 }
