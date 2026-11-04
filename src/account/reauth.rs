@@ -72,12 +72,19 @@ async fn save_reauthorized(
     token: TokenInfo,
 ) -> Result<(), Box<Error>> {
     let account_name = &app_cfg.account.name;
-    let email = authorized_email(hub).await.map_err(Error::About)?;
-    if let Some(email) = email {
-        if email != *account_name {
+    match authorized_email(hub).await.map_err(Error::About)? {
+        Some(email) if email == *account_name => {}
+        Some(email) => {
             return Err(Error::OtherGoogleAccount {
                 account: account_name.clone(),
                 authorized: email,
+            }
+            .into());
+        }
+        // Without the address the check cannot be made; do not replace the credentials blindly.
+        None => {
+            return Err(Error::UnknownGoogleAccount {
+                account: account_name.clone(),
             }
             .into());
         }
@@ -102,6 +109,7 @@ pub(crate) enum Error {
     HubCreation(io::Error),
     About(Box<google_drive3::Error>),
     OtherGoogleAccount { account: String, authorized: String },
+    UnknownGoogleAccount { account: String },
     SaveTokens(io::Error),
 }
 
@@ -115,7 +123,7 @@ impl error::Error for Error {
             Error::Login(source) => source.source(),
             Error::HubCreation(source) | Error::SaveTokens(source) => Some(source),
             Error::About(source) => Some(source),
-            Error::OtherGoogleAccount { .. } => None,
+            Error::OtherGoogleAccount { .. } | Error::UnknownGoogleAccount { .. } => None,
         }
     }
 }
@@ -138,6 +146,12 @@ impl Display for Error {
                 "the authorization is for '{authorized}', not for account '{account}'; nothing \
                  was changed. Sign in as '{account}', or add '{authorized}' with 'gdrive account \
                  add'"
+            ),
+            Error::UnknownGoogleAccount { account } => write!(
+                f,
+                "Google did not report the email address of the account you signed in with, so \
+                 gdrive cannot check that it is '{account}'; nothing was changed. Run the command \
+                 again, or add the account with 'gdrive account add'"
             ),
             Error::SaveTokens(_) => f.write_str("unable to save the new tokens"),
         }
@@ -206,5 +220,44 @@ mod tests {
         let about = &server.requests()[0];
         assert_eq!(about.path, "/drive/v3/about");
         assert_eq!(about.query_param("fields"), Some("user"));
+    }
+
+    const OLD_TOKENS: &str = r#"[{"scopes":["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/drive.metadata.readonly"],"token":{"access_token":"old","refresh_token":"old-refresh","expires_at":null,"id_token":null}}]"#;
+
+    async fn rejected(about: serde_json::Value) -> Box<Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let (app_cfg, secret) = account(dir.path(), Some(OLD_TOKENS));
+        let server = MockServer::start(vec![Response::json(200, &about)]).await;
+
+        let error = save_reauthorized(&app_cfg, &secret, &server.hub(), new_token())
+            .await
+            .unwrap_err();
+
+        let tokens = tokio::fs::read_to_string(app_cfg.tokens_path())
+            .await
+            .unwrap();
+        assert_eq!(tokens, OLD_TOKENS, "the stored tokens were changed");
+        error
+    }
+
+    #[tokio::test]
+    async fn reauth_without_a_reported_email_changes_nothing() {
+        for about in [json!({}), json!({"user": {"displayName": "Me"}})] {
+            let error = rejected(about.clone()).await;
+            assert!(
+                matches!(&*error, Error::UnknownGoogleAccount { account } if account == "me@example.com"),
+                "{about}: {error:?}"
+            );
+            assert!(error.to_string().contains("nothing was changed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn reauth_as_another_google_account_changes_nothing() {
+        let error = rejected(json!({"user": {"emailAddress": "other@example.com"}})).await;
+        assert!(
+            matches!(&*error, Error::OtherGoogleAccount { authorized, .. } if authorized == "other@example.com"),
+            "{error:?}"
+        );
     }
 }
