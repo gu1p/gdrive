@@ -90,8 +90,10 @@
 //! - a result without `parents` in a batch of several folders cannot be placed, so the batch is
 //!   split and each folder is listed by a query of its own, skipping the ids already emitted;
 //! - an error of a batch of several folders cannot be attributed, so the batch is split the
-//!   same way, and only the folder that fails again yields a [`FolderError`]. Retries of
-//!   transient errors belong to the request layer (see `TODO(retry)`).
+//!   same way, and only the folder that fails again yields a [`FolderError`]. Transient errors
+//!   never get that far: every page request is retried per the hub's retry policy and throttle
+//!   (`retry_read`, which also repeats a page whose reply broke off), so a split is only for
+//!   errors that remain.
 //!
 //! Batches are filled greedily, up to the limit, rather than spread over free slots: it sends
 //! the fewest requests (each `files.list` costs quota), and the latency of a walk is bound by
@@ -150,7 +152,14 @@ use google_drive3::api::{File, FileList, Scope};
 use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, USER_AGENT};
 use tokio::{sync::mpsc, task::JoinHandle};
 
-use crate::{common::drive_file, files::list::ListQuery, hub::Hub};
+use crate::{
+    common::{
+        drive_file,
+        retry::{retry_read, ApiDelegate},
+    },
+    files::list::ListQuery,
+    hub::Hub,
+};
 
 /// The largest page `files.list` returns.
 pub(crate) const PAGE_SIZE: i32 = 1000;
@@ -883,19 +892,27 @@ impl Producer {
     }
 }
 
-/// Requests one page of a batch's query.
+/// Requests one page of a batch's query, through either request path, retried per the hub's
+/// policy and sharing its throttle: a rate limit seen by one listing slot holds back the others
+/// and the transfers of the same hub.
 async fn list_page(
     hub: &Hub,
     batch: &Batch,
     page_token: Option<&str>,
 ) -> Result<FileList, Box<google_drive3::Error>> {
-    // TODO(retry): wrap with retry_api once merged
-    match batch.resource_keys() {
-        None => list_page_call(hub, batch, page_token).await,
-        Some(resource_keys) => {
-            list_page_with_resource_keys(hub, batch, page_token, &resource_keys).await
-        }
-    }
+    let resource_keys = batch.resource_keys();
+    let resource_keys = resource_keys.as_deref();
+    retry_read(hub.retrier(), "files.list", |mut delegate| async move {
+        let page = match resource_keys {
+            None => list_page_call(hub, batch, page_token, &mut delegate).await,
+            Some(resource_keys) => {
+                list_page_with_resource_keys(hub, batch, page_token, resource_keys, &delegate).await
+            }
+        };
+        page.map_err(|error| *error)
+    })
+    .await
+    .map_err(Box::new)
 }
 
 /// The page request through google-drive3's `files.list` call.
@@ -903,6 +920,7 @@ async fn list_page_call(
     hub: &Hub,
     batch: &Batch,
     page_token: Option<&str>,
+    delegate: &mut ApiDelegate,
 ) -> Result<FileList, Box<google_drive3::Error>> {
     let mut call = hub
         .files()
@@ -920,17 +938,20 @@ async fn list_page_call(
         call = call.corpora("drive").drive_id(drive_id);
     }
 
-    let (_, list) = call.doit().await.map_err(Box::new)?;
+    let (_, list) = call.delegate(delegate).doit().await.map_err(Box::new)?;
     Ok(list)
 }
 
 /// The same request as [`list_page_call`] with the [`RESOURCE_KEYS_HEADER`], which google-drive3
 /// cannot send: built on the hub's client and credentials, with google-drive3's error mapping.
+/// A failed reply's status and headers go to `delegate`, as google-drive3 hands them to its
+/// delegate, so that the retry policy sees its `Retry-After`.
 async fn list_page_with_resource_keys(
     hub: &Hub,
     batch: &Batch,
     page_token: Option<&str>,
     resource_keys: &str,
+    delegate: &ApiDelegate,
 ) -> Result<FileList, Box<google_drive3::Error>> {
     use google_drive3::Error;
 
@@ -977,6 +998,7 @@ async fn list_page_with_resource_keys(
     let (parts, body) = response.into_parts();
     let bytes = to_bytes(body).await.unwrap_or_default();
     if !parts.status.is_success() {
+        delegate.record_failure(parts.status, &parts.headers);
         return Err(Box::new(match serde_json::from_slice(&bytes) {
             Ok(value) => Error::BadRequest(value),
             Err(_) => Error::Failure(hyper::Response::from_parts(parts, to_body(Some(bytes)))),

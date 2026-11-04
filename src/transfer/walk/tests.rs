@@ -1101,3 +1101,72 @@ fn options_are_normalized() {
         MAX_PARENTS_PER_QUERY
     );
 }
+
+#[tokio::test]
+async fn a_page_that_gets_503_is_retried() {
+    let files = vec![
+        FakeFile::folder("a", "a", "root"),
+        FakeFile::blob("a1", "1.txt", "a", "x"),
+        FakeFile::blob("r1", "top.txt", "root", "x"),
+    ];
+    let behavior = Behavior {
+        unavailable_first: HashMap::from([(String::from("a"), 1)]),
+        ..Behavior::default()
+    };
+    let walked = walk_all(files, behavior, options()).await;
+
+    assert_eq!(walked.paths(), ["a", "a/1.txt", "top.txt"]);
+    assert!(
+        walked.errors().is_empty(),
+        "a transient error is not a folder error"
+    );
+    let parents = walked
+        .server
+        .requests()
+        .into_iter()
+        .map(|request| request.parents)
+        .collect::<Vec<_>>();
+    let a = vec![String::from("a")];
+    assert_eq!(
+        parents,
+        [vec![String::from("root")], a.clone(), a],
+        "the same query again, not a split"
+    );
+}
+
+#[tokio::test]
+async fn a_page_with_resource_keys_that_gets_503_honors_retry_after() {
+    // The request google-drive3 cannot build goes through the same retries, with the
+    // Retry-After of its reply.
+    let files = vec![
+        FakeFile::folder("x", "x", "root").with_resource_key("kx"),
+        FakeFile::blob("x1", "1.txt", "x", "x"),
+    ];
+    let behavior = Behavior {
+        resource_keys: resource_keys(&[("x", "kx")]),
+        unavailable_first: HashMap::from([(String::from("x"), 1)]),
+        unavailable_retry_after: Some(1),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(files, behavior).await;
+
+    let started = std::time::Instant::now();
+    let walked = Walked {
+        items: collect(start(&server, options())).await,
+        server,
+    };
+    let elapsed = started.elapsed();
+    walked.assert_item_order();
+
+    assert_eq!(walked.paths(), ["x", "x/1.txt"]);
+    assert!(walked.errors().is_empty());
+    let requests = walked.server.requests();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[1].resource_keys.as_deref(), Some("x/kx"));
+    assert_eq!(requests[2].resource_keys.as_deref(), Some("x/kx"));
+    // The test policy's own backoff is at most 10 ms: only Retry-After explains a second.
+    assert!(
+        elapsed >= Duration::from_millis(950),
+        "Retry-After: 1 must be honored, the walk took {elapsed:?}"
+    );
+}

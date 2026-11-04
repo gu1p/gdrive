@@ -705,16 +705,24 @@ pub(crate) struct ApiDelegate {
     failed_reply: Arc<Mutex<Option<FailedReply>>>,
 }
 
+impl ApiDelegate {
+    /// Keeps the status and headers of a failed reply. google-drive3 calls it through
+    /// `http_failure`; a request built by hand outside google-drive3 calls it itself.
+    pub(crate) fn record_failure(&self, status: StatusCode, headers: &HeaderMap) {
+        *lock(&self.failed_reply) = Some(FailedReply {
+            status,
+            headers: headers.clone(),
+        });
+    }
+}
+
 impl google_apis_common::Delegate for ApiDelegate {
     fn http_failure(
         &mut self,
         response: &google_apis_common::Response,
         _error: Option<&serde_json::Value>,
     ) -> google_apis_common::Retry {
-        *lock(&self.failed_reply) = Some(FailedReply {
-            status: response.status(),
-            headers: response.headers().clone(),
-        });
+        self.record_failure(response.status(), response.headers());
         google_apis_common::Retry::Abort
     }
 }
