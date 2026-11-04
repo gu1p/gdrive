@@ -354,19 +354,22 @@ async fn a_failed_file_stops_the_download_and_removes_the_temporary_files() {
     );
 }
 
-/// Waits until `path` exists.
-async fn appears(path: &Path) {
-    while !path.exists() {
+/// Waits until the file at `path` has content. A download writes to its temporary file only
+/// after the cleanup took note of it; a file that merely exists may not be noted yet.
+async fn written(path: &Path) {
+    while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 #[tokio::test]
 async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
+    // Two at a time, in this order: s2 starts only once the job of done.bin has ended, so Ctrl-C
+    // (once s2 writes) never finds done.bin in flight, however slow the machine is.
     let files = vec![
+        FakeFile::blob("done", "done.bin", "root", "done"),
         FakeFile::blob("s1", "s1.bin", "root", "0123456789"),
         FakeFile::blob("s2", "s2.bin", "root", "abcdefghij"),
-        FakeFile::blob("done", "done.bin", "root", "done"),
     ];
     let behavior = Behavior {
         media_stalled: HashSet::from([String::from("s1"), String::from("s2")]),
@@ -386,13 +389,13 @@ async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
     let cancel = {
         let root = root.clone();
         async move {
-            appears(&root.join(".gdrive-s1-1.part")).await;
-            appears(&root.join(".gdrive-s2.part")).await;
+            written(&root.join(".gdrive-s1-1.part")).await;
+            written(&root.join(".gdrive-s2.part")).await;
             std::fs::write(root.join(".gdrive-s1-2.part"), "concurrent").unwrap();
             std::fs::write(root.join(".gdrive-s2-1.part"), "concurrent").unwrap();
         }
     };
-    let downloaded = download(&server, &config(destination.path(), 3, false), cancel).await;
+    let downloaded = download(&server, &config(destination.path(), 2, false), cancel).await;
 
     assert_eq!(
         downloaded.error(),
