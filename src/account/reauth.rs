@@ -5,9 +5,9 @@ use std::{
 };
 
 use crate::{
-    account::add::authorized_email,
+    account::add::{self, authorized_email, received_token},
     app_config::{self, AppConfig},
-    auth::{self, store},
+    auth::{self, store::TokenFile},
     hub,
 };
 
@@ -61,10 +61,11 @@ pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
         }
     }
 
-    let tokens = store::TokenFile::load(&tmp_tokens)
-        .await
-        .map_err(Error::ReadNewTokens)?
-        .ok_or(Error::NoTokenReceived)?;
+    let token = received_token(&tmp_tokens).await.map_err(Error::NewToken)?;
+    // Google leaves out the refresh token when the grant still exists; keep the stored one then.
+    let previous = app_cfg.tokens_of_client(&secret.client_id).await;
+    let tokens = TokenFile::after_login(previous.as_ref(), &auth::DRIVE_SCOPES, token);
+    auth::warn_if_no_refresh_token(&tokens, &account_name);
     tokens
         .save(app_cfg.tokens_path())
         .await
@@ -89,8 +90,7 @@ pub(crate) enum Error {
     HubCreation(io::Error),
     About(Box<google_drive3::Error>),
     OtherGoogleAccount { account: String, authorized: String },
-    ReadNewTokens(store::LoadError),
-    NoTokenReceived,
+    NewToken(Box<add::Error>),
     SaveTokens(io::Error),
 }
 
@@ -107,10 +107,8 @@ impl error::Error for Error {
             | Error::SaveTokens(source) => Some(source),
             Error::AccessToken(source) => Some(source),
             Error::About(source) => Some(source),
-            Error::ReadNewTokens(source) => Some(source),
-            Error::AccountNotFound(_)
-            | Error::OtherGoogleAccount { .. }
-            | Error::NoTokenReceived => None,
+            Error::NewToken(source) => source.source(),
+            Error::AccountNotFound(_) | Error::OtherGoogleAccount { .. } => None,
         }
     }
 }
@@ -142,8 +140,7 @@ impl Display for Error {
                 "the authorization is for '{authorized}', not for account '{account}'; nothing \
                  was changed. Sign in as '{account}', or add '{authorized}' with 'gdrive account add'"
             ),
-            Error::ReadNewTokens(_) => f.write_str("unable to read the new tokens"),
-            Error::NoTokenReceived => f.write_str("the authorization returned no token"),
+            Error::NewToken(source) => source.fmt(f),
             Error::SaveTokens(_) => f.write_str("unable to save the new tokens"),
         }
     }

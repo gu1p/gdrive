@@ -97,6 +97,31 @@ impl TokenFile {
         }
     }
 
+    /// The tokens file after a new authorization of the account: only the new token, stored
+    /// for `scopes`, because the new grant supersedes the old entries.
+    ///
+    /// Google omits the refresh token when the user had already granted offline access to the
+    /// client (#150, #51). The new token then keeps the refresh token of `previous`, which
+    /// stays valid, instead of being stored with `refresh_token: null`. `previous` must be the
+    /// tokens of the same account and OAuth client.
+    pub(crate) fn after_login(
+        previous: Option<&TokenFile>,
+        scopes: &[&str],
+        mut token: TokenInfo,
+    ) -> TokenFile {
+        if token.refresh_token.is_none() {
+            token.refresh_token = previous
+                .and_then(TokenFile::refresh_token)
+                .map(str::to_owned);
+        }
+        TokenFile {
+            entries: vec![TokenEntry {
+                scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
+                token,
+            }],
+        }
+    }
+
     /// Reads `path`. A missing file is `Ok(None)`.
     pub(crate) async fn load(path: &Path) -> Result<Option<Self>, LoadError> {
         let content = match tokio::fs::read(path).await {
@@ -356,6 +381,61 @@ mod tests {
             file.entries()[0].token.refresh_token.as_deref(),
             Some("new")
         );
+    }
+
+    #[test]
+    fn after_login_keeps_the_previous_refresh_token_when_google_omits_it() {
+        let previous = TokenFile::from_json(GDRIVE_39_TOKENS.as_bytes()).unwrap();
+        let reauthorized = TokenInfo {
+            access_token: Some(String::from("ya29.new")),
+            refresh_token: None,
+            expires_at: Some(OffsetDateTime::new_utc(
+                time::Date::from_ordinal_date(2026, 308).unwrap(),
+                time::Time::from_hms(12, 0, 0).unwrap(),
+            )),
+            id_token: None,
+        };
+
+        let merged = TokenFile::after_login(Some(&previous), &DRIVE_SCOPES, reauthorized);
+        assert_eq!(
+            merged.to_json().unwrap(),
+            r#"[{"scopes":["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/drive.metadata.readonly"],"token":{"access_token":"ya29.new","refresh_token":"1//redacted","expires_at":[2026,308,12,0,0,0,0,0,0],"id_token":null}}]"#
+        );
+    }
+
+    #[test]
+    fn after_login_drops_old_entries_and_prefers_a_new_refresh_token() {
+        let previous = file(&[
+            (
+                &DRIVE_SCOPES,
+                token("old", Some("old-refresh"), Duration::hours(-1)),
+            ),
+            (
+                &[METADATA],
+                token("old-meta", Some("old-refresh"), Duration::minutes(30)),
+            ),
+        ]);
+
+        let merged = TokenFile::after_login(
+            Some(&previous),
+            &DRIVE_SCOPES,
+            token("new", Some("new-refresh"), Duration::hours(1)),
+        );
+        assert_eq!(merged.entries().len(), 1);
+        assert_eq!(merged.entries()[0].scopes, DRIVE_SCOPES);
+        assert_eq!(merged.refresh_token(), Some("new-refresh"));
+        assert_eq!(
+            merged.get(&[METADATA]).unwrap().access_token.as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn after_login_without_previous_tokens_stores_what_google_returned() {
+        let merged =
+            TokenFile::after_login(None, &DRIVE_SCOPES, token("new", None, Duration::hours(1)));
+        assert_eq!(merged.entries().len(), 1);
+        assert_eq!(merged.refresh_token(), None);
     }
 
     #[tokio::test]

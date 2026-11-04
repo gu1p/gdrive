@@ -73,6 +73,18 @@ impl Display for ReauthRequired {
 
 impl Error for ReauthRequired {}
 
+/// Warns when the tokens of a fresh authorization have no refresh token: the account would
+/// stop working when the access token expires.
+pub(crate) fn warn_if_no_refresh_token(tokens: &store::TokenFile, account: &str) {
+    if tokens.refresh_token().is_none() {
+        eprintln!(
+            "Warning: Google returned no refresh token for '{account}', so gdrive will stop \
+             working when the access token expires (in about an hour). Remove gdrive's access at \
+             https://myaccount.google.com/permissions, then run 'gdrive account reauth {account}'"
+        );
+    }
+}
+
 /// Finds a [`ReauthRequired`] in an error chain.
 ///
 /// The Drive API client wraps token errors in `MissingToken`, whose `source()` returns `None`,

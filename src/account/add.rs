@@ -3,9 +3,19 @@ use std::{
     error,
     fmt::{Display, Formatter},
     io::{self, Write},
+    path::Path,
 };
 
-use crate::{app_config, auth, hub};
+use yup_oauth2::storage::TokenInfo;
+
+use crate::{
+    app_config,
+    auth::{
+        self,
+        store::{self, TokenFile},
+    },
+    hub,
+};
 
 pub(crate) async fn add() -> Result<(), Box<Error>> {
     println!("To add an account you need a Google Client ID and Client Secret.");
@@ -39,8 +49,19 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
         .map_err(|error| Error::About(*error))?
         .map_or(Cow::Borrowed("unknown"), Into::into);
 
-    let app_cfg =
-        app_config::add_account(&email, &secret, &tokens_path).map_err(Error::AddAccount)?;
+    let token = received_token(&tokens_path).await?;
+    // When the account is added again with the same client, Google may leave out the refresh
+    // token; keep the stored one then.
+    let previous = app_config::AppConfig::load_account(&email)
+        .map_err(Error::LoadAccount)?
+        .tokens_of_client(&secret.client_id)
+        .await;
+    let tokens = TokenFile::after_login(previous.as_ref(), &auth::DRIVE_SCOPES, token);
+    auth::warn_if_no_refresh_token(&tokens, &email);
+
+    let app_cfg = app_config::add_account(&email, &secret, &tokens)
+        .await
+        .map_err(Error::AddAccount)?;
 
     println!();
     println!(
@@ -57,6 +78,15 @@ pub(crate) async fn add() -> Result<(), Box<Error>> {
     println!("Logged in as {}", app_cfg.account.name);
 
     Ok(())
+}
+
+/// The token the login flow saved in `tokens_path`.
+pub(super) async fn received_token(tokens_path: &Path) -> Result<TokenInfo, Box<Error>> {
+    store::TokenFile::load(tokens_path)
+        .await
+        .map_err(Error::ReadNewTokens)?
+        .and_then(|tokens| tokens.get(&auth::DRIVE_SCOPES).cloned())
+        .ok_or_else(|| Box::new(Error::NoTokenReceived))
 }
 
 /// The email address of the Google account the hub is authorized for.
@@ -79,6 +109,9 @@ pub(crate) enum Error {
     Prompt(io::Error),
     Tempdir(io::Error),
     Auth(io::Error),
+    ReadNewTokens(store::LoadError),
+    NoTokenReceived,
+    LoadAccount(app_config::errors::LoadAccount),
     AddAccount(app_config::errors::AddAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
     AccessToken(yup_oauth2::Error),
@@ -92,6 +125,9 @@ impl error::Error for Error {
             | Error::Prompt(error)
             | Error::Tempdir(error)
             | Error::Auth(error) => Some(error),
+            Error::ReadNewTokens(error) => Some(error),
+            Error::NoTokenReceived => None,
+            Error::LoadAccount(error) => Some(error),
             Error::AddAccount(error) => Some(error),
             Error::SwitchAccount(error) => Some(error),
             Error::AccessToken(error) => Some(error),
@@ -107,6 +143,9 @@ impl Display for Error {
             Error::Prompt(_) => "failed to get input from user",
             Error::Tempdir(_) => "failed to create temporary directory",
             Error::Auth(_) => "failed to authenticate",
+            Error::ReadNewTokens(_) => "unable to read the new tokens",
+            Error::NoTokenReceived => "the authorization returned no token",
+            Error::LoadAccount(_) => "unable to load the account config",
             Error::AddAccount(_) => "unable to add account in the config",
             Error::SwitchAccount(_) => "unable to switch account in the config",
             Error::AccessToken(_) => "failed to get access token",

@@ -103,7 +103,7 @@ impl Error for SaveSecret {
 pub(crate) enum AddAccount {
     InitAccount(InitAccount),
     SaveSecret(SaveSecret),
-    CopyTokens(io::Error),
+    SaveTokens(io::Error),
 }
 
 impl Display for AddAccount {
@@ -111,7 +111,7 @@ impl Display for AddAccount {
         let s = match self {
             AddAccount::InitAccount(_) => "unable to initialize account",
             AddAccount::SaveSecret(_) => "unable to save secret",
-            AddAccount::CopyTokens(_) => "unable to save tokens to file",
+            AddAccount::SaveTokens(_) => "unable to save tokens to file",
         };
         f.write_str(s)
     }
@@ -122,7 +122,7 @@ impl Error for AddAccount {
         match self {
             AddAccount::InitAccount(source) => Some(source),
             AddAccount::SaveSecret(source) => Some(source),
-            AddAccount::CopyTokens(source) => Some(source),
+            AddAccount::SaveTokens(source) => Some(source),
         }
     }
 }

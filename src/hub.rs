@@ -73,6 +73,9 @@ impl Auth {
         )
         .persist_tokens_to_disk(tokens_path)
         .flow_delegate(delegate)
+        // Adds prompt=select_account+consent: Google issues a refresh token only when the user
+        // goes through the consent screen, not when an earlier grant is reused (#150).
+        .force_account_selection(true)
         .build()
         .await?;
 

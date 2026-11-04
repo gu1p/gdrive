@@ -9,6 +9,8 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
+use crate::auth::store::TokenFile;
+
 const SYSTEM_CONFIG_DIR_NAME: &str = ".config";
 const BASE_PATH_DIR_NAME: &str = "gdrive3";
 const ACCOUNT_CONFIG_NAME: &str = "account.json";
@@ -25,16 +27,19 @@ pub(crate) struct AppConfig {
     tokens_path: OnceLock<PathBuf>,
 }
 
-pub(crate) fn add_account(
+pub(crate) async fn add_account(
     account_name: &str,
     secret: &Secret,
-    tokens_path: &Path,
+    tokens: &TokenFile,
 ) -> Result<AppConfig, errors::AddAccount> {
     let config = AppConfig::init_account(account_name).map_err(errors::AddAccount::InitAccount)?;
     config
         .save_secret(secret)
         .map_err(errors::AddAccount::SaveSecret)?;
-    fs::copy(tokens_path, config.tokens_path()).map_err(errors::AddAccount::CopyTokens)?;
+    tokens
+        .save(config.tokens_path())
+        .await
+        .map_err(errors::AddAccount::SaveTokens)?;
     Ok(config)
 }
 
@@ -178,6 +183,16 @@ impl AppConfig {
         }
     }
 
+    /// The stored tokens of this account, if there are any and they were issued to the OAuth
+    /// client `client_id`. A refresh token of another client is of no use.
+    pub(crate) async fn tokens_of_client(&self, client_id: &str) -> Option<TokenFile> {
+        let secret = self.load_secret().ok()?;
+        if secret.client_id != client_id {
+            return None;
+        }
+        TokenFile::load(self.tokens_path()).await.ok().flatten()
+    }
+
     fn load_account_config() -> Result<AccountConfig, errors::LoadAccountConfig> {
         let base_path =
             AppConfig::default_base_path().map_err(errors::LoadAccountConfig::DefaultBasePath)?;
@@ -290,4 +305,31 @@ pub(crate) fn set_file_permissions(path: &Path) -> Result<(), io::Error> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TOKENS: &str = r#"[{"scopes":["https://www.googleapis.com/auth/drive"],"token":{"access_token":"a","refresh_token":"r","expires_at":null,"id_token":null}}]"#;
+
+    #[tokio::test]
+    async fn tokens_of_client_requires_the_same_client_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AppConfig::new(dir.path().to_path_buf(), Account::new("me@example.com"));
+        assert!(config.tokens_of_client("id").await.is_none());
+
+        config.create_account_dir().unwrap();
+        config
+            .save_secret(&Secret {
+                client_id: String::from("id"),
+                client_secret: String::from("secret"),
+            })
+            .unwrap();
+        fs::write(config.tokens_path(), TOKENS).unwrap();
+
+        let tokens = config.tokens_of_client("id").await.unwrap();
+        assert_eq!(tokens.refresh_token(), Some("r"));
+        assert!(config.tokens_of_client("other-id").await.is_none());
+    }
 }
