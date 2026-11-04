@@ -75,6 +75,16 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
 
 ### New
 
+- **One-way sync.** `files sync up <LOCAL_DIR> <FOLDER_ID>` and `files sync down <FOLDER_ID> <LOCAL_DIR>`
+  copy new and changed files one way, print one line per item (`create`, `update`, `unchanged`, `extra`,
+  `skip:<reason>`), and exit 1 when anything failed. `--dry-run` prints the same plan without touching
+  anything. `--delete` runs only after a complete inventory and a fully successful transfer phase; Drive
+  extras go to the Drive trash and local extras to `<LOCAL_DIR>/.gdrive-trash/<time>/`
+  (`--delete-permanently` for real removal). Duplicate or ambiguous names, Google Docs without
+  `--export`, shortcuts, symlinks and unreadable entries are skipped and never deleted. Takes `--jobs`,
+  `--continue-on-error`, `--export` (down), `--acknowledge-abuse` (down) and the progress flags.
+  See docs/sync.md. Closes the rsync-style requests #84, #16, #116, #69.
+
 Accounts and login:
 
 - `gdrive account reauth [NAME]` signs in again with the account's stored client and replaces its
