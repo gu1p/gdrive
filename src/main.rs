@@ -248,6 +248,22 @@ enum FileCommand {
         recursive: bool,
     },
 
+    /// Move file/directory to the trash. A shortcut is trashed itself, not its target
+    Trash {
+        /// File id
+        file_id: String,
+
+        /// Trash directory and all its content
+        #[arg(long)]
+        recursive: bool,
+    },
+
+    /// Restore file/directory from the trash
+    Untrash {
+        /// File id
+        file_id: String,
+    },
+
     /// Create directory
     Mkdir {
         /// Name
@@ -600,6 +616,24 @@ async fn handle_files_command(
             files::delete(files::delete::Config {
                 file_id,
                 delete_directories: recursive,
+            })
+            .await?;
+        }
+
+        FileCommand::Trash { file_id, recursive } => {
+            files::trash(files::trash::Config {
+                file_id,
+                action: files::trash::Action::Trash,
+                trash_directories: recursive,
+            })
+            .await?;
+        }
+
+        FileCommand::Untrash { file_id } => {
+            files::trash(files::trash::Config {
+                file_id,
+                action: files::trash::Action::Untrash,
+                trash_directories: false,
             })
             .await?;
         }
