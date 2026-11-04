@@ -209,6 +209,14 @@ pub(crate) fn unique_local_names(entries: &[NameEntry<'_>]) -> Result<UniqueName
     unique_local_names_with(entries, Rules::HOST)
 }
 
+/// The local name [`unique_local_names`] gives the file `file_id` named `drive_name` when another
+/// file of its folder keeps the name: `report~1a2b3c4d.pdf`. (A third file that took this name
+/// too would push it to `-2`, `-3`, ...; those are not covered.)
+pub(crate) fn duplicate_local_name(drive_name: &str, file_id: &str) -> Result<String, InvalidName> {
+    let name = sanitize(drive_name, file_id, Rules::HOST)?;
+    Ok(with_tag(&name, &duplicate_tag(file_id, 0)))
+}
+
 fn unique_local_names_with(
     entries: &[NameEntry<'_>],
     rules: Rules,
@@ -897,6 +905,19 @@ mod tests {
         let insensitive = unique(&pairs, WINDOWS);
         assert_eq!(insensitive.names[0], "Report.pdf");
         assert_eq!(insensitive.names[1], format!("report{}.pdf", id_tag("2")));
+    }
+
+    #[test]
+    fn the_duplicate_name_is_the_one_unique_names_gives() {
+        let result = unique(&[("1", "a.pdf"), ("2", "a.pdf")], Rules::HOST);
+        assert_eq!(
+            super::duplicate_local_name("a.pdf", "2").unwrap(),
+            result.names[1]
+        );
+        assert_eq!(
+            super::duplicate_local_name("..", "2"),
+            Err(InvalidName::ParentDir)
+        );
     }
 
     #[test]

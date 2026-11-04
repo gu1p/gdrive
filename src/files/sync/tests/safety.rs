@@ -898,3 +898,62 @@ async fn an_extra_drive_folder_with_duplicate_names_is_not_trashed_whole() {
     trashed.sort();
     assert_eq!(trashed, ["keep", "other"]);
 }
+
+#[tokio::test]
+async fn the_suffixed_exports_of_duplicate_documents_are_never_deleted() {
+    // Two documents `Report`, and a file `Notes.docx` next to the document `Notes`: an earlier
+    // `--export` gave one of each pair a suffixed name. Without --export they are skipped, and
+    // so is every file a download could have made of them.
+    let files = drive(vec![
+        FakeFile::document("doc1", "Report", "root"),
+        FakeFile::document("doc2", "Report", "root"),
+        FakeFile::document("notes", "Notes", "root"),
+        FakeFile::blob("blob", "Notes.docx", "root", "a real docx"),
+    ]);
+    let exported = |entries: &[(&str, &str)]| {
+        let entries = entries
+            .iter()
+            .map(|&(id, name)| local_name::NameEntry { id, name })
+            .collect::<Vec<_>>();
+        local_name::unique_local_names(&entries).unwrap().names
+    };
+    let reports = exported(&[("doc1", "Report.docx"), ("doc2", "Report.docx")]);
+    let reports_pdf = exported(&[("doc1", "Report.pdf"), ("doc2", "Report.pdf")]);
+    let notes = exported(&[("notes", "Notes.docx"), ("blob", "Notes.docx")]);
+    let mut local_files = reports.clone();
+    local_files.extend(reports_pdf.clone());
+    local_files.extend(notes.clone());
+    local_files.sort();
+    local_files.dedup();
+    assert!(local_files.len() >= 6, "{local_files:?}");
+    let dir = tempfile::tempdir().unwrap();
+    let contents = local_files
+        .iter()
+        .map(|name| (name.as_str(), "an export"))
+        .collect::<Vec<_>>();
+    write(dir.path(), &contents);
+    // The blob's own file is the plain name, with its content.
+    write(dir.path(), &[("Notes.docx", "a real docx")]);
+    write(dir.path(), &[("extra.txt", "x")]);
+
+    let synced = sync(
+        &server_of(files).await,
+        &deleting(config(Direction::Down, dir.path())),
+    )
+    .await;
+
+    synced.ok();
+    let out = synced.lines();
+    assert_eq!(
+        out.iter()
+            .filter(|line| line.starts_with("extra"))
+            .collect::<Vec<_>>(),
+        ["extra->trash extra.txt"],
+        "{out:?}"
+    );
+    assert_eq!(outside_trash(dir.path()), local_files);
+}
+
+async fn server_of(files: Vec<FakeFile>) -> FakeDrive {
+    FakeDrive::start(files, Behavior::default()).await
+}

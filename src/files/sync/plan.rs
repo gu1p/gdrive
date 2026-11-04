@@ -482,12 +482,21 @@ impl Builder<'_> {
                         Err(_) => unusable(),
                     };
                 }
-                let protects = doc_type
+                // Every name a download could have given the document or one of its exports: the
+                // plain one, and the one it gets next to another file of that name.
+                let sources = doc_type
                     .supported_export_types()
                     .iter()
-                    .filter_map(|&format| {
-                        local_name::local_name(&export_file_name(name, format), id).ok()
+                    .map(|&format| export_file_name(name, format))
+                    .chain([name.to_owned()]);
+                let protects = sources
+                    .flat_map(|source| {
+                        [
+                            local_name::local_name(&source, id),
+                            local_name::duplicate_local_name(&source, id),
+                        ]
                     })
+                    .filter_map(Result::ok)
                     .collect();
                 Role::Document {
                     base,
@@ -627,13 +636,19 @@ impl Builder<'_> {
             .values()
             .filter(|group| group.remote.len() > 1)
             .flat_map(|group| group.remote.iter());
-        for index in duplicates {
-            if let Some(name) = grouping.unique.get(index) {
-                grouping
-                    .protected
-                    .entry(fold(name))
-                    .or_insert(Reason::Ambiguous);
+        let mut names = Vec::new();
+        for &index in duplicates {
+            names.extend(grouping.unique.get(&index).cloned());
+            // The name it gets next to another file, whichever keeps the plain one.
+            if let (Role::Named { source, .. }, Some(id)) = (&roles[index], &remote[index].id) {
+                names.extend(local_name::duplicate_local_name(source, id).ok());
             }
+        }
+        for name in names {
+            grouping
+                .protected
+                .entry(fold(&name))
+                .or_insert(Reason::Ambiguous);
         }
         grouping
     }
