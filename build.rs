@@ -1,4 +1,8 @@
-use std::{env, path::PathBuf, process::Command};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 /// Set by release builds that do not run from a git checkout (a source tarball, for example).
 const GIT_HASH_ENV: &str = "GDRIVE_GIT_HASH";
@@ -35,18 +39,29 @@ fn git(args: &[&str]) -> Option<String> {
 }
 
 /// The files that change when HEAD moves to another commit: HEAD itself (`.git/HEAD`, or the
-/// worktree's own HEAD) and, when a branch is checked out, its ref. Only existing files are
+/// worktree's own HEAD) and, when a branch is checked out, its ref. A packed ref has no file of its
+/// own until the next commit writes one, so then the directory it will be created in is watched
+/// (Cargo rescans watched directories), together with `packed-refs`. Only existing paths are
 /// returned, because Cargo reruns the build script on every build for a missing one.
 fn git_files_to_watch() -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    paths.extend(git(&["rev-parse", "--git-path", "HEAD"]));
+    paths.extend(git(&["rev-parse", "--git-path", "HEAD"]).map(PathBuf::from));
     if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        paths.extend(git(&["rev-parse", "--git-path", &branch]));
-        paths.extend(git(&["rev-parse", "--git-path", "packed-refs"]));
+        if let Some(ref_path) = git(&["rev-parse", "--git-path", &branch]).map(PathBuf::from) {
+            if ref_path.exists() {
+                paths.push(ref_path);
+            } else {
+                let refs_root = git(&["rev-parse", "--git-path", "refs"]).map(PathBuf::from);
+                let ref_dir = ref_path
+                    .ancestors()
+                    .skip(1)
+                    .take_while(|dir| refs_root.as_ref().is_none_or(|root| dir.starts_with(root)))
+                    .find(|dir| dir.is_dir());
+                paths.extend(ref_dir.map(Path::to_path_buf));
+            }
+        }
+        paths.extend(git(&["rev-parse", "--git-path", "packed-refs"]).map(PathBuf::from));
     }
+    paths.retain(|path| path.exists());
     paths
-        .into_iter()
-        .map(PathBuf::from)
-        .filter(|path| path.exists())
-        .collect()
 }
