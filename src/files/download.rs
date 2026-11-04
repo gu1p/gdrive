@@ -11,7 +11,7 @@ use http_body_util::BodyExt;
 use md5::Digest;
 use tokio::{
     fs::{self, File},
-    io::{self, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
 };
 
 use crate::{
@@ -241,21 +241,10 @@ pub(crate) async fn save_body_to_file(
     let tmp_file_path = file_path.with_extension("incomplete");
     let file = File::create(&tmp_file_path).await.map_err(E::CreateFile)?;
 
-    // Wrap file in writer that calculates md5
-    let mut writer = Md5Writer::new(file);
-
-    let mut body = body.into_stream();
-
-    // Read chunks from stream and write to file
-    while let Some(chunk_result) = body.next().await {
-        let chunk = chunk_result.map_err(E::ReadChunk)?;
-        if let Some(data) = chunk.data_ref() {
-            writer.write_all(data).await.map_err(E::WriteChunk)?;
-        }
-    }
+    // The file is closed when this returns, before it is renamed
+    let md5_digest = write_body(body, file).await?;
 
     // Check md5
-    let md5_digest = writer.md5();
     if let Some(expected_md5) = expected_md5 {
         if *expected_md5 != md5_digest {
             return Err(E::Md5Mismatch {
@@ -269,6 +258,35 @@ pub(crate) async fn save_body_to_file(
     fs::rename(&tmp_file_path, file_path)
         .await
         .map_err(E::RenameFile)
+}
+
+/// Writes `body` to `writer` and returns the md5 digest of the bytes written.
+///
+/// The writer is flushed before the digest is taken: `tokio::fs::File` reports the error of a write
+/// only on the next write or flush, so without the flush a failure on the last chunk (a full disk,
+/// for example) would be lost and the incomplete file renamed as if it were complete.
+async fn write_body<W>(body: Body, writer: W) -> Result<Digest, errors::SaveBodyToFile>
+where
+    W: AsyncWrite + Unpin,
+{
+    use errors::SaveBodyToFile as E;
+
+    // Wrap the writer in one that calculates md5
+    let mut writer = Md5Writer::new(writer);
+
+    let mut body = body.into_stream();
+
+    // Read chunks from stream and write them
+    while let Some(chunk_result) = body.next().await {
+        let chunk = chunk_result.map_err(E::ReadChunk)?;
+        if let Some(data) = chunk.data_ref() {
+            writer.write_all(data).await.map_err(E::WriteChunk)?;
+        }
+    }
+
+    writer.flush().await.map_err(E::Flush)?;
+
+    Ok(writer.md5())
 }
 
 // TODO: move to common
@@ -286,6 +304,12 @@ async fn save_body_to_stdout(body: Body) -> Result<(), errors::SaveBodyToStdout>
                 .map_err(errors::SaveBodyToStdout::WriteChunk)?;
         }
     }
+
+    // Like a file, stdout reports the error of the last write only on flush
+    stdout
+        .flush()
+        .await
+        .map_err(errors::SaveBodyToStdout::WriteChunk)?;
 
     Ok(())
 }
@@ -359,4 +383,81 @@ where
     }
 
     Ok(context.compute())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use bytes::Bytes;
+
+    use super::*;
+
+    const DATA: &[u8] = b"the last chunk of a download";
+
+    fn body() -> Body {
+        google_apis_common::to_body(Some(Bytes::from_static(DATA)))
+    }
+
+    /// Accepts every write, as `tokio::fs::File` does while the write runs in the background, and
+    /// reports the failure of that write on flush.
+    struct FailsOnFlush;
+
+    impl AsyncWrite for FailsOnFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Err(io::Error::other("no space left on device")))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            self.poll_flush(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn write_body_returns_md5_of_the_written_bytes() {
+        let mut written = Vec::new();
+
+        let digest = write_body(body(), &mut written).await.unwrap();
+
+        assert_eq!(written, DATA);
+        assert_eq!(digest, md5::compute(DATA));
+    }
+
+    #[tokio::test]
+    async fn write_body_reports_a_write_error_that_surfaces_on_flush() {
+        let result = write_body(body(), FailsOnFlush).await;
+
+        assert!(
+            matches!(result, Err(errors::SaveBodyToFile::Flush(_))),
+            "{result:?}"
+        );
+    }
+
+    /// The same with a real `tokio::fs::File`: every write to /dev/full fails with ENOSPC, but
+    /// tokio only reports it on the next write or flush.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn write_body_reports_a_full_disk_on_the_last_chunk() {
+        let Ok(file) = File::options().write(true).open("/dev/full").await else {
+            return;
+        };
+
+        let result = write_body(body(), file).await;
+
+        assert!(
+            matches!(result, Err(errors::SaveBodyToFile::Flush(_))),
+            "{result:?}"
+        );
+    }
 }

@@ -148,6 +148,7 @@ pub(crate) enum SaveBodyToFile {
     CreateFile(io::Error),
     ReadChunk(hyper::Error),
     WriteChunk(io::Error),
+    Flush(io::Error),
     Md5Mismatch { expected: Digest, actual: Digest },
     RenameFile(io::Error),
 }
@@ -158,6 +159,7 @@ impl Display for SaveBodyToFile {
             SaveBodyToFile::CreateFile(_) => f.write_str("unable to create file"),
             SaveBodyToFile::ReadChunk(_) => f.write_str("unable to read chunk of bytes"),
             SaveBodyToFile::WriteChunk(_) => f.write_str("unable to write chunk of bytes"),
+            SaveBodyToFile::Flush(_) => f.write_str("unable to finish writing the file"),
             SaveBodyToFile::Md5Mismatch { expected, actual } => {
                 write!(
                     f,
@@ -176,6 +178,7 @@ impl Error for SaveBodyToFile {
             SaveBodyToFile::Md5Mismatch { .. } => None,
             SaveBodyToFile::CreateFile(source)
             | SaveBodyToFile::WriteChunk(source)
+            | SaveBodyToFile::Flush(source)
             | SaveBodyToFile::RenameFile(source) => Some(source),
         }
     }
