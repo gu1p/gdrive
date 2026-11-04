@@ -18,6 +18,7 @@ use crate::{
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
         progress::{NoProgress, ProgressDisplay},
+        relay::{RelayError, Unsupported, EXPORT_LIMIT},
         scheduler::{
             capture::{output, Captured},
             Options,
@@ -577,13 +578,14 @@ async fn a_dry_run_reads_the_destination_and_writes_nothing() {
     assert!(source.media().is_empty() && source.exports().is_empty());
     assert_eq!(source.patches(), []);
 
+    let skip = format!("skip photos/link: {}", Unsupported::Shortcut);
     let mut expected = vec![
         "Found 6 files in 4 folders with a total size of 16 B",
         "reuse photos/",
         "already-there photos/a.txt",
         "create photos/b.txt (2 B)",
         "convert photos/Budget",
-        "skip photos/link: shortcuts have no content",
+        &skip,
         "create photos/2024/",
         "create photos/2024/d.txt (4 B)",
         "create photos/2024/jan/",
@@ -656,10 +658,9 @@ async fn shortcuts_and_workspace_types_without_export_are_skipped_and_listed() {
     migrated.assert_ok();
     assert_eq!(created_tree(&dest), migrated_tree());
     let lines = migrated.sorted_out();
+    let shortcut = Unsupported::Shortcut;
     assert!(
-        lines.contains(&String::from(
-            "skip photos/link to a: shortcuts have no content"
-        )),
+        lines.contains(&format!("skip photos/link to a: {shortcut}")),
         "{lines:?}"
     );
     let err = migrated.err.lines();
@@ -667,12 +668,9 @@ async fn shortcuts_and_workspace_types_without_export_are_skipped_and_listed() {
         .iter()
         .position(|line| line == "Skipped 2 unsupported items, which cannot be migrated:")
         .unwrap_or_else(|| panic!("{err:?}"));
-    assert_eq!(
-        err[at + 1],
-        "  photos/2024/Survey: Google Workspace files of type application/vnd.google-apps.form \
-         cannot be exported"
-    );
-    assert_eq!(err[at + 2], "  photos/link to a: shortcuts have no content");
+    let form = Unsupported::NativeType(String::from("application/vnd.google-apps.form"));
+    assert_eq!(err[at + 1], format!("  photos/2024/Survey: {form}"));
+    assert_eq!(err[at + 2], format!("  photos/link to a: {shortcut}"));
     assert_eq!(
         migrated.summary(),
         "Summary: 4 migrated (16 B), 0 already there, 2 skipped (unsupported), 0 failed, \
@@ -760,8 +758,11 @@ async fn an_export_over_the_limit_is_a_failed_item() {
         "Error: the migration is incomplete: 1 file failed"
     );
     let err = migrated.err.text();
+    let too_large = RelayError::ExportTooLarge {
+        limit: EXPORT_LIMIT,
+    };
     assert!(
-        err.contains("Error: unable to migrate 'docs/Big': the export is larger than the"),
+        err.contains(&format!("Error: unable to migrate 'docs/Big': {too_large}")),
         "{err}"
     );
     assert!(dest.created().iter().any(|file| file.name == "small.txt"));
@@ -925,18 +926,19 @@ async fn a_relay_error_is_a_failed_item() {
         "Error: the migration is incomplete: 2 files failed"
     );
     let err = migrated.err.lines();
+    // The relay's own words are its business; the status Drive answered comes through.
     assert!(
-        err.iter().any(|line| line.starts_with(
-            "Error: unable to migrate 'photos/b.txt': unable to read the source file: Drive \
-             answered 404 Not Found"
-        )),
+        err.iter().any(
+            |line| line.starts_with("Error: unable to migrate 'photos/b.txt': ")
+                && line.contains("404 Not Found")
+        ),
         "{err:?}"
     );
     assert!(
-        err.iter().any(|line| line.starts_with(
-            "Error: unable to migrate 'photos/2024/d.txt': unable to upload the file to the \
-             destination"
-        )),
+        err.iter().any(
+            |line| line.starts_with("Error: unable to migrate 'photos/2024/d.txt': ")
+                && line.contains("400 Bad Request")
+        ),
         "{err:?}"
     );
     let mut expected = migrated_tree();
