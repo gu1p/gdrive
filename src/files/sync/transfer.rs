@@ -11,7 +11,8 @@
 //! - `down`: a new folder is created as it is reached, before the jobs of its contents. Files
 //!   come through the recursive download's jobs ([`Files`]): a temporary file per download,
 //!   renamed into place once size and md5 match, removed when the job is cancelled; a new file
-//!   never replaces a local file that appeared since the inventory.
+//!   never replaces a local file that appeared since the inventory. A downloaded file gets
+//!   Drive's `modifiedTime`, which the next run compares.
 
 use std::{
     io,
@@ -27,7 +28,7 @@ use tokio::fs;
 
 use super::{
     errors::{self, ItemError},
-    plan::{self, Direction, FileWork, Item, Work},
+    plan::{self, Direction, FileWork, Item, Touch, Work},
 };
 use crate::{
     common::file_tree_drive::{PlannedExport, PlannedFile},
@@ -36,11 +37,12 @@ use crate::{
             recursive::{Files, PartialFiles},
             ExistingFileAction,
         },
+        export::set_modified_time,
         upload::recursive::{create_folder, send_file},
     },
     hub::Hub,
     transfer::{
-        scheduler::{Job, JobKind, JobOutput, Outcome, Printer, Subtree},
+        scheduler::{Job, JobContext, JobKind, JobOutput, Outcome, Printer, Subtree},
         upload::{UploadOptions, UploadTarget},
     },
 };
@@ -231,14 +233,20 @@ impl Transfers {
                 };
                 self.upload_job(label, line, path, target, size)
             }
-            FileWork::Download { rel, id, size, md5 } => {
+            FileWork::Download {
+                rel,
+                id,
+                size,
+                md5,
+                modified,
+            } => {
                 let file = PlannedFile {
                     path: rel,
                     id,
                     size,
                     md5,
                 };
-                self.download_job(label, line, file, create)
+                self.download_job(label, line, file, modified, create)
             }
             FileWork::Export {
                 rel,
@@ -295,23 +303,28 @@ impl Transfers {
         .with_size(size)
     }
 
-    /// `down`: downloads `file` with the recursive download's job.
+    /// `down`: downloads `file` with the recursive download's job, then gives it Drive's time.
     fn download_job(
         self: &Arc<Self>,
         label: String,
         line: String,
         file: PlannedFile,
+        modified: Option<chrono::DateTime<chrono::Utc>>,
         create: bool,
     ) -> Job {
         let transfers = Arc::clone(self);
         let files = Arc::clone(if create { &self.create } else { &self.update });
-        let partial = PartialFiles::new(self.local_root.join(&file.path), &file.id);
+        let path = self.local_root.join(&file.path);
+        let partial = PartialFiles::new(path.clone(), &file.id);
         let cleanup = partial.clone();
         let size = file.size;
         Job::new(JobKind::Media, label, move |context| async move {
             context.printer.out(line).await;
             let outcome = files.download(file, &partial, &context).await;
             if matches!(outcome, Outcome::Transferred { .. }) {
+                if let Some(modified) = modified {
+                    keep_time(&path, modified, &context).await;
+                }
                 transfers.count(create);
             }
             outcome.into()
@@ -353,6 +366,32 @@ impl Transfers {
             &self.done.updated
         });
     }
+
+    /// `down`: an unchanged file that was compared by md5 gets Drive's time, so that the next
+    /// run does not read it again.
+    fn touch_job(self: &Arc<Self>, label: String, touch: Touch) -> Job {
+        let transfers = Arc::clone(self);
+        Job::new(JobKind::Media, label.clone(), move |context| async move {
+            context.printer.out(format!("unchanged {label}")).await;
+            keep_time(&touch.path, touch.modified, &context).await;
+            Done::add(&transfers.done.unchanged);
+            Outcome::Unchanged.into()
+        })
+    }
+}
+
+/// Gives the local file Drive's modification time; a failure is a warning, the content is
+/// right.
+async fn keep_time(path: &Path, modified: chrono::DateTime<chrono::Utc>, context: &JobContext) {
+    if let Err(err) = set_modified_time(path, modified).await {
+        context
+            .printer
+            .err(format!(
+                "Warning: unable to set the modification time of '{}': {err}",
+                path.display()
+            ))
+            .await;
+    }
 }
 
 /// The items of one folder still to walk.
@@ -387,9 +426,12 @@ impl Source {
                 Work::Skip(_) | Work::Compare { .. } => {
                     self.printer.out(line.unwrap_or_default()).await;
                 }
-                Work::Unchanged => {
+                Work::Unchanged(None) => {
                     self.printer.out(line.unwrap_or_default()).await;
                     Done::add(&self.transfers.done.unchanged);
+                }
+                Work::Unchanged(Some(touch)) => {
+                    return Some(self.transfers.touch_job(label, touch))
                 }
                 Work::Create(work) => {
                     return Some(self.transfers.file_job(label, work, true, parent));
@@ -480,7 +522,7 @@ fn subtree(items: &[Item]) -> Subtree {
                     subtree.folders += 1;
                     pending.push(items);
                 }
-                Work::Create(_) | Work::Update(_) => {
+                Work::Create(_) | Work::Update(_) | Work::Unchanged(Some(_)) => {
                     subtree.files += 1;
                 }
                 _ => {}

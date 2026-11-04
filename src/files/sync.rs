@@ -152,6 +152,17 @@ async fn sync_with_hub(
 
 /// Phase 1: the inventory, the plan, and the md5 of the local files whose size matches. Returns
 /// the plan, the canonical local root and the inventory's problems, which are printed already.
+///
+/// What is persisted between runs: nothing but the local modification time, which `down` sets
+/// to Drive's `modifiedTime` (full precision) for every file it downloads or finds unchanged by
+/// md5, so that the next run trusts size and time without reading the file. `up` records
+/// nothing: Drive keeps the md5 of every file, and the next run reads every local file whose
+/// size matches to compare it.
+// TODO(manifest): an id-to-path manifest of the synced files (Drive id, local path, md5, size,
+// modifiedTime after each transfer) would go here, read before the plan is built: matching by
+// id would follow renames and moves on either side, keep the local names of Drive duplicates
+// stable across runs (see local_name::unique_local_names), spare `up` the md5 of files that did
+// not change since the last run, and let the Changes API replace the full listing.
 async fn phase_one(
     hub: &Hub,
     config: &Config,

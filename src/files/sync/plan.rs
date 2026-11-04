@@ -26,7 +26,8 @@
 //! - Different sizes: changed.
 //! - `down`: same size and the local modification time is Drive's `modifiedTime` exactly (a
 //!   download sets it): unchanged, without reading the file. Otherwise the local md5 is
-//!   computed; equal to Drive's, the file is unchanged, else changed.
+//!   computed; equal to Drive's, the file is unchanged (and gets Drive's time, so the next run
+//!   does not read it again), else changed.
 //! - `up`: same size: the local md5 is computed and compared with Drive's. Drive's
 //!   `modifiedTime` is the time of the upload, not of the local file, so the time is no hint;
 //!   nothing is recorded, every run reads every file whose size matches.
@@ -179,9 +180,10 @@ pub(crate) enum Work {
     Compare {
         index: usize,
         differ: FileWork,
+        touch: Option<Touch>,
     },
-    /// Nothing to transfer.
-    Unchanged,
+    /// Nothing to transfer; `down` gives the file Drive's time when it was compared by md5.
+    Unchanged(Option<Touch>),
     Skip(Reason),
 }
 
@@ -201,6 +203,7 @@ pub(crate) enum FileWork {
         id: String,
         size: u64,
         md5: Option<md5::Digest>,
+        modified: Option<DateTime<Utc>>,
     },
     /// `down --export`: the document `id` exported to `rel` below the local root.
     Export {
@@ -210,6 +213,13 @@ pub(crate) enum FileWork {
         format: FileExtension,
         modified: Option<DateTime<Utc>>,
     },
+}
+
+/// Set the modification time of the local file `path` to Drive's `modified`.
+#[derive(Debug, Clone)]
+pub(crate) struct Touch {
+    pub(crate) path: PathBuf,
+    pub(crate) modified: DateTime<Utc>,
 }
 
 /// A deletion candidate.
@@ -307,14 +317,14 @@ fn resolve_items(
                 let index = *index;
                 let result = digests.get_mut(index).and_then(Option::take);
                 let work = std::mem::replace(&mut item.work, Work::Skip(Reason::Unreadable));
-                let Work::Compare { differ, .. } = work else {
+                let Work::Compare { differ, touch, .. } = work else {
                     continue;
                 };
                 let Some((path, expected)) = compares.get(index) else {
                     continue;
                 };
                 item.work = match result {
-                    Some(Ok(digest)) if digest == *expected => Work::Unchanged,
+                    Some(Ok(digest)) if digest == *expected => Work::Unchanged(touch),
                     Some(Ok(_)) => Work::Update(differ),
                     Some(Err(error)) => {
                         errors.push((item.label.clone(), path.clone(), error));
@@ -327,7 +337,7 @@ fn resolve_items(
                     }
                 };
             }
-            Work::Create(_) | Work::Update(_) | Work::Unchanged | Work::Skip(_) => {}
+            Work::Create(_) | Work::Update(_) | Work::Unchanged(_) | Work::Skip(_) => {}
         }
     }
 }
@@ -771,7 +781,9 @@ impl Builder<'_> {
                     existing: Some(id),
                 };
                 match md5 {
-                    Some(md5) if *size == Some(local_size) => self.compare(local, *md5, differ),
+                    Some(md5) if *size == Some(local_size) => {
+                        self.compare(local, *md5, differ, None)
+                    }
                     _ => Work::Update(differ),
                 }
             }
@@ -791,20 +803,25 @@ impl Builder<'_> {
                     id,
                     size: *size,
                     md5: *md5,
+                    modified: *modified,
                 };
                 if *size != local_size {
                     return Work::Update(differ);
                 }
                 if same_time(local_modified, *modified) {
-                    return Work::Unchanged;
+                    return Work::Unchanged(None);
                 }
+                let touch = modified.map(|modified| Touch {
+                    path: local.path.clone(),
+                    modified,
+                });
                 match md5 {
-                    Some(md5) => self.compare(local, *md5, differ),
+                    Some(md5) => self.compare(local, *md5, differ, touch),
                     None => Work::Update(differ),
                 }
             }
             (RemoteKind::Native { modified, .. }, _) => match export {
-                Some(_) if same_time(local_modified, *modified) => Work::Unchanged,
+                Some(_) if same_time(local_modified, *modified) => Work::Unchanged(None),
                 Some((doc_type, format)) => Work::Update(FileWork::Export {
                     rel,
                     id,
@@ -818,11 +835,18 @@ impl Builder<'_> {
         }
     }
 
-    fn compare(&mut self, local: &LocalNode, md5: md5::Digest, differ: FileWork) -> Work {
+    fn compare(
+        &mut self,
+        local: &LocalNode,
+        md5: md5::Digest,
+        differ: FileWork,
+        touch: Option<Touch>,
+    ) -> Work {
         self.compares.push((local.path.clone(), md5));
         Work::Compare {
             index: self.compares.len() - 1,
             differ,
+            touch,
         }
     }
 
@@ -865,12 +889,13 @@ impl Builder<'_> {
             RemoteKind::Blob {
                 size: Some(size),
                 md5,
-                ..
+                modified,
             } => Work::Create(FileWork::Download {
                 rel,
                 id,
                 size: *size,
                 md5: *md5,
+                modified: *modified,
             }),
             RemoteKind::Native { modified, .. } => match export {
                 Some((doc_type, format)) => Work::Create(FileWork::Export {
@@ -1140,7 +1165,7 @@ impl Tally {
                 }
                 Work::Create(_) => self.created += 1,
                 Work::Update(_) | Work::Compare { .. } => self.updated += 1,
-                Work::Unchanged => self.unchanged += 1,
+                Work::Unchanged(_) => self.unchanged += 1,
                 Work::Skip(reason) => *self.skipped.entry(*reason).or_default() += 1,
             }
         }
@@ -1158,7 +1183,7 @@ pub(crate) fn line(item: &Item) -> Option<String> {
         Work::Descend { .. } => return None,
         Work::CreateDir { .. } | Work::Create(_) => String::from("create"),
         Work::Update(_) | Work::Compare { .. } => String::from("update"),
-        Work::Unchanged => String::from("unchanged"),
+        Work::Unchanged(_) => String::from("unchanged"),
         Work::Skip(reason) => format!("skip:{reason}"),
     };
     Some(format!("{action} {}", item.label))

@@ -421,6 +421,15 @@ async fn down_creates_folders_and_files_with_drive_times() {
     assert_eq!(read(&dir, "a.txt"), "aaa");
     assert_eq!(read(&dir, "sub/b.txt"), "bb");
     assert!(local(&dir, "sub/empty").is_dir());
+    // Full precision, so that the next run trusts it.
+    assert_eq!(
+        modified(&local(&dir, "a.txt")),
+        time("2024-05-06T07:08:09.123Z")
+    );
+    assert_eq!(
+        modified(&local(&dir, "sub/b.txt")),
+        time("2023-01-02T03:04:05.678Z")
+    );
     assert_eq!(paths(&dir), ["a.txt", "sub", "sub/b.txt", "sub/empty"]);
 }
 
@@ -468,6 +477,61 @@ async fn down_compares_by_time_then_md5() {
     let mut media = server.media();
     media.sort();
     assert_eq!(media, ["edited", "grown"]);
+    // The unchanged file read for its md5 got Drive's time.
+    assert_eq!(modified(&local(dir.path(), "same.txt")), time(when));
+    assert_eq!(modified(&local(dir.path(), "edited.txt")), time(when));
+}
+
+#[tokio::test]
+async fn a_second_down_run_reads_nothing_and_changes_nothing() {
+    let files = drive(vec![
+        FakeFile::blob("a", "a.txt", "root", "aaa").modified("2024-05-06T07:08:09.123Z"),
+        FakeFile::folder("sub", "sub", "root"),
+        FakeFile::blob("b", "b.txt", "sub", "bb").modified("2024-05-06T07:08:09.456Z"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let server = FakeDrive::start(files.clone(), Behavior::default()).await;
+    sync(&server, &config(Direction::Down, dir.path()))
+        .await
+        .ok();
+    let before = snapshot(dir.path());
+
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let again = sync(&server, &config(Direction::Down, dir.path())).await;
+
+    again.ok();
+    assert_eq!(
+        again.lines(),
+        lines(&["unchanged a.txt", "unchanged sub/b.txt"])
+    );
+    assert_eq!(server.media(), Vec::<String>::new());
+    assert_eq!(snapshot(dir.path()), before);
+}
+
+#[tokio::test]
+async fn up_records_nothing_and_compares_by_md5_on_every_run() {
+    // Drive's time is the time of the upload: it never decides anything for `up`.
+    let files = drive(vec![
+        FakeFile::blob("a", "a.txt", "root", "same").modified("2024-05-06T07:08:09.123Z"),
+        FakeFile::blob("b", "b.txt", "root", "drive").modified("2024-05-06T07:08:09.123Z"),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("a.txt", "same"), ("b.txt", "local")]);
+    // Even the exact time does not make a file of the same size unchanged.
+    set_time(
+        &local(dir.path(), "b.txt"),
+        time("2024-05-06T07:08:09.123Z"),
+    );
+    let before = snapshot(dir.path());
+
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let synced = sync(&server, &config(Direction::Up, dir.path())).await;
+
+    synced.ok();
+    assert_eq!(synced.lines(), lines(&["unchanged a.txt", "update b.txt"]));
+    assert_eq!(server.updates(), [(String::from("b"), b"local".to_vec())]);
+    // Nothing local is written: no time, no record.
+    assert_eq!(snapshot(dir.path()), before);
 }
 
 #[tokio::test]

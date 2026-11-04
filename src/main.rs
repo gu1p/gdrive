@@ -572,8 +572,8 @@ enum SyncCommand {
 
     /// Make the local directory like the Drive folder: download new and changed files
     ///
-    /// A file whose size and modification time match Drive's is unchanged without being read;
-    /// otherwise files of the same size are compared by md5. Local
+    /// A file whose size and modification time match Drive's is unchanged without being read
+    /// (downloads set the time); otherwise files of the same size are compared by md5. Local
     /// symlinks are never written through or deleted. Google Docs files are skipped unless
     /// --export is given, and local files with their names are never deleted.
     Down {
