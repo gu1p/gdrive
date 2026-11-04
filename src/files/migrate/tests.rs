@@ -634,7 +634,7 @@ async fn a_dry_run_reports_a_conflict_as_the_run_would() {
 }
 
 #[tokio::test]
-async fn shortcuts_and_workspace_types_without_export_are_skipped_and_listed() {
+async fn shortcuts_drawings_and_forms_are_skipped_and_listed() {
     let mut files = source_tree();
     files.push(FakeFile::shortcut(
         "link",
@@ -649,6 +649,14 @@ async fn shortcuts_and_workspace_types_without_export_are_skipped_and_listed() {
         "y2024",
         "application/vnd.google-apps.form",
         "",
+    ));
+    // Drive converts nothing back to a Drawing.
+    files.push(FakeFile::native(
+        "drawing",
+        "Sketch",
+        "photos",
+        "application/vnd.google-apps.drawing",
+        "png",
     ));
     let source = FakeDrive::start(files, Behavior::default()).await;
     let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
@@ -666,14 +674,16 @@ async fn shortcuts_and_workspace_types_without_export_are_skipped_and_listed() {
     let err = migrated.err.lines();
     let at = err
         .iter()
-        .position(|line| line == "Skipped 2 unsupported items, which cannot be migrated:")
+        .position(|line| line == "Skipped 3 unsupported items, which cannot be migrated:")
         .unwrap_or_else(|| panic!("{err:?}"));
     let form = Unsupported::NativeType(String::from("application/vnd.google-apps.form"));
+    let drawing = Unsupported::NativeType(String::from("application/vnd.google-apps.drawing"));
     assert_eq!(err[at + 1], format!("  photos/2024/Survey: {form}"));
-    assert_eq!(err[at + 2], format!("  photos/link to a: {shortcut}"));
+    assert_eq!(err[at + 2], format!("  photos/Sketch: {drawing}"));
+    assert_eq!(err[at + 3], format!("  photos/link to a: {shortcut}"));
     assert_eq!(
         migrated.summary(),
-        "Summary: 4 migrated (16 B), 0 already there, 2 skipped (unsupported), 0 failed, \
+        "Summary: 4 migrated (16 B), 0 already there, 3 skipped (unsupported), 0 failed, \
          0 cancelled; 4 folders created, 0 reused"
     );
     assert_eq!(source.exports(), []);
@@ -1032,7 +1042,9 @@ async fn an_unlisted_source_folder_fails_with_what_is_below_it() {
     );
     let err = migrated.err.text();
     assert!(
-        err.contains("Error: unable to migrate 'photos/2024': unable to list folder '2024'"),
+        err.contains(
+            "Error: unable to migrate 'photos/2024': unable to list the folder in the source"
+        ),
         "{err}"
     );
     let created = created_tree(&dest);
@@ -1067,4 +1079,398 @@ fn account_errors_name_the_account_and_the_commands_to_run() {
         "Error: 'me@example.com' is both the source and the destination account; --to must name \
          another account, see 'gdrive account list'"
     );
+}
+
+/// A server in front of a fake Drive: requests that `answer` replies to get its JSON, the others
+/// go to the fake. For what the fake cannot do, such as a source that changes during a run.
+struct Interceptor {
+    addr: std::net::SocketAddr,
+    task: tokio::task::JoinHandle<()>,
+}
+
+type Answer = dyn Fn(&hyper::Method, &str, &HashMap<String, String>) -> Option<serde_json::Value>
+    + Send
+    + Sync;
+
+impl Interceptor {
+    async fn start(
+        upstream: &FakeDrive,
+        answer: impl Fn(&hyper::Method, &str, &HashMap<String, String>) -> Option<serde_json::Value>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        use http_body_util::{BodyExt, Full};
+        use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+
+        let root = upstream
+            .hub()
+            .drive_base_url()
+            .trim_end_matches("drive/v3/")
+            .trim_end_matches('/')
+            .to_owned();
+        let answer: Arc<Answer> = Arc::new(answer);
+        let client = Client::builder(TokioExecutor::new()).build_http::<Full<bytes::Bytes>>();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (answer, client, root) = (Arc::clone(&answer), client.clone(), root.clone());
+                let service = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        let (answer, client, root) =
+                            (Arc::clone(&answer), client.clone(), root.clone());
+                        async move {
+                            let params = request
+                                .uri()
+                                .query()
+                                .map(|query| {
+                                    url::form_urlencoded::parse(query.as_bytes())
+                                        .into_owned()
+                                        .collect::<HashMap<_, _>>()
+                                })
+                                .unwrap_or_default();
+                            let path = request.uri().path().to_owned();
+                            if let Some(reply) = answer(request.method(), &path, &params) {
+                                let response = hyper::Response::builder()
+                                    .header("content-type", "application/json")
+                                    .body(Full::new(bytes::Bytes::from(reply.to_string())))
+                                    .unwrap();
+                                return Ok::<_, std::convert::Infallible>(response);
+                            }
+                            let (parts, body) = request.into_parts();
+                            let body = body.collect().await.unwrap().to_bytes();
+                            let path_and_query =
+                                parts.uri.path_and_query().map_or("/", |path| path.as_str());
+                            let mut forwarded = hyper::Request::builder()
+                                .method(parts.method)
+                                .uri(format!("{root}{path_and_query}"));
+                            // The Host stays this server's, so that a session URL leads here.
+                            for (name, value) in &parts.headers {
+                                forwarded = forwarded.header(name, value);
+                            }
+                            let reply = client
+                                .request(forwarded.body(Full::new(body)).unwrap())
+                                .await
+                                .unwrap();
+                            let (mut parts, body) = reply.into_parts();
+                            let body = body.collect().await.unwrap().to_bytes();
+                            parts.headers.remove("transfer-encoding");
+                            Ok(hyper::Response::from_parts(parts, Full::new(body)))
+                        }
+                    },
+                );
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        Interceptor { addr, task }
+    }
+
+    fn hub(&self) -> crate::hub::Hub {
+        crate::hub::Hub::for_mock_server(&format!("http://{}/", self.addr)).unwrap()
+    }
+}
+
+impl Drop for Interceptor {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// [`migrate`] with the source behind `source`.
+async fn migrate_through(source: &Interceptor, dest: &FakeDrive, settings: Settings) -> Migrated {
+    let output = output();
+    let (source, dest) = (source.hub(), dest.hub());
+    let options = UploadOptions::default();
+    let run = run(
+        &source,
+        &dest,
+        &settings,
+        &options,
+        &output.printer,
+        ProgressDisplay::reporting_to(Arc::new(NoProgress)),
+        future::pending(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the migration should end");
+    Migrated {
+        result,
+        out: output.out,
+        err: output.err,
+    }
+}
+
+fn trashed_ids(source: &FakeDrive) -> Vec<String> {
+    let mut trashed = source
+        .patches()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    trashed.sort();
+    trashed
+}
+
+#[tokio::test]
+async fn a_folder_that_both_accounts_see_is_never_its_own_copy() {
+    // Both accounts serve the same objects, as for a folder shared with the destination.
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(source_tree(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    assert!(
+        migrated
+            .error()
+            .starts_with("Error: the migration is incomplete: 1 folder failed"),
+        "{}",
+        migrated.error()
+    );
+    assert!(migrated.err.lines().contains(&String::from(
+        "Error: unable to migrate 'photos': the source and the destination are the same folder; \
+         nothing to do"
+    )));
+    assert_eq!(trashed_ids(&source), Vec::<String>::new());
+    assert_eq!(dest.created().len(), 0);
+}
+
+#[tokio::test]
+async fn a_file_that_both_accounts_see_is_never_its_own_copy() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(source_tree(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            into: Some(String::from("photos")),
+            trash_source: true,
+            ..settings(&["a"])
+        },
+    )
+    .await;
+
+    assert!(
+        migrated
+            .error()
+            .starts_with("Error: the migration is incomplete: 1 file failed"),
+        "{}",
+        migrated.error()
+    );
+    assert!(migrated.err.lines().contains(&String::from(
+        "Error: unable to migrate 'a.txt': the source and the destination are the same file; \
+         nothing to do"
+    )));
+    assert_eq!(trashed_ids(&source), Vec::<String>::new());
+    assert_eq!(dest.created().len(), 0);
+}
+
+#[tokio::test]
+async fn into_must_not_be_a_folder_that_is_migrated() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(source_tree(), Behavior::default()).await;
+
+    for into in ["photos", "jan"] {
+        let migrated = migrate(
+            &source,
+            &dest,
+            Settings {
+                into: Some(into.to_owned()),
+                trash_source: true,
+                ..settings(&["photos"])
+            },
+        )
+        .await;
+        assert_eq!(
+            migrated.error(),
+            format!(
+                "Error: the destination folder '{into}' is one of the folders to migrate, or \
+                 inside one; --into must name a folder outside them"
+            )
+        );
+    }
+    assert_eq!(trashed_ids(&source), Vec::<String>::new());
+    assert_eq!(dest.created().len(), 0);
+}
+
+#[tokio::test]
+async fn a_folder_that_got_a_new_file_during_the_run_stays_in_the_source() {
+    let fake = FakeDrive::start(source_tree(), Behavior::default()).await;
+    // The check right before `jan` goes to the trash finds a file that the walk did not.
+    let source = Interceptor::start(&fake, |method, path, params| {
+        let leftover = *method == hyper::Method::GET
+            && path == "/drive/v3/files"
+            && params.get("fields").map(String::as_str) == Some(super::LEFTOVER_FIELDS)
+            && params
+                .get("q")
+                .is_some_and(|q| q.contains("'jan' in parents"));
+        leftover.then(|| json!({"files": [{"id": "late"}]}))
+    })
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate_through(
+        &source,
+        &dest,
+        Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert_eq!(created_tree(&dest), migrated_tree());
+    assert!(migrated.out.lines().contains(&String::from(
+        "keep photos/2024/jan/: it has files that were not migrated"
+    )));
+    // `jan` stays, and so do the folders around it.
+    assert_eq!(trashed_ids(&fake), ["a", "b", "d", "empty", "f"]);
+    assert!(
+        migrated
+            .summary()
+            .ends_with("; 5 moved to the trash in the source, 1 kept there"),
+        "{}",
+        migrated.summary()
+    );
+}
+
+#[tokio::test]
+async fn a_source_file_that_changed_during_the_run_stays_in_the_source() {
+    let fake = FakeDrive::start(source_tree(), Behavior::default()).await;
+    // The check right before `f.txt` goes to the trash finds other content.
+    let source = Interceptor::start(&fake, |method, path, params| {
+        let recheck = *method == hyper::Method::GET
+            && path == "/drive/v3/files/f"
+            && params.get("fields").map(String::as_str) == Some(super::RECHECK_FIELDS);
+        recheck.then(|| json!({"id": "f", "size": "7", "md5Checksum": "0123456789abcdef"}))
+    })
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate_through(
+        &source,
+        &dest,
+        Settings {
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert!(migrated.out.lines().contains(&String::from(
+        "keep photos/2024/jan/f.txt: it changed in the source during the migration"
+    )));
+    assert_eq!(trashed_ids(&fake), ["a", "b", "d", "empty"]);
+}
+
+#[tokio::test]
+async fn an_incomplete_destination_listing_fails_that_folder() {
+    let mut files = source_tree();
+    files.push(FakeFile::blob("notes", "notes.txt", "root", "n"));
+    let source = FakeDrive::start(files.clone(), Behavior::default()).await;
+    let dest = FakeDrive::start(
+        vec![FakeFile::folder("old-photos", "photos", "root")],
+        Behavior {
+            incomplete: HashSet::from([String::from("old-photos")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["notes", "photos"]))).await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 folder failed, 7 cancelled"
+    );
+    let err = migrated.err.text();
+    assert!(
+        err.contains(
+            "Error: unable to migrate 'photos': Drive did not list the destination folder \
+             completely"
+        ),
+        "{err}"
+    );
+    let created = dest.created();
+    assert_eq!(created.len(), 1);
+    assert_eq!(created[0].name, "notes.txt");
+
+    // The top folder of the destination: nothing can be compared, so nothing starts.
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            incomplete: HashSet::from([String::from("root")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let migrated = migrate(&source, &dest, continuing(settings(&["notes", "photos"]))).await;
+    assert!(
+        migrated
+            .error()
+            .starts_with("Error: Drive did not list the destination folder completely"),
+        "{}",
+        migrated.error()
+    );
+    assert_eq!(dest.created().len(), 0);
+}
+
+#[tokio::test]
+async fn control_characters_in_names_are_escaped_in_the_output() {
+    let mut files = source_tree();
+    files.push(FakeFile::blob("nl", "bad\nname.txt", "photos", "x"));
+    files.push(FakeFile::folder("esc", "esc\u{1b}[2J", "photos"));
+    files.push(FakeFile::blob("cr", "c\rr.txt", "esc", "y"));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let before = vec![
+        FakeFile::folder("old-photos", "photos", "root"),
+        FakeFile::blob("old-nl", "bad\nname.txt", "old-photos", "not x"),
+    ];
+    let dest = FakeDrive::start(before, Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+    assert_eq!(
+        migrated.error(),
+        "Error: the migration is incomplete: 1 file failed"
+    );
+    let out = migrated.sorted_out();
+    assert!(
+        out.contains(&String::from("create photos/esc\\u{1b}[2J/")),
+        "{out:?}"
+    );
+    assert!(
+        out.contains(&String::from("create photos/esc\\u{1b}[2J/c\\rr.txt (1 B)")),
+        "{out:?}"
+    );
+    assert!(migrated.err.lines().contains(&String::from(
+        "Error: unable to migrate 'photos/bad\\nname.txt': it exists in the destination with \
+         different content"
+    )));
+    for text in [migrated.out.text(), migrated.err.text()] {
+        assert!(!text.contains('\u{1b}') && !text.contains('\r'), "{text:?}");
+        assert!(
+            !text.lines().any(|line| line.starts_with("name.txt")),
+            "{text}"
+        );
+    }
+    // Drive gets the names as they are.
+    let created = dest.created();
+    assert!(created.iter().any(|file| file.name == "esc\u{1b}[2J"));
+    assert!(created.iter().any(|file| file.name == "c\rr.txt"));
 }

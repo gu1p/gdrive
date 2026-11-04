@@ -123,6 +123,20 @@ pub(super) enum SourceNode {
 }
 
 impl SourceNode {
+    /// Whether this is the folder `id` or one below it.
+    pub(super) fn has_folder(&self, id: &str) -> bool {
+        let mut pending = vec![self];
+        while let Some(node) = pending.pop() {
+            if let SourceNode::Folder(folder) = node {
+                if folder.id == id {
+                    return true;
+                }
+                pending.extend(&folder.children);
+            }
+        }
+        false
+    }
+
     pub(super) fn name(&self) -> &str {
         match self {
             SourceNode::File(item) => &item.file.name,

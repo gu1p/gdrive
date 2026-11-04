@@ -14,7 +14,12 @@
 //! compared with the destination's files of its name before it is created. The same size and
 //! md5 is "already there"; another content fails that item. Workspace files (no size or md5)
 //! are already there when the destination has a file of their name and type. Shortcuts and
-//! Workspace types without an export are skipped and listed at the end.
+//! Workspace types without an export are skipped and listed at the end. A destination listing
+//! with `incompleteSearch` fails its folder, so that a missing file is not created twice.
+//!
+//! Both accounts may see the same objects (a shared folder): a destination folder that holds
+//! the source item itself (the same Drive id) fails that item, and an `--into` folder that is
+//! migrated, or inside a migrated folder, is refused before anything starts.
 //!
 //! `--dry-run` runs the same jobs without a write: folders that would be created are not
 //! listed (they would be empty), and only the destination folders that exist are read.
@@ -23,7 +28,9 @@
 //! verified, or already there with the same md5), and a source folder once everything in it is:
 //! each folder counts its children that went to the trash, and the last one releases the job
 //! that trashes the folder. A folder with anything that was not migrated (a failure, an
-//! unsupported item, an incomplete listing) stays, and so do its ancestors.
+//! unsupported item, an incomplete listing) stays, and so do its ancestors. Right before an item
+//! goes, it is read again: a file whose size, md5 or modification time changed since the listing
+//! stays, and so does a folder that holds anything not in the trash (added during the run).
 
 mod source;
 #[cfg(test)]
@@ -42,7 +49,7 @@ use std::{
 };
 
 use futures::stream;
-use google_drive3::api::File;
+use google_drive3::api::{File, FileList};
 
 use source::{SourceFile, SourceFolder, SourceItem, SourceNode, Totals};
 
@@ -58,9 +65,8 @@ use crate::{
         retry::retry_read,
     },
     files::{
-        self,
         generate_ids::generate_ids,
-        list::{list_files, ListFilesConfig, ListQuery, ListSortOrder},
+        list::ListQuery,
         mkdir,
         update::{update_metadata, PatchFile},
     },
@@ -81,6 +87,19 @@ const MY_DRIVE: &str = "root";
 
 /// How many ids one `files.generateIds` request asks for.
 const ID_BATCH: i32 = 100;
+
+/// The largest page of a destination folder's listing.
+const LIST_PAGE_SIZE: i32 = 1000;
+
+/// What a destination folder's listing returns of each file.
+const DEST_FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,md5Checksum)";
+
+/// A source folder is checked for leftovers with one small page: any file is one too many.
+const LEFTOVER_PAGE_SIZE: i32 = 10;
+const LEFTOVER_FIELDS: &str = "nextPageToken,incompleteSearch,files(id)";
+
+/// What a source file is checked for right before it goes to the trash.
+const RECHECK_FIELDS: &str = "id,size,md5Checksum,modifiedTime";
 
 #[expect(
     clippy::struct_excessive_bools,
@@ -217,9 +236,7 @@ async fn run(
         Some(id) => destination_folder(dest, id).await?,
         None => MY_DRIVE.to_owned(),
     };
-    let existing = list_existing(dest, &into)
-        .await
-        .map_err(|error| Error::ListDestination(Box::new(error)))?;
+    let existing = list_existing(dest, &into).await?;
 
     let listing_jobs = settings.transfer.metadata_jobs.get();
     let mut roots = Vec::new();
@@ -233,6 +250,15 @@ async fn run(
             Err(_) => totals.files += 1,
         }
         roots.push((id, root));
+    }
+    // The source folders' ids, to refuse an `--into` among them: trashing a source folder would
+    // trash the copies in it, and its listing would include them.
+    let inside = roots
+        .iter()
+        .filter_map(|(_, root)| root.as_ref().ok())
+        .any(|root| root.has_folder(&into));
+    if inside {
+        return Err(Error::IntoInsideSource(into));
     }
     printer
         .out(format!(
@@ -401,6 +427,10 @@ fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
     }
     if settings.trash_source {
         let _ = write!(line, "; {} {trashed}", tally.trashed.load(Ordering::SeqCst));
+        let kept = tally.kept.load(Ordering::SeqCst);
+        if kept > 0 {
+            let _ = write!(line, ", {kept} kept there");
+        }
     }
     if report.interrupted {
         line.push_str("; interrupted");
@@ -451,6 +481,11 @@ impl Existing {
         Existing { by_name }
     }
 
+    /// Whether the folder holds the file or folder `id` itself: one that both accounts see.
+    fn contains(&self, id: &str) -> bool {
+        self.by_name.values().flatten().any(|file| file.id == id)
+    }
+
     /// The first folder named `name`.
     fn folder(&self, name: &str) -> Option<&str> {
         self.by_name
@@ -492,18 +527,81 @@ impl Existing {
 }
 
 /// Lists the destination folder `folder_id`: the files that are not in the trash.
-async fn list_existing(dest: &Hub, folder_id: &str) -> Result<Existing, files::list::Error> {
-    let query = ListQuery::files_in_folder(folder_id.to_owned());
-    let files = list_files(
-        dest,
-        ListFilesConfig {
-            query: &query,
-            order_by: &ListSortOrder::default(),
-            max_files: usize::MAX,
-        },
-    )
-    .await?;
-    Ok(Existing::of(files))
+///
+/// Fails when Drive answers a page with `incompleteSearch`: a file missing from the listing would
+/// be taken for absent and created a second time.
+async fn list_existing(dest: &Hub, folder_id: &str) -> Result<Existing, Error> {
+    let q = ListQuery::files_in_folder(folder_id.to_owned()).q();
+    let mut files = Vec::new();
+    let mut page_token = None;
+    loop {
+        let list = list_page(dest, &q, LIST_PAGE_SIZE, DEST_FIELDS, page_token.as_deref())
+            .await
+            .map_err(Error::ListDestination)?;
+        if list.incomplete_search == Some(true) {
+            return Err(Error::IncompleteDestination);
+        }
+        files.extend(list.files.unwrap_or_default());
+        page_token = list.next_page_token;
+        if page_token.is_none() {
+            return Ok(Existing::of(files));
+        }
+    }
+}
+
+/// One page of the files `q` names (in any drive), with the `fields` mask `fields`.
+async fn list_page(
+    hub: &Hub,
+    q: &str,
+    page_size: i32,
+    fields: &str,
+    page_token: Option<&str>,
+) -> Result<FileList, Box<google_drive3::Error>> {
+    let (_, list) = retry_read(hub.retrier(), "files.list", |mut delegate| async move {
+        let mut call = hub
+            .files()
+            .list()
+            .q(q)
+            .page_size(page_size)
+            .supports_all_drives(true)
+            .include_items_from_all_drives(true)
+            .param("fields", fields)
+            .add_scope(google_drive3::api::Scope::Full);
+        if let Some(token) = page_token {
+            call = call.page_token(token);
+        }
+        call.delegate(&mut delegate).doit().await
+    })
+    .await
+    .map_err(Box::new)?;
+    Ok(list)
+}
+
+/// What a source folder holds that is not in the trash, checked right before it goes there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leftover {
+    Nothing,
+    /// Something that was not migrated: added to the folder during the run.
+    Items,
+    /// Drive did not search everything.
+    Unknown,
+}
+
+impl Leftover {
+    /// Lists the first few files of the source folder `id` that are not in the trash.
+    async fn of(source: &Hub, id: &str) -> Result<Leftover, Error> {
+        let q = ListQuery::files_in_folder(id.to_owned()).q();
+        let list = list_page(source, &q, LEFTOVER_PAGE_SIZE, LEFTOVER_FIELDS, None)
+            .await
+            .map_err(Error::Recheck)?;
+        Ok(if list.files.is_some_and(|files| !files.is_empty()) {
+            Leftover::Items
+        } else if list.incomplete_search == Some(true) || list.next_page_token.is_some() {
+            Leftover::Unknown
+        } else {
+            Leftover::Nothing
+        })
+    }
 }
 
 /// What the jobs of a migration share.
@@ -529,6 +627,8 @@ struct Tally {
     converted: AtomicU64,
     /// Source files and folders moved to the trash.
     trashed: AtomicU64,
+    /// Source files and folders that stay although they were to go to the trash.
+    kept: AtomicU64,
 }
 
 /// Where the items of a source folder go.
@@ -591,6 +691,10 @@ impl Migration {
             error: _,
         } = folder;
 
+        // Both accounts see this folder, and it is in the destination folder already.
+        if place.existing.contains(&id) {
+            return failed(&label, Error::SameItem { folder: true }).into();
+        }
         let (folder_id, existing) = if let Some(dest_id) = place.existing.folder(&name) {
             context.printer.out(format!("reuse {label}/")).await;
             match list_existing(&self.dest, dest_id).await {
@@ -598,9 +702,7 @@ impl Migration {
                     self.tally.folders_reused.fetch_add(1, Ordering::SeqCst);
                     (Some(dest_id.to_owned()), existing)
                 }
-                Err(error) => {
-                    return failed(&label, Error::ListDestination(Box::new(error))).into();
-                }
+                Err(error) => return failed(&label, error).into(),
             }
         } else {
             context.printer.out(format!("create {label}/")).await;
@@ -680,6 +782,9 @@ impl Migration {
             return self.unsupported(&label, &reason, context).await;
         }
 
+        if place.existing.contains(&file.id) {
+            return failed(&label, Error::SameItem { folder: false }).into();
+        }
         let (outcome, verified) = match place.existing.file(&file) {
             Match::Different => return failed(&label, Error::Conflict).into(),
             Match::Same { verified } => {
@@ -715,6 +820,18 @@ impl Migration {
 
         let mut output = JobOutput::from(outcome);
         if self.trash_source && verified {
+            match self.unchanged(&file).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.keep(
+                        format!("{label}: it changed in the source during the migration"),
+                        context,
+                    )
+                    .await;
+                    return output;
+                }
+                Err(error) => return failed(&label, error).into(),
+            }
             if let Err(error) = self
                 .trash(&file.id, format!("trash {label}"), context)
                 .await
@@ -811,6 +928,40 @@ impl Migration {
         Outcome::Skipped { reason }.into()
     }
 
+    /// Whether the source `file` is still what was migrated or matched: the same size, md5 and
+    /// modification time (each where both are known). A dry run changes nothing to look at.
+    async fn unchanged(&self, file: &SourceFile) -> Result<bool, Error> {
+        if self.dry_run {
+            return Ok(true);
+        }
+        let source = &self.source;
+        let id = file.id.as_str();
+        let (_, now) = retry_read(source.retrier(), "files.get", |mut delegate| async move {
+            source
+                .files()
+                .get(id)
+                .param("fields", RECHECK_FIELDS)
+                .supports_all_drives(true)
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .doit()
+                .await
+        })
+        .await
+        .map_err(|error| Error::Recheck(Box::new(error)))?;
+        let modified = match (now.modified_time, file.modified_time) {
+            (Some(now), Some(then)) => now == then,
+            _ => true,
+        };
+        Ok(now.size == file.size && now.md5_checksum == file.md5 && modified)
+    }
+
+    /// Prints that the source item `what` (its label and why) stays where it is.
+    async fn keep(&self, what: String, context: &JobContext) {
+        context.printer.out(format!("keep {what}")).await;
+        self.tally.kept.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Moves the source file or folder `id` to the trash (not in a dry run) and prints `line`.
     async fn trash(&self, id: &str, line: String, context: &JobContext) -> Result<(), Error> {
         if !self.dry_run {
@@ -837,6 +988,24 @@ impl Migration {
             JobKind::Metadata,
             folder.label.clone(),
             move |context| async move {
+                let leftover = if migration.dry_run {
+                    Ok(Leftover::Nothing)
+                } else {
+                    Leftover::of(&migration.source, &folder.id).await
+                };
+                let reason = match leftover {
+                    Ok(Leftover::Nothing) => None,
+                    Ok(Leftover::Items) => Some("it has files that were not migrated"),
+                    Ok(Leftover::Unknown) => Some("Drive did not list it completely"),
+                    Err(error) => return failed(&folder.label, error).into(),
+                };
+                if let Some(reason) = reason {
+                    // It stays, and so do the folders around it.
+                    migration
+                        .keep(format!("{}/: {reason}", folder.label), &context)
+                        .await;
+                    return Outcome::Transferred { bytes: 0 }.into();
+                }
                 let line = format!("trash {}/", folder.label);
                 if let Err(error) = migration.trash(&folder.id, line, &context).await {
                     return failed(&folder.label, error).into();
@@ -898,7 +1067,17 @@ pub(crate) enum Error {
     },
     /// `--into` is not a folder.
     NotAFolder(String),
-    ListDestination(Box<files::list::Error>),
+    ListDestination(Box<google_drive3::Error>),
+    /// Drive did not search everything while listing a destination folder.
+    IncompleteDestination,
+    /// `--into` is a folder that is migrated, or is inside one: both accounts see it.
+    IntoInsideSource(String),
+    /// The destination folder holds the source item itself: both accounts see it.
+    SameItem {
+        folder: bool,
+    },
+    /// The source item could not be checked right before it would go to the trash.
+    Recheck(Box<google_drive3::Error>),
     GetSource {
         id: String,
         source: Box<google_drive3::Error>,
@@ -965,10 +1144,28 @@ impl Display for Error {
                 "'{id}' is not a folder of the destination account; --into takes a folder id"
             ),
             Error::ListDestination(_) => f.write_str("unable to list the destination folder"),
+            Error::IncompleteDestination => f.write_str(
+                "Drive did not list the destination folder completely, a file of the same name \
+                 might be missed and made twice; run the command again later",
+            ),
+            Error::IntoInsideSource(id) => write!(
+                f,
+                "the destination folder '{id}' is one of the folders to migrate, or inside one; \
+                 --into must name a folder outside them"
+            ),
+            Error::SameItem { folder } => write!(
+                f,
+                "the source and the destination are the same {}; nothing to do",
+                if *folder { "folder" } else { "file" }
+            ),
+            Error::Recheck(_) => {
+                f.write_str("unable to check the source file before moving it to the trash")
+            }
             Error::GetSource { id, .. } => {
                 write!(f, "unable to get '{id}' from the source account")
             }
-            Error::ListSource(error) => error.fmt(f),
+            // The walk's own message names the folder unescaped; the label of the item is enough.
+            Error::ListSource(_) => f.write_str("unable to list the folder in the source"),
             Error::Cycle => f.write_str("the folder is inside itself, it is not migrated"),
             Error::Conflict => f.write_str("it exists in the destination with different content"),
             Error::CreateFolder(_) => f.write_str("unable to create the folder in the destination"),
@@ -1000,16 +1197,19 @@ impl error::Error for Error {
             Error::GetDestinationFolder { source, .. }
             | Error::GetSource { source, .. }
             | Error::CreateFolder(source)
-            | Error::Trash(source) => Some(source.as_ref()),
-            Error::ListDestination(source) => Some(source.as_ref()),
-            // The message is the source's own.
-            Error::ListSource(error) => error::Error::source(error),
+            | Error::Trash(source)
+            | Error::ListDestination(source)
+            | Error::Recheck(source) => Some(source.as_ref()),
+            Error::ListSource(error) => Some(error.error.as_ref()),
             Error::Relay(error) => error::Error::source(error.as_ref()),
             Error::Item { source, .. } => Some(source.as_ref()),
             Error::Incomplete(source) => Some(source),
             Error::GenerateId(source) => Some(source),
             Error::WriteOutput(source) => Some(source),
             Error::SameAccount(_)
+            | Error::IncompleteDestination
+            | Error::IntoInsideSource(_)
+            | Error::SameItem { .. }
             | Error::NotAFolder(_)
             | Error::Cycle
             | Error::Conflict
