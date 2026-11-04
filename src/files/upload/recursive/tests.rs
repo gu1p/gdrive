@@ -662,28 +662,17 @@ async fn concurrent_multi_chunk_uploads_retry_a_failed_chunk() {
 async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
     let (_dir, root, _files) = big_tree();
     let behavior = Behavior {
-        // Every upload gets its first chunk on Drive and then hangs on the second, so no file
-        // can be completed before Ctrl-C, however slow the machine is.
+        // Every upload gets its first chunk on Drive, and the fake holds its second without a
+        // reply, so no file can be completed before Ctrl-C, however slow the machine is.
         chunks_stalled_from: Some(256 * 1024),
         ..Behavior::default()
     };
     let server = FakeDrive::start(Vec::new(), behavior).await;
     let output = output();
-    // Ctrl-C once both running uploads have a chunk on Drive.
-    let cancel = async {
-        loop {
-            let started = server
-                .chunks()
-                .iter()
-                .filter(|chunk| chunk.status == 308)
-                .map(|chunk| chunk.name.clone())
-                .collect::<HashSet<_>>();
-            if started.len() == 2 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
+    // Ctrl-C once the fake holds the second chunk of both running uploads: both have their first
+    // chunk on Drive and are in the middle of their sessions. The fake says when, so nothing
+    // here depends on how long the uploads take.
+    let cancel = server.wait_for_stalled_chunks(2);
 
     let result = upload_with(
         &server,
@@ -704,10 +693,29 @@ async fn ctrl_c_stops_multi_chunk_uploads_in_the_middle_of_their_sessions() {
     assert!(output.err.lines().contains(&String::from(
         "Interrupted: cancelling the transfers in progress"
     )));
+    // Drive answered the first chunk of the two uploads and holds their second.
+    let answered = server.chunks();
+    assert_eq!(
+        answered
+            .iter()
+            .map(|chunk| (chunk.first, chunk.status))
+            .collect::<Vec<_>>(),
+        [(Some(0), 308), (Some(0), 308)],
+        "{answered:?}"
+    );
+    assert_eq!(
+        answered
+            .iter()
+            .map(|chunk| &chunk.name)
+            .collect::<HashSet<_>>()
+            .len(),
+        2
+    );
+    assert_eq!(server.stalled_chunks(), 2);
     // The aborted uploads send nothing more.
-    let sent = server.chunks().len();
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(server.chunks().len(), sent);
+    assert_eq!(server.chunks(), answered);
+    assert_eq!(server.stalled_chunks(), 2);
 }
 
 #[tokio::test]
