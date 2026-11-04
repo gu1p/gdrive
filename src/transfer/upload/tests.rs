@@ -120,7 +120,7 @@ fn assert_uploaded_once(
         "Drive must hold the uploaded bytes unchanged: {} of {} bytes\n{}",
         stored.content.len(),
         data.len(),
-        mock.log()
+        state.log_text()
     );
     assert_eq!(state.sessions.len(), 1, "one session must be started");
     for request in state.session_log() {
@@ -254,25 +254,8 @@ async fn lost_final_reply_is_resolved_by_a_status_query() {
     assert_uploaded_once(&mock, &fixture.data, result);
     let state = mock.state();
     let last = state.session_log().last().copied().unwrap().clone();
-    assert!(last.is_status_query(), "{}", mock_log(&state));
+    assert!(last.is_status_query(), "{}", state.log_text());
     assert_eq!(last.status, Some(StatusCode::OK));
-}
-
-fn mock_log(state: &super::mock_drive::State) -> String {
-    state
-        .log
-        .iter()
-        .map(|request| {
-            format!(
-                "{} {} {:?} -> {:?}",
-                request.method,
-                request.path,
-                request.header("content-range"),
-                request.status
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 #[tokio::test]
@@ -332,7 +315,7 @@ async fn repeated_308_without_progress_fails_within_the_retry_budget() {
         (2..=max_attempts).contains(&stalled),
         "the stalled chunk must be sent again with backoff, at most {max_attempts} times, was \
          sent {stalled} times\n{}",
-        mock_log(&state)
+        state.log_text()
     );
     assert_eq!(state.sessions[0].received.len() as u64, CHUNK);
     assert!(state.files.is_empty());
@@ -437,7 +420,7 @@ async fn an_expired_session_is_replaced_by_a_new_one() {
 
     assert_eq!(file.id.as_deref(), Some("gen-id-1"));
     let state = mock.state();
-    assert_eq!(state.sessions.len(), 2, "{}", mock_log(&state));
+    assert_eq!(state.sessions.len(), 2, "{}", state.log_text());
     assert!(state.sessions[0].expired);
     assert_eq!(
         state.sessions[1].received, fixture.data,
@@ -941,7 +924,7 @@ async fn an_interrupted_upload_continues_in_the_next_run() {
     assert_eq!(file.id.as_deref(), Some("gen-id-1"));
     let state = mock.state();
     let second_run = &state.log[before..];
-    assert!(second_run[0].is_status_query(), "{}", mock_log(&state));
+    assert!(second_run[0].is_status_query(), "{}", state.log_text());
     let starts: Vec<_> = second_run.iter().filter_map(Logged::chunk_start).collect();
     assert_eq!(
         starts,
@@ -1072,7 +1055,7 @@ async fn a_session_that_completed_is_found_by_its_record() {
     assert_eq!(file.id.as_deref(), Some("gen-id-1"));
     let state = mock.state();
     let second_run = &state.log[before..];
-    assert_eq!(second_run.len(), 1, "{}", mock_log(&state));
+    assert_eq!(second_run.len(), 1, "{}", state.log_text());
     assert!(second_run[0].is_status_query());
     assert_eq!(state.files.len(), 1);
     records.assert_none();
@@ -1091,4 +1074,28 @@ async fn without_a_session_dir_nothing_is_recorded() {
         .await
         .unwrap_err();
     assert!(!records.uploads.exists());
+}
+
+/// The failure messages of the tests are formatted from the guard they hold: taking the lock
+/// again for them would deadlock on a real failure.
+#[tokio::test]
+async fn failure_logs_come_from_the_held_guard() {
+    let fixture = fixture(SIZE);
+    let mock = MockDrive::start(Faults::default()).await;
+    upload(&mock, &fixture, &target(), &options())
+        .await
+        .unwrap();
+
+    let state = mock.state();
+    let text = state.log_text();
+    assert!(text.contains("POST /upload/drive/v3/files"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "PUT /upload-session/0 Content-Range: bytes 0-{}",
+            CHUNK - 1
+        )),
+        "{text}"
+    );
+    drop(state);
+    assert_eq!(mock.log(), text);
 }

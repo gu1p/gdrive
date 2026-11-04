@@ -146,6 +146,32 @@ pub(super) struct State {
 }
 
 impl State {
+    /// The last requests, for failure messages.
+    pub(super) fn log_text(&self) -> String {
+        const LINES: usize = 40;
+        let skipped = self.log.len().saturating_sub(LINES);
+        let mut text = if skipped > 0 {
+            format!("({skipped} earlier requests not shown)\n")
+        } else {
+            String::new()
+        };
+        for request in &self.log[skipped..] {
+            let _ = writeln!(
+                text,
+                "{} {} Content-Range: {} ({} bytes) -> {}",
+                request.method,
+                request.path,
+                request.header("content-range").unwrap_or("-"),
+                request.body.len(),
+                request.status.map_or_else(
+                    || String::from("closed"),
+                    |status| status.as_u16().to_string()
+                ),
+            );
+        }
+        text
+    }
+
     /// The requests to upload sessions.
     pub(super) fn session_log(&self) -> Vec<&Logged> {
         self.log
@@ -664,31 +690,10 @@ impl MockDrive {
         state.faults.die_after_chunks = None;
     }
 
-    /// The last requests, for failure messages.
+    /// The last requests, for failure messages. Not while holding [`MockDrive::state`]: use
+    /// [`State::log_text`] on the guard then.
     pub(super) fn log(&self) -> String {
-        const LINES: usize = 40;
-        let state = self.state();
-        let skipped = state.log.len().saturating_sub(LINES);
-        let mut text = if skipped > 0 {
-            format!("({skipped} earlier requests not shown)\n")
-        } else {
-            String::new()
-        };
-        for request in &state.log[skipped..] {
-            let _ = writeln!(
-                text,
-                "{} {} Content-Range: {} ({} bytes) -> {}",
-                request.method,
-                request.path,
-                request.header("content-range").unwrap_or("-"),
-                request.body.len(),
-                request.status.map_or_else(
-                    || String::from("closed"),
-                    |status| status.as_u16().to_string()
-                ),
-            );
-        }
-        text
+        self.state().log_text()
     }
 }
 
