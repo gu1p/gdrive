@@ -53,6 +53,31 @@ pub(crate) fn write<W: Write, H: Display, V: Display, const COLUMNS: usize>(
     tw.flush()
 }
 
+/// Treats a closed stdout as the normal end of the output: when the reader has gone away, as in
+/// `gdrive files list | head -n 1`, the listing stops quietly and exits 0, as 3.9 did. Other write
+/// errors are kept.
+pub(crate) fn ignore_broken_pipe(result: Result<(), io::Error>) -> Result<(), io::Error> {
+    match result {
+        Err(err) if err.kind() == io::ErrorKind::BrokenPipe => Ok(()),
+        result => result,
+    }
+}
+
+/// A writer whose every write and flush fails with the given kind, for tests.
+#[cfg(test)]
+pub(crate) struct FailingWriter(pub(crate) io::ErrorKind);
+
+#[cfg(test)]
+impl Write for FailingWriter {
+    fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+        Err(self.0.into())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Err(self.0.into())
+    }
+}
+
 /// Writes the table as tab-separated values: one line per row, no alignment, and tab, newline,
 /// carriage return and backslash inside a value written as `\t`, `\n`, `\r` and `\\`.
 pub(crate) fn write_tsv<W: Write, H: Display, V: Display, const COLUMNS: usize>(
@@ -123,7 +148,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{escape_tsv, write, write_tsv, DisplayConfig, Table};
+    use std::io;
+
+    use super::{escape_tsv, ignore_broken_pipe, write, write_tsv, DisplayConfig, Table};
 
     fn sample() -> Table<&'static str, &'static str, 2> {
         Table {
@@ -172,5 +199,15 @@ mod tests {
             String::from_utf8(out).expect("utf-8"),
             "Id    Name\na1    x\nb22   y\n"
         );
+    }
+
+    #[test]
+    fn broken_pipe_ends_output_quietly() {
+        assert!(ignore_broken_pipe(Ok(())).is_ok());
+        assert!(ignore_broken_pipe(Err(io::ErrorKind::BrokenPipe.into())).is_ok());
+        for kind in [io::ErrorKind::StorageFull, io::ErrorKind::PermissionDenied] {
+            let err = ignore_broken_pipe(Err(kind.into())).expect_err("other errors are kept");
+            assert_eq!(err.kind(), kind);
+        }
     }
 }

@@ -35,12 +35,13 @@ pub(crate) async fn list(config: Config) -> Result<(), Box<Error>> {
     .await
     .map_err(Error::ListDrives)?;
 
-    print_drives_table(&config, drives).map_err(Error::WriteOutput)?;
+    write_drives_table(io::stdout(), &config, drives).map_err(Error::WriteOutput)?;
 
     Ok(())
 }
 
-fn print_drives_table(
+fn write_drives_table(
+    writer: impl io::Write,
     config: &Config,
     drives: Vec<google_drive3::api::Drive>,
 ) -> Result<(), io::Error> {
@@ -55,14 +56,14 @@ fn print_drives_table(
         values,
     };
 
-    table::write(
-        io::stdout(),
+    table::ignore_broken_pipe(table::write(
+        writer,
         table,
         &table::DisplayConfig {
             skip_header: config.skip_header,
             separator: &config.field_separator,
         },
-    )
+    ))
 }
 
 async fn list_drives(
@@ -125,10 +126,13 @@ impl fmt::Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{list_drives, FIELDS};
+    use std::io;
+
+    use super::{list_drives, write_drives_table, Config, FIELDS};
     use crate::common::{
         delegate::UploadDelegateConfig,
         stub_server::{Request, StubServer, TIMEOUT},
+        table::FailingWriter,
     };
 
     /// A `drives.list` response with drives `d<first>..d<last>` and an optional next page token.
@@ -208,5 +212,39 @@ mod tests {
             page_params(&requests),
             [(Some("100"), None), (Some("20"), Some("t1"))]
         );
+    }
+
+    fn sample_drives() -> Vec<google_drive3::api::Drive> {
+        vec![google_drive3::api::Drive {
+            id: Some(String::from("d0")),
+            name: Some(String::from("Team")),
+            ..Default::default()
+        }]
+    }
+
+    fn config() -> Config {
+        Config {
+            skip_header: false,
+            field_separator: String::from("\t"),
+            max_drives: None,
+        }
+    }
+
+    #[test]
+    fn table_lists_id_and_name() {
+        let mut out = Vec::new();
+        write_drives_table(&mut out, &config(), sample_drives()).expect("write to vec");
+        assert_eq!(out, b"Id   Name\nd0   Team\n");
+    }
+
+    #[test]
+    fn closed_stdout_ends_the_listing_successfully() {
+        let writer = FailingWriter(io::ErrorKind::BrokenPipe);
+        assert!(write_drives_table(writer, &config(), sample_drives()).is_ok());
+
+        let writer = FailingWriter(io::ErrorKind::StorageFull);
+        let err = write_drives_table(writer, &config(), sample_drives())
+            .expect_err("other write errors are reported");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
     }
 }

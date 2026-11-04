@@ -62,7 +62,8 @@ async fn list_to(hub: &Hub, config: &Config, writer: impl Write) -> Result<(), E
     )
     .await?;
 
-    write_files(writer, &files, &config.output).map_err(Error::WriteOutput)
+    table::ignore_broken_pipe(write_files(writer, &files, &config.output))
+        .map_err(Error::WriteOutput)
 }
 
 fn write_files(
@@ -492,6 +493,7 @@ mod tests {
         common::{
             drive_file::{MIME_TYPE_DRIVE_DOCUMENT, MIME_TYPE_DRIVE_FOLDER},
             stub_server::{Request, StubServer, TIMEOUT},
+            table::FailingWriter,
         },
         files::info::{format_date_time, DisplayBytes, DisplayConfig},
     };
@@ -792,19 +794,6 @@ mod tests {
         assert_eq!(out, b"[]\n");
     }
 
-    /// A stdout whose reader has gone away.
-    struct BrokenPipe;
-
-    impl Write for BrokenPipe {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::ErrorKind::BrokenPipe.into())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Err(io::ErrorKind::BrokenPipe.into())
-        }
-    }
-
     #[test]
     fn write_errors_are_returned() {
         for output in [
@@ -812,8 +801,12 @@ mod tests {
             Output::Tsv { skip_header: false },
             Output::Json,
         ] {
-            let err = write_files(BrokenPipe, &sample_files(), &output)
-                .expect_err("writing to a broken pipe should fail");
+            let err = write_files(
+                FailingWriter(io::ErrorKind::BrokenPipe),
+                &sample_files(),
+                &output,
+            )
+            .expect_err("writing to a broken pipe should fail");
             assert_eq!(err.kind(), io::ErrorKind::BrokenPipe, "{output:?}");
         }
     }
@@ -1011,5 +1004,46 @@ mod tests {
         assert_eq!(truncate_middle("🤡🧑🌾😞🧐✅", 5), "🤡🧑…🧐✅");
         assert_eq!(truncate_middle("🤡🧑🌾😞🧐✅❌😃", 5), "🤡🧑…❌😃");
         assert_eq!(truncate_middle("🤡🧑🌾😞🧐✅❌😃", 6), "🤡🧑…✅❌😃");
+    }
+
+    /// `gdrive files list --max 2500 | head -n 1`: the reader goes away, the listing ends with Ok
+    /// (exit 0, as in 3.9); any other write error is still reported.
+    #[tokio::test]
+    async fn closed_stdout_ends_the_listing_successfully() {
+        for (kind, succeeds) in [
+            (io::ErrorKind::BrokenPipe, true),
+            (io::ErrorKind::StorageFull, false),
+        ] {
+            for output in [
+                table(false, true),
+                Output::Tsv { skip_header: false },
+                Output::Json,
+            ] {
+                let server = StubServer::start(vec![file_page(0..3, None)])
+                    .await
+                    .expect("start stub server");
+                let hub = server.hub().expect("create hub");
+                let config = Config {
+                    query: ListQuery::default(),
+                    order_by: ListSortOrder::default(),
+                    max_files: 30,
+                    output: output.clone(),
+                };
+
+                let result =
+                    tokio::time::timeout(TIMEOUT, list_to(&hub, &config, FailingWriter(kind)))
+                        .await
+                        .expect("listing should finish");
+
+                match result {
+                    Ok(()) => assert!(succeeds, "{kind:?} {output:?} should fail"),
+                    Err(super::Error::WriteOutput(err)) if !succeeds => {
+                        assert_eq!(err.kind(), kind);
+                    }
+                    Err(err) => panic!("{kind:?} {output:?}: unexpected {err:?}"),
+                }
+                server.requests().await;
+            }
+        }
     }
 }
