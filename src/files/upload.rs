@@ -17,6 +17,7 @@ use crate::{
         file_info::{self, FileInfo},
         file_tree,
         hub_helper::{get_hub, GetHubError},
+        local_name,
     },
     files::{self, info::DisplayConfig},
     hub::Hub,
@@ -322,7 +323,7 @@ impl Display for Error {
             Error::CreateFileTree(_) => f.write_str("unable to create file tree"),
             Error::Mkdir(_) => f.write_str("unable to create directory"),
             Error::RecursiveItem { path, source: _ } => {
-                write!(f, "unable to upload '{}'", path.display())
+                write!(f, "unable to upload '{}'", local_name::tree_path(path))
             }
             Error::Incomplete(_) => f.write_str("the recursive upload is incomplete"),
             Error::WriteOutput(_) => {

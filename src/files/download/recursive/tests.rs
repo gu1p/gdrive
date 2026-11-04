@@ -82,7 +82,8 @@ fn local(dir: &Path, path: &str) -> PathBuf {
         .fold(dir.to_path_buf(), |path, name| path.join(name))
 }
 
-/// `path` with the platform's separator, as gdrive prints it.
+/// `path` with the platform's separator, as gdrive prints local paths on stdout. Warnings and
+/// errors show paths below the destination with `/`.
 fn shown(path: &str) -> String {
     local(Path::new(""), path).display().to_string()
 }
@@ -138,7 +139,8 @@ async fn three_levels_download_with_at_most_jobs_transfers_at_once() {
     let files = three_levels();
     let behavior = Behavior {
         delay: Duration::from_millis(10),
-        media_delay: Duration::from_millis(40),
+        // The first three downloads wait for each other: all three are in flight at once.
+        media_rendezvous: 3,
         ..Behavior::default()
     };
     let server = FakeDrive::start(files.clone(), behavior).await;
@@ -200,7 +202,9 @@ async fn three_levels_download_with_at_most_jobs_transfers_at_once() {
 #[tokio::test]
 async fn downloads_start_while_the_folder_is_still_being_listed() {
     let behavior = Behavior {
-        delay: Duration::from_millis(150),
+        // The listing of a1 waits for a download: it ends only if downloads start before the
+        // walk is done (else after a timeout, too late for the check below).
+        list_after_media: HashSet::from([String::from("a1")]),
         ..Behavior::default()
     };
     let server = FakeDrive::start(three_levels(), behavior).await;
@@ -329,11 +333,11 @@ async fn a_failed_file_stops_the_download_and_removes_the_temporary_files() {
     );
     assert!(error.contains("--continue-on-error"), "{error}");
     let err = downloaded.err.lines();
+    // The path below the destination, with `/` on every platform.
     assert!(
-        err[0].starts_with(&format!(
-            "Error: unable to download '{}': unable to download file from drive",
-            shown("Root/bad.bin")
-        )),
+        err[0].starts_with(
+            "Error: unable to download 'Root/bad.bin': unable to download file from drive"
+        ),
         "{err:?}"
     );
     assert_eq!(
@@ -350,19 +354,22 @@ async fn a_failed_file_stops_the_download_and_removes_the_temporary_files() {
     );
 }
 
-/// Waits until `path` exists.
-async fn appears(path: &Path) {
-    while !path.exists() {
+/// Waits until the file at `path` has content. A download writes to its temporary file only
+/// after the cleanup took note of it; a file that merely exists may not be noted yet.
+async fn written(path: &Path) {
+    while !std::fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 }
 
 #[tokio::test]
 async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
+    // Two at a time, in this order: s2 starts only once the job of done.bin has ended, so Ctrl-C
+    // (once s2 writes) never finds done.bin in flight, however slow the machine is.
     let files = vec![
+        FakeFile::blob("done", "done.bin", "root", "done"),
         FakeFile::blob("s1", "s1.bin", "root", "0123456789"),
         FakeFile::blob("s2", "s2.bin", "root", "abcdefghij"),
-        FakeFile::blob("done", "done.bin", "root", "done"),
     ];
     let behavior = Behavior {
         media_stalled: HashSet::from([String::from("s1"), String::from("s2")]),
@@ -382,13 +389,13 @@ async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
     let cancel = {
         let root = root.clone();
         async move {
-            appears(&root.join(".gdrive-s1-1.part")).await;
-            appears(&root.join(".gdrive-s2.part")).await;
+            written(&root.join(".gdrive-s1-1.part")).await;
+            written(&root.join(".gdrive-s2.part")).await;
             std::fs::write(root.join(".gdrive-s1-2.part"), "concurrent").unwrap();
             std::fs::write(root.join(".gdrive-s2-1.part"), "concurrent").unwrap();
         }
     };
-    let downloaded = download(&server, &config(destination.path(), 3, false), cancel).await;
+    let downloaded = download(&server, &config(destination.path(), 2, false), cancel).await;
 
     assert_eq!(
         downloaded.error(),
@@ -446,6 +453,53 @@ async fn the_cleanup_removes_the_files_it_created_and_no_other_file_of_these_nam
 
     assert_eq!(entries(dir.path()), [".gdrive-X-2.part", ".gdrive-X.part"]);
     assert_eq!(std::fs::read_to_string(&first).unwrap(), "someone else's");
+}
+
+#[tokio::test]
+async fn a_temporary_file_replaced_right_away_under_its_name_is_left_alone() {
+    // ext4 gives the inode of a removed file to the next file created, and Windows may give a
+    // file created under a name that was just removed the old one's identity: compared without an
+    // open handle, the new file passed for the job's own.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("x.bin");
+    for round in 0..200 {
+        let partial = PartialFiles::new(target.clone(), "X");
+        let (temp, file) = super::super::create_temp_file(&target, "X").await.unwrap();
+        drop(partial.track(file));
+        assert_eq!(temp.file_name().unwrap(), ".gdrive-X.part");
+        std::fs::remove_file(&temp).unwrap();
+        std::fs::write(&temp, "someone else's").unwrap();
+
+        partial.remove().await;
+
+        assert_eq!(
+            std::fs::read_to_string(&temp).unwrap(),
+            "someone else's",
+            "round {round}"
+        );
+        std::fs::remove_file(&temp).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_kept_handle_lets_the_download_rename_its_temporary_file_into_place() {
+    use tokio::io::AsyncWriteExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("x.bin");
+    let partial = PartialFiles::new(target.clone(), "X");
+    let (temp, file) = super::super::create_temp_file(&target, "X").await.unwrap();
+    let mut file = partial.track(file);
+    file.write_all(b"content").await.unwrap();
+    file.flush().await.unwrap();
+    drop(file);
+
+    // As `save_to_file` does, while the cleanup still holds the file open.
+    tokio::fs::rename(&temp, &target).await.unwrap();
+    partial.remove().await;
+
+    assert_eq!(entries(dir.path()), ["x.bin"]);
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "content");
 }
 
 #[tokio::test]
@@ -570,11 +624,10 @@ async fn an_existing_local_file_fails_without_overwrite() {
         .error()
         .starts_with("Error: the recursive download is incomplete"));
     let err = downloaded.err.lines();
+    // The path below the destination with `/`, then the local file as the platform shows it.
     assert!(
-        err[0].starts_with(&format!(
-            "Error: unable to download '{}': file '",
-            shown("Root/x.txt")
-        )) && err[0].ends_with("' already exists, use --overwrite to overwrite it"),
+        err[0].starts_with("Error: unable to download 'Root/x.txt': file '")
+            && err[0].ends_with("' already exists, use --overwrite to overwrite it"),
         "{err:?}"
     );
     assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "mine");

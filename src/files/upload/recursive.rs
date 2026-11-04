@@ -37,7 +37,7 @@ use crate::{
         file_tree_like::Node,
         human_size::human_size,
         id_gen::IdGen,
-        FileTreeLike,
+        local_name, FileTreeLike,
     },
     files::mkdir,
     hub::Hub,
@@ -87,7 +87,7 @@ pub(super) async fn upload_directory(
         } else {
             JobKind::Media
         };
-        let label = entry.relative_path.display().to_string();
+        let label = local_name::tree_path(&entry.relative_path);
         let error = Error::ReadLocal(entry.error);
         Job::done(kind, label, failed(entry.relative_path, error))
     });
@@ -129,7 +129,7 @@ impl Uploads {
         folder: file_tree::Folder,
         parents: Option<Vec<String>>,
     ) -> Job {
-        let label = folder.relative_path().display().to_string();
+        let label = local_name::tree_path(folder.relative_path());
         let subtree = subtree(&folder);
         let uploads = Arc::clone(self);
         Job::new(JobKind::Metadata, label, move |context| async move {
@@ -204,7 +204,7 @@ impl Uploads {
     }
 
     fn file_job(self: &Arc<Self>, file: file_tree::File, parents: Vec<String>) -> Job {
-        let label = file.relative_path().display().to_string();
+        let label = local_name::tree_path(file.relative_path());
         let size = file.size;
         let uploads = Arc::clone(self);
         Job::new(JobKind::Media, label, move |context| async move {

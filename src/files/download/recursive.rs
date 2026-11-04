@@ -22,11 +22,13 @@ mod tests;
 use std::{
     collections::VecDeque,
     future::Future,
+    mem,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
 };
 
 use futures::{stream, Stream, StreamExt};
+use same_file::Handle;
 use tokio::fs;
 
 use super::{
@@ -215,7 +217,7 @@ impl Source {
             Ok(()) => None,
             Err(err) => Some(Job::done(
                 JobKind::Metadata,
-                path.display().to_string(),
+                local_name::tree_path(path),
                 Outcome::failed(errors::Download::CreateDirectory(abs_path, err)),
             )),
         }
@@ -234,7 +236,7 @@ struct Files {
 impl Files {
     fn job(self: &Arc<Self>, file: PlannedFile) -> Job {
         let files = Arc::clone(self);
-        let label = file.path.display().to_string();
+        let label = local_name::tree_path(&file.path);
         let size = file.size;
         let partial = PartialFiles::new(self.root_path.join(&file.path), &file.id);
         let cleanup = partial.clone();
@@ -274,7 +276,7 @@ impl Files {
             return Ok(Outcome::Unchanged);
         }
 
-        let label = format!("download of '{}'", file.path.display());
+        let label = format!("download of '{}'", local_name::tree_path(&file.path));
         let source = file_content(&self.hub, &file.id, self.acknowledge_abuse, label)
             .map_err(|err| E::DownloadFile(Box::new(err)))?;
         // The walk lists md5 and size; the first check before a resume adds the rest.
@@ -316,12 +318,27 @@ impl Files {
 ///
 /// `save_to_file` names a temporary file `.gdrive-<id>.part`, `.gdrive-<id>-1.part`, ..., the
 /// first that is free, and another one when the content starts over. Other files with these
-/// names (a stale one of an earlier run, one of a concurrent gdrive) are not this download's, so
-/// the names alone do not say what to remove. [`Self::track`] notes the identity of every
-/// temporary file as it is created (device and inode on Unix, the creation time on Windows), and
-/// [`Self::remove`] removes only the temporary names that are still one of those files. Where
-/// no identity is available, nothing is removed: a leftover temporary file is better than a
-/// removed file of someone else.
+/// names (a stale one of an earlier run, one of a concurrent gdrive, one that took the name of a
+/// temporary file of this download after it was removed) are not this download's, so the names
+/// alone do not say what to remove. [`Self::track`] keeps an open handle on every temporary file
+/// as it is created, and [`Self::remove`] removes only the temporary names that are still one of
+/// these files, compared as [`same_file::Handle`]s: device and inode on Unix, volume serial number
+/// and file index on Windows.
+///
+/// The handles stay open for the life of the job because these numbers identify a file only while
+/// it is open: ext4 gives the inode of a removed file to the next file it creates, and Windows
+/// documents the file index as stable only while a handle is open (FAT derives it from the
+/// directory entry, so a file created under the same name may get the same one). An open handle
+/// keeps the file, removed or not, and with it its numbers. The cost: one more open file per
+/// running download, and a temporary file that `save_to_file` removes when the content starts
+/// over keeps its disk space until the job ends (on a Windows file system without POSIX delete
+/// semantics, such as FAT, also its name).
+///
+/// The handles do not get in the way of the download: std opens files with `FILE_SHARE_DELETE` on
+/// Windows, the handles kept here and the one same-file opens to compare included, so a temporary
+/// file can still be renamed into place or removed while they are open. Where no identity is
+/// available (same-file knows Unix and Windows), nothing is removed: a leftover temporary file is
+/// better than a removed file of someone else.
 #[derive(Clone)]
 struct PartialFiles(Arc<PartialState>);
 
@@ -329,8 +346,8 @@ struct PartialState {
     /// The final path of the download.
     path: PathBuf,
     file_id: String,
-    /// The temporary files this download created.
-    created: Mutex<Vec<FileIdentity>>,
+    /// An open handle on every temporary file this download created.
+    created: Mutex<Vec<Handle>>,
 }
 
 impl PartialFiles {
@@ -347,84 +364,62 @@ impl PartialFiles {
         local_name::safe_join(dir, &local_name::temp_file_name(&self.0.file_id, attempt))
     }
 
-    fn created(&self) -> std::sync::MutexGuard<'_, Vec<FileIdentity>> {
+    fn created(&self) -> std::sync::MutexGuard<'_, Vec<Handle>> {
         self.0
             .created
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Notes the identity of a temporary file `save_to_file` just created, and hands the file
-    /// back to it unchanged.
+    /// Keeps a handle on a temporary file `save_to_file` just created, and hands the file back
+    /// to it unchanged.
     fn track(&self, file: fs::File) -> fs::File {
         // Nothing has run on the new file yet, so it converts without waiting.
         let file = match file.try_into_std() {
             Ok(file) => file,
             Err(file) => return file,
         };
-        if let Some(identity) = file.metadata().ok().as_ref().and_then(FileIdentity::of) {
-            self.created().push(identity);
+        // A second handle on the same open file: the download closes its own when it is done
+        // writing.
+        let handle = file.try_clone().and_then(Handle::from_file).ok();
+        if let Some(handle) = handle {
+            self.created().push(handle);
         }
         fs::File::from_std(file)
     }
 
-    /// Removes the temporary files this download created that are still there.
+    /// Removes the temporary files this download created that are still there, and lets go of
+    /// the handles.
     async fn remove(&self) {
-        let mut created = self.created().clone();
+        let mut created = mem::take(&mut *self.created());
         for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
             if created.is_empty() {
                 break;
             }
             let path = self.temp_path(attempt);
-            let Ok(metadata) = fs::symlink_metadata(&path).await else {
+            // Only a regular file is opened to compare: opening a FIFO would wait for a writer.
+            let is_file = fs::symlink_metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
+            if !is_file {
+                continue;
+            }
+            let Some(found) = open_handle(path.clone()).await else {
                 continue;
             };
-            let identity = metadata
-                .is_file()
-                .then(|| FileIdentity::of(&metadata))
-                .flatten();
-            if let Some(found) = created.iter().position(|ours| Some(*ours) == identity) {
-                created.swap_remove(found);
+            if let Some(ours) = created.iter().position(|ours| *ours == found) {
+                drop(found);
                 remove_temp_file(&path).await;
+                created.swap_remove(ours);
             }
         }
     }
 }
 
-/// What tells one file from another while both exist.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    /// Unix: the device and the inode. Windows: the creation time, in 100 ns units.
-    id: (u64, u64),
-}
-
-impl FileIdentity {
-    #[cfg(unix)]
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "the same signature as on platforms without file identities"
-    )]
-    fn of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-        use std::os::unix::fs::MetadataExt;
-        Some(FileIdentity {
-            id: (metadata.dev(), metadata.ino()),
-        })
-    }
-
-    #[cfg(windows)]
-    #[allow(
-        clippy::unnecessary_wraps,
-        reason = "the same signature as on platforms without file identities"
-    )]
-    fn of(metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-        use std::os::windows::fs::MetadataExt;
-        Some(FileIdentity {
-            id: (metadata.creation_time(), 0),
-        })
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn of(_metadata: &std::fs::Metadata) -> Option<FileIdentity> {
-        None
-    }
+/// A handle on the file at `path`, to compare with the ones [`PartialFiles::track`] keeps.
+async fn open_handle(path: PathBuf) -> Option<Handle> {
+    tokio::task::spawn_blocking(move || Handle::from_path(path))
+        .await
+        .ok()?
+        .ok()
 }

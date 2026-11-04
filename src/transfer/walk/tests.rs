@@ -956,6 +956,9 @@ async fn in_flight_requests_never_exceed_listing_jobs() {
     for listing_jobs in [1, 3] {
         let behavior = Behavior {
             delay: Duration::from_millis(40),
+            // As many subfolder queries as the walk may send at once wait for each other, so they
+            // are in flight together however slow the machine is.
+            list_rendezvous: (0..listing_jobs).map(|n| format!("f{n}")).collect(),
             ..Behavior::default()
         };
         let options = WalkOptions {

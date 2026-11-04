@@ -14,6 +14,10 @@
 //! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
 //! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
 //! last). Like Drive, a create fails with 404 when a parent does not exist yet.
+//!
+//! A test that checks how many requests were in flight at once does not rely on delays: the
+//! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
+//! listing until a download has started, so the overlap happens however slow the machine is.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -32,7 +36,12 @@ use http_body_util::{combinators::BoxBody, BodyExt, Full, StreamBody};
 use hyper::{body::Incoming, service::service_fn, Method, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::{json, Map, Value};
-use tokio::{net::TcpListener, task::JoinHandle, time::Instant};
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Barrier},
+    task::JoinHandle,
+    time::Instant,
+};
 
 use crate::{common::drive_file::MIME_TYPE_DRIVE_FOLDER, hub::Hub};
 
@@ -226,6 +235,49 @@ pub(crate) struct Behavior {
     /// The chunk of the file with this name that starts at this offset fails with 503 once,
     /// committing nothing.
     pub(crate) chunk_unavailable: HashMap<String, u64>,
+    /// Chunks that start at or after this offset get no reply, like a transfer that hangs.
+    pub(crate) chunks_stalled_from: Option<u64>,
+    /// The first this many file uploads (multipart creates of files, first chunks of resumable
+    /// sessions) are held until all of them have arrived, so they are in flight together.
+    pub(crate) upload_rendezvous: usize,
+    /// The first this many media downloads are held until all of them have arrived.
+    pub(crate) media_rendezvous: usize,
+    /// The first queries naming one of these folders, as many as there are folders, are held
+    /// until all of them have arrived.
+    pub(crate) list_rendezvous: HashSet<String>,
+    /// A query naming one of these folders is answered only once a media download has arrived.
+    pub(crate) list_after_media: HashSet<String>,
+}
+
+/// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
+/// Then it goes on, so that a test whose requests do not overlap fails on its check of what was
+/// in flight at once instead of hanging.
+const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Holds the first `parties` requests that join it until all of them have arrived; later ones
+/// pass. A test sees these requests in flight together without depending on how long anything
+/// takes.
+struct Rendezvous {
+    parties: usize,
+    joined: AtomicUsize,
+    barrier: Barrier,
+}
+
+impl Rendezvous {
+    fn new(parties: usize) -> Self {
+        Self {
+            parties,
+            joined: AtomicUsize::new(0),
+            barrier: Barrier::new(parties),
+        }
+    }
+
+    async fn join(&self) {
+        if self.joined.fetch_add(1, Ordering::SeqCst) < self.parties {
+            // A party that gives up still counts: the others are not held longer.
+            let _ = tokio::time::timeout(RENDEZVOUS_TIMEOUT, self.barrier.wait()).await;
+        }
+    }
 }
 
 /// A chunk or status request of a resumable session, as the fake answered it.
@@ -316,6 +368,11 @@ struct State {
     chunks: Mutex<Vec<Chunk>>,
     /// The faults of [`Behavior::chunk_unavailable`] still to inject.
     chunk_faults_left: Mutex<HashMap<String, u64>>,
+    upload_rendezvous: Rendezvous,
+    media_rendezvous: Rendezvous,
+    list_rendezvous: Rendezvous,
+    /// Whether a media download has arrived, for [`Behavior::list_after_media`].
+    media_arrived: watch::Sender<bool>,
 }
 
 pub(crate) struct FakeDrive {
@@ -331,6 +388,9 @@ impl FakeDrive {
             .expect("bind fake drive");
         let addr = listener.local_addr().expect("fake drive address");
         let behavior_chunk_faults = behavior.chunk_unavailable.clone();
+        let upload_rendezvous = Rendezvous::new(behavior.upload_rendezvous);
+        let media_rendezvous = Rendezvous::new(behavior.media_rendezvous);
+        let list_rendezvous = Rendezvous::new(behavior.list_rendezvous.len());
         let state = Arc::new(State {
             files,
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
@@ -354,6 +414,10 @@ impl FakeDrive {
             sessions_max_active: AtomicUsize::new(0),
             chunks: Mutex::new(Vec::new()),
             chunk_faults_left: Mutex::new(behavior_chunk_faults),
+            upload_rendezvous,
+            media_rendezvous,
+            list_rendezvous,
+            media_arrived: watch::channel(false).0,
         });
 
         let server_state = Arc::clone(&state);
@@ -540,6 +604,15 @@ async fn handle(
         .expect("requests lock")
         .push(list_request.clone());
 
+    let names = |set: &HashSet<String>| list_request.parents.iter().any(|id| set.contains(id));
+    if names(&state.behavior.list_rendezvous) {
+        state.list_rendezvous.join().await;
+    }
+    if names(&state.behavior.list_after_media) {
+        let mut media_arrived = state.media_arrived.subscribe();
+        let arrived = media_arrived.wait_for(|arrived| *arrived);
+        let _ = tokio::time::timeout(RENDEZVOUS_TIMEOUT, arrived).await;
+    }
     tokio::time::sleep(state.behavior.delay).await;
 
     let response = list(&state, &list_request, &q);
@@ -583,6 +656,7 @@ async fn create(state: &State, request: hyper::Request<Incoming>) -> FakeRespons
     let _upload =
         (!is_folder).then(|| InFlight::new(&state.uploads_in_flight, &state.uploads_max_in_flight));
     if !is_folder {
+        state.upload_rendezvous.join().await;
         tokio::time::sleep(state.behavior.upload_delay).await;
     }
 
@@ -732,7 +806,7 @@ async fn session_request(
     if range != "*" && first.is_none() {
         return error(StatusCode::BAD_REQUEST, "malformed Content-Range");
     }
-    tokio::time::sleep(state.behavior.chunk_delay).await;
+    hold_chunk(state, first.map(|(first, _)| first)).await;
 
     let mut sessions = state.sessions.lock().expect("sessions lock");
     let Some(this) = sessions.get_mut(session) else {
@@ -810,6 +884,25 @@ async fn session_request(
     response
 }
 
+/// What a request of a session waits for before it is answered: [`Behavior::chunk_delay`]; a
+/// chunk from [`Behavior::chunks_stalled_from`] on, forever; and the first chunk of a session,
+/// for those of the others ([`Behavior::upload_rendezvous`]). `first` is the chunk's first byte.
+async fn hold_chunk(state: &State, first: Option<u64>) {
+    if let Some(first) = first {
+        if state
+            .behavior
+            .chunks_stalled_from
+            .is_some_and(|from| first >= from)
+        {
+            std::future::pending::<()>().await;
+        }
+        if first == 0 {
+            state.upload_rendezvous.join().await;
+        }
+    }
+    tokio::time::sleep(state.behavior.chunk_delay).await;
+}
+
 fn record_chunk(state: &State, name: &str, first: Option<u64>, status: StatusCode) {
     state.chunks.lock().expect("chunks lock").push(Chunk {
         name: name.to_owned(),
@@ -869,6 +962,8 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         .lock()
         .expect("first media lock")
         .get_or_insert_with(Instant::now);
+    state.media_arrived.send_replace(true);
+    state.media_rendezvous.join().await;
 
     let behavior = &state.behavior;
     if let Some(delay) = behavior.media_missing.get(id) {

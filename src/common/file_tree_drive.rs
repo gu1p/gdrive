@@ -270,7 +270,7 @@ impl LocalTree {
             for change in &listed.changes {
                 self.actions.push(Action::Warning(format!(
                     "Warning: In '{}': {change}",
-                    path.display()
+                    local_name::tree_path(&path)
                 )));
             }
 
