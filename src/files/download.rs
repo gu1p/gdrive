@@ -43,6 +43,9 @@ pub(crate) struct Config {
     /// How many files a recursive download transfers at once, and whether it goes on after a
     /// failure.
     pub(crate) transfer: scheduler::Options,
+    /// The formats a recursive download exports Google Docs files to (`--export`); `None`
+    /// skips them.
+    pub(crate) export: Option<files::export::ExportFormats>,
 }
 
 impl Config {
@@ -806,6 +809,7 @@ mod tests {
             destination: Destination::Path(destination.to_path_buf()),
             acknowledge_abuse: false,
             transfer: crate::transfer::scheduler::Options::default(),
+            export: None,
         }
     }
 

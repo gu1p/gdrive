@@ -140,8 +140,9 @@ gdrive files download <SHORTCUT_ID> --follow-shortcuts      # download the targe
 ```
 
 `files download` works for files with binary content: PDFs, images, archives, Office files and so on.
-Google Docs, Sheets and Slides have no binary content. Use [`files export`](#google-docs-sheets-and-slides)
-for them.
+Google Docs, Sheets, Slides and Drawings have no binary content. Use
+[`files export`](#google-docs-sheets-and-slides) for them, or `--export` with a
+[recursive download](#google-docs-in-a-recursive-download).
 
 A download that breaks off (a dropped connection, an HTTP/2 `GOAWAY`) continues where it stopped, with a
 `Warning:` line on stderr, but only if the file did not change on Drive meanwhile; a changed file is
@@ -175,10 +176,12 @@ line.
 
 Things to know:
 
-- **Google Docs, Sheets and Slides are skipped.** Recursive download leaves out all Google-native files
-  and says how many at the end, for example ``3 Google Docs files skipped; use `gdrive files export` to
-  download them``. Export them one by one with `files export`. Exporting them during recursive download is
-  planned. Shortcuts are skipped and counted the same way: a recursive download does not follow them.
+- **Google Docs, Sheets, Slides and Drawings are skipped unless you pass `--export`.** Without it, a
+  recursive download leaves out all Google-native files and says how many at the end, for example
+  ``3 Google Docs files skipped; use `gdrive files export` to download them``. With
+  `--export default` it exports them; see
+  [Google Docs in a recursive download](#google-docs-in-a-recursive-download). Shortcuts are skipped and
+  counted the same way: a recursive download does not follow them.
 - **There is no `--skip`.** gdrive 2's `--skip` kept every local file that already existed. gdrive 3 has
   no exact equivalent yet. Without `--overwrite`, a recursive download stops when the local folder already
   exists. A real skip-existing mode is planned (roadmap milestone 2, item 6).
@@ -188,6 +191,67 @@ Things to know:
   as a replacement for `--skip` on folders with local edits.
 - A Drive name that contains `/` makes the download fail
   ([upstream #19](https://github.com/glotlabs/gdrive/issues/19)). A fix is planned.
+
+### Google Docs in a recursive download
+
+`--export <SPEC>` exports Google Docs, Sheets, Slides and Drawings while the folder downloads, next to
+the other files:
+
+```sh
+gdrive files download --recursive root --destination ~/backup --export default
+gdrive files download --recursive <FOLDER_ID> --export md                    # Docs as Markdown
+gdrive files download --recursive <FOLDER_ID> --export docs=pdf,sheets=csv,slides=pdf,drawings=svg
+gdrive files download --recursive <FOLDER_ID> --export md,sheets=ods,drawings=skip
+```
+
+`SPEC` is a profile, a list of `TYPE=FORMAT` overrides separated by commas, or a profile followed by
+overrides:
+
+```text
+SPEC     := PROFILE | [PROFILE ","] OVERRIDE ("," OVERRIDE)*
+PROFILE  := default | md
+OVERRIDE := TYPE=FORMAT
+TYPE     := docs | sheets | slides | drawings
+FORMAT   := one of the type's formats below | skip
+```
+
+| Type | `default` | `md` | Formats |
+|---|---|---|---|
+| `docs` (Google Docs) | `docx` | `md` | `pdf`, `docx`, `odt`, `rtf`, `txt`, `html`, `epub`, `md` |
+| `sheets` (Google Sheets) | `xlsx` | `xlsx` | `xlsx`, `ods`, `csv`, `tsv`, `pdf` |
+| `slides` (Google Slides) | `pptx` | `pptx` | `pptx`, `odp`, `pdf`, `txt` |
+| `drawings` (Google Drawings) | `png` | `png` | `png`, `jpg`, `svg`, `pdf` |
+
+Overrides apply on top of the profile, `default` when the spec starts with an override, so
+`--export sheets=ods` exports Docs as `docx` and Sheets as `ods`. `skip` leaves a type out, as without
+`--export`. Each type can be given once. `--export` needs `--recursive`.
+
+- **Names.** An export is saved as the Drive name plus the format's extension: `Report` becomes
+  `Report.docx`. A name that ends with the extension already keeps it (`notes.md` exported as `md` stays
+  `notes.md`). The name is made safe and unique in its folder like any other name, so a document `report`
+  and a file `report.docx` in the same Drive folder do not overwrite each other: one of them gets a
+  `~<8 hex digits>` suffix, with a `Warning:` line that says which.
+- **Reruns and modification time.** An exported file gets the document's last modification time on
+  Drive, to the millisecond. Running the same download again into the same destination needs
+  `--overwrite`, because without it the existing top folder stops the download (see above). On such a
+  rerun, an export whose local file has exactly the document's time is unchanged: it is counted as
+  `unchanged` and not exported again, so a backup run with `--overwrite --export default` only exports
+  the documents that changed. Every other existing export is exported again and replaced, as `--overwrite`
+  replaces other files. The check compares only that time, not the content: any edit of the document,
+  also within the same second, changes it, and so does a local edit of the file. On filesystems that keep
+  coarser times (FAT, exFAT, HFS+) the times never match and every run exports everything again. Files
+  with content keep the time of the download, as before, and are compared by MD5 checksum.
+- **Size limit.** Google exports at most 10 MB per file. A larger export fails with an error that says so
+  (`the exported file would be larger than the 10 MB that the Drive API exports`); try another format, or
+  download that file from drive.google.com. Like any failed file, it stops the download unless
+  `--continue-on-error`.
+- **Not exportable.** Google Forms, Sites, My Maps, Apps Script projects, Vids and other Google types that
+  gdrive has no export format for are skipped with a `Warning: skipping '<path>' (<type>): ...` line each,
+  and counted at the end: `2 Google Workspace files skipped; gdrive has no export format for their types`.
+- `csv` and `tsv` hold only the first sheet, and Drive checks no checksum for exports: gdrive checks the
+  size Drive announces, when it does.
+- The output says `Found N Google Docs files to export` after the listing, `Exporting document
+  '<path>'` per export, and `Exported N Google Docs files` at the end, after the `Downloaded ...` line.
 
 ## Upload
 
@@ -256,8 +320,8 @@ The counts are files:
 | Count | Meaning |
 |---|---|
 | transferred | Downloaded or uploaded. The size in parentheses is their total. |
-| unchanged | Not downloaded: with `--overwrite`, the local file has the same MD5 checksum as the Drive file. |
-| skipped | Not transferable: Google Docs, Sheets and Slides (use `files export`) and shortcuts. |
+| unchanged | Not downloaded: with `--overwrite`, the local file has the same MD5 checksum as the Drive file; or an export whose local file has the document's modification time. |
+| skipped | Not transferable: Google Docs, Sheets, Slides and Drawings without `--export` (or with `skip`), Google types that cannot be exported, and shortcuts. |
 | failed | The file failed; its error is printed above. |
 | cancelled | Not done because the command stopped (a failure without `--continue-on-error`, Ctrl-C) or because the folder it is in failed. |
 
@@ -302,23 +366,30 @@ only. To change a folder, upload it again with `files upload --recursive`.
 
 ## Google Docs, Sheets and Slides
 
-Export a Google file to a local file. The file extension selects the format:
+Export a Google file to a local file. The file extension selects the format, or `--format`:
 
 ```sh
 gdrive files export <FILE_ID> notes.docx
 gdrive files export <FILE_ID> budget.xlsx
 gdrive files export <FILE_ID> slides.pdf --overwrite
+gdrive files export <FILE_ID> notes --format md      # writes the file `notes`
 ```
 
 | Google file | Extensions |
 |---|---|
-| Docs | `pdf`, `docx`, `odt`, `rtf`, `txt`, `html`, `epub` |
+| Docs | `pdf`, `docx`, `odt`, `rtf`, `txt`, `html`, `epub`, `md` |
 | Sheets | `xlsx`, `ods`, `csv`, `tsv`, `pdf` |
 | Slides | `pdf`, `pptx`, `odp`, `txt` |
+| Drawings | `pdf`, `jpg` (or `jpeg`), `png`, `svg` |
 
+- `--format <EXTENSION>` chooses the format; the path is then used as given, with any extension or none.
 - `csv` and `tsv` contain only the first sheet. To keep all sheets, export to `xlsx` or `ods`
   ([upstream #98](https://github.com/glotlabs/gdrive/issues/98)).
-- Google limits an export to 10 MB. Larger documents fail to export.
+- Google limits an export to 10 MB. A larger export fails with an error that names the limit.
+- The exported file gets the document's last modification time on Drive. An existing file at the path is
+  an error without `--overwrite`; with it, gdrive always exports again.
+- To export every document of a folder, use
+  [`--export` with a recursive download](#google-docs-in-a-recursive-download).
 
 Import a local file and convert it to a Google file:
 
@@ -376,7 +447,7 @@ Without options, `permissions share` makes the file readable by anyone who has t
 | `gdrive update <ID> <FILE>` | `gdrive files update <ID> <FILE>` |
 | `gdrive mkdir <NAME>` | `gdrive files mkdir <NAME>` |
 | `gdrive delete <ID>` | `gdrive files delete <ID>` |
-| `gdrive export --mime <TYPE> <ID>` | `gdrive files export <ID> <FILE.ext>` |
+| `gdrive export --mime <TYPE> <ID>` | `gdrive files export <ID> <FILE.ext>`, or `--format <EXT>` for another path |
 | `gdrive import <FILE>` | `gdrive files import <FILE>` |
 | `gdrive share <ID>` | `gdrive permissions share <ID>` |
 | `gdrive share list <ID>` | `gdrive permissions list <ID>` |

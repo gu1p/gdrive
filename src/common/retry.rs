@@ -488,7 +488,7 @@ fn error_reasons(error: Option<&serde_json::Value>) -> Vec<String> {
 }
 
 /// `rateLimitExceeded` and `RATE_LIMIT_EXCEEDED` are the same reason.
-fn is_reason(reason: &str, known: &str) -> bool {
+pub(crate) fn is_reason(reason: &str, known: &str) -> bool {
     let normalize = |s: &str| {
         s.chars()
             .filter(|c| *c != '_')

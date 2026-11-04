@@ -23,11 +23,13 @@ pub(crate) const MIME_TYPE_DRIVE_DOCUMENT: &str = "application/vnd.google-apps.d
 pub(crate) const MIME_TYPE_DRIVE_SHORTCUT: &str = "application/vnd.google-apps.shortcut";
 pub(crate) const MIME_TYPE_DRIVE_SPREADSHEET: &str = "application/vnd.google-apps.spreadsheet";
 pub(crate) const MIME_TYPE_DRIVE_PRESENTATION: &str = "application/vnd.google-apps.presentation";
+pub(crate) const MIME_TYPE_DRIVE_DRAWING: &str = "application/vnd.google-apps.drawing";
 
 create_mime_from_str!(
     MIME_TYPE_DRIVE_DOCUMENT => MIME_TYPE_DRIVE_DOCUMENT_MIME: "drive document" ,
     MIME_TYPE_DRIVE_SPREADSHEET => MIME_TYPE_DRIVE_SPREADSHEET_MIME: "drive spreadsheet",
     MIME_TYPE_DRIVE_PRESENTATION => MIME_TYPE_DRIVE_PRESENTATION_MIME: "drive presentation",
+    MIME_TYPE_DRIVE_DRAWING => MIME_TYPE_DRIVE_DRAWING_MIME: "drive drawing",
 );
 
 pub(crate) const EXTENSION_DOC: &str = "doc";
@@ -51,6 +53,7 @@ pub(crate) const EXTENSION_ODP: &str = "odp";
 pub(crate) const EXTENSION_EPUB: &str = "epub";
 pub(crate) const EXTENSION_TXT: &str = "txt";
 pub(crate) const EXTENSION_MD: &str = "md";
+pub(crate) const EXTENSION_SVG: &str = "svg";
 
 pub(crate) const MIME_TYPE_DOC: &str = "application/msword";
 pub(crate) const MIME_TYPE_DOCX: &str =
@@ -76,6 +79,7 @@ pub(crate) const MIME_TYPE_ODP: &str = "application/vnd.oasis.opendocument.prese
 pub(crate) const MIME_TYPE_EPUB: &str = "application/epub+zip";
 pub(crate) const MIME_TYPE_TXT: &str = "text/plain";
 pub(crate) const MIME_TYPE_MD: &str = "text/markdown";
+pub(crate) const MIME_TYPE_SVG: &str = "image/svg+xml";
 
 create_mime_from_str!(
     MIME_TYPE_DOC => MIME_TYPE_DOC_MIME: "microsoft doc",
@@ -99,16 +103,30 @@ create_mime_from_str!(
     MIME_TYPE_EPUB => MIME_TYPE_EPUB_MIME: "epub document",
     MIME_TYPE_TXT => MIME_TYPE_TXT_MIME: "plain text",
     MIME_TYPE_MD => MIME_TYPE_MD_MIME: "markdown",
+    MIME_TYPE_SVG => MIME_TYPE_SVG_MIME: "svg image",
 );
 
+/// A Google Workspace type that Drive exports (`files.export`). The formats are those of
+/// Google's table, <https://developers.google.com/workspace/drive/api/guides/ref-export-formats>,
+/// that gdrive knows a file extension for. The other Workspace types (Forms, Sites, My Maps,
+/// Apps Script, Vids, ...) have no `files.export` format gdrive supports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DocType {
     Document,
     Spreadsheet,
     Presentation,
+    Drawing,
 }
 
 impl DocType {
+    #[cfg(test)]
+    pub(crate) const ALL: [DocType; 4] = [
+        DocType::Document,
+        DocType::Spreadsheet,
+        DocType::Presentation,
+        DocType::Drawing,
+    ];
+
     const IMPORT_EXTENSION_MAP: [(FileExtension, DocType); 19] = [
         (FileExtension::Doc, DocType::Document),
         (FileExtension::Docx, DocType::Document),
@@ -162,6 +180,7 @@ impl DocType {
             MIME_TYPE_DRIVE_DOCUMENT => Some(DocType::Document),
             MIME_TYPE_DRIVE_SPREADSHEET => Some(DocType::Spreadsheet),
             MIME_TYPE_DRIVE_PRESENTATION => Some(DocType::Presentation),
+            MIME_TYPE_DRIVE_DRAWING => Some(DocType::Drawing),
             _ => None,
         }
     }
@@ -199,6 +218,14 @@ impl DocType {
                 FileExtension::Odp,
                 FileExtension::Txt,
             ],
+
+            DocType::Drawing => &[
+                FileExtension::Pdf,
+                FileExtension::Jpg,
+                FileExtension::Jpeg,
+                FileExtension::Png,
+                FileExtension::Svg,
+            ],
         }
     }
 
@@ -208,6 +235,7 @@ impl DocType {
             DocType::Document => &MIME_TYPE_DRIVE_DOCUMENT_MIME,
             DocType::Spreadsheet => &MIME_TYPE_DRIVE_SPREADSHEET_MIME,
             DocType::Presentation => &MIME_TYPE_DRIVE_PRESENTATION_MIME,
+            DocType::Drawing => &MIME_TYPE_DRIVE_DRAWING_MIME,
         }
     }
 }
@@ -238,6 +266,7 @@ impl fmt::Display for DocType {
             DocType::Document => write!(f, "document"),
             DocType::Spreadsheet => write!(f, "spreadsheet"),
             DocType::Presentation => write!(f, "presentation"),
+            DocType::Drawing => write!(f, "drawing"),
         }
     }
 }
@@ -265,6 +294,7 @@ pub(crate) enum FileExtension {
     Epub,
     Txt,
     Md,
+    Svg,
 }
 
 impl FileExtension {
@@ -292,6 +322,7 @@ impl FileExtension {
                 | (Self::Epub, Self::Epub)
                 | (Self::Txt, Self::Txt)
                 | (Self::Md, Self::Md)
+                | (Self::Svg, Self::Svg)
         )
     }
 }
@@ -320,6 +351,7 @@ impl fmt::Display for FileExtension {
             FileExtension::Epub => EXTENSION_EPUB,
             FileExtension::Txt => EXTENSION_TXT,
             FileExtension::Md => EXTENSION_MD,
+            FileExtension::Svg => EXTENSION_SVG,
         };
 
         f.write_str(s)
@@ -329,9 +361,13 @@ impl fmt::Display for FileExtension {
 impl FileExtension {
     #[must_use]
     pub(crate) fn from_path(path: &Path) -> Option<FileExtension> {
-        let extension = path.extension()?.to_str()?;
+        Self::from_name(path.extension()?.to_str()?)
+    }
 
-        match extension {
+    /// The extension `name`, without the dot, in lower case.
+    #[must_use]
+    pub(crate) fn from_name(name: &str) -> Option<FileExtension> {
+        match name {
             EXTENSION_DOC => Some(FileExtension::Doc),
             EXTENSION_DOCX => Some(FileExtension::Docx),
             EXTENSION_ODT => Some(FileExtension::Odt),
@@ -353,6 +389,7 @@ impl FileExtension {
             EXTENSION_EPUB => Some(FileExtension::Epub),
             EXTENSION_TXT => Some(FileExtension::Txt),
             EXTENSION_MD => Some(FileExtension::Md),
+            EXTENSION_SVG => Some(FileExtension::Svg),
             _ => None,
         }
     }
@@ -381,6 +418,7 @@ impl FileExtension {
             FileExtension::Epub => &MIME_TYPE_EPUB_MIME,
             FileExtension::Txt => &MIME_TYPE_TXT_MIME,
             FileExtension::Md => &MIME_TYPE_MD_MIME,
+            FileExtension::Svg => &MIME_TYPE_SVG_MIME,
         }
     }
 }
@@ -422,6 +460,23 @@ mod tests {
     }
 
     #[test]
+    fn drawings_export_to_images_and_pdf() {
+        assert_eq!(
+            DocType::from_mime_type("application/vnd.google-apps.drawing"),
+            Some(DocType::Drawing)
+        );
+        for name in ["pdf", "jpg", "png", "svg"] {
+            let extension = FileExtension::from_name(name).unwrap();
+            assert!(DocType::Drawing.can_export_to(extension), "{name}");
+        }
+        assert_eq!(
+            FileExtension::Svg.get_export_mime().essence_str(),
+            "image/svg+xml"
+        );
+        assert!(!DocType::Document.can_export_to(FileExtension::Svg));
+    }
+
+    #[test]
     fn markdown_imports_as_a_document() {
         assert_eq!(
             DocType::from_file_path(Path::new("notes.md")),
@@ -432,11 +487,11 @@ mod tests {
 
     #[test]
     fn every_extension_round_trips_through_its_name() {
-        let all = DocType::SUPPORTED_INPUT_TYPES
-            .iter()
-            .chain(DocType::Document.supported_export_types())
-            .chain(DocType::Spreadsheet.supported_export_types())
-            .chain(DocType::Presentation.supported_export_types());
+        let all = DocType::SUPPORTED_INPUT_TYPES.iter().chain(
+            DocType::ALL
+                .iter()
+                .flat_map(|doc_type| doc_type.supported_export_types()),
+        );
 
         for &extension in all {
             let path = format!("file.{extension}");

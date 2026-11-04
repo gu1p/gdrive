@@ -11,8 +11,14 @@ use std::{
 
 use super::{download_directory, PartialFiles};
 use crate::{
-    common::drive_file::MIME_TYPE_DRIVE_FOLDER,
-    files::download::{errors, Config, Destination, ExistingFileAction},
+    common::drive_file::{
+        MIME_TYPE_DRIVE_DOCUMENT, MIME_TYPE_DRIVE_DRAWING, MIME_TYPE_DRIVE_FOLDER,
+        MIME_TYPE_DRIVE_PRESENTATION, MIME_TYPE_DRIVE_SPREADSHEET,
+    },
+    files::{
+        download::{errors, Config, Destination, ExistingFileAction},
+        export::ExportFormats,
+    },
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
         scheduler::{
@@ -31,6 +37,7 @@ fn config(destination: &Path, jobs: usize, continue_on_error: bool) -> Config {
         destination: Destination::Path(destination.to_path_buf()),
         acknowledge_abuse: false,
         transfer: Options::new(NonZeroUsize::new(jobs).unwrap(), continue_on_error),
+        export: None,
     }
 }
 
@@ -384,8 +391,10 @@ async fn ctrl_c_removes_only_the_temporary_files_of_the_cancelled_downloads() {
     std::fs::write(root.join(".gdrive-s1.part"), "stale").unwrap();
     std::fs::write(root.join(".gdrive-s2-2.part"), "other process").unwrap();
 
-    // Once both downloads write their temporary files, another gdrive takes the next names,
-    // and then Ctrl-C comes.
+    // Once done.bin is complete and both other downloads write their temporary files, another
+    // gdrive takes the next names, and then Ctrl-C comes. done.bin is waited for, and its job
+    // given a moment to return after the rename: under load it may finish after the others
+    // started writing.
     let cancel = {
         let root = root.clone();
         async move {
@@ -632,4 +641,600 @@ async fn an_existing_local_file_fails_without_overwrite() {
     );
     assert_eq!(std::fs::read_to_string(root.join("x.txt")).unwrap(), "mine");
     assert_eq!(server.media(), Vec::<String>::new());
+}
+
+/// `config` exporting per `spec`.
+fn exporting(destination: &Path, spec: &str, continue_on_error: bool) -> Config {
+    Config {
+        export: Some(ExportFormats::parse(spec).unwrap()),
+        ..config(destination, 2, continue_on_error)
+    }
+}
+
+const DOCX: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const XLSX: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const PPTX: &str = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+
+/// A blob, a document of each exportable type (one in a subfolder) and a form, which has no
+/// export format.
+fn mixed_tree() -> Vec<FakeFile> {
+    vec![
+        FakeFile::blob("x", "x.txt", "root", "x"),
+        FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, "doc!")
+            .modified("2024-05-06T07:08:09.123Z"),
+        FakeFile::native(
+            "sheet",
+            "budget",
+            "root",
+            MIME_TYPE_DRIVE_SPREADSHEET,
+            "sheet!",
+        ),
+        FakeFile::native(
+            "slides",
+            "deck",
+            "root",
+            MIME_TYPE_DRIVE_PRESENTATION,
+            "slides!",
+        ),
+        FakeFile::native(
+            "drawing",
+            "diagram",
+            "root",
+            MIME_TYPE_DRIVE_DRAWING,
+            "drawing!",
+        ),
+        FakeFile::native(
+            "form",
+            "survey",
+            "root",
+            "application/vnd.google-apps.form",
+            "",
+        ),
+        FakeFile::folder("a", "a", "root"),
+        FakeFile::native("notes", "notes", "a", MIME_TYPE_DRIVE_DOCUMENT, "notes!"),
+    ]
+}
+
+/// The exports of `server`, sorted, as (file id, MIME type).
+fn exports(server: &FakeDrive) -> Vec<(String, String)> {
+    let mut exports = server.exports();
+    exports.sort();
+    exports
+}
+
+fn pairs(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|&(a, b)| (a.to_owned(), b.to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn the_default_profile_exports_every_exportable_type_and_counts_the_form_as_skipped() {
+    let server = FakeDrive::start(mixed_tree(), Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let downloaded = download(
+        &server,
+        &exporting(destination.path(), "default", false),
+        future::pending(),
+    )
+    .await;
+
+    downloaded.result.unwrap();
+    let root = destination.path().join("Root");
+    assert_eq!(
+        entries(&root),
+        [
+            "a",
+            "budget.xlsx",
+            "deck.pptx",
+            "diagram.png",
+            "report.docx",
+            "x.txt"
+        ]
+    );
+    assert_eq!(entries(&root.join("a")), ["notes.docx"]);
+    for (path, content) in [
+        ("Root/report.docx", "doc!"),
+        ("Root/budget.xlsx", "sheet!"),
+        ("Root/deck.pptx", "slides!"),
+        ("Root/diagram.png", "drawing!"),
+        ("Root/a/notes.docx", "notes!"),
+        ("Root/x.txt", "x"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(local(destination.path(), path)).unwrap(),
+            content,
+            "{path}"
+        );
+    }
+    assert_eq!(
+        exports(&server),
+        pairs(&[
+            ("doc", DOCX),
+            ("drawing", "image/png"),
+            ("notes", DOCX),
+            ("sheet", XLSX),
+            ("slides", PPTX),
+        ])
+    );
+    assert_eq!(server.media(), ["x"]);
+
+    // The export has the document's modification time.
+    let modified = std::fs::metadata(root.join("report.docx"))
+        .unwrap()
+        .modified()
+        .unwrap();
+    let modified = chrono::DateTime::<chrono::Utc>::from(modified);
+    assert_eq!(modified.timestamp_millis(), 1_714_979_289_123);
+
+    let out = downloaded.out.lines();
+    assert!(
+        out.contains(&format!(
+            "Exporting document '{}'",
+            shown("Root/report.docx")
+        )),
+        "{out:?}"
+    );
+    assert!(out.contains(&format!(
+        "Exporting drawing '{}'",
+        shown("Root/diagram.png")
+    )));
+    assert!(out.contains(&String::from("Found 5 Google Docs files to export")));
+    assert_eq!(
+        out[out.len() - 2..],
+        [
+            String::from("Downloaded 1 files in 2 directories with a total size of 1 B"),
+            String::from("Exported 5 Google Docs files"),
+        ]
+    );
+    // 1 + 4 + 6 + 7 + 8 + 6 bytes.
+    assert_eq!(
+        downloaded.err.lines(),
+        [
+            "Warning: skipping 'Root/survey' (application/vnd.google-apps.form): gdrive has no \
+            export format for this type",
+            "1 Google Workspace file skipped; gdrive has no export format for their types \
+            (Forms, Sites, My Maps, Apps Script, ...)",
+            "Summary: 6 transferred (32 B), 0 unchanged, 1 skipped, 0 failed, 0 cancelled",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn overrides_choose_the_format_of_each_type() {
+    let server = FakeDrive::start(mixed_tree(), Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let downloaded = download(
+        &server,
+        &exporting(
+            destination.path(),
+            "docs=pdf,sheets=csv,slides=pdf,drawings=svg",
+            false,
+        ),
+        future::pending(),
+    )
+    .await;
+
+    downloaded.result.unwrap();
+    let root = destination.path().join("Root");
+    assert_eq!(
+        entries(&root),
+        [
+            "a",
+            "budget.csv",
+            "deck.pdf",
+            "diagram.svg",
+            "report.pdf",
+            "x.txt"
+        ]
+    );
+    assert_eq!(entries(&root.join("a")), ["notes.pdf"]);
+    assert_eq!(
+        exports(&server),
+        pairs(&[
+            ("doc", "application/pdf"),
+            ("drawing", "image/svg+xml"),
+            ("notes", "application/pdf"),
+            ("sheet", "text/csv"),
+            ("slides", "application/pdf"),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn the_md_profile_exports_documents_as_markdown_and_skip_leaves_a_type_out() {
+    let server = FakeDrive::start(mixed_tree(), Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let downloaded = download(
+        &server,
+        &exporting(destination.path(), "md,sheets=skip,drawings=skip", false),
+        future::pending(),
+    )
+    .await;
+
+    downloaded.result.unwrap();
+    let root = destination.path().join("Root");
+    assert_eq!(entries(&root), ["a", "deck.pptx", "report.md", "x.txt"]);
+    assert_eq!(entries(&root.join("a")), ["notes.md"]);
+    assert_eq!(
+        exports(&server),
+        pairs(&[
+            ("doc", "text/markdown"),
+            ("notes", "text/markdown"),
+            ("slides", PPTX),
+        ])
+    );
+    let err = downloaded.err.lines();
+    assert!(
+        err.contains(&String::from(
+            "2 Google Docs files skipped; use `gdrive files export` to download them"
+        )),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.last().unwrap(),
+        "Summary: 4 transferred (18 B), 0 unchanged, 3 skipped, 0 failed, 0 cancelled"
+    );
+}
+
+#[tokio::test]
+async fn an_export_and_a_file_of_the_same_name_get_distinct_local_names() {
+    let files = vec![
+        FakeFile::blob("b-report", "report.docx", "root", "the uploaded file"),
+        FakeFile::native(
+            "d-report",
+            "report",
+            "root",
+            MIME_TYPE_DRIVE_DOCUMENT,
+            "the document",
+        ),
+        // Already has the extension: it is not added twice.
+        FakeFile::native(
+            "d-notes",
+            "notes.md",
+            "root",
+            MIME_TYPE_DRIVE_DOCUMENT,
+            "# notes",
+        ),
+    ];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let downloaded = download(
+        &server,
+        &exporting(destination.path(), "md,docs=docx", false),
+        future::pending(),
+    )
+    .await;
+
+    downloaded.result.unwrap();
+    let root = destination.path().join("Root");
+    let names = entries(&root);
+    assert_eq!(names.len(), 3, "{names:?}");
+    assert_eq!(names[0], "notes.md.docx");
+    assert_eq!(names[1], "report.docx");
+    assert!(
+        names[2].starts_with("report~")
+            && Path::new(&names[2]).extension() == Some("docx".as_ref()),
+        "{names:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.docx")).unwrap(),
+        "the uploaded file",
+        "the lower id keeps the name"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join(&names[2])).unwrap(),
+        "the document"
+    );
+    let err = downloaded.err.lines();
+    assert!(
+        err[0].starts_with("Warning: In 'Root': 'report.docx' (id d-report) is saved as 'report~"),
+        "{err:?}"
+    );
+}
+
+/// A tree with an export Drive refuses as too large next to two that work.
+fn with_too_large_export() -> (Vec<FakeFile>, Behavior) {
+    let files = vec![
+        FakeFile::native("big", "big", "root", MIME_TYPE_DRIVE_DOCUMENT, "huge"),
+        FakeFile::native("small", "small", "root", MIME_TYPE_DRIVE_DOCUMENT, "small"),
+        FakeFile::blob("x", "x.txt", "root", "x"),
+    ];
+    let behavior = Behavior {
+        export_too_large: HashSet::from([String::from("big")]),
+        ..Behavior::default()
+    };
+    (files, behavior)
+}
+
+#[tokio::test]
+async fn an_export_over_the_size_limit_fails_and_the_others_finish_with_continue_on_error() {
+    let (files, behavior) = with_too_large_export();
+    let server = FakeDrive::start(files, behavior).await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let downloaded = download(
+        &server,
+        &exporting(destination.path(), "default", true),
+        future::pending(),
+    )
+    .await;
+
+    assert_eq!(
+        downloaded.error(),
+        "Error: the recursive download is incomplete: 1 file failed"
+    );
+    let err = downloaded.err.lines();
+    assert_eq!(
+        err[0],
+        format!(
+            "Error: unable to export '{}': the exported file would be larger than the 10 MB \
+            that the Drive API exports; try another format, or download the file from \
+            drive.google.com: Drive answered 403 Forbidden: This file is too large to be \
+            exported.",
+            shown("Root/big.docx")
+        )
+    );
+    assert_eq!(
+        err.last().unwrap(),
+        "Summary: 2 transferred (6 B), 0 unchanged, 0 skipped, 1 failed, 0 cancelled"
+    );
+    assert_eq!(
+        entries(&destination.path().join("Root")),
+        ["small.docx", "x.txt"],
+        "no temporary file is left"
+    );
+    let big = server
+        .exports()
+        .iter()
+        .filter(|(id, _)| id == "big")
+        .count();
+    assert_eq!(big, 1, "a too large export is not repeated");
+}
+
+#[tokio::test]
+async fn an_export_over_the_size_limit_stops_the_download_by_default() {
+    let (files, behavior) = with_too_large_export();
+    let server = FakeDrive::start(files, behavior).await;
+    let destination = tempfile::tempdir().unwrap();
+
+    let downloaded = download(
+        &server,
+        &exporting(destination.path(), "default", false),
+        future::pending(),
+    )
+    .await;
+
+    let error = downloaded.error();
+    assert!(
+        error.starts_with("Error: the recursive download is incomplete: 1 file failed"),
+        "{error}"
+    );
+    assert!(error.contains("--continue-on-error"), "{error}");
+    assert!(downloaded.err.lines()[0].contains("10 MB"));
+}
+
+#[tokio::test]
+async fn an_existing_export_fails_without_overwrite_and_is_replaced_with_it() {
+    let files = vec![FakeFile::native(
+        "doc",
+        "report",
+        "root",
+        MIME_TYPE_DRIVE_DOCUMENT,
+        "new",
+    )];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let destination = tempfile::tempdir().unwrap();
+    let root = destination.path().join("Root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(root.join("report.docx"), "mine").unwrap();
+
+    let strict = download(
+        &server,
+        &exporting(destination.path(), "default", false),
+        future::pending(),
+    )
+    .await;
+    let err = strict.err.lines();
+    assert!(
+        err[0].starts_with(&format!(
+            "Error: unable to export '{}': file '",
+            shown("Root/report.docx")
+        )) && err[0].ends_with("' already exists, use --overwrite to overwrite it"),
+        "{err:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.docx")).unwrap(),
+        "mine"
+    );
+    assert_eq!(server.exports(), Vec::<(String, String)>::new());
+
+    let overwrite = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..exporting(destination.path(), "default", false)
+    };
+    download(&server, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("report.docx")).unwrap(),
+        "new"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_export_is_not_exported_again() {
+    let document = |modified: &str| {
+        vec![
+            FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, modified)
+                .modified(modified),
+            // Without modifiedTime nothing tells that it is unchanged.
+            FakeFile::native("undated", "undated", "root", MIME_TYPE_DRIVE_DOCUMENT, "x"),
+        ]
+    };
+    let destination = tempfile::tempdir().unwrap();
+    let report = local(destination.path(), "Root/report.docx");
+    let overwrite = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..exporting(destination.path(), "default", false)
+    };
+
+    let server = FakeDrive::start(document("2024-05-06T07:08:09.123Z"), Behavior::default()).await;
+    download(&server, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    assert_eq!(server.exports().len(), 2);
+
+    // Unchanged on Drive: left alone, with --overwrite and without.
+    for config in [&overwrite, &exporting(destination.path(), "default", true)] {
+        let again = download(&server, config, future::pending()).await;
+        let summary = again.err.lines().last().unwrap().clone();
+        if config.existing_file_action == ExistingFileAction::Overwrite {
+            again.result.unwrap();
+            assert_eq!(
+                summary,
+                "Summary: 1 transferred (1 B), 1 unchanged, 0 skipped, 0 failed, 0 cancelled"
+            );
+            // Completed exports, not found ones.
+            assert_eq!(
+                again.out.lines().last().unwrap(),
+                "Exported 1 Google Docs file; 1 unchanged, not exported again"
+            );
+        } else {
+            // The undated export exists and cannot be told unchanged.
+            assert_eq!(
+                summary,
+                "Summary: 0 transferred (0 B), 1 unchanged, 0 skipped, 1 failed, 0 cancelled"
+            );
+        }
+    }
+    let exported = server.exports();
+    assert_eq!(
+        exported.iter().filter(|(id, _)| id == "doc").count(),
+        1,
+        "{exported:?}"
+    );
+
+    // Edited on Drive: exported again with --overwrite, an error without.
+    let edited = FakeDrive::start(document("2024-05-06T07:08:10Z"), Behavior::default()).await;
+    let strict = download(
+        &edited,
+        &exporting(destination.path(), "default", true),
+        future::pending(),
+    )
+    .await;
+    assert!(strict
+        .error()
+        .starts_with("Error: the recursive download is incomplete: 2 files failed"));
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "2024-05-06T07:08:09.123Z"
+    );
+    download(&edited, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "2024-05-06T07:08:10Z"
+    );
+}
+
+#[tokio::test]
+async fn an_edit_in_the_same_second_as_the_last_export_is_exported_again() {
+    let document = |modified: &str| {
+        vec![
+            FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, modified)
+                .modified(modified),
+        ]
+    };
+    let destination = tempfile::tempdir().unwrap();
+    let report = local(destination.path(), "Root/report.docx");
+    let overwrite = Config {
+        existing_file_action: ExistingFileAction::Overwrite,
+        ..exporting(destination.path(), "default", false)
+    };
+
+    let first = FakeDrive::start(document("2024-05-06T07:08:09.123Z"), Behavior::default()).await;
+    download(&first, &overwrite, future::pending())
+        .await
+        .result
+        .unwrap();
+    let modified = std::fs::metadata(&report).unwrap().modified().unwrap();
+    assert_eq!(
+        chrono::DateTime::<chrono::Utc>::from(modified),
+        chrono::DateTime::parse_from_rfc3339("2024-05-06T07:08:09.123Z").unwrap(),
+        "the export has the document's time to the millisecond"
+    );
+
+    let edited = FakeDrive::start(document("2024-05-06T07:08:09.456Z"), Behavior::default()).await;
+    let again = download(&edited, &overwrite, future::pending()).await;
+
+    again.result.unwrap();
+    assert_eq!(edited.exports().len(), 1, "exported again");
+    assert_eq!(
+        std::fs::read_to_string(&report).unwrap(),
+        "2024-05-06T07:08:09.456Z"
+    );
+    assert_eq!(
+        again.err.lines().last().unwrap(),
+        "Summary: 1 transferred (24 B), 0 unchanged, 0 skipped, 0 failed, 0 cancelled"
+    );
+}
+
+#[tokio::test]
+async fn a_rerun_with_overwrite_through_the_command_skips_the_unchanged_export() {
+    let files = vec![
+        // The root folder, for the command's `files.get`.
+        FakeFile::folder("root", "Root", "none"),
+        FakeFile::native("doc", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, "doc!")
+            .modified("2024-05-06T07:08:09.123Z"),
+        FakeFile::blob("x", "x.txt", "root", "x"),
+    ];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let hub = server.hub();
+    let destination = tempfile::tempdir().unwrap();
+    let run = |existing_file_action| Config {
+        existing_file_action,
+        ..exporting(destination.path(), "default", false)
+    };
+
+    super::super::download_with_hub(&hub, run(ExistingFileAction::Abort))
+        .await
+        .unwrap();
+    assert_eq!(server.exports().len(), 1);
+
+    // Into an existing destination, only --overwrite gets past the existing top folder.
+    let error = super::super::download_with_hub(&hub, run(ExistingFileAction::Abort))
+        .await
+        .unwrap_err();
+    assert!(
+        crate::error_message(&error).ends_with("already exists, use --overwrite to overwrite it"),
+        "{error}"
+    );
+
+    super::super::download_with_hub(&hub, run(ExistingFileAction::Overwrite))
+        .await
+        .unwrap();
+    assert_eq!(
+        server.exports().len(),
+        1,
+        "the unchanged export is not requested"
+    );
+    assert_eq!(
+        server.media(),
+        ["x"],
+        "the identical file is not downloaded either"
+    );
+    assert_eq!(
+        std::fs::read_to_string(local(destination.path(), "Root/report.docx")).unwrap(),
+        "doc!"
+    );
 }

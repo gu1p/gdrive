@@ -15,10 +15,12 @@ mod version;
 use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
+use common::drive_file::FileExtension;
 use common::{
     delegate::{ChunkSize, MultipartThreshold},
     permission,
 };
+use files::export::ExportFormats;
 use files::list::{ListQuery, ListSortOrder};
 use mime::Mime;
 use transfer::scheduler::Options;
@@ -336,6 +338,10 @@ enum FileCommand {
         /// With --recursive: when a file fails, go on with the others instead of stopping. The command still exits with an error
         #[arg(long)]
         continue_on_error: bool,
+
+        /// With --recursive: export Google Docs, Sheets, Slides and Drawings instead of skipping them. SPEC is a profile, `default` (docs=docx, sheets=xlsx, slides=pptx, drawings=png) or `md` (docs=md, the rest as default), and/or TYPE=FORMAT overrides separated by commas, for example `md,sheets=ods` or `docs=pdf,drawings=skip`. Types: docs, sheets, slides, drawings; formats as for `files export`, or skip
+        #[arg(long, value_name = "SPEC", requires = "recursive", value_parser = ExportFormats::parse)]
+        export: Option<ExportFormats>,
     },
 
     /// Upload file
@@ -519,12 +525,16 @@ enum FileCommand {
         /// File id
         file_id: String,
 
-        /// File path to export to. The file extension will determine the export format. Documents: pdf, odt, docx, epub, rtf, txt, html, md. Spreadsheets: csv, tsv, ods, xlsx, pdf. Presentations: pdf, pptx, odp, txt
+        /// File path to export to. The file extension will determine the export format. Documents: pdf, odt, docx, epub, rtf, txt, html, md. Spreadsheets: csv, tsv, ods, xlsx, pdf. Presentations: pdf, pptx, odp, txt. Drawings: pdf, jpg (or jpeg), png, svg
         file_path: PathBuf,
 
         /// Overwrite existing files
         #[arg(short, long)]
         overwrite: bool,
+
+        /// Export to this format, a file extension such as pdf or md, instead of the one the extension of the file path names. The path is then used as given
+        #[arg(long, value_name = "EXTENSION", value_parser = parse_export_format)]
+        format: Option<FileExtension>,
     },
 }
 
@@ -586,6 +596,16 @@ enum PermissionCommand {
 }
 
 /// `--jobs`: 1 to [`Options::MAX_JOBS`].
+/// A `--format` of `files export`: a known file extension, without the dot.
+fn parse_export_format(value: &str) -> Result<FileExtension, String> {
+    FileExtension::from_name(&value.to_ascii_lowercase()).ok_or_else(|| {
+        format!(
+            "unknown format '{value}', use a file extension such as pdf, docx, xlsx, pptx, md or \
+            png"
+        )
+    })
+}
+
 fn parse_jobs(value: &str) -> Result<NonZeroUsize, String> {
     let jobs = value.parse::<usize>().map_err(|err| err.to_string())?;
     NonZeroUsize::new(jobs)
@@ -815,6 +835,7 @@ async fn handle_files_command(
             acknowledge_abuse,
             jobs,
             continue_on_error,
+            export,
         } => {
             let existing_file_action = if overwrite {
                 files::download::ExistingFileAction::Overwrite
@@ -838,6 +859,7 @@ async fn handle_files_command(
                 destination: dst,
                 acknowledge_abuse,
                 transfer: Options::new(jobs, continue_on_error),
+                export,
             })
             .await?;
         }
@@ -976,6 +998,7 @@ async fn handle_files_command(
             file_id,
             file_path,
             overwrite,
+            format,
         } => {
             let existing_file_action = if overwrite {
                 files::export::ExistingFileAction::Overwrite
@@ -987,6 +1010,7 @@ async fn handle_files_command(
                 file_id,
                 file_path,
                 existing_file_action,
+                format,
             })
             .await?;
         }
@@ -1178,8 +1202,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        parse_jobs, parse_positive_usize, AccountCommand, Cli, Command, DriveCommand, FileCommand,
-        PermissionCommand,
+        parse_jobs, parse_positive_usize, AccountCommand, Cli, Command, DriveCommand,
+        ExportFormats, FileCommand, PermissionCommand,
     };
     use crate::files::list::ListQuery;
 
@@ -1292,6 +1316,45 @@ mod tests {
             panic!("expected files upload");
         };
         assert_eq!((jobs.get(), continue_on_error), (2, true));
+    }
+
+    #[test]
+    fn export_takes_a_spec_and_needs_recursive() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["gdrive", "files", "download", "id"].iter().chain(args))
+        };
+        let export = |args: &[&str]| {
+            let Command::Files {
+                command: FileCommand::Download { export, .. },
+            } = parse(args).expect("valid flags").command
+            else {
+                panic!("expected files download");
+            };
+            export
+        };
+
+        assert_eq!(export(&["-r"]), None);
+        assert_eq!(
+            export(&["-r", "--export", "default"]),
+            Some(ExportFormats::DEFAULT)
+        );
+        assert_eq!(
+            export(&["-r", "--export", "md"]),
+            Some(ExportFormats::MARKDOWN)
+        );
+        let error = parse(&["--export", "default"]).err().unwrap();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let error = parse(&["-r", "--export", "sheets=md"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("sheets cannot be exported as 'md'"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1473,7 +1536,7 @@ mod flag_tests {
     use clap::Parser;
 
     use super::{Cli, Command, FileCommand};
-    use crate::common::drive_file::DocType;
+    use crate::common::drive_file::{DocType, FileExtension};
 
     fn words(text: &str) -> HashSet<&str> {
         text.split(|c: char| !c.is_ascii_alphanumeric())
@@ -1597,6 +1660,17 @@ mod flag_tests {
                 ..
             }
         ));
+        assert!(matches!(
+            parse(&["files", "export", "id", "notes", "--format", "MD"]),
+            FileCommand::Export {
+                format: Some(FileExtension::Md),
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["gdrive", "files", "export", "id", "x", "--format", "exe"])
+                .is_err()
+        );
     }
 
     #[test]
@@ -1647,11 +1721,7 @@ mod flag_tests {
         let help = file_path.get_help().unwrap().to_string();
         let listed = words(&help);
 
-        for doc_type in [
-            DocType::Document,
-            DocType::Spreadsheet,
-            DocType::Presentation,
-        ] {
+        for doc_type in DocType::ALL {
             for extension in doc_type.supported_export_types() {
                 let extension = extension.to_string();
                 assert!(listed.contains(extension.as_str()), "{extension}: {help}");

@@ -125,8 +125,7 @@
 //! - A file with a `resourceKey` (shared by link only) must be downloaded with the
 //!   [`RESOURCE_KEYS_HEADER`] naming it, as the walk does for folders. Add
 //!   `capabilities/canDownload` to [`FIELDS`] when a transfer needs it. Skip and update modes
-//!   need `modifiedTime`. Native documents need an export format before they can be
-//!   transferred.
+//!   need `modifiedTime`.
 //! - Shortcuts to files are not resolved: the shortcut entry carries `shortcutDetails` (target
 //!   id, MIME type and resource key); a consumer that follows shortcuts gets the target's
 //!   metadata with `files.get` and the same fields, within the listing limit.
