@@ -328,11 +328,11 @@ impl Files {
 /// The handles stay open for the life of the job because these numbers identify a file only while
 /// it is open: ext4 gives the inode of a removed file to the next file it creates, and Windows
 /// documents the file index as stable only while a handle is open (FAT derives it from the
-/// directory entry, so a file created under the same name gets the same one). An open handle
-/// keeps the file, removed or not, and with it its numbers. The cost: a temporary file that
-/// `save_to_file` removes when the content starts over keeps its disk space until the job ends,
-/// and on a Windows file system without POSIX delete semantics (FAT, some network shares) also
-/// its name.
+/// directory entry, so a file created under the same name may get the same one). An open handle
+/// keeps the file, removed or not, and with it its numbers. The cost: one more open file per
+/// running download, and a temporary file that `save_to_file` removes when the content starts
+/// over keeps its disk space until the job ends (on a Windows file system without POSIX delete
+/// semantics, such as FAT, also its name).
 ///
 /// The handles do not get in the way of the download: std opens files with `FILE_SHARE_DELETE` on
 /// Windows, the handles kept here and the one same-file opens to compare included, so a temporary
