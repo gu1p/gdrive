@@ -27,8 +27,8 @@ use test_support::{service_account_key_json, verified_jwt_claims, MockServer, TE
 const TOKEN_RESPONSE: &str =
     r#"{"access_token":"ya29.integration","expires_in":3599,"token_type":"Bearer"}"#;
 
-/// Runs gdrive with `home` as its home directory (and working directory), no proxy and no
-/// Application Default Credentials.
+/// Runs gdrive with `home` as its home directory (and working directory), and none of the proxy
+/// and Application Default Credentials variables of the environment the tests run in.
 async fn gdrive(home: &Path, args: &[&str]) -> Output {
     gdrive_with_env(home, args, &[]).await
 }
@@ -52,6 +52,11 @@ async fn gdrive_with_env(home: &Path, args: &[&str], vars: &[(&str, &str)]) -> O
         "https_proxy",
         "HTTP_PROXY",
         "http_proxy",
+        // An inherited NO_PROXY=127.0.0.1 would let a proxied test reach the mock directly, and
+        // REQUEST_METHOD (CGI) makes gdrive ignore every proxy variable.
+        "NO_PROXY",
+        "no_proxy",
+        "REQUEST_METHOD",
     ] {
         command.env_remove(var);
     }
