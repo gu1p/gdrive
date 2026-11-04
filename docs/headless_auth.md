@@ -40,8 +40,9 @@ otherwise nothing is changed. If Google does not send a new refresh token, the s
 
 Only `account add` and `account reauth` ask for an authorization. Every other command uses the
 stored token and refreshes it when it expires; it never opens a port or waits for a browser. When
-the token cannot be refreshed (no refresh token is stored, or Google answers `invalid_grant`
-because the token expired or was revoked), the command fails at once with exit status 1:
+the stored token has expired and cannot be refreshed (no refresh token is stored, or Google
+answers `invalid_grant` because the refresh token expired or was revoked), the command fails at
+once with exit status 1:
 
 ```
 Error: account 'me@example.com' needs to be authorized again: Google rejected the stored refresh token (invalid_grant: Token has been expired or revoked.); run 'gdrive account add' (or 'gdrive account reauth me@example.com') to authorize again

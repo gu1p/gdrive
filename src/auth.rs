@@ -35,7 +35,8 @@ pub(crate) struct ReauthRequired {
 pub(crate) enum ReauthReason {
     /// `tokens.json` is missing or holds no token.
     NoStoredToken,
-    /// No stored token has a refresh token (for example after Google omitted it, #150).
+    /// The cached access token expired and no stored token has a refresh token (for example
+    /// after Google omitted it, #150).
     NoRefreshToken,
     /// Google answered the refresh request with `invalid_grant`: the refresh token expired or
     /// was revoked. Holds the server's `error_description`, if any.
@@ -48,7 +49,9 @@ impl Display for ReauthRequired {
         write!(f, "account '{account}' needs to be authorized again: ")?;
         match &self.reason {
             ReauthReason::NoStoredToken => f.write_str("no stored token was found")?,
-            ReauthReason::NoRefreshToken => f.write_str("the stored token has no refresh token")?,
+            ReauthReason::NoRefreshToken => {
+                f.write_str("the stored access token expired and no refresh token is stored")?;
+            }
             ReauthReason::RefreshTokenRejected(description) => {
                 f.write_str("Google rejected the stored refresh token (invalid_grant")?;
                 if let Some(description) = description {
@@ -127,9 +130,9 @@ mod tests {
         let message = reauth(ReauthReason::NoRefreshToken).to_string();
         assert_eq!(
             message,
-            "account 'me@example.com' needs to be authorized again: the stored token has no \
-             refresh token; run 'gdrive account add' (or 'gdrive account reauth me@example.com') \
-             to authorize again"
+            "account 'me@example.com' needs to be authorized again: the stored access token \
+             expired and no refresh token is stored; run 'gdrive account add' (or 'gdrive \
+             account reauth me@example.com') to authorize again"
         );
 
         let message = reauth(ReauthReason::RefreshTokenRejected(Some(String::from(

@@ -44,8 +44,20 @@ pub(crate) struct StoredCredentials<C>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
-    auth: Authenticator<C>,
+    source: Source<C>,
     account: Arc<str>,
+}
+
+#[derive(Clone)]
+enum Source<C>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    /// Uses the cached token and refreshes it with the stored refresh token when it expired.
+    Refreshing(Authenticator<C>),
+    /// No refresh token is stored (Google left it out, #150): the cached access token works
+    /// until it expires, as in gdrive 3.9; only then is a new authorization needed.
+    CachedOnly(Arc<TokenFile>),
 }
 
 impl<C> StoredCredentials<C>
@@ -53,7 +65,8 @@ where
     C: Connect + Clone + Send + Sync + 'static,
 {
     /// Loads the token of `account` from `tokens_path`. Fails with [`ReauthRequired`] when the
-    /// file holds no token or no refresh token; no request is sent in that case.
+    /// file holds no token; no request is sent in that case. Without a refresh token the
+    /// credentials only serve the cached access token (see [`StoredCredentials::access_token`]).
     pub(crate) async fn load(
         client: Client<C, String>,
         account: &str,
@@ -72,10 +85,12 @@ where
             .map_err(Error::LoadTokens)?
             .filter(|file| !file.is_empty())
             .ok_or_else(|| reauth(ReauthReason::NoStoredToken))?;
-        let refresh_token = file
-            .refresh_token()
-            .ok_or_else(|| reauth(ReauthReason::NoRefreshToken))?
-            .to_owned();
+        let Some(refresh_token) = file.refresh_token().map(str::to_owned) else {
+            return Ok(StoredCredentials {
+                source: Source::CachedOnly(Arc::new(file)),
+                account: account.into(),
+            });
+        };
 
         let user_secret = AuthorizedUserSecret {
             client_id: secret.client_id.clone(),
@@ -94,15 +109,29 @@ where
         .map_err(Error::Build)?;
 
         Ok(StoredCredentials {
-            auth,
+            source: Source::Refreshing(auth),
             account: account.into(),
         })
     }
 
     /// An access token for `scopes`: the stored one while it is valid, otherwise a refreshed
-    /// one, which is saved to `tokens.json`.
+    /// one, which is saved to `tokens.json`. Without a stored refresh token, an expired token
+    /// is a [`ReauthReason::NoRefreshToken`] error.
     pub(crate) async fn access_token(&self, scopes: &[&str]) -> Result<AccessToken, Error> {
-        let result = tokio::time::timeout(REFRESH_TIMEOUT, self.auth.token(scopes))
+        let auth = match &self.source {
+            Source::Refreshing(auth) => auth,
+            Source::CachedOnly(file) => {
+                return match file.get(scopes) {
+                    Some(token) if !token.is_expired() => Ok(AccessToken::from(token.clone())),
+                    _ => Err(Error::Reauth(ReauthRequired {
+                        account: self.account.to_string(),
+                        reason: ReauthReason::NoRefreshToken,
+                    })),
+                };
+            }
+        };
+
+        let result = tokio::time::timeout(REFRESH_TIMEOUT, auth.token(scopes))
             .await
             .map_err(|_| Error::Timeout)?;
 
@@ -398,7 +427,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_refresh_token_or_tokens_fail_without_any_request() {
+    async fn missing_or_empty_tokens_fail_without_any_request() {
         let server = MockServer::start(vec![(500, String::from("{}"))]).await;
         let dir = tempfile::tempdir().unwrap();
 
@@ -416,13 +445,48 @@ mod tests {
             "{error:?}"
         );
 
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn valid_token_without_refresh_token_works_until_it_expires() {
+        let server = MockServer::start(vec![(500, String::from("{}"))]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tokens(dir.path(), token("valid", None, TimeDuration::minutes(30))).await;
+
+        let credentials = load(server.addr(), &path).await.unwrap();
+        let access = bounded(credentials.access_token(&DRIVE_SCOPES[1..]))
+            .await
+            .unwrap();
+        assert_eq!(access.token(), Some("valid"));
+
+        // The Drive client gets it the same way.
+        let token = bounded(google_apis_common::GetToken::get_token(
+            &credentials,
+            &DRIVE_SCOPES,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(token.as_deref(), Some("valid"));
+
+        assert!(server.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_token_without_refresh_token_needs_a_new_authorization() {
+        let server = MockServer::start(vec![(500, String::from("{}"))]).await;
+        let dir = tempfile::tempdir().unwrap();
         let path = write_tokens(dir.path(), token("stale", None, TimeDuration::hours(-1))).await;
-        let error = load(server.addr(), &path).await.err().unwrap();
+
+        // Loading works; the error comes when a refresh would be needed.
+        let credentials = load(server.addr(), &path).await.unwrap();
+        let error = bounded(credentials.access_token(&DRIVE_SCOPES))
+            .await
+            .unwrap_err();
         assert!(
             matches!(&error, Error::Reauth(r) if r.reason == ReauthReason::NoRefreshToken),
             "{error:?}"
         );
-
         assert!(server.requests().is_empty());
     }
 }
