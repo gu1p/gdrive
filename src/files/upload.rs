@@ -12,20 +12,19 @@ use mime::Mime;
 
 use crate::{
     common::{
-        delegate::{ChunkSize, MultipartThreshold, UploadDelegateConfig},
+        delegate::{ChunkSize, MultipartThreshold},
         file_helper,
         file_info::{self, FileInfo},
         file_tree,
         hub_helper::{get_hub, GetHubError},
-        retry::RetryPolicy,
     },
-    files::{self, info::DisplayConfig, FileResult},
+    files::{self, info::DisplayConfig},
     hub::Hub,
     transfer::{
         scheduler::{self, Printer},
         upload::{
             session::{account_session_dir, account_session_identity},
-            upload_path, upload_reader, UploadError, UploadOptions, UploadTarget,
+            upload_path, UploadError, UploadOptions, UploadTarget,
         },
     },
 };
@@ -50,16 +49,9 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    /// The common part, the path, the configuration of `upload_file` and the uploader's
-    /// options (which record sessions in the account directory).
-    fn split(
-        self,
-    ) -> (
-        CommonConfig,
-        Option<PathBuf>,
-        UploadDelegateConfig,
-        UploadOptions,
-    ) {
+    /// The common part, the path and the uploader's options (which record sessions in the
+    /// account directory).
+    fn split(self) -> (CommonConfig, Option<PathBuf>, UploadOptions) {
         let Self {
             file_path,
             mime_type,
@@ -90,16 +82,6 @@ impl Config {
                 transfer,
             },
             file_path,
-            UploadDelegateConfig {
-                chunk_size,
-                multipart_threshold,
-                // Bounded: a chunk the server accepts starts a new budget, so a long upload
-                // survives many transient errors, but a dead connection ends it (it used to be
-                // 100,000 retries).
-                retry_policy: RetryPolicy::default(),
-                print_chunk_errors,
-                print_chunk_info,
-            },
             options,
         )
     }
@@ -108,7 +90,7 @@ impl Config {
 pub(crate) async fn upload(config: Config) -> Result<(), Error> {
     let hub = get_hub().await.map_err(Error::Hub)?;
 
-    let (common, file_path, delegate_config, options) = config.split();
+    let (common, file_path, options) = config.split();
 
     if let Some(file_path) = file_path {
         if file_path.is_dir() && common.upload_directories.not() {
@@ -116,12 +98,7 @@ pub(crate) async fn upload(config: Config) -> Result<(), Error> {
         }
 
         if file_path.is_dir() {
-            upload_directory(
-                &hub,
-                UploadDirectoryConfig { file_path, common },
-                &delegate_config,
-            )
-            .await?;
+            upload_directory(&hub, UploadDirectoryConfig { file_path, common }, &options).await?;
         } else {
             upload_regular(
                 &hub,
@@ -258,70 +235,15 @@ struct UploadDirectoryConfig {
 }
 
 /// Uploads the local folder and everything in it: folders are created parent first with
-/// pre-generated ids, files are uploaded `common.transfer.jobs` at a time (see [`recursive`]).
+/// pre-generated ids, files are uploaded `common.transfer.jobs` at a time with `options` (see
+/// [`recursive`]).
 async fn upload_directory(
     hub: &Hub,
     config: UploadDirectoryConfig,
-    delegate_config: &UploadDelegateConfig,
+    options: &UploadOptions,
 ) -> Result<(), Error> {
     let printer = Printer::stdio();
-    recursive::upload_directory(hub, config, delegate_config, &printer, scheduler::ctrl_c()).await
-}
-
-/// Uploads `src_file` as a new file with the pre-generated id `file_id`, if given, through
-/// gdrive's uploader (multipart up to the configured threshold, resumable above, md5 checked;
-/// sessions are not kept across runs). The content is all of `src_file`, measured when the upload starts, not
-/// `file_info.size` (which may be older); a size change during the upload is an error. A `file_info.source_mime_type` makes it a
-/// conversion to `file_info.mime_type`. Errors are google-drive3's, as they were when
-/// google-drive3 made the upload (see [`UploadError::into_drive_error`]).
-///
-/// The bridge for callers that have a reader rather than a path; with a path,
-/// `transfer::upload::upload_path` reads the file asynchronously and continues interrupted
-/// uploads.
-#[expect(
-    clippy::result_large_err,
-    reason = "Ok variant is bigger, see test next to FileResult"
-)]
-pub(crate) async fn upload_file<RS>(
-    hub: &Hub,
-    src_file: RS,
-    file_id: Option<String>,
-    file_info: FileInfo<'_>,
-    delegate_config: &UploadDelegateConfig,
-) -> FileResult
-where
-    RS: google_apis_common::ReadSeek,
-{
-    let FileInfo {
-        name,
-        mime_type,
-        source_mime_type,
-        parents,
-        size: _,
-    } = file_info;
-    let (mime, convert_to) = match source_mime_type {
-        Some(source_mime_type) => (source_mime_type.clone(), Some(mime_type.into_owned())),
-        None => (mime_type.into_owned(), None),
-    };
-    let target = UploadTarget {
-        parents: parents.unwrap_or_default(),
-        name: name.into_owned(),
-        mime: Some(mime),
-        existing_file_id: None,
-        convert_to,
-        new_file_id: file_id,
-    };
-
-    upload_reader(
-        hub,
-        src_file,
-        &target,
-        &delegate_config.options(),
-        delegate_config.retry_policy,
-        None,
-    )
-    .await
-    .map_err(UploadError::into_drive_error)
+    recursive::upload_directory(hub, config, options, &printer, scheduler::ctrl_c()).await
 }
 
 #[derive(Debug)]
@@ -333,7 +255,6 @@ pub(crate) enum Error {
     },
     OpenFile(PathBuf, io::Error),
     StdinToFile(file_helper::StdinToFileError),
-    Upload(Box<google_drive3::Error>),
     Transfer(Box<UploadError>),
     IsDirectory(PathBuf),
     DriveFolderMissingId,
@@ -359,7 +280,7 @@ impl error::Error for Error {
             Error::FileInfo { source, .. } => Some(source),
             Error::OpenFile(_, source) => Some(source),
             Error::StdinToFile(source) => Some(source),
-            Error::Upload(source) | Error::Mkdir(source) => Some(source),
+            Error::Mkdir(source) => Some(source),
             Error::Transfer(source) => Some(source.as_ref()),
             Error::IsDirectory(_) | Error::DriveFolderMissingId => None,
             Error::CreateFileTree(file_tree) => Some(file_tree),
@@ -382,7 +303,7 @@ impl Display for Error {
                 write!(f, "unable to open file '{}'", path.display())
             }
             Error::StdinToFile(_) => f.write_str("unable to write stdin to file"),
-            Error::Upload(_) | Error::Transfer(_) => f.write_str("unable to upload file"),
+            Error::Transfer(_) => f.write_str("unable to upload file"),
             Error::IsDirectory(path) => write!(
                 f,
                 "'{}' is a directory, use --recursive to upload directories",
@@ -407,179 +328,33 @@ impl Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, io::Cursor, path::PathBuf};
+    use std::path::PathBuf;
 
-    use serde_json::json;
-
-    use super::{upload_file, Config};
-    use crate::common::{
-        delegate::UploadDelegateConfig,
-        file_info::FileInfo,
-        mock_server::{MockServer, Response},
-    };
+    use super::Config;
     use crate::transfer::scheduler;
 
-    fn file_info(size: u64) -> FileInfo<'static> {
-        FileInfo {
-            name: Cow::Borrowed("a.txt"),
-            mime_type: Cow::Owned(mime::TEXT_PLAIN),
-            source_mime_type: None,
-            parents: Some(vec![String::from("folder-id")]),
-            size,
-        }
-    }
-
-    #[tokio::test]
-    async fn upload_file_creates_the_file_with_the_given_id() {
-        let content = b"hello";
-        let server = MockServer::start(vec![Response::json(
-            200,
-            &json!({
-                "id": "pre-id",
-                "name": "a.txt",
-                "size": "5",
-                "md5Checksum": format!("{:x}", md5::compute(content)),
-            }),
-        )])
-        .await;
-
-        let file = upload_file(
-            &server.hub(),
-            Cursor::new(content.to_vec()),
-            Some(String::from("pre-id")),
-            file_info(5),
-            &UploadDelegateConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(file.id.as_deref(), Some("pre-id"));
-        // No files.generateIds: the id was given.
-        let requests = server.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].path, "/upload/drive/v3/files");
-        assert_eq!(requests[0].query_param("uploadType"), Some("multipart"));
-        let body = requests[0].body_text();
-        assert!(
-            body.contains(r#""id":"pre-id""#) && body.contains(r#""parents":["folder-id"]"#),
-            "{body}"
-        );
-        assert!(body.contains("\r\n\r\nhello\r\n"), "{body}");
-    }
-
-    /// `files upload --recursive --multipart-threshold 0 --chunk-size 1`: the configuration
-    /// the recursive upload gets.
-    fn recursive_config() -> UploadDelegateConfig {
-        let (_, _, delegate_config, _) = Config {
+    /// `files upload --recursive --multipart-threshold 0 --chunk-size 1`: the options the
+    /// recursive upload gets.
+    #[test]
+    fn the_recursive_upload_gets_the_selected_chunk_size_and_threshold() {
+        let (common, _, options) = Config {
             file_path: Some(PathBuf::from("dir")),
             mime_type: None,
             parents: None,
             chunk_size: "1".parse().unwrap(),
             multipart_threshold: "0".parse().unwrap(),
             print_chunk_errors: false,
-            print_chunk_info: false,
+            print_chunk_info: true,
             upload_directories: true,
             print_only_id: false,
             transfer: scheduler::Options::default(),
         }
         .split();
-        delegate_config
-    }
 
-    #[test]
-    fn the_recursive_upload_gets_the_selected_threshold() {
-        let options = recursive_config().options();
         assert_eq!(options.multipart_threshold, 0);
         assert_eq!(options.chunk_size, 1 << 20);
-    }
-
-    #[tokio::test]
-    async fn upload_file_follows_the_selected_threshold() {
-        // A 5-byte file is resumable with a threshold of 0.
-        let content = b"hello";
-        let server = MockServer::start(vec![
-            Response::json(200, &json!({})).with_header("Location", "{root}upload-session"),
-            Response::json(
-                200,
-                &json!({
-                    "id": "pre-id",
-                    "size": "5",
-                    "md5Checksum": format!("{:x}", md5::compute(content)),
-                }),
-            ),
-        ])
-        .await;
-
-        upload_file(
-            &server.hub(),
-            Cursor::new(content.to_vec()),
-            Some(String::from("pre-id")),
-            file_info(5),
-            &recursive_config(),
-        )
-        .await
-        .unwrap();
-
-        let requests = server.requests();
-        assert_eq!(requests[0].query_param("uploadType"), Some("resumable"));
-        assert_eq!(requests[1].header("content-range"), Some("bytes 0-4/5"));
-    }
-
-    /// The recursive upload measures its files while it discovers them, earlier than it uploads
-    /// them: a file that grew in between goes up whole.
-    #[tokio::test]
-    async fn upload_file_sends_what_the_file_holds_when_it_is_uploaded() {
-        let content = b"hello, world";
-        let server = MockServer::start(vec![Response::json(
-            200,
-            &json!({
-                "id": "pre-id",
-                "size": "12",
-                "md5Checksum": format!("{:x}", md5::compute(content)),
-            }),
-        )])
-        .await;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        std::fs::write(&path, &content[..5]).unwrap();
-        let discovered = file_info(std::fs::metadata(&path).unwrap().len());
-        std::fs::write(&path, content).unwrap();
-
-        upload_file(
-            &server.hub(),
-            std::fs::File::open(&path).unwrap(),
-            Some(String::from("pre-id")),
-            discovered,
-            &UploadDelegateConfig::default(),
-        )
-        .await
-        .unwrap();
-
-        let body = server.requests()[0].body_text();
-        assert!(body.contains("\r\n\r\nhello, world\r\n"), "{body}");
-    }
-
-    #[tokio::test]
-    async fn upload_file_reports_drive_errors_as_google_drive3_did() {
-        let error = json!({"error": {
-            "code": 403,
-            "message": "The user's Drive storage quota has been exceeded.",
-            "errors": [{"domain": "usageLimits", "reason": "storageQuotaExceeded"}],
-        }});
-        let server = MockServer::start(vec![Response::json(403, &error)]).await;
-
-        let result = upload_file(
-            &server.hub(),
-            Cursor::new(b"hello".to_vec()),
-            Some(String::from("pre-id")),
-            file_info(5),
-            &UploadDelegateConfig::default(),
-        )
-        .await;
-
-        assert!(
-            matches!(&result, Err(google_drive3::Error::BadRequest(body)) if *body == error),
-            "{result:?}"
-        );
+        assert!(options.print_chunk_info && !options.print_chunk_errors);
+        assert!(options.verify_md5);
+        assert_eq!(common.transfer, scheduler::Options::default());
     }
 }

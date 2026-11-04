@@ -222,7 +222,7 @@ gdrive files upload --recursive ~/photos --jobs 2 --continue-on-error
   and folder creations run besides, 2 at a time. `--jobs 1` transfers one file after the other, as gdrive
   3.9 did. More jobs help most with many small files; with a few large files the connection is the limit.
   All jobs share one rate-limit backoff: when Drive answers `429` or `403 rateLimitExceeded`, all of them
-  wait.
+  wait, also between the chunks of uploads that are already running.
 - A recursive download starts while it is still listing the folder: the files of a folder are downloaded
   once that folder is listed, and each local folder is created before the files in it. A recursive upload
   lists the local folder first and creates every Drive folder before it uploads anything into it.

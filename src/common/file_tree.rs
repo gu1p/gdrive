@@ -1,7 +1,6 @@
 pub(crate) mod errors;
 
 use std::{
-    borrow::Cow,
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
@@ -11,7 +10,7 @@ use std::{
 use async_recursion::async_recursion;
 
 use super::{FileLike, FileTreeLike, FolderInfoLike, FolderLike};
-use crate::common::{file_info::FileInfo, file_tree_like, id_gen::IdGen};
+use crate::common::{file_tree_like, id_gen::IdGen};
 
 #[derive(Debug)]
 pub(crate) struct FileTree {
@@ -312,17 +311,6 @@ impl File {
     #[must_use]
     pub(crate) fn relative_path(&self) -> &Path {
         get_relative_path(&self.path, &self.parent)
-    }
-
-    #[must_use]
-    pub(crate) fn info(&self, parents: Option<Vec<String>>) -> FileInfo<'_> {
-        FileInfo {
-            name: Cow::Borrowed(&self.name),
-            size: self.size,
-            mime_type: Cow::Borrowed(&self.mime_type),
-            source_mime_type: None,
-            parents,
-        }
     }
 }
 

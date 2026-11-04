@@ -19,14 +19,20 @@
 #[cfg(test)]
 mod tests;
 
-use std::{fs, future::Future, path::PathBuf, sync::Arc};
+use std::{
+    future::Future,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use futures::stream;
 
-use super::{upload_file, Error, UploadDirectoryConfig};
+use super::{Error, UploadDirectoryConfig};
 use crate::{
     common::{
-        delegate::UploadDelegateConfig,
         file_tree::{self, FileTree},
         file_tree_like::Node,
         human_size::human_size,
@@ -38,6 +44,7 @@ use crate::{
     transfer::{
         progress::JobProgress,
         scheduler::{Job, JobContext, JobKind, JobOutput, Outcome, Printer, Scheduler, Subtree},
+        upload::{upload_path, UploadOptions, UploadTarget},
     },
 };
 
@@ -46,7 +53,7 @@ use crate::{
 pub(super) async fn upload_directory(
     hub: &Hub,
     config: UploadDirectoryConfig,
-    delegate_config: &UploadDelegateConfig,
+    options: &UploadOptions,
     printer: &Printer,
     cancel: impl Future<Output = ()> + Send,
 ) -> Result<(), Error> {
@@ -71,7 +78,7 @@ pub(super) async fn upload_directory(
 
     let uploads = Arc::new(Uploads {
         hub: hub.clone(),
-        delegate_config: delegate_config.clone(),
+        options: options.clone(),
         print_only_id,
     });
     let unreadable = tree.unreadable.into_iter().map(|entry| {
@@ -110,7 +117,7 @@ pub(super) async fn upload_directory(
 /// What every job of a recursive upload shares.
 struct Uploads {
     hub: Hub,
-    delegate_config: UploadDelegateConfig,
+    options: UploadOptions,
     print_only_id: bool,
 }
 
@@ -214,11 +221,6 @@ impl Uploads {
     ) -> Outcome {
         let path = file.relative_path().to_path_buf();
 
-        // Opened once the job has its slot: at most `--jobs` files are open.
-        let os_file = match fs::File::open(&file.path) {
-            Ok(os_file) => os_file,
-            Err(err) => return failed(path, Error::OpenFile(file.path.clone(), err)),
-        };
         if !self.print_only_id {
             context
                 .printer
@@ -229,9 +231,10 @@ impl Uploads {
                 ))
                 .await;
         }
-        if let Err(source) = self.send(os_file, &file, parents, &context.progress).await {
-            return failed(path, source);
-        }
+        let bytes = match self.send(&file, parents, &context.progress).await {
+            Ok(bytes) => bytes,
+            Err(source) => return failed(path, source),
+        };
         if self.print_only_id {
             context
                 .printer
@@ -239,32 +242,42 @@ impl Uploads {
                 .await;
         }
 
-        Outcome::Transferred { bytes: file.size }
+        Outcome::Transferred { bytes }
     }
 
     /// The one call that sends a file of a recursive upload to Drive, under its pre-generated
-    /// id, into the folder `parents`, and reports the bytes Drive confirmed to `progress`.
-    ///
-    /// The gdrive-owned uploader (milestone 2, item 1) replaces the `upload_file` call here
-    /// with its own, which reports confirmed bytes per chunk instead of once at the end.
+    /// id, into the folder `parents`: gdrive's uploader, which opens the file once the job has
+    /// its slot (so at most `--jobs` files are open), measures it then, and reports the bytes
+    /// Drive confirmed to `progress` after every chunk. Returns the size of the uploaded
+    /// content.
     async fn send(
         &self,
-        os_file: fs::File,
         file: &file_tree::File,
         parents: Vec<String>,
         progress: &JobProgress,
-    ) -> Result<(), Error> {
-        upload_file(
-            &self.hub,
-            os_file,
-            Some(file.drive_id.clone()),
-            file.info(Some(parents)),
-            &self.delegate_config,
-        )
-        .await
-        .map_err(|err| Error::Upload(Box::new(err)))?;
-        progress.bytes(file.size);
-        Ok(())
+    ) -> Result<u64, Error> {
+        let target = UploadTarget {
+            parents,
+            name: file.name.clone(),
+            mime: Some(file.mime_type.clone()),
+            existing_file_id: None,
+            convert_to: None,
+            new_file_id: Some(file.drive_id.clone()),
+        };
+        // The uploader tells the bytes Drive holds so far; progress takes what is new.
+        let confirmed = AtomicU64::new(0);
+        let report = |held: u64| {
+            let before = confirmed.fetch_max(held, Ordering::SeqCst);
+            progress.bytes(held.saturating_sub(before));
+        };
+        let uploaded = upload_path(&self.hub, &file.path, &target, &self.options, Some(&report))
+            .await
+            .map_err(|err| Error::Transfer(Box::new(err)))?;
+        let size = uploaded
+            .size
+            .and_then(|size| u64::try_from(size).ok())
+            .unwrap_or_else(|| confirmed.load(Ordering::SeqCst));
+        Ok(size)
     }
 }
 

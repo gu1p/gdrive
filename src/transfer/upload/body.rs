@@ -69,7 +69,7 @@ impl Source for FileSource {
     }
 }
 
-/// Any seekable reader, for callers that have no path (`files::upload::upload_file`). Its reads
+/// Any seekable reader, for callers that have no path ([`super::upload_reader`]). Its reads
 /// block the thread they run on, as google-apis-common's did.
 pub(crate) struct ReaderSource<R> {
     reader: R,

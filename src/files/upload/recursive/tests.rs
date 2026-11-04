@@ -11,10 +11,7 @@ use std::{
 
 use super::upload_directory;
 use crate::{
-    common::{
-        delegate::UploadDelegateConfig, drive_file::MIME_TYPE_DRIVE_FOLDER, retry::RetryPolicy,
-        table::FailingWriter,
-    },
+    common::{drive_file::MIME_TYPE_DRIVE_FOLDER, table::FailingWriter},
     files::upload::{CommonConfig, Error, UploadDirectoryConfig},
     transfer::{
         fake_drive::{Behavior, Created, FakeDrive, FakeFile},
@@ -22,6 +19,7 @@ use crate::{
             capture::{output, Captured},
             Options, Printer,
         },
+        upload::UploadOptions,
     },
 };
 
@@ -95,12 +93,25 @@ async fn upload_through(
     config: UploadDirectoryConfig,
     printer: &Printer,
 ) -> Result<(), Error> {
+    upload_with(
+        server,
+        config,
+        &UploadOptions::default(),
+        printer,
+        future::pending(),
+    )
+    .await
+}
+
+async fn upload_with(
+    server: &FakeDrive,
+    config: UploadDirectoryConfig,
+    options: &UploadOptions,
+    printer: &Printer,
+    cancel: impl std::future::Future<Output = ()> + Send,
+) -> Result<(), Error> {
     let hub = server.hub();
-    let delegate_config = UploadDelegateConfig {
-        retry_policy: RetryPolicy::for_tests(),
-        ..UploadDelegateConfig::default()
-    };
-    let run = upload_directory(&hub, config, &delegate_config, printer, future::pending());
+    let run = upload_directory(&hub, config, options, printer, cancel);
     tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the upload should end")

@@ -212,6 +212,14 @@ pub(crate) async fn upload_path(
 /// [`upload_path`] for a seekable reader, with the retry policy `policy` (and the hub's
 /// throttle). The content is the whole reader, measured when the upload starts. The content type
 /// is `target.mime`, `application/octet-stream` without one.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "for sources without a path; every command uploads files by path since the \
+                  recursive upload moved to upload_path"
+    )
+)]
 pub(crate) async fn upload_reader<R: Read + Seek + Send>(
     hub: &Hub,
     reader: R,
@@ -394,11 +402,19 @@ pub(crate) enum UploadError {
 }
 
 impl UploadError {
-    /// The error as google-drive3 reports one, for callers that return its errors
-    /// (`files::upload::upload_file`): a Drive error reply stays the `BadRequest` with its JSON
-    /// body, a request without reply the `HttpError`, a missing token `MissingToken`; anything
-    /// else becomes an `Io` error with this error inside.
+    /// The error as google-drive3 reports one, for callers that return its errors: a Drive
+    /// error reply stays the `BadRequest` with its JSON body, a request without reply the
+    /// `HttpError`, a missing token `MissingToken`; anything else becomes an `Io` error with this
+    /// error inside.
     #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "for callers that return google-drive3's errors; the last one, \
+                      files::upload::upload_file, is gone"
+        )
+    )]
     pub(crate) fn into_drive_error(self) -> google_drive3::Error {
         match self {
             UploadError::Failed {
