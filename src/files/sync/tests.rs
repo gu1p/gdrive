@@ -877,3 +877,77 @@ async fn local_names_that_differ_only_in_normalization_are_ambiguous() {
         synced.err.text()
     );
 }
+
+#[tokio::test]
+async fn a_second_up_run_finds_everything_unchanged() {
+    let files = drive(vec![
+        FakeFile::blob("changed", "changed.txt", "root", "old"),
+        FakeFile::blob("old", "old.txt", "root", "old"),
+    ]);
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[("changed.txt", "new content"), ("dir/new.txt", "new")],
+    );
+    let config = deleting(config(Direction::Up, dir.path()));
+
+    let first = sync(&server, &config).await;
+    first.ok();
+    assert_eq!(
+        first.lines(),
+        lines(&[
+            "create dir/",
+            "create dir/new.txt",
+            "extra->trash old.txt",
+            "update changed.txt",
+        ])
+    );
+
+    // The same Drive, which now holds what the first run did.
+    let second = sync(&server, &config).await;
+    second.ok();
+    assert_eq!(
+        second.lines(),
+        lines(&["unchanged changed.txt", "unchanged dir/new.txt"])
+    );
+    assert_eq!(server.created().len(), 2, "nothing created again");
+    assert_eq!(server.updates().len(), 1, "nothing updated again");
+}
+
+#[tokio::test]
+async fn a_large_changed_file_goes_up_through_a_resumable_update() {
+    let files = drive(vec![FakeFile::blob("big", "big.bin", "root", "old")]);
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    // Two chunks of 256 KiB and a bit.
+    let content = "x".repeat(2 * 256 * 1024 + 10);
+    write(dir.path(), &[("big.bin", content.as_str())]);
+    let config = Config {
+        upload: UploadOptions {
+            chunk_size: 256 * 1024,
+            multipart_threshold: 0,
+            ..UploadOptions::default()
+        },
+        ..config(Direction::Up, dir.path())
+    };
+
+    let synced = sync(&server, &config).await;
+
+    synced.ok();
+    assert_eq!(synced.lines(), lines(&["update big.bin"]));
+    assert_eq!(
+        server.updates(),
+        [(String::from("big"), content.as_bytes().to_vec())]
+    );
+    let chunks = server.chunks();
+    assert_eq!(chunks.len(), 3, "{chunks:?}");
+    assert!(chunks
+        .iter()
+        .all(|chunk| chunk.status == 308 || chunk.status == 200));
+    assert_eq!(server.created().len(), 0);
+
+    let again = sync(&server, &config).await;
+    again.ok();
+    assert_eq!(again.lines(), lines(&["unchanged big.bin"]));
+}
