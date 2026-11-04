@@ -1,6 +1,6 @@
 use std::{
     error,
-    fmt::{self, Display, Formatter},
+    fmt::{self, Display, Formatter, Write as _},
 };
 
 use chrono::{
@@ -31,14 +31,39 @@ pub(crate) async fn info(config: Config) -> Result<(), Box<Error>> {
         .await
         .map_err(Error::GetFile)?;
 
-    print_file_info(
-        &file,
-        &DisplayConfig {
-            size_in_bytes: config.size_in_bytes,
-        },
+    print!(
+        "{}",
+        info_text(
+            &file,
+            &DisplayConfig {
+                size_in_bytes: config.size_in_bytes,
+            },
+        )
     );
 
     Ok(())
+}
+
+/// What `files info` prints: the fields of [`print_file_info`], then whether the file is in the
+/// trash.
+fn info_text(file: &google_drive3::api::File, display_config: &DisplayConfig) -> String {
+    let mut text = file_info_text(file, display_config);
+    push_field(
+        &mut text,
+        "Trashed",
+        file.trashed
+            .map(|trashed| trashed_status(trashed, file.explicitly_trashed)),
+    );
+    text
+}
+
+/// `explicitly`: the file itself was trashed, not (only) a folder it is in.
+fn trashed_status(trashed: bool, explicitly: Option<bool>) -> &'static str {
+    match (trashed, explicitly) {
+        (false, _) => "no",
+        (true, Some(true)) => "yes (explicitly)",
+        (true, _) => "yes",
+    }
 }
 
 #[expect(
@@ -53,7 +78,7 @@ pub(crate) async fn get_file(hub: &Hub, file_id: &str) -> FileResult {
                 "fields",
                 "id,name,size,createdTime,modifiedTime,version,md5Checksum,mimeType,parents,\
                 driveId,shared,description,webContentLink,webViewLink,\
-                shortcutDetails(targetId,targetMimeType)",
+                shortcutDetails(targetId,targetMimeType),trashed,explicitlyTrashed",
             )
             .supports_all_drives(true)
             .add_scope(google_drive3::api::Scope::Full)
@@ -72,6 +97,11 @@ pub(crate) struct DisplayConfig {
 }
 
 pub(crate) fn print_file_info(file: &google_drive3::api::File, display_config: &DisplayConfig) {
+    print!("{}", file_info_text(file, display_config));
+}
+
+/// The lines [`print_file_info`] prints, one per field that `file` has.
+fn file_info_text(file: &google_drive3::api::File, display_config: &DisplayConfig) -> String {
     let google_drive3::api::File {
         created_time,
         id,
@@ -86,27 +116,36 @@ pub(crate) fn print_file_info(file: &google_drive3::api::File, display_config: &
         ..
     } = file;
 
-    print_field("Id", id.as_ref());
-    print_field("Name", name.as_ref());
-    print_field("Mime", mime_type.as_ref());
-    print_field(
+    let mut text = String::new();
+    push_field(&mut text, "Id", id.as_ref());
+    push_field(&mut text, "Name", name.as_ref());
+    push_field(&mut text, "Mime", mime_type.as_ref());
+    push_field(
+        &mut text,
         "Size",
         size.map(|bytes| DisplayBytes {
             bytes: u64::try_from(bytes).unwrap_or(0),
             config: display_config,
         }),
     );
-    print_field("Created", created_time.map(format_date_time));
-    print_field("Modified", modified_time.map(format_date_time));
-    print_field("MD5", md5_checksum.as_ref());
-    print_field("Shared", shared.map(format_bool));
-    print_field("Parents", parents.as_deref().map(DisplayJoinedSlice));
-    print_field("ViewUrl", web_view_link.as_ref());
+    push_field(&mut text, "Created", created_time.map(format_date_time));
+    push_field(&mut text, "Modified", modified_time.map(format_date_time));
+    push_field(&mut text, "MD5", md5_checksum.as_ref());
+    push_field(&mut text, "Shared", shared.map(format_bool));
+    push_field(
+        &mut text,
+        "Parents",
+        parents.as_deref().map(DisplayJoinedSlice),
+    );
+    push_field(&mut text, "ViewUrl", web_view_link.as_ref());
+    text
 }
 
-fn print_field(name: &str, value: Option<impl Display>) {
+/// Adds the line `name: value` to `text`, if there is a value.
+fn push_field(text: &mut String, name: &str, value: Option<impl Display>) {
     if let Some(value) = value {
-        println!("{name}: {value}");
+        // Writing to a String does not fail.
+        let _ = writeln!(text, "{name}: {value}");
     }
 }
 
@@ -186,5 +225,104 @@ impl error::Error for Error {
             Error::Hub(source) => Some(source),
             Error::GetFile(source) => Some(source),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{file_info_text, format_date_time, get_file, info_text, DisplayConfig};
+    use crate::common::{
+        human_size::human_size,
+        mock_server::{MockServer, Response},
+    };
+
+    async fn info_of(file: &serde_json::Value) -> (String, String, Vec<String>) {
+        let server = MockServer::start(vec![Response::json(200, file)]).await;
+        let file = get_file(&server.hub(), "file-id").await.unwrap();
+        let fields = server.requests()[0]
+            .query_param("fields")
+            .unwrap()
+            .replace("%2C", ",")
+            .split(',')
+            .map(str::to_owned)
+            .collect();
+        let config = DisplayConfig::default();
+        (
+            info_text(&file, &config),
+            file_info_text(&file, &config),
+            fields,
+        )
+    }
+
+    #[tokio::test]
+    async fn info_prints_the_trashed_status_after_the_other_fields() {
+        let (text, other_commands, fields) = info_of(&json!({
+            "id": "file-id",
+            "name": "a.txt",
+            "mimeType": "text/plain",
+            "size": "2048",
+            "createdTime": "2024-01-02T03:04:05Z",
+            "modifiedTime": "2024-02-03T04:05:06Z",
+            "md5Checksum": "0cc175b9c0f1b6a831c399e269772661",
+            "shared": false,
+            "parents": ["parent-a", "parent-b"],
+            "webViewLink": "https://drive.example/view",
+            "trashed": true,
+            "explicitlyTrashed": true,
+        }))
+        .await;
+
+        let time = |rfc3339: &str| {
+            format_date_time(
+                chrono::DateTime::parse_from_rfc3339(rfc3339)
+                    .unwrap()
+                    .with_timezone(&chrono::Utc),
+            )
+            .to_string()
+        };
+        let fields_before = format!(
+            "Id: file-id\n\
+             Name: a.txt\n\
+             Mime: text/plain\n\
+             Size: {}\n\
+             Created: {}\n\
+             Modified: {}\n\
+             MD5: 0cc175b9c0f1b6a831c399e269772661\n\
+             Shared: False\n\
+             Parents: parent-a, parent-b\n\
+             ViewUrl: https://drive.example/view\n",
+            human_size(2048),
+            time("2024-01-02T03:04:05Z"),
+            time("2024-02-03T04:05:06Z"),
+        );
+        assert_eq!(text, format!("{fields_before}Trashed: yes (explicitly)\n"));
+        // The other commands print the file as before.
+        assert_eq!(other_commands, fields_before);
+        assert!(
+            fields.iter().any(|field| field == "trashed")
+                && fields.iter().any(|field| field == "explicitlyTrashed"),
+            "{fields:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trashed_status_says_whether_the_file_itself_was_trashed() {
+        let (text, ..) = info_of(&json!({"id": "file-id", "trashed": false})).await;
+        assert_eq!(text, "Id: file-id\nTrashed: no\n");
+
+        // Trashed with a folder it is in.
+        let (text, ..) = info_of(&json!({
+            "id": "file-id",
+            "trashed": true,
+            "explicitlyTrashed": false,
+        }))
+        .await;
+        assert_eq!(text, "Id: file-id\nTrashed: yes\n");
+
+        // Drive did not say.
+        let (text, ..) = info_of(&json!({"id": "file-id"})).await;
+        assert_eq!(text, "Id: file-id\n");
     }
 }
