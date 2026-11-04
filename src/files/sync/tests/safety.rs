@@ -805,3 +805,96 @@ async fn a_changed_file_still_replaces_the_local_one() {
     assert_eq!(synced.lines(), super::lines(&["update a.txt"]));
     assert_eq!(read(dir.path(), "a.txt"), "from drive");
 }
+
+/// Names that differ only in case, inside a directory that is only local.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn an_extra_local_directory_with_ambiguous_names_is_not_deleted_whole() {
+    let server = FakeDrive::start(drive(Vec::new()), Behavior::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    write(
+        dir.path(),
+        &[
+            ("gone/A.txt", "upper"),
+            ("gone/a.txt", "lower"),
+            ("gone/other.txt", "o"),
+            ("deep/sub/X", "upper"),
+            ("deep/sub/x", "lower"),
+            ("deep/keep.txt", "k"),
+        ],
+    );
+
+    let synced = sync(&server, &deleting(config(Direction::Down, dir.path()))).await;
+
+    synced.ok();
+    assert_eq!(
+        synced.lines(),
+        super::lines(&[
+            "extra->trash deep/keep.txt",
+            "extra->trash gone/other.txt",
+            "skip:ambiguous deep/sub/X",
+            "skip:ambiguous deep/sub/x",
+            "skip:ambiguous gone/A.txt",
+            "skip:ambiguous gone/a.txt",
+            "skip:protected deep/",
+            "skip:protected deep/sub/",
+            "skip:protected gone/",
+        ])
+    );
+    assert_eq!(
+        outside_trash(dir.path()),
+        [
+            "deep",
+            "deep/sub",
+            "deep/sub/X",
+            "deep/sub/x",
+            "gone",
+            "gone/A.txt",
+            "gone/a.txt"
+        ]
+    );
+    assert_eq!(
+        paths(&run_trash(dir.path())),
+        ["deep", "deep/keep.txt", "gone", "gone/other.txt"]
+    );
+}
+
+#[tokio::test]
+async fn an_extra_drive_folder_with_duplicate_names_is_not_trashed_whole() {
+    let files = drive(vec![
+        FakeFile::folder("old", "old", "root"),
+        FakeFile::blob("dup1", "dup.txt", "old", "one"),
+        FakeFile::blob("dup2", "dup.txt", "old", "two"),
+        FakeFile::blob("other", "other.txt", "old", "o"),
+        FakeFile::folder("inner", "inner", "old"),
+        FakeFile::blob("case1", "Case.txt", "inner", "1"),
+        FakeFile::blob("case2", "case.txt", "inner", "2"),
+        FakeFile::blob("keep", "keep.txt", "inner", "k"),
+    ]);
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+
+    let synced = sync(&server, &deleting(config(Direction::Up, dir.path()))).await;
+
+    synced.ok();
+    let out = synced.lines();
+    for line in [
+        "skip:protected old/",
+        "skip:protected old/inner/",
+        "skip:ambiguous old/dup.txt",
+        "skip:ambiguous old/inner/Case.txt",
+        "skip:ambiguous old/inner/case.txt",
+        "extra->trash old/other.txt",
+        "extra->trash old/inner/keep.txt",
+    ] {
+        assert!(out.contains(&String::from(line)), "{line}: {out:?}");
+    }
+    assert_eq!(out.len(), 8, "{out:?}");
+    let mut trashed = server
+        .patches()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect::<Vec<_>>();
+    trashed.sort();
+    assert_eq!(trashed, ["keep", "other"]);
+}

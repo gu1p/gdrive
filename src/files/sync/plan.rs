@@ -621,22 +621,7 @@ impl Builder<'_> {
 
         // The names a download gives Drive duplicates, `x` and `x~1a2b3c4d`: none of them is
         // anybody's to delete.
-        let named = roles
-            .iter()
-            .enumerate()
-            .filter_map(|(index, role)| match role {
-                Role::Named { source, .. } => Some((index, remote[index].id.as_deref()?, source)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let entries = named
-            .iter()
-            .map(|(_, id, name)| NameEntry { id, name })
-            .collect::<Vec<_>>();
-        if let Ok(names) = local_name::unique_local_names(&entries) {
-            let indexes = named.iter().map(|(index, _, _)| *index);
-            grouping.unique.extend(indexes.zip(names.names));
-        }
+        grouping.unique = unique_names(remote, roles);
         let duplicates = grouping
             .groups
             .values()
@@ -994,9 +979,34 @@ impl Builder<'_> {
                     top: false,
                 };
                 let mut items = vec![skip(label.clone(), Reason::Protected)];
-                for child in &remote_folder.children {
-                    let role = self.role(child);
+                let children = &remote_folder.children;
+                let roles = children
+                    .iter()
+                    .map(|child| self.role(child))
+                    .collect::<Vec<_>>();
+                let ambiguous = ambiguous_remote(&roles);
+                if !ambiguous.is_empty() {
+                    let group = Group {
+                        remote: ambiguous.clone(),
+                        local: Vec::new(),
+                    };
+                    self.ambiguous(&inner, children, &roles, &[], &group);
+                }
+                let unique = unique_names(children, &roles);
+                for (index, (child, role)) in children.iter().zip(roles).enumerate() {
                     let child_label = remote_label(&inner, child, &role);
+                    if ambiguous.contains(&index) {
+                        // Under the name a download gives it, with everything below it.
+                        let label = match unique.get(&index) {
+                            Some(name) if matches!(child.kind, RemoteKind::Folder(_)) => {
+                                inner.dir_label(name)
+                            }
+                            Some(name) => inner.label(name),
+                            None => child_label,
+                        };
+                        items.push(skip(label, Reason::Ambiguous));
+                        continue;
+                    }
                     match role {
                         Role::Named { mapped, .. } => {
                             items.extend(self.extra_remote(&inner, &mapped, child));
@@ -1016,19 +1026,31 @@ impl Builder<'_> {
         }
     }
 
-    /// Whether everything in the Drive folder can be deleted with it.
+    /// Whether everything in the Drive folder can be deleted with it: it is listed completely,
+    /// and in it and in every folder below, every entry has a name of its own and is a file with
+    /// content or such a folder.
     fn remote_deletable(&self, remote_folder: &RemoteFolder) -> bool {
+        let roles = remote_folder
+            .children
+            .iter()
+            .map(|child| self.role(child))
+            .collect::<Vec<_>>();
         remote_folder.listing == Listing::Complete
-            && remote_folder.children.iter().all(|child| {
-                matches!(self.role(child), Role::Named { .. })
-                    && match &child.kind {
-                        RemoteKind::Blob { .. } => true,
-                        RemoteKind::Folder(Some(inner)) => self.remote_deletable(inner),
-                        RemoteKind::Folder(None)
-                        | RemoteKind::Native { .. }
-                        | RemoteKind::Shortcut => false,
-                    }
-            })
+            && ambiguous_remote(&roles).is_empty()
+            && remote_folder
+                .children
+                .iter()
+                .zip(&roles)
+                .all(|(child, role)| {
+                    matches!(role, Role::Named { .. })
+                        && match &child.kind {
+                            RemoteKind::Blob { .. } => true,
+                            RemoteKind::Folder(Some(inner)) => self.remote_deletable(inner),
+                            RemoteKind::Folder(None)
+                            | RemoteKind::Native { .. }
+                            | RemoteKind::Shortcut => false,
+                        }
+                })
     }
 
     /// `down`: a local entry that is not on Drive.
@@ -1064,8 +1086,20 @@ impl Builder<'_> {
                     top: false,
                 };
                 let mut items = vec![skip(label.clone(), Reason::Protected)];
-                for child in children {
-                    items.extend(self.extra_local(&inner, child));
+                let ambiguous = ambiguous_local(children);
+                if !ambiguous.is_empty() {
+                    let group = Group {
+                        remote: Vec::new(),
+                        local: ambiguous.clone(),
+                    };
+                    self.ambiguous(&inner, &[], &[], children, &group);
+                }
+                for (index, child) in children.iter().enumerate() {
+                    if ambiguous.contains(&index) {
+                        items.push(skip(local_label(&inner, child), Reason::Ambiguous));
+                    } else {
+                        items.extend(self.extra_local(&inner, child));
+                    }
                 }
                 items
             }
@@ -1081,15 +1115,84 @@ impl Builder<'_> {
     }
 }
 
-/// Whether the local entry, and everything in it, can be deleted.
+/// Whether the local entry, and everything in it, can be deleted: no symlink, temporary file,
+/// unreadable entry or cycle in it, and in no directory of it two names that are the same when
+/// case and normalization are ignored, or a name that is not UTF-8.
 fn local_deletable(local: &LocalNode) -> bool {
     !local.symlink
         && !local_name::is_reserved_temp_name(&local.name)
         && match &local.kind {
             LocalKind::File { .. } => true,
-            LocalKind::Dir(children) => children.iter().all(local_deletable),
+            LocalKind::Dir(children) => {
+                ambiguous_local(children).is_empty() && children.iter().all(local_deletable)
+            }
             LocalKind::Unreadable { .. } | LocalKind::Cycle => false,
         }
+}
+
+/// The entries of one local directory that are ambiguous among their siblings: the same key as
+/// another, or a name that is not UTF-8. Temporary files are skipped on their own.
+fn ambiguous_local(children: &[LocalNode]) -> Vec<usize> {
+    let mut keys = HashMap::<String, Vec<usize>>::new();
+    let mut ambiguous = Vec::new();
+    for (index, child) in children.iter().enumerate() {
+        if local_name::is_reserved_temp_name(&child.name) {
+            continue;
+        }
+        if !child.utf8 {
+            ambiguous.push(index);
+        }
+        keys.entry(local_key(child).0).or_default().push(index);
+    }
+    ambiguous.extend(
+        keys.into_values()
+            .filter(|indexes| indexes.len() > 1)
+            .flatten(),
+    );
+    ambiguous.sort_unstable();
+    ambiguous.dedup();
+    ambiguous
+}
+
+/// The children of one Drive folder, by their `roles`, that share their key with a sibling.
+fn ambiguous_remote(roles: &[Role]) -> Vec<usize> {
+    let mut keys = HashMap::<String, Vec<usize>>::new();
+    for (index, role) in roles.iter().enumerate() {
+        let key = match role {
+            Role::Named { mapped, .. } => fold(mapped),
+            Role::Document { base, .. } | Role::Shortcut { base } => fold(base),
+            Role::Unusable { .. } => continue,
+        };
+        keys.entry(key).or_default().push(index);
+    }
+    let mut ambiguous = keys
+        .into_values()
+        .filter(|indexes| indexes.len() > 1)
+        .flatten()
+        .collect::<Vec<_>>();
+    ambiguous.sort_unstable();
+    ambiguous
+}
+
+/// The local name a download gives each named child of a Drive folder, by index.
+fn unique_names(children: &[RemoteNode], roles: &[Role]) -> HashMap<usize, String> {
+    let named = roles
+        .iter()
+        .enumerate()
+        .filter_map(|(index, role)| match role {
+            Role::Named { source, .. } => Some((index, children[index].id.as_deref()?, source)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let entries = named
+        .iter()
+        .map(|(_, id, name)| NameEntry { id, name })
+        .collect::<Vec<_>>();
+    let mut unique = HashMap::new();
+    if let Ok(names) = local_name::unique_local_names(&entries) {
+        unique.extend(named.iter().map(|(index, _, _)| *index).zip(names.names));
+    }
+    unique
 }
 
 /// The snapshot of a deletable local entry.
