@@ -550,6 +550,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "url",
  "yup-oauth2",
 ]
 

@@ -96,6 +96,10 @@ enum AccountCommand {
 enum DriveCommand {
     /// List drives
     List {
+        /// Max drives to list [default: all]
+        #[arg(long, value_parser = parse_positive_usize)]
+        max: Option<usize>,
+
         /// Don't print header
         #[arg(long)]
         skip_header: bool,
@@ -410,12 +414,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + 'static>> {
 
         Command::Drives { command } => match command {
             DriveCommand::List {
+                max,
                 skip_header,
                 field_separator,
             } => {
                 drives::list(drives::list::Config {
                     skip_header,
                     field_separator,
+                    max_drives: max,
                 })
                 .await?;
             }
@@ -723,11 +729,19 @@ async fn handle_account_command(
     Ok(())
 }
 
+/// Parses a count that must be at least 1.
+fn parse_positive_usize(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(n),
+        _ => Err(String::from("expected a positive integer")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{Cli, Command, FileCommand};
+    use super::{parse_positive_usize, Cli, Command, DriveCommand, FileCommand};
     use crate::files::list::ListQuery;
 
     #[test]
@@ -772,5 +786,32 @@ mod tests {
         let query = parse_files_list(&["--drive", "D", "--query", "name = 'a'"]);
         assert_eq!(query.q(), "name = 'a'");
         assert_eq!(query.drive_id(), Some("D"));
+    }
+
+    #[test]
+    fn positive_usize_rejects_zero_and_non_numbers() {
+        assert_eq!(parse_positive_usize("1"), Ok(1));
+        assert_eq!(parse_positive_usize("250"), Ok(250));
+        for invalid in ["0", "-1", "", "ten", "1.5"] {
+            assert!(parse_positive_usize(invalid).is_err(), "{invalid:?}");
+        }
+    }
+
+    #[test]
+    fn drives_list_max_defaults_to_all() {
+        let parse_max = |args: &[&str]| {
+            let cli = Cli::try_parse_from(["gdrive", "drives", "list"].iter().chain(args))?;
+            let Command::Drives {
+                command: DriveCommand::List { max, .. },
+            } = cli.command
+            else {
+                panic!("expected drives list");
+            };
+            Ok::<_, clap::Error>(max)
+        };
+
+        assert_eq!(parse_max(&[]).expect("no flags"), None);
+        assert_eq!(parse_max(&["--max", "250"]).expect("--max 250"), Some(250));
+        assert!(parse_max(&["--max", "0"]).is_err());
     }
 }

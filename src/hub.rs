@@ -39,6 +39,20 @@ impl Hub {
     }
 }
 
+#[cfg(test)]
+impl Hub {
+    /// A hub without credentials that sends every Drive request to `base_url`, for tests
+    /// against a local stub server.
+    pub(crate) fn with_base_url(base_url: String) -> io::Result<Hub> {
+        let http_client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(create_connector()?);
+        let mut hub = google_drive3::DriveHub::new(http_client, google_apis_common::NoToken);
+        hub.base_url(base_url);
+        Ok(Hub(hub))
+    }
+}
+
 pub(crate) struct Auth(pub(crate) Authenticator<HttpsConnector<HttpConnector>>);
 
 impl Deref for Auth {

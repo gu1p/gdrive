@@ -4,30 +4,46 @@ use crate::{
     common::{
         delegate::{UploadDelegate, UploadDelegateConfig},
         hub_helper::{get_hub, GetHubError},
+        paginate::{self, Page, PageRequest},
         table::{self, Table},
     },
     hub::Hub,
 };
 
+/// The API maximum for `drives.list`.
+const MAX_PAGE_SIZE: usize = 100;
+
+/// Only what the table prints.
+const FIELDS: &str = "drives(id,name),nextPageToken";
+
 pub(crate) struct Config {
     pub(crate) skip_header: bool,
     pub(crate) field_separator: String,
+    /// List at most this many drives; `None` lists all of them.
+    pub(crate) max_drives: Option<usize>,
 }
 
 pub(crate) async fn list(config: Config) -> Result<(), Box<Error>> {
     let hub = get_hub().await.map_err(Error::Hub)?;
     let delegate_config = UploadDelegateConfig::default();
 
-    let drives = list_drives(&hub, &delegate_config)
-        .await
-        .map_err(Error::ListDrives)?;
+    let drives = list_drives(
+        &hub,
+        &delegate_config,
+        config.max_drives.unwrap_or(usize::MAX),
+    )
+    .await
+    .map_err(Error::ListDrives)?;
 
-    print_drives_table(&config, drives);
+    print_drives_table(&config, drives).map_err(Error::WriteOutput)?;
 
     Ok(())
 }
 
-fn print_drives_table(config: &Config, drives: Vec<google_drive3::api::Drive>) {
+fn print_drives_table(
+    config: &Config,
+    drives: Vec<google_drive3::api::Drive>,
+) -> Result<(), io::Error> {
     let mut values: Vec<[String; 2]> = vec![];
 
     for drive in drives {
@@ -39,37 +55,50 @@ fn print_drives_table(config: &Config, drives: Vec<google_drive3::api::Drive>) {
         values,
     };
 
-    let _ = table::write(
+    table::write(
         io::stdout(),
         table,
         &table::DisplayConfig {
             skip_header: config.skip_header,
             separator: &config.field_separator,
         },
-    );
+    )
 }
 
 async fn list_drives(
     hub: &Hub,
     delegate_config: &UploadDelegateConfig,
+    max_drives: usize,
 ) -> Result<Vec<google_drive3::api::Drive>, Box<google_drive3::Error>> {
-    let mut delegate = UploadDelegate::new(delegate_config);
+    paginate::collect_pages(max_drives, MAX_PAGE_SIZE, async |page: PageRequest| {
+        let mut delegate = UploadDelegate::new(delegate_config);
 
-    let (_, drives_list) = hub
-        .drives()
-        .list()
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .doit()
-        .await?;
+        let mut req = hub
+            .drives()
+            .list()
+            .page_size(page.page_size)
+            .param("fields", FIELDS)
+            .add_scope(google_drive3::api::Scope::Full);
 
-    Ok(drives_list.drives.unwrap_or_default())
+        if let Some(token) = &page.page_token {
+            req = req.page_token(token);
+        }
+
+        let (_, drive_list) = req.delegate(&mut delegate).doit().await?;
+
+        Ok(Page {
+            items: drive_list.drives.unwrap_or_default(),
+            next_page_token: drive_list.next_page_token,
+        })
+    })
+    .await
 }
 
 #[derive(Debug)]
 pub(crate) enum Error {
     Hub(GetHubError),
     ListDrives(Box<google_drive3::Error>),
+    WriteOutput(io::Error),
 }
 
 impl error::Error for Error {
@@ -77,6 +106,7 @@ impl error::Error for Error {
         match self {
             Error::Hub(source) => Some(source),
             Error::ListDrives(source) => Some(source),
+            Error::WriteOutput(source) => Some(source),
         }
     }
 }
@@ -86,8 +116,97 @@ impl fmt::Display for Error {
         let s = match self {
             Error::Hub(_) => "unable to get drive hub",
             Error::ListDrives(_) => "failed to list drives",
+            Error::WriteOutput(_) => "unable to write the drive list to stdout",
         };
 
         f.write_str(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{list_drives, FIELDS};
+    use crate::common::{
+        delegate::UploadDelegateConfig,
+        stub_server::{Request, StubServer, TIMEOUT},
+    };
+
+    /// A `drives.list` response with drives `d<first>..d<last>` and an optional next page token.
+    fn drive_page(range: std::ops::Range<usize>, next_page_token: Option<&str>) -> String {
+        let drives: Vec<_> = range
+            .map(|i| serde_json::json!({ "id": format!("d{i}"), "name": format!("Drive {i}") }))
+            .collect();
+        let mut page = serde_json::json!({ "drives": drives });
+        if let Some(token) = next_page_token {
+            page["nextPageToken"] = token.into();
+        }
+        page.to_string()
+    }
+
+    /// Lists drives against a stub serving `pages`; returns the drive ids and the requests.
+    async fn list_from_stub(max_drives: usize, pages: Vec<String>) -> (Vec<String>, Vec<Request>) {
+        let server = StubServer::start(pages).await.expect("start stub server");
+        let hub = server.hub().expect("create hub");
+
+        let drives = tokio::time::timeout(
+            TIMEOUT,
+            list_drives(&hub, &UploadDelegateConfig::default(), max_drives),
+        )
+        .await
+        .expect("listing should finish")
+        .expect("listing should succeed");
+
+        let ids = drives.into_iter().filter_map(|drive| drive.id).collect();
+        (ids, server.requests().await)
+    }
+
+    fn page_params(requests: &[Request]) -> Vec<(Option<&str>, Option<&str>)> {
+        requests
+            .iter()
+            .map(|r| (r.param("pageSize"), r.param("pageToken")))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn lists_all_pages_by_default() {
+        let pages = vec![
+            drive_page(0..100, Some("t1")),
+            drive_page(100..200, Some("t2")),
+            drive_page(200..205, None),
+        ];
+
+        let (ids, requests) = list_from_stub(usize::MAX, pages).await;
+
+        assert_eq!(ids.len(), 205);
+        assert_eq!(ids.first().map(String::as_str), Some("d0"));
+        assert_eq!(ids.last().map(String::as_str), Some("d204"));
+        assert_eq!(
+            page_params(&requests),
+            [
+                (Some("100"), None),
+                (Some("100"), Some("t1")),
+                (Some("100"), Some("t2")),
+            ]
+        );
+        for request in &requests {
+            assert_eq!(request.path, "/drive/v3/drives");
+            assert_eq!(request.param("fields"), Some(FIELDS));
+        }
+    }
+
+    #[tokio::test]
+    async fn max_caps_the_listing() {
+        let pages = vec![
+            drive_page(0..100, Some("t1")),
+            drive_page(100..120, Some("t2")),
+        ];
+
+        let (ids, requests) = list_from_stub(120, pages).await;
+
+        assert_eq!(ids.len(), 120);
+        assert_eq!(
+            page_params(&requests),
+            [(Some("100"), None), (Some("20"), Some("t1"))]
+        );
     }
 }
