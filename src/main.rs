@@ -560,17 +560,23 @@ async fn main() -> ExitCode {
 /// the user which command to run next end the innermost message, on lines of their own.
 ///
 /// When the account has to be authorized again, only that error is printed: it names the command
-/// to run, and the layers around it add nothing.
+/// to run, and the layers around it add nothing. A message that the one before it contains already
+/// is left out: hyper's and yup-oauth2's errors put the message of their source into their own.
 fn error_message(err: &(dyn std::error::Error + 'static)) -> String {
     if let Some(reauth) = auth::find_reauth_required(err) {
         return format!("Error: {reauth}");
     }
 
-    let mut message = format!("Error: {}", err.to_string().trim_end());
+    let mut previous = err.to_string().trim_end().to_owned();
+    let mut message = format!("Error: {previous}");
     let mut source = err.source();
     while let Some(cause) = source {
-        message.push_str(": ");
-        message.push_str(cause.to_string().trim_end());
+        let text = cause.to_string().trim_end().to_owned();
+        if !previous.contains(&text) {
+            message.push_str(": ");
+            message.push_str(&text);
+        }
+        previous = text;
         source = cause.source();
     }
     message
@@ -996,6 +1002,43 @@ mod error_message_tests {
              no account has been selected\n\
              Use `gdrive account list` to show all accounts.\n\
              Use `gdrive account switch` to select an account."
+        );
+    }
+
+    #[test]
+    fn error_message_leaves_out_messages_that_were_shown_already() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.1.as_deref().map(|layer| layer as _)
+            }
+        }
+        let layer = |text, inner| Some(Box::new(Layer(text, inner)));
+
+        // As yup-oauth2 and hyper's client nest a connection error.
+        let err = Layer(
+            "unable to refresh the access token",
+            layer(
+                "Connection failure: Hyper error: client error (Connect)",
+                layer(
+                    "Hyper error: client error (Connect)",
+                    layer(
+                        "client error (Connect)",
+                        layer("tcp connect error", layer("Connection refused", None)),
+                    ),
+                ),
+            ),
+        );
+        assert_eq!(
+            error_message(&err),
+            "Error: unable to refresh the access token: Connection failure: Hyper error: client \
+             error (Connect): tcp connect error: Connection refused"
         );
     }
 
