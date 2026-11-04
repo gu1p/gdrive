@@ -850,8 +850,43 @@ fn sync_config(command: SyncCommand) -> files::sync::Config {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+/// The stack of the thread that runs the commands. The future of [`run`] holds the state of
+/// every command at once (the largest one sets its size), which in a debug build is more than
+/// the 1 MiB that the main thread gets on Windows; a thread of this size has room for it and
+/// for growth.
+const MAIN_STACK_SIZE: usize = 32 * 1024 * 1024;
+
+fn main() -> ExitCode {
+    let thread = std::thread::Builder::new()
+        .name("gdrive".to_owned())
+        .stack_size(MAIN_STACK_SIZE)
+        .spawn(|| {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(err) => {
+                    eprintln!("Error: unable to start the async runtime: {err}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            runtime.block_on(async_main())
+        });
+    match thread {
+        Ok(handle) => match handle.join() {
+            Ok(code) => code,
+            // The thread panicked (its message is printed already): end as a panic in main does.
+            Err(panic) => std::panic::resume_unwind(panic),
+        },
+        Err(err) => {
+            eprintln!("Error: unable to start the main thread: {err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn async_main() -> ExitCode {
     if let Err(err) = run().await {
         eprintln!("{}", failure_message(err.as_ref()));
         ExitCode::FAILURE
