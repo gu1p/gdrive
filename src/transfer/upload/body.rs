@@ -29,6 +29,9 @@ pub(super) const DEPTH: usize = 4;
 pub(crate) trait Source {
     /// Reads at most `buf.len()` bytes at `offset`; 0 only at the end of the source.
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>>;
+
+    /// The size of the source now.
+    fn size(&mut self) -> impl Future<Output = io::Result<u64>>;
 }
 
 /// A local file, read with tokio's file I/O.
@@ -60,6 +63,10 @@ impl Source for FileSource {
         self.position = Some(offset + read as u64);
         Ok(read)
     }
+
+    async fn size(&mut self) -> io::Result<u64> {
+        Ok(self.file.metadata().await?.len())
+    }
 }
 
 /// Any seekable reader, for callers that have no path (`files::upload::upload_file`). Its reads
@@ -82,6 +89,11 @@ impl<R> ReaderSource<R> {
 impl<R: Read + Seek> Source for ReaderSource<R> {
     fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> impl Future<Output = io::Result<usize>> {
         std::future::ready(self.read_blocking(offset, buf))
+    }
+
+    fn size(&mut self) -> impl Future<Output = io::Result<u64>> {
+        self.position = None;
+        std::future::ready(self.reader.seek(SeekFrom::End(0)))
     }
 }
 

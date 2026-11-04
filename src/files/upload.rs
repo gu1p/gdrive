@@ -353,9 +353,10 @@ async fn upload_directory(
     Ok(())
 }
 
-/// Uploads `src_file` (`file_info.size` bytes) as a new file with the pre-generated id
-/// `file_id`, if given, through gdrive's uploader (multipart up to 5 MiB, resumable above, md5
-/// checked; sessions are not kept across runs). A `file_info.source_mime_type` makes it a
+/// Uploads `src_file` as a new file with the pre-generated id `file_id`, if given, through
+/// gdrive's uploader (multipart up to 5 MiB, resumable above, md5 checked; sessions are not kept
+/// across runs). The content is all of `src_file`, measured when the upload starts, not
+/// `file_info.size` (which may be older); a size change during the upload is an error. A `file_info.source_mime_type` makes it a
 /// conversion to `file_info.mime_type`. Errors are google-drive3's, as they were when
 /// google-drive3 made the upload (see [`UploadError::into_drive_error`]).
 ///
@@ -381,7 +382,7 @@ where
         mime_type,
         source_mime_type,
         parents,
-        size,
+        size: _,
     } = file_info;
     let (mime, convert_to) = match source_mime_type {
         Some(source_mime_type) => (source_mime_type.clone(), Some(mime_type.into_owned())),
@@ -399,7 +400,6 @@ where
     upload_reader(
         hub,
         src_file,
-        size,
         &target,
         &delegate_config.options(),
         delegate_config.retry_policy,
@@ -526,6 +526,40 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("\r\n\r\nhello\r\n"), "{body}");
+    }
+
+    /// The recursive upload measures its files while it discovers them, earlier than it uploads
+    /// them: a file that grew in between goes up whole.
+    #[tokio::test]
+    async fn upload_file_sends_what_the_file_holds_when_it_is_uploaded() {
+        let content = b"hello, world";
+        let server = MockServer::start(vec![Response::json(
+            200,
+            &json!({
+                "id": "pre-id",
+                "size": "12",
+                "md5Checksum": format!("{:x}", md5::compute(content)),
+            }),
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, &content[..5]).unwrap();
+        let discovered = file_info(std::fs::metadata(&path).unwrap().len());
+        std::fs::write(&path, content).unwrap();
+
+        upload_file(
+            &server.hub(),
+            std::fs::File::open(&path).unwrap(),
+            Some(String::from("pre-id")),
+            discovered,
+            &UploadDelegateConfig::default(),
+        )
+        .await
+        .unwrap();
+
+        let body = server.requests()[0].body_text();
+        assert!(body.contains("\r\n\r\nhello, world\r\n"), "{body}");
     }
 
     #[tokio::test]

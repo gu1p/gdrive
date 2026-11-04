@@ -198,24 +198,26 @@ pub(crate) async fn upload_path(
     upload.run(&mut FileSource::new(file)).await
 }
 
-/// [`upload_path`] for a seekable reader of `size` bytes, with the retry policy `policy` (and the
-/// hub's throttle). The content type is `target.mime`, `application/octet-stream` without one.
+/// [`upload_path`] for a seekable reader, with the retry policy `policy` (and the hub's
+/// throttle). The content is the whole reader, measured when the upload starts. The content type
+/// is `target.mime`, `application/octet-stream` without one.
 pub(crate) async fn upload_reader<R: Read + Seek + Send>(
     hub: &Hub,
     reader: R,
-    size: u64,
     target: &UploadTarget,
     opts: &UploadOptions,
     policy: RetryPolicy,
     progress: Option<&(dyn Fn(u64) + Send + Sync)>,
 ) -> Result<google_drive3::api::File, UploadError> {
+    let mut source = ReaderSource::new(reader);
+    let size = source.size().await.map_err(UploadError::Read)?;
     let media_type = target
         .mime
         .clone()
         .unwrap_or(mime::APPLICATION_OCTET_STREAM);
     let retry = RetryState::new(policy, Some(hub.retrier().throttle.clone()));
     let upload = Upload::new(hub, retry, target, opts, progress, size, media_type);
-    upload.run(&mut ReaderSource::new(reader)).await
+    upload.run(&mut source).await
 }
 
 /// The request of an upload that failed.
@@ -354,6 +356,13 @@ pub(crate) enum UploadError {
     SessionsExpired { sessions: u32 },
     /// Looking up whether the file had been created failed.
     Reconcile(Box<google_drive3::Error>),
+    /// The size of the source changed during the upload: Drive holds the first `uploaded`
+    /// bytes of a file that has `now` bytes.
+    SourceChanged {
+        file_id: String,
+        uploaded: u64,
+        now: u64,
+    },
     /// Drive's md5 of the uploaded file differs from the local content's.
     Md5Mismatch {
         file_id: String,
@@ -436,6 +445,15 @@ impl Display for UploadError {
             UploadError::Reconcile(_) => {
                 f.write_str("unable to check whether the upload created the file")
             }
+            UploadError::SourceChanged {
+                file_id,
+                uploaded,
+                now,
+            } => write!(
+                f,
+                "the local file changed during the upload, from {uploaded} to {now} bytes; the \
+                 uploaded file {file_id} has the first {uploaded}, upload it again"
+            ),
             UploadError::Md5Mismatch {
                 file_id,
                 local,
@@ -472,6 +490,7 @@ impl Error for UploadError {
             | UploadError::InvalidReply { .. }
             | UploadError::LostReply
             | UploadError::SessionsExpired { .. }
+            | UploadError::SourceChanged { .. }
             | UploadError::Md5Mismatch { .. } => None,
         }
     }
@@ -735,6 +754,16 @@ impl<'a> Upload<'a> {
             self.resumable(source).await?
         };
         self.report(self.total);
+        // A file that grew during the upload went up only in part, and both md5s would be of
+        // that part.
+        let size = source.size().await.map_err(UploadError::Read)?;
+        if size != self.total {
+            return Err(UploadError::SourceChanged {
+                file_id: file.id.clone().unwrap_or_default(),
+                uploaded: self.total,
+                now: size,
+            });
+        }
         self.verify(source, &file).await?;
         Ok(file)
     }

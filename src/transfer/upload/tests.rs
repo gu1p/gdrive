@@ -666,31 +666,79 @@ async fn a_conversion_asks_for_the_google_type_and_sends_the_source_type() {
     }
 }
 
+/// Changes the file at `path` once the server confirmed the first chunk.
+fn after_first_chunk(path: PathBuf, change: fn(&std::fs::File)) -> impl Fn(u64) + Send + Sync {
+    move |offset| {
+        if offset == CHUNK {
+            let file = std::fs::File::options().append(true).open(&path).unwrap();
+            change(&file);
+        }
+    }
+}
+
 #[tokio::test]
 async fn a_source_that_gets_shorter_fails_without_retrying() {
+    let fixture = fixture(SIZE);
     let mock = MockDrive::start(Faults::default()).await;
-    let hub = mock.hub();
-    let data = test_data(SIZE - 1000);
+    let progress = after_first_chunk(fixture.path.clone(), |file| {
+        file.set_len(2 * CHUNK + 100).unwrap();
+    });
 
-    let error = upload_reader(
-        &hub,
-        Cursor::new(data),
-        SIZE,
-        &target(),
-        &options(),
-        RetryPolicy::for_tests(),
-        None,
-    )
-    .await
-    .unwrap_err();
+    let error = upload_with_progress(&mock, &fixture, &target(), &options(), Some(&progress))
+        .await
+        .unwrap_err();
 
     assert!(
         matches!(&error, UploadError::Read(source) if source.kind() == std::io::ErrorKind::UnexpectedEof),
         "{error:?}"
     );
     let state = mock.state();
-    assert_eq!(state.sessions[0].received.len() as u64, 4 * CHUNK);
+    assert_eq!(state.sessions[0].received.len() as u64, 2 * CHUNK);
     assert!(state.files.is_empty());
+}
+
+#[tokio::test]
+async fn a_source_that_grows_during_the_upload_is_an_error() {
+    let fixture = fixture(SIZE);
+    let mock = MockDrive::start(Faults::default()).await;
+    let progress = after_first_chunk(fixture.path.clone(), |mut file| {
+        std::io::Write::write_all(&mut file, b"more").unwrap();
+    });
+
+    let error = upload_with_progress(&mock, &fixture, &target(), &options(), Some(&progress))
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            UploadError::SourceChanged { file_id, uploaded: SIZE, now }
+                if file_id == "gen-id-1" && *now == SIZE + 4
+        ),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains("gen-id-1"), "{error}");
+}
+
+/// The size is the reader's when the upload starts, whatever an earlier look at the file said.
+#[tokio::test]
+async fn a_reader_is_uploaded_whole() {
+    let mock = MockDrive::start(Faults::default()).await;
+    let hub = mock.hub();
+    let data = test_data(SIZE);
+
+    upload_reader(
+        &hub,
+        Cursor::new(data.clone()),
+        &target(),
+        &options(),
+        RetryPolicy::for_tests(),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(mock.state().files["gen-id-1"].content, data);
 }
 
 #[tokio::test]
@@ -789,7 +837,6 @@ async fn an_upload_can_be_spawned() {
     let reader = upload_reader(
         &hub,
         Cursor::new(Vec::new()),
-        0,
         &target,
         &options,
         RetryPolicy::for_tests(),
