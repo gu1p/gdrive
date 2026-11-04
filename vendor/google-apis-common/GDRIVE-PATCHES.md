@@ -58,6 +58,13 @@ transport errors (no reply at all) were already retried with the same chunk; see
 local file still `unwrap()`. gdrive's own uploader (milestone 2 in docs/triage/README.md) is meant to
 replace this helper, and the patch should be offered upstream for #438.
 
+## Tests
+
+`tests/resumable_upload.rs` runs gdrive's upload delegate and the `files.create` call of
+`src/files/upload.rs` against an in-process mock of the protocol: a 503 on the second chunk, a cut
+reply body on the final chunk, and a 308 whose Range covers only part of a chunk. All three fail with
+pristine 8.0.0 and pass with this patch.
+
 ## Updating
 
 To see the patch, or to reapply it to a newer release:
