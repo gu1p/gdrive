@@ -1,5 +1,7 @@
 //! `files sync` against the fake Drive and temporary directories.
 
+mod safety;
+
 use std::{
     collections::BTreeMap,
     future::{self, Future},
