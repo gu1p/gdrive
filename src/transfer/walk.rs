@@ -25,6 +25,7 @@
 //!  |     |                                        supportsAllDrives,                 |
 //!  |     |                                        includeItemsFromAllDrives,         |
 //!  |     |                                        [corpora=drive&driveId]            |
+//!  |     |                                        [X-Goog-Drive-Resource-Keys]       |
 //!  |     |                                                  |                        |
 //!  |     |                                                  | pages, in completion   |
 //!  |     |                                                  v order                  |
@@ -102,17 +103,25 @@
 //! `driveId`). Its subfolders inherit the corpus; a followed shortcut's target is searched in
 //! the user's corpus, because it may be in another drive.
 //!
+//! Resource keys: every queued folder keeps its `resourceKey` (for a followed shortcut, the
+//! `targetResourceKey`; for the root, [`WalkRoot::resource_key`]), and every page request of a
+//! batch with keys carries them in the [`RESOURCE_KEYS_HEADER`]. google-drive3 cannot add a
+//! header, so those requests are built on the hub's client and credentials with the same
+//! parameters and error mapping; requests without keys go through google-drive3.
+//!
 //! # TODO for the scheduler
 //!
 //! - Fields: a download needs `id`, `size`, `md5Checksum` (verification, skip checks) and
 //!   `mimeType` ([`EntryKind`]); skip and update modes need `modifiedTime`; local paths come
 //!   from [`WalkEntry::components`] through `local_name::unique_local_names`, per
 //!   [`WalkEntry::parent`], once [`WalkItem::FolderDone`] says all names of the folder are
-//!   known. Native documents need an export format before they can be transferred. Add
-//!   `resourceKey` or `capabilities/canDownload` to [`FIELDS`] when a transfer needs them.
+//!   known. Native documents need an export format before they can be transferred. A file with
+//!   a `resourceKey` (shared by link only) must be downloaded with the [`RESOURCE_KEYS_HEADER`]
+//!   naming it, as the walk does for folders. Add `capabilities/canDownload` to [`FIELDS`] when
+//!   a transfer needs it.
 //! - Shortcuts to files are not resolved: the shortcut entry carries `shortcutDetails` (target
-//!   id and MIME type); the scheduler gets the target's metadata with `files.get` and the same
-//!   fields, within the listing limit, when it follows shortcuts.
+//!   id, MIME type and resource key); the scheduler gets the target's metadata with `files.get`
+//!   and the same fields, within the listing limit, when it follows shortcuts.
 //! - Errors: a [`FolderError`] is a failed outcome for that folder, and its subtree is unknown,
 //!   not empty: count it, continue with the other folders and exit non-zero at the end. An
 //!   [`IncompleteSearch`] marks the inventories of its folders incomplete. Either one must
@@ -129,13 +138,16 @@ use std::{
     error,
     fmt::{self, Display, Formatter},
     future::Future,
+    io,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
 };
 
 use futures::{future::BoxFuture, stream::FuturesUnordered, Stream, StreamExt};
+use google_apis_common::{to_body, to_bytes};
 use google_drive3::api::{File, FileList, Scope};
+use hyper::header::{AUTHORIZATION, CONTENT_LENGTH, USER_AGENT};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{common::drive_file, files::list::ListQuery, hub::Hub};
@@ -147,10 +159,15 @@ pub(crate) const PAGE_SIZE: i32 = 1000;
 pub(crate) const MAX_PARENTS_PER_QUERY: usize = 50;
 
 /// The `fields` mask of every list request: what the recursive download and the scheduler read
-/// (`parents` routes the results of a batched query, `driveId` tells shared-drive items apart).
+/// (`parents` routes the results of a batched query, `driveId` tells shared-drive items apart,
+/// `resourceKey` opens link-shared folders and files).
 pub(crate) const FIELDS: &str = "nextPageToken,incompleteSearch,files(id,name,mimeType,size,\
-    md5Checksum,modifiedTime,parents,driveId,trashed,\
+    md5Checksum,modifiedTime,parents,driveId,trashed,resourceKey,\
     shortcutDetails(targetId,targetMimeType,targetResourceKey))";
+
+/// The header that names the resource keys of link-shared items a request reads: comma-separated
+/// `<id>/<resourceKey>` pairs.
+pub(crate) const RESOURCE_KEYS_HEADER: &str = "X-Goog-Drive-Resource-Keys";
 
 /// The MIME type prefix of Google Workspace types (Docs, Sheets, folders, shortcuts, ...).
 const GOOGLE_APPS_MIME_PREFIX: &str = "application/vnd.google-apps.";
@@ -207,6 +224,8 @@ pub(crate) struct WalkRoot {
     /// The shared drive the root is in (the root's `driveId`). The subtree is then searched in
     /// that drive's corpus (`corpora=drive`, `driveId`) instead of the user's.
     pub(crate) drive_id: Option<String>,
+    /// The root's `resourceKey`, needed to list a folder that is shared by link only.
+    pub(crate) resource_key: Option<String>,
 }
 
 /// Identifies one listed folder location in one walk. A folder reached on two paths (a shortcut
@@ -363,7 +382,12 @@ impl Walk {
         let options = options.normalized();
         let (sender, items) = mpsc::channel(options.buffer);
 
-        let WalkRoot { id, name, drive_id } = root;
+        let WalkRoot {
+            id,
+            name,
+            drive_id,
+            resource_key,
+        } = root;
         let root = PendingFolder {
             folder: FolderRef {
                 key: FolderKey::ROOT,
@@ -372,6 +396,7 @@ impl Walk {
                 components: Vec::new(),
             },
             corpus: drive_id.map_or(Corpus::User, Corpus::Drive),
+            resource_key,
             ancestors: Arc::new(Ancestors {
                 id: id.clone(),
                 parent: None,
@@ -467,6 +492,9 @@ impl Ancestors {
 struct PendingFolder {
     folder: FolderRef,
     corpus: Corpus,
+    /// The folder's `resourceKey` (for a followed shortcut, the target's), sent with every page
+    /// request of the folder.
+    resource_key: Option<String>,
     /// This folder's id and its ancestors' ids.
     ancestors: Arc<Ancestors>,
     /// Ids already emitted under this folder, by a batch that was split.
@@ -498,6 +526,20 @@ impl Batch {
             emitted,
             q,
         }
+    }
+
+    /// The value of [`RESOURCE_KEYS_HEADER`] for the folders of this batch that have a resource
+    /// key, if any has one.
+    fn resource_keys(&self) -> Option<String> {
+        let keys = self
+            .folders
+            .iter()
+            .filter_map(|folder| {
+                let key = folder.resource_key.as_deref()?;
+                Some(format!("{}/{key}", folder.folder.id))
+            })
+            .collect::<Vec<_>>();
+        (!keys.is_empty()).then(|| keys.join(","))
     }
 
     fn corpus(&self) -> &Corpus {
@@ -775,7 +817,8 @@ impl Producer {
         }
         self.visited.insert(id.clone());
         let corpus = parent.corpus.clone();
-        Children::Listed(self.queue(parent, id, components, corpus))
+        let resource_key = file.resource_key.clone();
+        Children::Listed(self.queue(parent, id, resource_key, components, corpus))
     }
 
     fn queue_shortcut_target(
@@ -801,13 +844,15 @@ impl Producer {
         }
         self.visited.insert(target_id.clone());
         // The target may be in another drive than the shortcut, so search the user's corpus.
-        Children::Listed(self.queue(parent, target_id, components, Corpus::User))
+        let resource_key = details.target_resource_key.clone();
+        Children::Listed(self.queue(parent, target_id, resource_key, components, Corpus::User))
     }
 
     fn queue(
         &mut self,
         parent: &PendingFolder,
         id: &str,
+        resource_key: Option<String>,
         components: &[String],
         corpus: Corpus,
     ) -> FolderKey {
@@ -821,6 +866,7 @@ impl Producer {
                 components: components.to_vec(),
             },
             corpus,
+            resource_key,
             ancestors: Arc::new(Ancestors {
                 id: id.to_owned(),
                 parent: Some(Arc::clone(&parent.ancestors)),
@@ -843,6 +889,21 @@ async fn list_page(
     batch: &Batch,
     page_token: Option<&str>,
 ) -> Result<FileList, Box<google_drive3::Error>> {
+    // TODO(retry): wrap with retry_api once merged
+    match batch.resource_keys() {
+        None => list_page_call(hub, batch, page_token).await,
+        Some(resource_keys) => {
+            list_page_with_resource_keys(hub, batch, page_token, &resource_keys).await
+        }
+    }
+}
+
+/// The page request through google-drive3's `files.list` call.
+async fn list_page_call(
+    hub: &Hub,
+    batch: &Batch,
+    page_token: Option<&str>,
+) -> Result<FileList, Box<google_drive3::Error>> {
     let mut call = hub
         .files()
         .list()
@@ -859,7 +920,75 @@ async fn list_page(
         call = call.corpora("drive").drive_id(drive_id);
     }
 
-    // TODO(retry): wrap with retry_api once merged
     let (_, list) = call.doit().await.map_err(Box::new)?;
     Ok(list)
 }
+
+/// The same request as [`list_page_call`] with the [`RESOURCE_KEYS_HEADER`], which google-drive3
+/// cannot send: built on the hub's client and credentials, with google-drive3's error mapping.
+async fn list_page_with_resource_keys(
+    hub: &Hub,
+    batch: &Batch,
+    page_token: Option<&str>,
+    resource_keys: &str,
+) -> Result<FileList, Box<google_drive3::Error>> {
+    use google_drive3::Error;
+
+    let page_size = PAGE_SIZE.to_string();
+    let mut params = vec![
+        ("q", batch.q.as_str()),
+        ("pageSize", page_size.as_str()),
+        ("supportsAllDrives", "true"),
+        ("includeItemsFromAllDrives", "true"),
+        ("fields", FIELDS),
+        ("alt", "json"),
+    ];
+    if let Some(token) = page_token {
+        params.push(("pageToken", token));
+    }
+    if let Corpus::Drive(drive_id) = batch.corpus() {
+        params.push(("corpora", "drive"));
+        params.push(("driveId", drive_id));
+    }
+    let url = url::Url::parse_with_params(&format!("{}files", hub.drive_base_url()), &params)
+        .map_err(|err| Error::Io(io::Error::other(err)))?;
+
+    let token = hub
+        .auth
+        .get_token(&[Scope::Full.as_ref()])
+        .await
+        .map_err(Error::MissingToken)?;
+    let mut request = hyper::Request::get(url.as_str())
+        .header(USER_AGENT, USER_AGENT_VALUE)
+        .header(RESOURCE_KEYS_HEADER, resource_keys)
+        .header(CONTENT_LENGTH, 0_u64);
+    if let Some(token) = token {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+    let request = request
+        .body(to_body::<String>(None))
+        .map_err(|err| Error::Io(io::Error::other(err)))?;
+
+    let response = hub
+        .client
+        .request(request)
+        .await
+        .map_err(Error::HttpError)?;
+    let (parts, body) = response.into_parts();
+    let bytes = to_bytes(body).await.unwrap_or_default();
+    if !parts.status.is_success() {
+        return Err(Box::new(match serde_json::from_slice(&bytes) {
+            Ok(value) => Error::BadRequest(value),
+            Err(_) => Error::Failure(hyper::Response::from_parts(parts, to_body(Some(bytes)))),
+        }));
+    }
+    serde_json::from_slice(&bytes).map_err(|err| {
+        Box::new(Error::JsonDecodeError(
+            String::from_utf8_lossy(&bytes).into_owned(),
+            err,
+        ))
+    })
+}
+
+/// The `User-Agent` of requests the walk builds itself.
+const USER_AGENT_VALUE: &str = concat!("gdrive/", env!("CARGO_PKG_VERSION"));

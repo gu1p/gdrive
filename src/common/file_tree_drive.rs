@@ -82,6 +82,7 @@ impl Folder {
             id: file_id,
             name: name.clone(),
             drive_id: file.drive_id,
+            resource_key: file.resource_key,
         };
         let mut listing = list_subtree(hub, root).await?;
 

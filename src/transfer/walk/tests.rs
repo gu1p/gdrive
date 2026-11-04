@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use futures::StreamExt;
 
@@ -19,6 +23,7 @@ fn root() -> WalkRoot {
         id: String::from("root"),
         name: String::from("Root"),
         drive_id: None,
+        resource_key: None,
     }
 }
 
@@ -697,6 +702,149 @@ async fn incomplete_search_is_reported_before_the_page_entries() {
     assert!(index < x);
 }
 
+fn resource_keys(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+    pairs
+        .iter()
+        .map(|&(id, key)| (id.to_owned(), key.to_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn followed_shortcut_target_is_listed_with_its_resource_key() {
+    let files = vec![
+        FakeFile::folder("a", "a", "root"),
+        FakeFile::shortcut("link", "link", "a", "ext", MIME_TYPE_DRIVE_FOLDER)
+            .with_target_resource_key("rk-ext"),
+        // Shared by link only, outside the walked tree.
+        FakeFile::folder("ext", "external", "elsewhere").with_resource_key("rk-ext"),
+        FakeFile::blob("e1", "e.txt", "ext", "e"),
+        FakeFile::blob("e2", "f.txt", "ext", "f"),
+        FakeFile::folder("sub", "sub", "ext").with_resource_key("rk-sub"),
+        FakeFile::blob("s1", "s.txt", "sub", "s"),
+    ];
+    let behavior = Behavior {
+        // One file per page, so that the header is also needed with a page token.
+        page_size: Some(1),
+        resource_keys: resource_keys(&[("ext", "rk-ext"), ("sub", "rk-sub")]),
+        ..Behavior::default()
+    };
+    let options = WalkOptions {
+        follow_shortcuts: true,
+        ..options()
+    };
+    let walked = walk_all(files, behavior, options).await;
+
+    assert!(walked.errors().is_empty(), "{:#?}", walked.errors());
+    assert_eq!(
+        walked.paths(),
+        [
+            "a",
+            "a/link",
+            "a/link/e.txt",
+            "a/link/f.txt",
+            "a/link/sub",
+            "a/link/sub/s.txt"
+        ]
+    );
+    let sent = walked
+        .server
+        .requests()
+        .into_iter()
+        .map(|request| {
+            let page = request.param("pageToken").is_some();
+            (request.parents, page, request.resource_keys)
+        })
+        .collect::<Vec<_>>();
+    let key = |key: &str| Some(String::from(key));
+    assert_eq!(
+        sent,
+        [
+            (ids(&["root"]), false, None),
+            (ids(&["a"]), false, None),
+            (ids(&["ext"]), false, key("ext/rk-ext")),
+            (ids(&["ext"]), true, key("ext/rk-ext")),
+            (ids(&["ext"]), true, key("ext/rk-ext")),
+            (ids(&["sub"]), false, key("sub/rk-sub")),
+        ]
+    );
+    let request = &walked.server.requests()[2];
+    assert_eq!(request.param("fields"), Some(FIELDS));
+    assert_eq!(request.param("pageSize"), Some("1000"));
+    assert_eq!(request.param("supportsAllDrives"), Some("true"));
+    assert_eq!(request.param("includeItemsFromAllDrives"), Some("true"));
+    assert_eq!(
+        request.param("q"),
+        Some("'ext' in parents and trashed = false")
+    );
+}
+
+#[tokio::test]
+async fn batch_sends_the_resource_keys_of_its_folders() {
+    let files = vec![
+        FakeFile::folder("x", "x", "root").with_resource_key("kx"),
+        FakeFile::folder("y", "y", "root").with_resource_key("ky"),
+        FakeFile::folder("z", "z", "root"),
+        FakeFile::folder("w", "w", "root").with_resource_key("stale"),
+        FakeFile::blob("x1", "1.txt", "x", "x"),
+        FakeFile::blob("y1", "1.txt", "y", "y"),
+        FakeFile::blob("z1", "1.txt", "z", "z"),
+        FakeFile::blob("w1", "1.txt", "w", "w"),
+    ];
+    let behavior = Behavior {
+        resource_keys: resource_keys(&[
+            ("root", "rk-root"),
+            ("x", "kx"),
+            ("y", "ky"),
+            ("w", "current"),
+        ]),
+        ..Behavior::default()
+    };
+    let server = FakeDrive::start(files, behavior).await;
+    let root = WalkRoot {
+        resource_key: Some(String::from("rk-root")),
+        ..root()
+    };
+    let walked = Walked {
+        items: collect(Walk::start(Arc::new(server.hub()), root, options())).await,
+        server,
+    };
+    walked.assert_item_order();
+
+    // `w`'s key is refused: the batch is split and only `w` fails, through the same error
+    // mapping as google-drive3's.
+    assert_eq!(
+        walked.paths(),
+        ["w", "x", "x/1.txt", "y", "y/1.txt", "z", "z/1.txt"]
+    );
+    let errors = walked.errors();
+    assert_eq!(errors.len(), 1);
+    assert_eq!(errors[0].folder.id, "w");
+    assert!(matches!(
+        *errors[0].error,
+        google_drive3::Error::BadRequest(_)
+    ));
+    let mut sent = walked
+        .server
+        .requests()
+        .into_iter()
+        .map(|request| (request.parents, request.resource_keys))
+        .collect::<Vec<_>>();
+    // The queries of the split batch run two at a time, in any order.
+    sent[2..].sort();
+    let key = |key: &str| Some(String::from(key));
+    assert_eq!(
+        sent,
+        [
+            (ids(&["root"]), key("root/rk-root")),
+            (ids(&["x", "y", "z", "w"]), key("x/kx,y/ky,w/stale")),
+            (ids(&["w"]), key("w/stale")),
+            (ids(&["x"]), key("x/kx")),
+            (ids(&["y"]), key("y/ky")),
+            (ids(&["z"]), None),
+        ]
+    );
+}
+
 #[tokio::test]
 async fn shared_drive_root_searches_the_drive_corpus() {
     let files = vec![
@@ -765,6 +913,8 @@ async fn requests_ask_for_the_walk_fields_and_exclude_trashed_files() {
         "trashed",
         "parents",
         "driveId",
+        "resourceKey",
+        "targetResourceKey",
         "incompleteSearch",
         "nextPageToken",
     ] {

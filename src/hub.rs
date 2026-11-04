@@ -37,6 +37,16 @@ impl Hub {
     }
 }
 
+impl Hub {
+    /// The Drive API base URL (`https://www.googleapis.com/drive/v3/` unless a test changed it),
+    /// for requests google-drive3 cannot build, such as ones with extra headers.
+    pub(crate) fn drive_base_url(&self) -> String {
+        // google-drive3 only has a setter, which returns the previous value; the clone shares
+        // the client and credentials and is dropped right away.
+        self.0.clone().base_url(String::new())
+    }
+}
+
 /// The HTTP client for requests to the OAuth token endpoint.
 pub(crate) fn token_http_client() -> io::Result<Client<HttpsConnector<HttpConnector>, String>> {
     Ok(Client::builder(hyper_util::rt::TokioExecutor::new()).build(create_connector()?))

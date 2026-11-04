@@ -7,7 +7,7 @@
 //! request and the most requests it had in flight at once.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     sync::{
@@ -41,6 +41,8 @@ pub(crate) struct FakeFile {
     pub(crate) drive_id: Option<String>,
     /// Target id and target MIME type of a shortcut.
     pub(crate) shortcut_target: Option<(String, String)>,
+    pub(crate) target_resource_key: Option<String>,
+    pub(crate) resource_key: Option<String>,
 }
 
 impl FakeFile {
@@ -109,6 +111,21 @@ impl FakeFile {
         }
     }
 
+    pub(crate) fn with_resource_key(self, resource_key: &str) -> Self {
+        Self {
+            resource_key: Some(resource_key.to_owned()),
+            ..self
+        }
+    }
+
+    /// For a shortcut: the target's resource key.
+    pub(crate) fn with_target_resource_key(self, resource_key: &str) -> Self {
+        Self {
+            target_resource_key: Some(resource_key.to_owned()),
+            ..self
+        }
+    }
+
     pub(crate) fn with_parents(self, parents: &[&str]) -> Self {
         Self {
             parents: parents.iter().map(|&parent| parent.to_owned()).collect(),
@@ -134,11 +151,15 @@ impl FakeFile {
         if let Some(drive_id) = &self.drive_id {
             file.insert("driveId".into(), json!(drive_id));
         }
+        if let Some(resource_key) = &self.resource_key {
+            file.insert("resourceKey".into(), json!(resource_key));
+        }
         if let Some((target_id, target_mime_type)) = &self.shortcut_target {
-            file.insert(
-                "shortcutDetails".into(),
-                json!({"targetId": target_id, "targetMimeType": target_mime_type}),
-            );
+            let mut details = json!({"targetId": target_id, "targetMimeType": target_mime_type});
+            if let Some(resource_key) = &self.target_resource_key {
+                details["targetResourceKey"] = json!(resource_key);
+            }
+            file.insert("shortcutDetails".into(), details);
         }
         Value::Object(file)
     }
@@ -164,6 +185,9 @@ pub(crate) struct Behavior {
     /// Start every page after the first with the last file of the previous page, as Drive may
     /// when the folder changes during the listing.
     pub(crate) repeat_across_pages: bool,
+    /// Folders shared by link only: a query naming one fails with 404 unless the
+    /// `X-Goog-Drive-Resource-Keys` header has `<id>/<key>` for it.
+    pub(crate) resource_keys: HashMap<String, String>,
 }
 
 /// A list request as the fake saw it, with percent-decoded parameters.
@@ -172,6 +196,8 @@ pub(crate) struct ListRequest {
     pub(crate) params: Vec<(String, String)>,
     /// The folder ids named in `q`, in order.
     pub(crate) parents: Vec<String>,
+    /// The `X-Goog-Drive-Resource-Keys` header.
+    pub(crate) resource_keys: Option<String>,
 }
 
 impl ListRequest {
@@ -298,6 +324,11 @@ async fn handle(
     let list_request = ListRequest {
         parents: parent_ids(&q),
         params,
+        resource_keys: request
+            .headers()
+            .get("x-goog-drive-resource-keys")
+            .and_then(|value| value.to_str().ok())
+            .map(String::from),
     };
     state
         .requests
@@ -315,6 +346,21 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     let names = |set: &HashSet<String>| request.parents.iter().any(|id| set.contains(id));
 
     if names(&behavior.unreadable) {
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    }
+    let sent_keys = request
+        .resource_keys
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .collect::<Vec<_>>();
+    let missing_key = request.parents.iter().any(|id| {
+        behavior
+            .resource_keys
+            .get(id)
+            .is_some_and(|key| !sent_keys.contains(&format!("{id}/{key}").as_str()))
+    });
+    if missing_key {
         return error(StatusCode::NOT_FOUND, "File not found.");
     }
 
