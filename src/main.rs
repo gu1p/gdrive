@@ -10,10 +10,7 @@ mod version;
 
 use std::{path::PathBuf, process::ExitCode};
 
-use clap::{
-    builder::{StringValueParser, TypedValueParser},
-    Parser, Subcommand,
-};
+use clap::{Parser, Subcommand};
 use common::{delegate::ChunkSize, permission};
 use error_trace::ErrorTrace;
 use files::list::{ListQuery, ListSortOrder};
@@ -107,8 +104,8 @@ enum DriveCommand {
         #[arg(long)]
         skip_header: bool,
 
-        /// Field separator. `\t` stands for a tab
-        #[arg(long, default_value_t = String::from("\t"), value_parser = field_separator_parser())]
+        /// Field separator
+        #[arg(long, default_value_t = String::from("\t"))]
         field_separator: String,
     },
 }
@@ -169,8 +166,8 @@ enum FileCommand {
         #[arg(long)]
         full_name: bool,
 
-        /// Field separator. `\t` stands for a tab
-        #[arg(long, default_value_t = String::from("\t"), value_parser = field_separator_parser())]
+        /// Field separator. Columns stay aligned; for tab-separated values use --tsv
+        #[arg(long, default_value_t = String::from("\t"))]
         field_separator: String,
 
         /// Print tab-separated values for scripts
@@ -391,8 +388,8 @@ enum PermissionCommand {
         #[arg(long)]
         skip_header: bool,
 
-        /// Field separator. `\t` stands for a tab
-        #[arg(long, default_value_t = String::from("\t"), value_parser = field_separator_parser())]
+        /// Field separator
+        #[arg(long, default_value_t = String::from("\t"))]
         field_separator: String,
     },
 
@@ -762,11 +759,6 @@ async fn handle_account_command(
     Ok(())
 }
 
-/// Reads `\t` in a field separator as a tab, so a tab can be passed without shell quoting.
-fn field_separator_parser() -> impl TypedValueParser<Value = String> {
-    StringValueParser::new().map(|s| s.replace(r"\t", "\t"))
-}
-
 /// Parses a count that must be at least 1.
 fn parse_positive_usize(s: &str) -> Result<usize, String> {
     match s.parse::<usize>() {
@@ -779,7 +771,7 @@ fn parse_positive_usize(s: &str) -> Result<usize, String> {
 mod tests {
     use clap::{CommandFactory, Parser};
 
-    use super::{parse_positive_usize, Cli, Command, DriveCommand, FileCommand};
+    use super::{parse_positive_usize, Cli, Command, DriveCommand, FileCommand, PermissionCommand};
     use crate::files::list::ListQuery;
 
     #[test]
@@ -877,11 +869,13 @@ mod tests {
         (field_separator, tsv, json)
     }
 
+    /// 3.9 compatibility: the separator is used as given, so the two characters `\t` stay two
+    /// characters; real tabs come from --tsv.
     #[test]
-    fn field_separator_reads_backslash_t_as_tab() {
+    fn field_separator_is_taken_literally() {
         assert_eq!(files_list_flags(&[]).0, "\t");
-        assert_eq!(files_list_flags(&["--field-separator", r"\t"]).0, "\t");
-        assert_eq!(files_list_flags(&["--field-separator", r"a\tb"]).0, "a\tb");
+        assert_eq!(files_list_flags(&["--field-separator", r"\t"]).0, r"\t");
+        assert_eq!(files_list_flags(&["--field-separator", "\t"]).0, "\t");
         assert_eq!(files_list_flags(&["--field-separator", ","]).0, ",");
 
         let cli = parse(&["drives", "list", "--field-separator", r"\t"]).expect("parse");
@@ -893,7 +887,18 @@ mod tests {
         else {
             panic!("expected drives list");
         };
-        assert_eq!(field_separator, "\t");
+        assert_eq!(field_separator, r"\t");
+
+        let cli = parse(&["permissions", "list", "F", "--field-separator", r"\t"]).expect("parse");
+        let Command::Permissions {
+            command: PermissionCommand::List {
+                field_separator, ..
+            },
+        } = cli.command
+        else {
+            panic!("expected permissions list");
+        };
+        assert_eq!(field_separator, r"\t");
     }
 
     #[test]
