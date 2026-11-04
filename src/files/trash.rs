@@ -22,8 +22,8 @@ use crate::{
 };
 
 /// Metadata needed to decide whether a file may be (un)trashed.
-const FILE_FIELDS: &str =
-    "id,name,mimeType,trashed,driveId,ownedByMe,capabilities(canTrash,canUntrash)";
+const FILE_FIELDS: &str = "id,name,mimeType,trashed,explicitlyTrashed,driveId,ownedByMe,\
+    capabilities(canTrash,canUntrash)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Action {
@@ -122,10 +122,12 @@ fn check(
         return Err(Error::SharedDriveRoot(FileIdentifier::from(file)));
     }
 
-    let trashed = file.trashed.unwrap_or(false);
+    // `trashed` is also true for everything inside a trashed folder. Such a file is not in the
+    // trash on its own: skipping the patch would let a later restore of the folder bring it
+    // back. Only an explicitly trashed file needs nothing more.
     let done = match action {
-        Action::Trash => trashed,
-        Action::Untrash => !trashed,
+        Action::Trash => file.explicitly_trashed == Some(true),
+        Action::Untrash => !file.trashed.unwrap_or(false),
     };
     if done {
         return Ok(Check::AlreadyDone);
@@ -279,6 +281,7 @@ mod tests {
     fn trashing_a_trashed_file_is_a_no_op() {
         let file = File {
             trashed: Some(true),
+            explicitly_trashed: Some(true),
             ..my_file()
         };
         assert_eq!(
@@ -293,6 +296,22 @@ mod tests {
             check(&my_file(), Action::Untrash, false).unwrap(),
             Check::AlreadyDone
         );
+    }
+
+    #[test]
+    fn file_trashed_only_through_its_folder_is_still_trashed() {
+        for explicitly_trashed in [Some(false), None] {
+            let child = File {
+                trashed: Some(true),
+                explicitly_trashed,
+                ..my_file()
+            };
+            assert_eq!(
+                check(&child, Action::Trash, false).unwrap(),
+                Check::Proceed,
+                "explicitly_trashed: {explicitly_trashed:?}"
+            );
+        }
     }
 
     #[test]
@@ -374,6 +393,7 @@ mod tests {
                 "name": "report.txt",
                 "mimeType": "text/plain",
                 "trashed": trashed,
+                "explicitlyTrashed": trashed,
                 "ownedByMe": true,
                 "capabilities": {"canTrash": true, "canUntrash": true},
             }),
@@ -491,5 +511,60 @@ mod tests {
             ]
             .map(|(method, path)| (method.to_owned(), path.to_owned()))
         );
+    }
+
+    #[tokio::test]
+    async fn child_of_a_trashed_folder_is_still_patched() {
+        // Regression: trashing folder P and then its child C must patch C, otherwise C has no
+        // trash entry of its own and restoring P restores C as well.
+        let capabilities = json!({"canTrash": true, "canUntrash": true});
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({
+                    "id": "parent", "name": "P", "mimeType": MIME_TYPE_DRIVE_FOLDER,
+                    "trashed": false, "explicitlyTrashed": false,
+                    "ownedByMe": true, "capabilities": capabilities,
+                }),
+            ),
+            Response::json(200, &json!({"id": "parent", "trashed": true})),
+            Response::json(
+                200,
+                &json!({
+                    "id": "child", "name": "c.txt", "mimeType": "text/plain",
+                    "trashed": true, "explicitlyTrashed": false,
+                    "ownedByMe": true, "capabilities": capabilities,
+                }),
+            ),
+            Response::json(200, &json!({"id": "child", "trashed": true})),
+        ])
+        .await;
+
+        let config = Config {
+            file_ids: vec!["parent".to_owned(), "child".to_owned()],
+            action: Action::Trash,
+            trash_directories: true,
+        };
+        trash_files(&server.hub(), &config).await.unwrap();
+
+        let requests = server.requests();
+        let methods_and_paths: Vec<_> = requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.path.as_str()))
+            .collect();
+        assert_eq!(
+            methods_and_paths,
+            [
+                ("GET", "/drive/v3/files/parent"),
+                ("PATCH", "/drive/v3/files/parent"),
+                ("GET", "/drive/v3/files/child"),
+                ("PATCH", "/drive/v3/files/child"),
+            ]
+        );
+        assert!(requests[2]
+            .query_param("fields")
+            .unwrap()
+            .contains("explicitlyTrashed"));
+        assert_eq!(requests[3].body_json(), json!({"trashed": true}));
     }
 }
