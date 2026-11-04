@@ -14,6 +14,10 @@
 //!   rejects it with 400;
 //! - a new file whose id exists already gets a 409;
 //! - `GET /drive/v3/files/generateIds` and `GET /drive/v3/files/{id}` give ids and files.
+//!
+//! A checking mock ([`MockDrive::start_checking`]) compares the chunks of its sessions with the
+//! bytes a function says they must be instead of keeping them, so that a test can send a large
+//! file without holding it; such a file has no md5.
 
 use std::{
     collections::BTreeMap,
@@ -41,75 +45,78 @@ use crate::hub::Hub;
 
 type MockBody = UnsyncBoxBody<Bytes, io::Error>;
 
+/// Fills the buffer with the bytes the content must have at the offset.
+pub(crate) type Expected = fn(u64, &mut [u8]);
+
 /// Faults the mock injects. Unless said otherwise, each happens once.
 #[expect(clippy::struct_excessive_bools, reason = "independent faults")]
 #[derive(Debug, Default, Clone)]
-pub(super) struct Faults {
+pub(crate) struct Faults {
     /// Answer the chunk that starts at this offset with a 503 and commit none of it.
-    pub(super) fail_chunk_at: Option<u64>,
+    pub(crate) fail_chunk_at: Option<u64>,
     /// Commit only the given number of bytes of the chunk that starts at the given offset.
-    pub(super) short_commit: Option<(u64, usize)>,
+    pub(crate) short_commit: Option<(u64, usize)>,
     /// Cut the body of the reply that completes a session, after its head.
-    pub(super) cut_final_reply: bool,
+    pub(crate) cut_final_reply: bool,
     /// Answer every chunk that starts at this offset with a 308 that repeats the current
     /// Range, committing nothing (this one never goes away).
-    pub(super) stall_at: Option<u64>,
+    pub(crate) stall_at: Option<u64>,
     /// Answer the chunk that starts at the given offset with a 429 rateLimitExceeded and
     /// `Retry-After: <seconds>`, committing none of it.
-    pub(super) rate_limit_chunk_at: Option<(u64, u64)>,
+    pub(crate) rate_limit_chunk_at: Option<(u64, u64)>,
     /// Answer the chunk that starts at this offset with a 404, and every request to its
     /// session after it: the session expired.
-    pub(super) expire_session_at: Option<u64>,
+    pub(crate) expire_session_at: Option<u64>,
     /// After this many accepted chunks (over all sessions), close every connection without a
     /// reply until [`MockDrive::revive`]: the network or the process is gone.
-    pub(super) die_after_chunks: Option<u32>,
+    pub(crate) die_after_chunks: Option<u32>,
     /// Report an md5 that is not the one of the content.
-    pub(super) wrong_md5: bool,
+    pub(crate) wrong_md5: bool,
     /// Answer the first multipart upload with a 503 without storing it.
-    pub(super) fail_multipart: bool,
+    pub(crate) fail_multipart: bool,
     /// Store the first multipart upload but cut the body of its reply.
-    pub(super) cut_multipart_reply: bool,
+    pub(crate) cut_multipart_reply: bool,
     /// Store the first multipart upload, then close the connection without any reply.
-    pub(super) drop_multipart_reply: bool,
+    pub(crate) drop_multipart_reply: bool,
     /// Answer every session start with this status and JSON error (never goes away).
-    pub(super) reject_start: Option<(u16, Value)>,
+    pub(crate) reject_start: Option<(u16, Value)>,
 }
 
 /// A request the mock received, and how it answered (`None`: it closed the connection).
 #[derive(Debug, Clone)]
-pub(super) struct Logged {
-    pub(super) method: Method,
-    pub(super) path: String,
-    pub(super) query: String,
-    pub(super) headers: HeaderMap,
-    pub(super) body: Bytes,
-    pub(super) status: Option<StatusCode>,
-    pub(super) at: Instant,
+pub(crate) struct Logged {
+    pub(crate) method: Method,
+    pub(crate) path: String,
+    pub(crate) query: String,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Bytes,
+    pub(crate) status: Option<StatusCode>,
+    pub(crate) at: Instant,
 }
 
 impl Logged {
-    pub(super) fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name)?.to_str().ok()
     }
 
     /// A query parameter, percent-decoded.
-    pub(super) fn query_param(&self, name: &str) -> Option<String> {
+    pub(crate) fn query_param(&self, name: &str) -> Option<String> {
         url::form_urlencoded::parse(self.query.as_bytes())
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.into_owned())
     }
 
-    pub(super) fn is_session_request(&self) -> bool {
+    pub(crate) fn is_session_request(&self) -> bool {
         self.path.starts_with("/upload-session/")
     }
 
     /// The first byte of a chunk request; `None` for a status request.
-    pub(super) fn chunk_start(&self) -> Option<u64> {
+    pub(crate) fn chunk_start(&self) -> Option<u64> {
         let range = self.header("content-range")?.strip_prefix("bytes ")?;
         range.split_once('-')?.0.parse().ok()
     }
 
-    pub(super) fn is_status_query(&self) -> bool {
+    pub(crate) fn is_status_query(&self) -> bool {
         self.header("content-range")
             .is_some_and(|range| range.starts_with("bytes */"))
     }
@@ -117,35 +124,45 @@ impl Logged {
 
 /// A resumable session.
 #[derive(Debug)]
-pub(super) struct Session {
-    pub(super) metadata: Value,
-    pub(super) content_type: String,
-    pub(super) total: u64,
-    pub(super) received: Vec<u8>,
-    pub(super) complete: bool,
-    pub(super) expired: bool,
-    pub(super) file_id: String,
+pub(crate) struct Session {
+    pub(crate) metadata: Value,
+    pub(crate) content_type: String,
+    pub(crate) total: u64,
+    /// The committed bytes; empty in a checking mock.
+    pub(crate) received: Vec<u8>,
+    /// How many bytes are committed.
+    pub(crate) committed: u64,
+    /// In a checking mock: the first committed byte that is not the expected one.
+    pub(crate) first_mismatch: Option<u64>,
+    pub(crate) complete: bool,
+    pub(crate) expired: bool,
+    pub(crate) file_id: String,
 }
 
 /// A file on the mock Drive.
 #[derive(Debug, Clone)]
-pub(super) struct StoredFile {
-    pub(super) metadata: Value,
-    pub(super) content: Vec<u8>,
-    pub(super) content_type: String,
+pub(crate) struct StoredFile {
+    pub(crate) metadata: Value,
+    /// Empty when the file came from a session of a checking mock.
+    pub(crate) content: Vec<u8>,
+    pub(crate) content_type: String,
+    /// The size of a file whose content was checked instead of kept (a checking mock).
+    pub(crate) checked_size: Option<u64>,
 }
 
 #[derive(Debug, Default)]
-pub(super) struct State {
-    pub(super) faults: Faults,
-    pub(super) sessions: Vec<Session>,
-    pub(super) files: BTreeMap<String, StoredFile>,
-    pub(super) log: Vec<Logged>,
-    pub(super) dead: bool,
-    pub(super) accepted_chunks: u32,
-    pub(super) generated_ids: u32,
+pub(crate) struct State {
+    pub(crate) faults: Faults,
+    pub(crate) sessions: Vec<Session>,
+    pub(crate) files: BTreeMap<String, StoredFile>,
+    pub(crate) log: Vec<Logged>,
+    pub(crate) dead: bool,
+    pub(crate) accepted_chunks: u32,
+    pub(crate) generated_ids: u32,
     /// The email address `about.get` reports: the account the credentials are of.
-    pub(super) email: String,
+    pub(crate) email: String,
+    /// What the content of sessions must be, in a checking mock.
+    pub(crate) expected: Option<Expected>,
     next_file: u32,
     /// Close the connection instead of sending the reply the request got.
     drop_reply: bool,
@@ -153,7 +170,7 @@ pub(super) struct State {
 
 impl State {
     /// The last requests, for failure messages.
-    pub(super) fn log_text(&self) -> String {
+    pub(crate) fn log_text(&self) -> String {
         const LINES: usize = 40;
         let skipped = self.log.len().saturating_sub(LINES);
         let mut text = if skipped > 0 {
@@ -179,7 +196,7 @@ impl State {
     }
 
     /// The requests to upload sessions.
-    pub(super) fn session_log(&self) -> Vec<&Logged> {
+    pub(crate) fn session_log(&self) -> Vec<&Logged> {
         self.log
             .iter()
             .filter(|request| request.is_session_request())
@@ -187,12 +204,12 @@ impl State {
     }
 
     /// The first bytes of the chunk requests, in order.
-    pub(super) fn chunk_starts(&self) -> Vec<u64> {
+    pub(crate) fn chunk_starts(&self) -> Vec<u64> {
         self.log.iter().filter_map(Logged::chunk_start).collect()
     }
 
     /// The session starts and multipart uploads.
-    pub(super) fn uploads(&self) -> Vec<&Logged> {
+    pub(crate) fn uploads(&self) -> Vec<&Logged> {
         self.log
             .iter()
             .filter(|request| request.path.starts_with("/upload/drive/v3/files"))
@@ -339,6 +356,8 @@ impl State {
             content_type,
             total,
             received: Vec::new(),
+            committed: 0,
+            first_mismatch: None,
             complete: false,
             expired: false,
             file_id,
@@ -372,6 +391,7 @@ impl State {
             metadata,
             content,
             content_type,
+            checked_size: None,
         };
         let resource = self.resource(&id, &file);
         self.files.insert(id, file);
@@ -399,6 +419,7 @@ impl State {
             return text(StatusCode::BAD_REQUEST, "malformed total length");
         };
         let faults = &mut self.faults;
+        let expected = self.expected;
         let Some(session) = self.sessions.get_mut(index) else {
             return text(StatusCode::NOT_FOUND, "unknown session");
         };
@@ -427,7 +448,7 @@ impl State {
         }) else {
             return text(StatusCode::BAD_REQUEST, "malformed byte range");
         };
-        let committed = session.received.len() as u64;
+        let committed = session.committed;
         if first != committed {
             return text(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -454,18 +475,27 @@ impl State {
             }
             _ => body.len(),
         };
-        session.received.extend_from_slice(&body[..accepted]);
+        match expected {
+            Some(expected) => {
+                if session.first_mismatch.is_none() {
+                    session.first_mismatch = first_mismatch(expected, first, &body[..accepted]);
+                }
+            }
+            None => session.received.extend_from_slice(&body[..accepted]),
+        }
+        session.committed += accepted as u64;
         self.accepted_chunks += 1;
         if faults.die_after_chunks == Some(self.accepted_chunks) {
             self.dead = true;
         }
 
-        if session.received.len() as u64 == total {
+        if session.committed == total {
             session.complete = true;
             let file = StoredFile {
                 metadata: session.metadata.clone(),
                 content: session.received.clone(),
                 content_type: session.content_type.clone(),
+                checked_size: expected.is_some().then_some(total),
             };
             let id = session.file_id.clone();
             let cut = std::mem::take(&mut faults.cut_final_reply);
@@ -489,7 +519,9 @@ impl State {
             "name": file.metadata["name"],
             "mimeType": mime_type,
         });
-        if !mime_type.starts_with("application/vnd.google-apps.") {
+        if let Some(size) = file.checked_size {
+            resource["size"] = size.to_string().into();
+        } else if !mime_type.starts_with("application/vnd.google-apps.") {
             let md5 = if self.faults.wrong_md5 {
                 md5::compute(b"something else")
             } else {
@@ -498,8 +530,27 @@ impl State {
             resource["size"] = file.content.len().to_string().into();
             resource["md5Checksum"] = format!("{md5:x}").into();
         }
+        for time in ["modifiedTime", "createdTime"] {
+            if let Some(value) = file.metadata.get(time) {
+                resource[time] = value.clone();
+            }
+        }
         resource
     }
+}
+
+/// The offset of the first byte of `bytes`, received at `offset`, that is not the expected one.
+fn first_mismatch(expected: Expected, offset: u64, bytes: &[u8]) -> Option<u64> {
+    let mut want = vec![0; bytes.len()];
+    expected(offset, &mut want);
+    if bytes == want.as_slice() {
+        return None;
+    }
+    bytes
+        .iter()
+        .zip(&want)
+        .position(|(got, want)| got != want)
+        .map(|at| offset + at as u64)
 }
 
 /// The metadata, the content type and the content of a multipart/related body.
@@ -597,7 +648,7 @@ fn chunk_fault(
 
 fn resume_incomplete(session: &Session) -> Response<MockBody> {
     let mut builder = Response::builder().status(StatusCode::PERMANENT_REDIRECT);
-    if let Some(last) = (session.received.len() as u64).checked_sub(1) {
+    if let Some(last) = session.committed.checked_sub(1) {
         builder = builder.header("Range", format!("bytes=0-{last}"));
     }
     builder
@@ -672,14 +723,24 @@ fn text(status: StatusCode, message: &str) -> Response<MockBody> {
 }
 
 #[derive(Clone)]
-pub(super) struct MockDrive {
+pub(crate) struct MockDrive {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
     task: Arc<JoinHandle<()>>,
 }
 
 impl MockDrive {
-    pub(super) async fn start(faults: Faults) -> MockDrive {
+    pub(crate) async fn start(faults: Faults) -> MockDrive {
+        Self::start_with(faults, None).await
+    }
+
+    /// A checking mock: the chunks of its sessions are compared with what `expected` says they
+    /// must be ([`Session::first_mismatch`]) and not kept.
+    pub(crate) async fn start_checking(faults: Faults, expected: Expected) -> MockDrive {
+        Self::start_with(faults, Some(expected)).await
+    }
+
+    async fn start_with(faults: Faults, expected: Option<Expected>) -> MockDrive {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the mock server");
@@ -687,6 +748,7 @@ impl MockDrive {
         let state = Arc::new(Mutex::new(State {
             faults,
             email: String::from("user-a@example.com"),
+            expected,
             ..State::default()
         }));
 
@@ -715,16 +777,16 @@ impl MockDrive {
     }
 
     /// A hub whose requests all go to this server, with the retry policy for tests.
-    pub(super) fn hub(&self) -> Hub {
+    pub(crate) fn hub(&self) -> Hub {
         Hub::for_mock_server(&format!("http://{}/", self.addr)).expect("create mock hub")
     }
 
-    pub(super) fn state(&self) -> MutexGuard<'_, State> {
+    pub(crate) fn state(&self) -> MutexGuard<'_, State> {
         self.state.lock().expect("mock state lock")
     }
 
     /// The mock answers again after `die_after_chunks`, with the sessions it had.
-    pub(super) fn revive(&self) {
+    pub(crate) fn revive(&self) {
         let mut state = self.state();
         state.dead = false;
         state.faults.die_after_chunks = None;
@@ -732,7 +794,7 @@ impl MockDrive {
 
     /// The last requests, for failure messages. Not while holding [`MockDrive::state`]: use
     /// [`State::log_text`] on the guard then.
-    pub(super) fn log(&self) -> String {
+    pub(crate) fn log(&self) -> String {
         self.state().log_text()
     }
 }
@@ -790,6 +852,12 @@ async fn handle(
         &body,
         &format!("http://{addr}/"),
     );
+    // A checking mock keeps no content, in its log neither.
+    let body = if state.expected.is_some() && parts.uri.path().starts_with("/upload-session/") {
+        Bytes::new()
+    } else {
+        body
+    };
     if std::mem::take(&mut state.drop_reply) {
         log(&mut state, body, None);
         return Err(io::Error::other("reply dropped by the mock server"));
