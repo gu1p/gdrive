@@ -320,10 +320,7 @@ fn folder(label: &str, log: &Arc<Mutex<Vec<String>>>, follow_ups: Vec<Job>) -> J
     Job::new(JobKind::Metadata, label, move |_| async move {
         sleep(10 * MS).await;
         log.lock().unwrap().push(format!("created {name}"));
-        JobOutput {
-            outcome: Outcome::Transferred { bytes: 0 },
-            follow_ups,
-        }
+        JobOutput::from(Outcome::Transferred { bytes: 0 }).follow_up(follow_ups)
     })
 }
 
@@ -690,4 +687,117 @@ async fn a_closed_pipe_ends_the_output_quietly() {
     assert!(report.check().is_ok());
     printer.flush().await.unwrap();
     assert_eq!(err.lines(), Vec::<String>::new());
+}
+
+/// `count` jobs of `kind` that each wait for a permit of `gate`, counting the ones that started
+/// in `started`, as an iterator that counts the jobs taken from it in `taken`.
+fn gated(
+    kind: JobKind,
+    count: usize,
+    gate: &Arc<Semaphore>,
+    started: &Arc<AtomicUsize>,
+    taken: &Arc<AtomicUsize>,
+) -> impl Iterator<Item = Job> + Send + 'static {
+    let gate = Arc::clone(gate);
+    let started = Arc::clone(started);
+    let taken = Arc::clone(taken);
+    (0..count).map(move |i| {
+        taken.fetch_add(1, Ordering::SeqCst);
+        let gate = Arc::clone(&gate);
+        let started = Arc::clone(&started);
+        Job::new(kind, format!("{kind:?} {i}"), move |_| async move {
+            started.fetch_add(1, Ordering::SeqCst);
+            let _permit = gate.acquire().await;
+            Outcome::Transferred { bytes: 1 }.into()
+        })
+    })
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_full_queue_stops_taking_follow_ups() {
+    let output = output();
+    let gate = Arc::new(Semaphore::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let taken = Arc::new(AtomicUsize::new(0));
+    let files = gated(JobKind::Media, 100, &gate, &started, &taken);
+    let folder = Job::new(JobKind::Metadata, "folder", |_| async move {
+        JobOutput::from(Outcome::Transferred { bytes: 0 }).follow_up(files)
+    });
+
+    let printer = output.printer.clone();
+    let handle = tokio::spawn(async move { run(options(2, false), &printer, vec![folder]).await });
+    sleep(Duration::from_secs(1)).await;
+
+    // Two run and four wait in the queue; one more was taken to see that it does not fit. The
+    // other 93 were never made.
+    assert_eq!(started.load(Ordering::SeqCst), 2);
+    assert_eq!(taken.load(Ordering::SeqCst), 2 + 4 + 1);
+
+    gate.add_permits(100);
+    let report = handle.await.unwrap();
+    assert_eq!(report.files.transferred, 100);
+    assert_eq!(report.folders.transferred, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn follow_ups_of_one_kind_do_not_hold_back_the_other() {
+    let output = output();
+    let gate = Arc::new(Semaphore::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let folders_taken = Arc::new(AtomicUsize::new(0));
+    let files_taken = Arc::new(AtomicUsize::new(0));
+    let folders = gated(JobKind::Metadata, 20, &gate, &started, &folders_taken);
+    let files = gated(JobKind::Media, 20, &gate, &started, &files_taken);
+    let folder = Job::new(JobKind::Metadata, "folder", |_| async move {
+        JobOutput::from(Outcome::Transferred { bytes: 0 })
+            .follow_up(folders)
+            .follow_up(files)
+    });
+    let mut options = options(2, false);
+    options.metadata_jobs = NonZeroUsize::new(1).unwrap();
+
+    let printer = output.printer.clone();
+    let handle = tokio::spawn(async move { run(options, &printer, vec![folder]).await });
+    sleep(Duration::from_secs(1)).await;
+
+    // One folder and two files run; each kind has its own four queued and one seen.
+    assert_eq!(started.load(Ordering::SeqCst), 1 + 2);
+    assert_eq!(folders_taken.load(Ordering::SeqCst), 1 + 4 + 1);
+    assert_eq!(files_taken.load(Ordering::SeqCst), 2 + 4 + 1);
+
+    gate.add_permits(100);
+    let report = handle.await.unwrap();
+    assert_eq!(
+        (report.folders.transferred, report.files.transferred),
+        (21, 20)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_stop_cancels_the_follow_ups_that_were_not_taken() {
+    let output = output();
+    let gate = Arc::new(Semaphore::new(0));
+    let started = Arc::new(AtomicUsize::new(0));
+    let taken = Arc::new(AtomicUsize::new(0));
+    let files = gated(JobKind::Media, 50, &gate, &started, &taken);
+    let folder = Job::new(JobKind::Metadata, "folder", |_| async move {
+        JobOutput::from(Outcome::Transferred { bytes: 0 }).follow_up(files)
+    });
+    let mut options = options(2, false);
+    options.metadata_jobs = NonZeroUsize::new(2).unwrap();
+
+    let report = run(
+        options,
+        &output.printer,
+        vec![folder, failure("bad", 100 * MS)],
+    )
+    .await;
+
+    assert!(report.stopped);
+    assert_eq!(report.files.failed, 1);
+    assert_eq!(
+        report.files.cancelled, 50,
+        "running, queued and never taken"
+    );
+    assert_eq!(taken.load(Ordering::SeqCst), 50);
 }

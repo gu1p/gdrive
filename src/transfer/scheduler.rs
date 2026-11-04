@@ -8,12 +8,13 @@
 //! # Design
 //!
 //! ```text
+//!   follow-ups of finished jobs (lazy iterators: an upload folder's subfolders, its files)
+//!      |  taken first, a job at a time while the queue of its kind has room
 //!   source: Stream<Item = Job>              (a walk of Drive, a local tree, ...)
-//!      |  polled only while the queue has room: a full queue stops the source, and a walk
-//!      |  behind it stops listing once its own bounded channel is full
+//!      |  polled only while no follow-up waits and both queues have room: a full queue stops
+//!      |  the source, and a walk behind it stops listing once its own channel is full
 //!      v
-//!   pending queue, one per JobKind          at most `queue` jobs from the source; follow-up
-//!      |                                    jobs of a finished job are added without a bound
+//!   pending queue, one per JobKind          at most `queue` jobs each
 //!      |  started while a slot of its kind is free: `jobs` media transfers and
 //!      |  `metadata_jobs` metadata requests at once
 //!      v
@@ -54,6 +55,7 @@ use std::{
     error::Error,
     fmt::{self, Display, Formatter, Write as _},
     future::Future,
+    iter::Peekable,
     num::NonZeroUsize,
     pin::{pin, Pin},
     sync::Arc,
@@ -125,13 +127,33 @@ impl Outcome {
     }
 }
 
+/// The jobs a finished job releases, made as the scheduler takes them.
+type FollowUps = Box<dyn Iterator<Item = Job> + Send>;
+
 /// What a job returns: its outcome, and the jobs it releases (the children of an upload folder,
 /// which need the folder to exist first).
-#[derive(Debug)]
+///
+/// The follow-ups are iterators that the scheduler takes jobs from only while its queue has
+/// room for their kind, like a source; an iterator whose next job does not fit waits, the others
+/// go on. So a folder of a hundred thousand files does not queue a hundred thousand jobs, and
+/// its subfolders (one iterator) are created while its files (another) upload.
 pub(crate) struct JobOutput {
     pub(crate) outcome: Outcome,
-    /// Queued when `outcome` is a success; cancelled otherwise.
-    pub(crate) follow_ups: Vec<Job>,
+    /// Taken from when `outcome` is a success; cancelled otherwise.
+    follow_ups: Vec<FollowUps>,
+}
+
+impl JobOutput {
+    /// Adds the jobs of `follow_ups`, taken after those added before when their kinds have room.
+    #[must_use]
+    pub(crate) fn follow_up<I>(mut self, follow_ups: I) -> Self
+    where
+        I: IntoIterator<Item = Job>,
+        I::IntoIter: Send + 'static,
+    {
+        self.follow_ups.push(Box::new(follow_ups.into_iter()));
+        self
+    }
 }
 
 impl From<Outcome> for JobOutput {
@@ -140,6 +162,15 @@ impl From<Outcome> for JobOutput {
             outcome,
             follow_ups: Vec::new(),
         }
+    }
+}
+
+impl fmt::Debug for JobOutput {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.debug_struct("JobOutput")
+            .field("outcome", &self.outcome)
+            .field("follow_ups", &self.follow_ups.len())
+            .finish()
     }
 }
 
@@ -261,7 +292,7 @@ pub(crate) struct Options {
     /// Metadata requests at once, such as folder creations; a walk's listing requests use the
     /// same limit ([`WalkOptions::listing_jobs`]).
     pub(crate) metadata_jobs: NonZeroUsize,
-    /// Jobs taken from the source before they can start.
+    /// Jobs of each kind taken from the source or from follow-ups before they can start.
     pub(crate) queue: NonZeroUsize,
     /// Go on after a failure with the jobs that do not depend on it (`--continue-on-error`).
     pub(crate) continue_on_error: bool,
@@ -521,6 +552,7 @@ impl Scheduler {
             active: PerKind::default(),
             tasks: JoinSet::new(),
             running: HashMap::new(),
+            follow_ups: VecDeque::new(),
             next_id: 0,
             report: Report::default(),
             stopping: false,
@@ -575,6 +607,8 @@ struct Run<S> {
     active: PerKind<usize>,
     tasks: JoinSet<JobOutput>,
     running: HashMap<task::Id, Running>,
+    /// The follow-ups of finished jobs, taken from before the source.
+    follow_ups: VecDeque<Peekable<FollowUps>>,
     next_id: u64,
     report: Report,
     /// Nothing new starts: the run stopped after a failure or was cancelled.
@@ -587,10 +621,17 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
 
         loop {
             self.output_check();
-            self.start_ready();
-            let pull = self.source.is_some() && !self.stopping && self.queued() < self.queue();
-            // Nothing runs, so nothing is queued either: every queued job of a kind with a free
-            // slot was just started.
+            self.fill().await;
+            // The source is read when the follow-ups are done and both kinds have room: its
+            // next job may be of either.
+            let pull = self.source.is_some()
+                && !self.stopping
+                && self.follow_ups.is_empty()
+                && self.has_room(JobKind::Media)
+                && self.has_room(JobKind::Metadata);
+            // Nothing runs, so nothing is queued and no follow-up waits either: every queued job
+            // of a kind with a free slot was just started, and follow-ups only wait for a full
+            // queue.
             if self.tasks.is_empty() && !pull {
                 break;
             }
@@ -631,12 +672,50 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
         }
     }
 
-    fn queue(&self) -> usize {
-        self.options.queue.get()
+    /// Whether the queue of `kind` takes another job.
+    fn has_room(&self, kind: JobKind) -> bool {
+        let queued = match kind {
+            JobKind::Media => self.pending.media.len(),
+            JobKind::Metadata => self.pending.metadata.len(),
+        };
+        queued < self.options.queue.get()
     }
 
-    fn queued(&self) -> usize {
-        self.pending.media.len() + self.pending.metadata.len()
+    /// Starts what can start and queues follow-ups while their kinds have room.
+    async fn fill(&mut self) {
+        loop {
+            self.start_ready();
+            if self.stopping {
+                return;
+            }
+            let Some(job) = self.next_follow_up() else {
+                return;
+            };
+            self.enqueue(job).await;
+        }
+    }
+
+    /// The next follow-up that fits: from the first iterator whose next job is decided already
+    /// or has room in its kind's queue. Exhausted iterators are dropped.
+    fn next_follow_up(&mut self) -> Option<Job> {
+        let mut index = 0;
+        while index < self.follow_ups.len() {
+            let next = self.follow_ups[index]
+                .peek()
+                .map(|job| (job.kind, matches!(job.work, Work::Done(_))));
+            let fits = match next {
+                None => {
+                    self.follow_ups.remove(index);
+                    continue;
+                }
+                Some((kind, done)) => done || self.has_room(kind),
+            };
+            if fits {
+                return self.follow_ups[index].next();
+            }
+            index += 1;
+        }
+        None
     }
 
     /// Starts queued jobs while their kind has a free slot; folders first, so that the files
@@ -760,11 +839,11 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
 
         let ends_subtree = outcome.ends_subtree();
         self.finish(id, kind, &label, subtree, outcome).await;
-        for follow_up in follow_ups {
-            if ends_subtree {
-                self.cancel(follow_up);
+        for follow_ups in follow_ups {
+            if ends_subtree || self.stopping {
+                follow_ups.for_each(|job| self.cancel(job));
             } else {
-                self.enqueue(follow_up).await;
+                self.follow_ups.push_back(follow_ups.peekable());
             }
         }
     }
@@ -843,6 +922,9 @@ impl<S: Stream<Item = Job> + Send> Run<S> {
             for job in queued {
                 self.cancelled(job.id, job.kind, &job.label, job.subtree);
             }
+        }
+        for follow_ups in std::mem::take(&mut self.follow_ups) {
+            follow_ups.for_each(|job| self.cancel(job));
         }
         self.tasks.abort_all();
     }

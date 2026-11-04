@@ -181,20 +181,19 @@ impl Uploads {
         files.sort_by(|a, b| a.name.cmp(&b.name));
         folders.sort_by(|a, b| a.info.name.cmp(&b.info.name));
 
+        // Two iterators: the subfolders are created while the files upload.
         let parents = vec![folder_id];
-        let follow_ups = files
+        let uploads = Arc::clone(&self);
+        let folder_parents = parents.clone();
+        let folders = folders
             .into_iter()
-            .map(|file| self.file_job(file, parents.clone()))
-            .chain(
-                folders
-                    .into_iter()
-                    .map(|folder| self.folder_job(folder, Some(parents.clone()))),
-            )
-            .collect();
-        JobOutput {
-            outcome: Outcome::Transferred { bytes: 0 },
-            follow_ups,
-        }
+            .map(move |folder| uploads.folder_job(folder, Some(folder_parents.clone())));
+        let files = files
+            .into_iter()
+            .map(move |file| self.file_job(file, parents.clone()));
+        JobOutput::from(Outcome::Transferred { bytes: 0 })
+            .follow_up(folders)
+            .follow_up(files)
     }
 
     fn file_job(self: &Arc<Self>, file: file_tree::File, parents: Vec<String>) -> Job {
