@@ -48,11 +48,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::{
     common::{
-        media_client::{MediaClient, MediaError},
+        media_client::{get_file, MediaClient, MediaError},
         parse_md5_digest,
-        retry::{
-            classify_body_error, retry_read, Decision, DisplayDuration, RetryReason, RetryState,
-        },
+        retry::{classify_body_error, Decision, DisplayDuration, RetryReason, RetryState},
     },
     hub::Hub,
     // Warnings go above the progress bars.
@@ -124,6 +122,8 @@ impl Revision {
 pub(crate) struct Identity<'a> {
     hub: &'a Hub,
     file_id: String,
+    /// The `resourceKey` of a file shared by link only.
+    resource_key: Option<String>,
     revision: Revision,
 }
 
@@ -134,26 +134,35 @@ impl<'a> Identity<'a> {
         Identity {
             hub,
             file_id: file_id.to_owned(),
+            resource_key: None,
             revision,
         }
     }
 
+    /// The metadata requests name the file's `resource_key`, if it has one.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
+        )
+    )]
+    pub(crate) fn with_resource_key(mut self, resource_key: Option<&str>) -> Self {
+        self.resource_key = resource_key.map(str::to_owned);
+        self
+    }
+
     /// The file's revision now.
     async fn fetch(&self) -> Result<Revision, MediaError> {
-        let hub = self.hub;
-        let file_id = self.file_id.as_str();
-        let (_, file) = retry_read(hub.retrier(), "files.get", |mut delegate| async move {
-            hub.files()
-                .get(file_id)
-                .param("fields", REVISION_FIELDS)
-                .supports_all_drives(true)
-                .add_scope(google_drive3::api::Scope::Full)
-                .delegate(&mut delegate)
-                .doit()
-                .await
-        })
+        let file = get_file(
+            self.hub,
+            &self.file_id,
+            REVISION_FIELDS,
+            self.resource_key.as_deref(),
+        )
         .await
-        .map_err(|err| MediaError::Metadata(Box::new(err)))?;
+        .map_err(MediaError::Metadata)?;
         Ok(Revision::of(&file))
     }
 
@@ -595,7 +604,7 @@ mod tests {
         let server =
             MockServer::start(vec![resource("8", md5), resource("9", md5::compute(b"b"))]).await;
         let hub = server.hub();
-        // The content only: no version, no modification time.
+        // The content only: no version, no modification time. A file shared by link only.
         let identity = Identity::new(
             &hub,
             "f",
@@ -604,7 +613,8 @@ mod tests {
                 size: Some(1),
                 ..Revision::default()
             },
-        );
+        )
+        .with_resource_key(Some("key"));
 
         assert!(
             !identity.changed().await.unwrap(),
@@ -620,6 +630,9 @@ mod tests {
             Some(REVISION_FIELDS.to_owned())
         );
         assert_eq!(requests[0].query_param("supportsAllDrives"), Some("true"));
+        assert!(requests
+            .iter()
+            .all(|request| request.header("x-goog-drive-resource-keys") == Some("f/key")));
     }
 
     #[test]

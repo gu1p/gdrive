@@ -2,10 +2,16 @@
 //! exports, and gdrive's own uploader (`transfer/upload.rs`). They go through the hub's HTTP
 //! client (and so its connection pool), get their access token from the hub's token source the
 //! way google-drive3 does, and follow the hub's retry policy and throttle (`retry.rs`).
+//!
+//! A file shared by link only has a `resourceKey`, which every request about it must name in the
+//! `X-Goog-Drive-Resource-Keys` header ([`RESOURCE_KEYS_HEADER`]): a client made
+//! [`MediaClient::with_resource_key`] sends it, and [`get_file`] makes `files.get` with it, which
+//! google-drive3 cannot.
 
 use std::{
     error::Error,
     fmt::{self, Display, Formatter},
+    io,
 };
 
 use google_apis_common::Body;
@@ -18,12 +24,12 @@ use hyper::{
 
 use crate::{
     common::retry::{
-        classify_status, classify_transport, message_of_error_body, Decision, DisplayDuration,
-        RetryState, StopReason,
+        classify_status, classify_transport, message_of_error_body, retry_read, ApiDelegate,
+        Decision, DisplayDuration, RetryState, StopReason,
     },
     hub::Hub,
     // Warnings go above the progress bars.
-    transfer::progress::eprintln,
+    transfer::{progress::eprintln, walk::RESOURCE_KEYS_HEADER},
 };
 
 const USER_AGENT_VALUE: &str = concat!("gdrive/", env!("CARGO_PKG_VERSION"));
@@ -42,12 +48,33 @@ const ABUSIVE_FILE_HINT: &str = "; rerun with --acknowledge-abuse if you own the
 #[derive(Clone)]
 pub(crate) struct MediaClient<'a> {
     hub: &'a Hub,
+    /// The value of [`RESOURCE_KEYS_HEADER`] every authorized request carries, if any.
+    resource_keys: Option<HeaderValue>,
 }
 
 impl<'a> MediaClient<'a> {
     #[must_use]
     pub(crate) fn new(hub: &'a Hub) -> Self {
-        MediaClient { hub }
+        MediaClient {
+            hub,
+            resource_keys: None,
+        }
+    }
+
+    /// The client for requests about the file `file_id` with `resource_key`, which it names in
+    /// every request it authorizes (not in those to a session URL). Without a key, or with one
+    /// that cannot be a header, the client is unchanged.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
+        )
+    )]
+    pub(crate) fn with_resource_key(mut self, file_id: &str, resource_key: Option<&str>) -> Self {
+        self.resource_keys = resource_keys_value(file_id, resource_key);
+        self
     }
 
     /// The URL of the path `segments` (percent-encoded) under the hub's Drive base URL, for
@@ -112,6 +139,11 @@ impl<'a> MediaClient<'a> {
                 .map_err(|_| MediaError::InvalidToken)?;
             value.set_sensitive(true);
             request.headers_mut().insert(AUTHORIZATION, value);
+        }
+        if let Some(keys) = &self.resource_keys {
+            request
+                .headers_mut()
+                .insert(RESOURCE_KEYS_HEADER, keys.clone());
         }
         self.send_without_token(request).await
     }
@@ -201,6 +233,106 @@ impl<'a> MediaClient<'a> {
             }
         }
     }
+}
+
+/// The [`RESOURCE_KEYS_HEADER`] value naming `resource_key` of `file_id`: `<id>/<key>`.
+fn resource_keys_value(file_id: &str, resource_key: Option<&str>) -> Option<HeaderValue> {
+    HeaderValue::from_str(&format!("{file_id}/{}", resource_key?)).ok()
+}
+
+/// The most of a `files.get` reply that is read.
+const MAX_FILE_BODY: usize = 1 << 20;
+
+/// `files.get` of `file_id` with the `fields` mask (`supportsAllDrives`), through the hub's retry
+/// policy as a read ([`retry_read`]). With `resource_key`, the request names it in the
+/// [`RESOURCE_KEYS_HEADER`]: it is built on the hub's client and credentials then, with
+/// google-drive3's error mapping (a JSON error reply is `BadRequest`), since google-drive3 cannot
+/// send the header.
+pub(crate) async fn get_file(
+    hub: &Hub,
+    file_id: &str,
+    fields: &str,
+    resource_key: Option<&str>,
+) -> Result<google_drive3::api::File, Box<google_drive3::Error>> {
+    let keys = resource_keys_value(file_id, resource_key);
+    let keys = keys.as_ref();
+    let result = retry_read(hub.retrier(), "files.get", |mut delegate| async move {
+        match keys {
+            None => hub
+                .files()
+                .get(file_id)
+                .param("fields", fields)
+                .supports_all_drives(true)
+                .add_scope(google_drive3::api::Scope::Full)
+                .delegate(&mut delegate)
+                .doit()
+                .await
+                .map(|(_, file)| file),
+            Some(keys) => get_file_with_keys(hub, file_id, fields, keys, &delegate).await,
+        }
+    })
+    .await;
+    result.map_err(Box::new)
+}
+
+/// One `files.get` with the [`RESOURCE_KEYS_HEADER`] `keys`. A failed reply's status and headers
+/// go to `delegate`, as google-drive3 hands them to its delegate, so that the retry policy sees
+/// them.
+#[expect(
+    clippy::result_large_err,
+    reason = "google-drive3's error, as the call it stands in for returns it"
+)]
+async fn get_file_with_keys(
+    hub: &Hub,
+    file_id: &str,
+    fields: &str,
+    keys: &HeaderValue,
+    delegate: &ApiDelegate,
+) -> google_drive3::Result<google_drive3::api::File> {
+    use google_drive3::Error;
+
+    let client = MediaClient {
+        hub,
+        resource_keys: Some(keys.clone()),
+    };
+    let url = client
+        .drive_url(
+            &["files", file_id],
+            &[
+                ("fields", fields),
+                ("supportsAllDrives", "true"),
+                ("alt", "json"),
+            ],
+        )
+        .map_err(|error| Error::Io(io::Error::other(error)))?;
+    let request = Request::get(url.as_str())
+        .body(google_apis_common::to_body::<String>(None))
+        .map_err(|error| Error::Io(io::Error::other(error)))?;
+    let response = match client.send(request).await {
+        Ok(response) => response,
+        Err(MediaError::Transport { source, .. }) => return Err(Error::HttpError(source)),
+        Err(MediaError::Token(source)) => return Err(Error::MissingToken(source)),
+        Err(error) => return Err(Error::Io(io::Error::other(error))),
+    };
+    let (parts, body) = response.into_parts();
+    let bytes = http_body_util::Limited::new(body, MAX_FILE_BODY)
+        .collect()
+        .await
+        .map(http_body_util::Collected::to_bytes)
+        .unwrap_or_default();
+    if !parts.status.is_success() {
+        delegate.record_failure(parts.status, &parts.headers);
+        return Err(match serde_json::from_slice(&bytes) {
+            Ok(value) => Error::BadRequest(value),
+            Err(_) => Error::Failure(Response::from_parts(
+                parts,
+                google_apis_common::to_body(Some(bytes)),
+            )),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(|error| {
+        Error::JsonDecodeError(String::from_utf8_lossy(&bytes).into_owned(), error)
+    })
 }
 
 /// At most [`MAX_ERROR_BODY`] bytes of an error reply; `None` if it cannot be read.
@@ -337,7 +469,7 @@ impl Error for MediaError {
 mod tests {
     use serde_json::json;
 
-    use super::{MediaClient, MediaError};
+    use super::{get_file, MediaClient, MediaError};
     use crate::common::{
         mock_server::{MockServer, Response},
         retry::{RetryPolicy, StopReason},
@@ -370,6 +502,64 @@ mod tests {
         assert!(request
             .header("user-agent")
             .is_some_and(|agent| agent.starts_with("gdrive/")));
+    }
+
+    #[tokio::test]
+    async fn requests_about_a_file_shared_by_link_name_its_resource_key() {
+        let server = MockServer::start(vec![
+            Response::raw(200, "content"),
+            Response::json(
+                503,
+                &json!({"error": {"code": 503, "message": "Backend Error"}}),
+            ),
+            Response::json(200, &json!({"id": "f", "size": "7"})),
+            Response::json(
+                404,
+                &json!({"error": {"code": 404, "message": "File not found: f."}}),
+            ),
+        ])
+        .await;
+        let hub = server.hub();
+        let client = MediaClient::new(&hub).with_resource_key("f", Some("key"));
+        let url = client
+            .drive_url(&["files", "f"], &[("alt", "media")])
+            .unwrap();
+        let mut retry = hub.retrier().state();
+        client
+            .send_with_retry(&mut retry, "test", || get(&url))
+            .await
+            .unwrap();
+
+        // files.get, which google-drive3 cannot send with the header: retried like its calls.
+        let file = get_file(&hub, "f", "id,size", Some("key")).await.unwrap();
+        assert_eq!(file.size, Some(7));
+        let error = get_file(&hub, "f", "id,size", Some("key"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&*error, google_drive3::Error::BadRequest(json)
+                if json["error"]["message"] == "File not found: f."),
+            "{error:?}"
+        );
+
+        let requests = server.requests();
+        assert_eq!(requests.len(), 4, "the 503 is retried, the 404 is not");
+        for request in &requests {
+            assert_eq!(request.header("x-goog-drive-resource-keys"), Some("f/key"));
+            assert_eq!(request.header("authorization"), Some("Bearer mock-token"));
+        }
+        assert_eq!(requests[1].path, "/drive/v3/files/f");
+        assert_eq!(requests[1].query_param("supportsAllDrives"), Some("true"));
+        assert_eq!(
+            requests[1]
+                .query_param("fields")
+                .map(|fields| fields.replace("%2C", ",")),
+            Some(String::from("id,size"))
+        );
+
+        // Without a key, no header.
+        let plain = MediaClient::new(&hub).with_resource_key("f", None);
+        assert!(plain.resource_keys.is_none());
     }
 
     #[tokio::test]
