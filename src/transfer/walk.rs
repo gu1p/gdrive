@@ -220,6 +220,10 @@ pub(crate) struct IncompleteSearch {
 #[derive(Debug)]
 pub(crate) enum WalkItem {
     Entry(WalkEntry),
+    /// Every child of this folder location has been emitted: its listing is complete. Sent
+    /// once per listed folder, the root included, unless the folder ends with a
+    /// [`FolderError`] instead.
+    FolderDone(FolderKey),
     FolderError(FolderError),
     IncompleteSearch(IncompleteSearch),
 }
@@ -576,6 +580,10 @@ impl Producer {
             self.split(batch);
         } else if let Some(token) = list.next_page_token {
             self.request(batch, Some(token));
+        } else {
+            for folder in &batch.folders {
+                self.send(WalkItem::FolderDone(folder.folder.key)).await?;
+            }
         }
         Ok(())
     }

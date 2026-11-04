@@ -170,6 +170,7 @@ async fn list_subtree(hub: &Hub, root: WalkRoot) -> Result<Listing, errors::Fold
                 .entry(entry.parent)
                 .or_default()
                 .push((*entry.file, entry.children)),
+            WalkItem::FolderDone(_) => {}
             WalkItem::FolderError(error) => {
                 return Err(errors::Folder::ListFiles(list::Error::ListFiles(
                     error.error,

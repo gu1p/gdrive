@@ -39,7 +39,9 @@ async fn collect(walk: Walk) -> Vec<WalkItem> {
 async fn walk_all(files: Vec<FakeFile>, behavior: Behavior, options: WalkOptions) -> Walked {
     let server = FakeDrive::start(files, behavior).await;
     let items = collect(start(&server, options)).await;
-    Walked { server, items }
+    let walked = Walked { server, items };
+    walked.assert_item_order();
+    walked
 }
 
 struct Walked {
@@ -51,7 +53,9 @@ impl Walked {
     fn entries(&self) -> impl Iterator<Item = &WalkEntry> {
         self.items.iter().filter_map(|item| match item {
             WalkItem::Entry(entry) => Some(entry),
-            WalkItem::FolderError(_) | WalkItem::IncompleteSearch(_) => None,
+            WalkItem::FolderDone(_) | WalkItem::FolderError(_) | WalkItem::IncompleteSearch(_) => {
+                None
+            }
         })
     }
 
@@ -87,24 +91,59 @@ impl Walked {
             .iter()
             .filter_map(|item| match item {
                 WalkItem::FolderError(error) => Some(error),
-                WalkItem::Entry(_) | WalkItem::IncompleteSearch(_) => None,
+                WalkItem::Entry(_) | WalkItem::FolderDone(_) | WalkItem::IncompleteSearch(_) => {
+                    None
+                }
             })
             .collect()
     }
 
-    /// Every entry's parent was listed before it, and every listed key is new.
-    fn assert_parents_precede_children(&self) {
-        let mut listed = HashSet::from([FolderKey::ROOT]);
-        for entry in self.entries() {
-            assert!(
-                listed.contains(&entry.parent),
-                "parent of {:?} not seen yet",
-                entry.components
-            );
-            if let Children::Listed(key) = entry.children {
-                assert!(listed.insert(key), "key {key:?} given twice");
+    /// The order invariants of a complete walk: a folder's entry comes before every item about
+    /// its children, every listed key is new, and every listed folder ends with exactly one
+    /// `FolderDone` or `FolderError`, after which nothing names it.
+    fn assert_item_order(&self) {
+        let mut open = HashSet::from([FolderKey::ROOT]);
+        let mut ended = HashSet::new();
+        let assert_open = |open: &HashSet<FolderKey>, ended: &HashSet<_>, key, what: &str| {
+            assert!(open.contains(&key), "{what} for {key:?} before its folder");
+            assert!(!ended.contains(&key), "{what} for {key:?} after its end");
+        };
+        for item in &self.items {
+            match item {
+                WalkItem::Entry(entry) => {
+                    assert_open(&open, &ended, entry.parent, "entry");
+                    if let Children::Listed(key) = entry.children {
+                        assert!(open.insert(key), "key {key:?} given twice");
+                    }
+                }
+                WalkItem::FolderDone(key) => {
+                    assert_open(&open, &ended, *key, "FolderDone");
+                    ended.insert(*key);
+                }
+                WalkItem::FolderError(error) => {
+                    assert_open(&open, &ended, error.folder.key, "FolderError");
+                    ended.insert(error.folder.key);
+                }
+                WalkItem::IncompleteSearch(incomplete) => {
+                    for folder in &incomplete.folders {
+                        assert_open(&open, &ended, folder.key, "IncompleteSearch");
+                    }
+                }
             }
         }
+        assert_eq!(open, ended, "every listed folder ends once");
+    }
+
+    fn done(&self) -> Vec<FolderKey> {
+        self.items
+            .iter()
+            .filter_map(|item| match item {
+                WalkItem::FolderDone(key) => Some(*key),
+                WalkItem::Entry(_) | WalkItem::FolderError(_) | WalkItem::IncompleteSearch(_) => {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// The folder ids of each request, in order.
@@ -122,10 +161,13 @@ fn ids(ids: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn empty_folder_yields_nothing() {
+async fn empty_folder_yields_only_its_end() {
     let walked = walk_all(Vec::new(), Behavior::default(), options()).await;
 
-    assert!(walked.items.is_empty());
+    assert!(matches!(
+        walked.items.as_slice(),
+        [WalkItem::FolderDone(FolderKey::ROOT)]
+    ));
     assert_eq!(walked.queried_parents(), [ids(&["root"])]);
 }
 
@@ -145,7 +187,6 @@ async fn nested_folders_are_listed_with_components_depths_and_kinds() {
         walked.paths(),
         ["a", "a/a.txt", "a/b", "a/b/deep.txt", "notes", "top.txt"]
     );
-    walked.assert_parents_precede_children();
 
     let a = walked.entry("a");
     assert_eq!(
@@ -203,6 +244,57 @@ async fn multi_page_folder_follows_page_tokens() {
 }
 
 #[tokio::test]
+async fn folders_end_after_the_last_page_of_their_query() {
+    let mut files = vec![
+        FakeFile::folder("a", "a", "root"),
+        FakeFile::folder("b", "b", "root"),
+        FakeFile::blob("b1", "b.txt", "b", "b"),
+    ];
+    for n in 0..3 {
+        files.push(FakeFile::blob(
+            &format!("a{n}"),
+            &format!("{n}.txt"),
+            "a",
+            "a",
+        ));
+    }
+    let behavior = Behavior {
+        page_size: Some(2),
+        ..Behavior::default()
+    };
+    let walked = walk_all(files, behavior, options()).await;
+
+    // Pages of the batch [a, b]: a0 a1 | a2 b1; both folders end after the second page.
+    let done = walked.done();
+    assert_eq!(
+        done,
+        [
+            FolderKey::ROOT,
+            walked.folder_key("a"),
+            walked.folder_key("b")
+        ]
+    );
+    let position = |wanted: &WalkItem| {
+        walked
+            .items
+            .iter()
+            .position(|item| std::ptr::eq(item, wanted))
+            .unwrap()
+    };
+    let last_entry = walked
+        .items
+        .iter()
+        .rfind(|item| matches!(item, WalkItem::Entry(_)))
+        .unwrap();
+    let first_done_of_a = walked
+        .items
+        .iter()
+        .find(|item| matches!(item, WalkItem::FolderDone(key) if *key == walked.folder_key("a")))
+        .unwrap();
+    assert!(position(last_entry) < position(first_done_of_a));
+}
+
+#[tokio::test]
 async fn batched_query_routes_children_to_their_parents() {
     let mut files = vec![
         FakeFile::folder("a", "a", "root"),
@@ -242,7 +334,6 @@ async fn batched_query_routes_children_to_their_parents() {
         walked.folder_key("b")
     );
     assert_eq!(walked.entries().count(), 7);
-    walked.assert_parents_precede_children();
 }
 
 #[tokio::test]
@@ -357,6 +448,16 @@ async fn unreadable_folder_yields_an_error_and_the_walk_continues() {
         }
     );
     assert_eq!(error.to_string(), "unable to list folder 'b' with id 'b'");
+    let mut done = walked.done();
+    done.sort();
+    assert_eq!(
+        done,
+        [
+            FolderKey::ROOT,
+            walked.folder_key("a"),
+            walked.folder_key("c")
+        ]
+    );
     assert!(matches!(*error.error, google_drive3::Error::BadRequest(_)));
     assert_eq!(
         walked.queried_parents(),
@@ -402,6 +503,8 @@ async fn failed_later_page_of_a_batch_does_not_emit_entries_twice() {
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0].folder.id, "a");
     assert_eq!(errors[0].folder.key, walked.folder_key("a"));
+    assert!(walked.done().contains(&walked.folder_key("b")));
+    assert!(!walked.done().contains(&walked.folder_key("a")));
 }
 
 #[tokio::test]
@@ -476,7 +579,6 @@ async fn followed_shortcut_lists_its_target_and_cycles_stop() {
             "a/out/self"
         ]
     );
-    walked.assert_parents_precede_children();
     assert_eq!(walked.entry("a/back").children, Children::Cycle);
     assert_eq!(walked.entry("a/file link").children, Children::None);
     let e = walked.entry("a/out/e.txt");
@@ -522,7 +624,7 @@ async fn incomplete_search_is_reported_before_the_page_entries() {
         .enumerate()
         .filter_map(|(index, item)| match item {
             WalkItem::IncompleteSearch(incomplete) => Some((index, incomplete)),
-            WalkItem::Entry(_) | WalkItem::FolderError(_) => None,
+            WalkItem::Entry(_) | WalkItem::FolderDone(_) | WalkItem::FolderError(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(positions.len(), 1, "{:#?}", walked.items);
@@ -693,7 +795,8 @@ async fn walk_does_not_run_ahead_of_a_slow_consumer() {
     assert_eq!(server.request_count(), 1);
 
     let rest = collect(walk).await;
-    assert_eq!(rest.len(), 59);
+    // 30 folders and 30 files, and the end of 31 folders.
+    assert_eq!(rest.len(), 60 + 31 - 1);
     assert_eq!(server.request_count(), 31);
 }
 
