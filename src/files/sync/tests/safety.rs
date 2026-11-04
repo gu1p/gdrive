@@ -13,6 +13,7 @@ use crate::{
     common::local_name,
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
+        progress,
         scheduler::Options,
     },
 };
@@ -609,6 +610,20 @@ fn the_command_line_asks_for_permanent_deletion_explicitly() {
     assert!(up.dry_run);
     assert_eq!(up.transfer.jobs.get(), 8);
     assert_eq!(up.direction, Direction::Up);
+    // The progress flags of the other transfer commands, the last one winning.
+    for direction in [["up", "dir", "id"], ["down", "id", "dir"]] {
+        let mode = |flags: &[&str]| {
+            let mut args = direction.to_vec();
+            args.extend(flags);
+            parse(&args).unwrap().progress
+        };
+        assert_eq!(mode(&["--progress"]), progress::Mode::Always);
+        assert_eq!(mode(&["--no-progress"]), progress::Mode::Never);
+        assert_eq!(
+            mode(&["--no-progress", "--progress"]),
+            progress::Mode::Always
+        );
+    }
 }
 
 #[tokio::test]

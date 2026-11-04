@@ -20,9 +20,10 @@ use crate::{
     files::export::ExportFormats,
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
+        progress::{Mode, ProgressDisplay, ProgressEvent, ProgressSink},
         scheduler::{
             capture::{output, Captured},
-            Options,
+            JobKind, Options,
         },
         upload::UploadOptions,
     },
@@ -54,6 +55,7 @@ fn config(direction: Direction, local_dir: &Path) -> Config {
         acknowledge_abuse: false,
         transfer: Options::new(NonZeroUsize::new(2).unwrap(), false),
         upload: UploadOptions::default(),
+        progress: Mode::Never,
     }
 }
 
@@ -121,9 +123,19 @@ async fn sync_until(
     config: &Config,
     cancel: impl Future<Output = ()> + Send + 'static,
 ) -> Synced {
+    let display = ProgressDisplay::recursive(Mode::Never, config.transfer.jobs);
+    sync_showing(server, config, display, cancel).await
+}
+
+async fn sync_showing(
+    server: &FakeDrive,
+    config: &Config,
+    display: ProgressDisplay,
+    cancel: impl Future<Output = ()> + Send + 'static,
+) -> Synced {
     let output = output();
     let hub = server.hub();
-    let run = sync_with_hub(&hub, config, &output.printer, cancel);
+    let run = sync_with_hub(&hub, config, &output.printer, display, cancel);
     let result = tokio::time::timeout(Duration::from_secs(20), run)
         .await
         .expect("the sync should end");
@@ -950,4 +962,82 @@ async fn a_large_changed_file_goes_up_through_a_resumable_update() {
     let again = sync(&server, &config).await;
     again.ok();
     assert_eq!(again.lines(), lines(&["unchanged big.bin"]));
+}
+
+/// The totals a run planned, the bytes it confirmed, the file jobs that ended.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Shown {
+    planned: Option<(u64, u64)>,
+    confirmed: u64,
+    finished: u64,
+}
+
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Shown>);
+
+impl ProgressSink for Recorder {
+    fn event(&self, event: &ProgressEvent<'_>) {
+        let mut shown = self.0.lock().unwrap();
+        match *event {
+            ProgressEvent::Planned { files, bytes } => shown.planned = Some((files, bytes)),
+            ProgressEvent::Bytes { bytes, .. } => shown.confirmed += bytes,
+            ProgressEvent::Finished {
+                kind: JobKind::Media,
+                ..
+            } => shown.finished += 1,
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_transfers_of_a_sync_show_their_progress() {
+    for direction in [Direction::Up, Direction::Down] {
+        let files = drive(vec![
+            FakeFile::blob("same", "same.txt", "root", "same").modified("2024-05-06T07:08:09.123Z"),
+            FakeFile::blob("changed", "changed.txt", "root", "drive!"),
+            FakeFile::blob("drive-only", "drive.txt", "root", "drive only"),
+        ]);
+        let server = FakeDrive::start(files, Behavior::default()).await;
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            &[
+                ("same.txt", "same"),
+                ("changed.txt", "local"),
+                ("new/local.txt", "local only"),
+            ],
+        );
+        let recorder = std::sync::Arc::new(Recorder::default());
+        let display = ProgressDisplay::reporting_to(
+            std::sync::Arc::clone(&recorder) as std::sync::Arc<dyn ProgressSink>
+        );
+
+        let synced = sync_showing(
+            &server,
+            &config(direction, dir.path()),
+            display,
+            future::pending(),
+        )
+        .await;
+
+        synced.ok();
+        let shown = recorder.0.lock().unwrap();
+        // `same.txt` is unchanged by md5: `down` gives it Drive's time, a job too.
+        let expected = match direction {
+            // changed.txt (5 bytes) and new/local.txt (10), the folder's file a follow-up.
+            Direction::Up => Shown {
+                planned: Some((2, 15)),
+                confirmed: 15,
+                finished: 2,
+            },
+            // changed.txt (6), drive.txt (10), and the time of same.txt.
+            Direction::Down => Shown {
+                planned: Some((3, 16)),
+                confirmed: 16,
+                finished: 3,
+            },
+        };
+        assert_eq!(*shown, expected, "{direction:?}");
+    }
 }

@@ -55,6 +55,7 @@ use crate::{
     files::{self, export::ExportFormats},
     hub::Hub,
     transfer::{
+        progress::{self, ProgressDisplay, ProgressEvent},
         scheduler::{self, Options, Printer, Report, Scheduler},
         upload::UploadOptions,
     },
@@ -79,21 +80,33 @@ pub(crate) struct Config {
     pub(crate) transfer: Options,
     /// `up`: how files are uploaded.
     pub(crate) upload: UploadOptions,
+    /// Whether the transfers show their progress on stderr.
+    pub(crate) progress: progress::Mode,
 }
 
 pub(crate) async fn sync(config: Config) -> Result<(), errors::Sync> {
     let hub = get_hub().await.map_err(errors::Sync::Hub)?;
     let printer = Printer::stdio();
-    sync_with_hub(&hub, &config, &printer, scheduler::ctrl_c()).await
+    let display = ProgressDisplay::recursive(config.progress, config.transfer.jobs);
+    sync_with_hub(&hub, &config, &printer, display, scheduler::ctrl_c()).await
+}
+
+/// What every phase of a run uses.
+struct Context<'a> {
+    hub: &'a Hub,
+    config: &'a Config,
+    printer: &'a Printer,
 }
 
 type Cancel = Shared<futures::future::BoxFuture<'static, ()>>;
 
-/// The three phases, printing through `printer`, until done or `cancel` resolves.
+/// The three phases, printing through `printer` and showing the transfers on `progress`, until
+/// done or `cancel` resolves. The progress is gone before the summary is printed.
 async fn sync_with_hub(
     hub: &Hub,
     config: &Config,
     printer: &Printer,
+    progress: ProgressDisplay,
     cancel: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), errors::Sync> {
     let cancel: Cancel = cancel.boxed().shared();
@@ -115,10 +128,16 @@ async fn sync_with_hub(
         None => None,
     };
     if config.dry_run {
+        progress.finish();
         return dry_run(&plan, &tally, deleting, config.delete, printer).await;
     }
 
-    let acted = act(hub, config, plan, &local_root, deleting, printer, cancel).await?;
+    let context = Context {
+        hub,
+        config,
+        printer,
+    };
+    let acted = act(&context, plan, &local_root, deleting, progress, cancel).await?;
     let summary = Summary {
         created: transfer::Done::get(&acted.transfers.done.created),
         updated: transfer::Done::get(&acted.transfers.done.updated),
@@ -234,16 +253,21 @@ impl Acted {
     }
 }
 
-/// Phase 2, and phase 3 when `deleting` and phase 2 ended without a failure.
+/// Phase 2, shown on `progress`, and phase 3 when `deleting` and phase 2 ended without a
+/// failure.
 async fn act(
-    hub: &Hub,
-    config: &Config,
+    context: &Context<'_>,
     mut plan: Plan,
     local_root: &Path,
     deleting: Option<DeleteMode>,
-    printer: &Printer,
+    progress: ProgressDisplay,
     cancel: Cancel,
 ) -> Result<Acted, errors::Sync> {
+    let Context {
+        hub,
+        config,
+        printer,
+    } = *context;
     let ids = match config.direction {
         Direction::Up => new_ids(hub, transfer::new_ids(&plan.items)).await?,
         Direction::Down => Vec::new(),
@@ -257,10 +281,17 @@ async fn act(
         ids,
     );
     let items = std::mem::take(&mut plan.items);
+    // The jobs of new folders come as follow-ups: the totals are the plan's.
+    let (files, bytes) = transfer::planned(&items);
+    progress
+        .sink()
+        .event(&ProgressEvent::Planned { files, bytes });
     let source = transfers.source(items, plan.remote_root.clone(), printer.clone());
     let transferred = Scheduler::new(config.transfer, printer.clone())
+        .with_progress(progress.sink())
         .run(source, cancel.clone())
         .await;
+    progress.finish();
 
     let mut acted = Acted {
         transfers,

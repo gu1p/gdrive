@@ -578,14 +578,40 @@ fn subtree(items: &[Item]) -> Subtree {
                     subtree.folders += 1;
                     pending.push(items);
                 }
-                Work::Create(_) | Work::Update(_) | Work::Unchanged(Some(_)) => {
+                Work::Create(work) | Work::Update(work) => {
                     subtree.files += 1;
+                    subtree.bytes += work.size();
                 }
+                Work::Unchanged(Some(_)) => subtree.files += 1,
                 _ => {}
             }
         }
     }
     subtree
+}
+
+/// The file jobs of `items` and the bytes they transfer, for the progress's totals: transfers,
+/// and the files that get Drive's time. Exports count with no bytes, their size is unknown.
+#[must_use]
+pub(crate) fn planned(items: &[Item]) -> (u64, u64) {
+    let (mut files, mut bytes) = (0, 0);
+    let mut pending = vec![items];
+    while let Some(items) = pending.pop() {
+        for item in items {
+            match &item.work {
+                Work::CreateDir { items, .. } | Work::Descend { items, .. } => {
+                    pending.push(items);
+                }
+                Work::Create(work) | Work::Update(work) => {
+                    files += 1;
+                    bytes += work.size();
+                }
+                Work::Unchanged(Some(_)) => files += 1,
+                Work::Unchanged(None) | Work::Compare { .. } | Work::Skip(_) => {}
+            }
+        }
+    }
+    (files, bytes)
 }
 
 /// `up`: how many ids the new files and folders of `items` need.

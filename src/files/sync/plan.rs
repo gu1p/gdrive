@@ -215,6 +215,17 @@ pub(crate) enum FileWork {
     },
 }
 
+impl FileWork {
+    /// The bytes it transfers, as far as known: none for an export.
+    #[must_use]
+    pub(crate) fn size(&self) -> u64 {
+        match self {
+            FileWork::Upload { size, .. } | FileWork::Download { size, .. } => *size,
+            FileWork::Export { .. } => 0,
+        }
+    }
+}
+
 /// Set the modification time of the local file `path` to Drive's `modified`, if it is still the
 /// file that was read for its md5.
 #[derive(Debug, Clone)]

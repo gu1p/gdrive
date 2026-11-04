@@ -191,6 +191,7 @@ go through the same mapping, so a local `con.txt` meets the Drive `con.txt`. A D
 | `--acknowledge-abuse` | `down` only: download files Google flagged as malware or spam (owner only) |
 | `--jobs N` | transfer up to N files at once, 1 to 64 (default 4); also the number of md5 computations at once |
 | `--continue-on-error` | after a failed file, finish the others; the run still exits 1 and deletes nothing |
+| `--progress`, `--no-progress` | show the progress of the transfers on stderr, also off a terminal, or never; by default only on a terminal (see [Progress output](basic_usage.md#progress-output)) |
 
 Ctrl-C stops the transfers in progress, removes their temporary files, and deletes nothing. Run the
 sync again to finish: what was transferred is unchanged by then.

@@ -649,6 +649,9 @@ struct SyncArgs {
     /// When a file fails, go on with the others instead of stopping. Nothing is deleted after a failure, and the command still exits with an error
     #[arg(long)]
     continue_on_error: bool,
+
+    #[command(flatten)]
+    progress: ProgressArgs,
 }
 
 #[derive(Subcommand)]
@@ -776,6 +779,7 @@ fn sync_config(command: SyncCommand) -> files::sync::Config {
         export,
         acknowledge_abuse,
         transfer: Options::new(args.jobs, args.continue_on_error),
+        progress: args.progress.mode(),
         upload: transfer::upload::UploadOptions {
             session_dir: transfer::upload::session::account_session_dir(),
             session_identity: transfer::upload::session::account_session_identity(),
