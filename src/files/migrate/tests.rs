@@ -1474,3 +1474,96 @@ async fn control_characters_in_names_are_escaped_in_the_output() {
     assert!(created.iter().any(|file| file.name == "esc\u{1b}[2J"));
     assert!(created.iter().any(|file| file.name == "c\rr.txt"));
 }
+
+/// `D/x(A)/x(B)/x(C)`, `C` empty, seen by both accounts.
+fn nested_same_names() -> Vec<FakeFile> {
+    vec![
+        FakeFile::folder("D", "D", "root"),
+        FakeFile::folder("A", "x", "D"),
+        FakeFile::folder("B", "x", "A"),
+        FakeFile::folder("C", "x", "B"),
+    ]
+}
+
+#[tokio::test]
+async fn a_destination_folder_inside_the_source_is_never_reused() {
+    let source = FakeDrive::start(nested_same_names(), Behavior::default()).await;
+    let dest = FakeDrive::start(nested_same_names(), Behavior::default()).await;
+
+    // `B` goes into `D` and reuses `A`, which is outside the source; `C` would then reuse `B`,
+    // which is the source itself, and trashing `C` and `B` would remove what was reused.
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            into: Some(String::from("D")),
+            trash_source: true,
+            ..settings(&["B"])
+        },
+    )
+    .await;
+
+    assert!(
+        migrated
+            .error()
+            .starts_with("Error: the migration is incomplete: 1 folder failed"),
+        "{}",
+        migrated.error()
+    );
+    assert!(
+        migrated.err.lines().contains(&String::from(
+            "Error: unable to migrate 'x/x': the folder of this name in the destination is one \
+             of the source items that are migrated; nothing to do"
+        )),
+        "{}",
+        migrated.err.text()
+    );
+    assert!(migrated.out.lines().contains(&String::from("reuse x/")));
+    assert_eq!(trashed_ids(&source), Vec::<String>::new());
+    assert_eq!(dest.created().len(), 0);
+}
+
+#[tokio::test]
+async fn a_destination_file_that_is_a_source_file_is_never_matched() {
+    // `k` has two parents: `A` (outside the source) and `S` (inside it). `h` would match `k` as
+    // already there, and trashing `k` with the rest would remove what `h` matched.
+    let files = vec![
+        FakeFile::folder("D", "D", "root"),
+        FakeFile::folder("A", "p", "D"),
+        FakeFile::folder("B", "p", "root"),
+        FakeFile::blob("h", "n.txt", "B", "same"),
+        FakeFile::folder("S", "s", "B"),
+        FakeFile::blob("k", "n.txt", "S", "same").with_parents(&["S", "A"]),
+    ];
+    let source = FakeDrive::start(files.clone(), Behavior::default()).await;
+    let dest = FakeDrive::start(files, Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            into: Some(String::from("D")),
+            trash_source: true,
+            ..settings(&["B"])
+        }),
+    )
+    .await;
+
+    assert!(
+        migrated.err.lines().contains(&String::from(
+            "Error: unable to migrate 'p/n.txt': the file of this name in the destination is one \
+             of the source items that are migrated; nothing to do"
+        )),
+        "{}",
+        migrated.err.text()
+    );
+    assert!(
+        migrated
+            .error()
+            .starts_with("Error: the migration is incomplete"),
+        "{}",
+        migrated.error()
+    );
+    assert!(!trashed_ids(&source).contains(&String::from("h")));
+    assert!(!trashed_ids(&source).contains(&String::from("B")));
+}

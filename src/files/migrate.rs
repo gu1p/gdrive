@@ -251,13 +251,16 @@ async fn run(
         }
         roots.push((id, root));
     }
-    // The source folders' ids, to refuse an `--into` among them: trashing a source folder would
-    // trash the copies in it, and its listing would include them.
-    let inside = roots
-        .iter()
-        .filter_map(|(_, root)| root.as_ref().ok())
-        .any(|root| root.has_folder(&into));
-    if inside {
+    // Every source id, for the destination folders and files that both accounts see: an
+    // `--into` among them is refused, and so is one reused or matched later. Trashing a source
+    // folder would trash what was put in it, and its listing would include the copies.
+    let mut source_ids = HashSet::new();
+    for (_, root) in &roots {
+        if let Ok(root) = root {
+            root.collect_ids(&mut source_ids);
+        }
+    }
+    if source_ids.contains(&into) {
         return Err(Error::IntoInsideSource(into));
     }
     printer
@@ -278,6 +281,7 @@ async fn run(
         unsupported: Mutex::new(Vec::new()),
         tally: Tally::default(),
         ids: tokio::sync::Mutex::new(Vec::new()),
+        source_ids,
     });
     let place = Place {
         folder: Some(into),
@@ -462,6 +466,8 @@ enum Match {
     Same { verified: bool },
     /// Files of its name exist, all with other content.
     Different,
+    /// A file of its name is one of the migrated source files, which both accounts see.
+    Source,
 }
 
 impl Existing {
@@ -495,7 +501,9 @@ impl Existing {
             .map(|file| file.id.as_str())
     }
 
-    fn file(&self, source: &SourceFile) -> Match {
+    /// How `source` compares with the files of its name; one of them that is a source item
+    /// itself (in `source_ids`) is [`Match::Source`].
+    fn file(&self, source: &SourceFile, source_ids: &HashSet<String>) -> Match {
         let mut candidates = self
             .by_name
             .get(&source.name)
@@ -505,6 +513,9 @@ impl Existing {
             .peekable();
         if candidates.peek().is_none() {
             return Match::None;
+        }
+        if candidates.clone().any(|file| source_ids.contains(&file.id)) {
+            return Match::Source;
         }
         // A Workspace file's export is converted again: the copy has another size than the
         // original, and neither has an md5. Its type is what can be compared.
@@ -616,6 +627,10 @@ struct Migration {
     tally: Tally,
     /// Ids from `files.generateIds` of the destination, not used yet.
     ids: tokio::sync::Mutex<Vec<String>>,
+    /// The ids of every source file and folder that is migrated. A destination folder or file
+    /// with one of them is part of the source, which both accounts see: it is never reused or
+    /// matched.
+    source_ids: HashSet<String>,
 }
 
 /// What the scheduler's report does not count.
@@ -696,6 +711,10 @@ impl Migration {
             return failed(&label, Error::SameItem { folder: true }).into();
         }
         let (folder_id, existing) = if let Some(dest_id) = place.existing.folder(&name) {
+            // A source folder, which would go to the trash with what is put in it.
+            if self.source_ids.contains(dest_id) {
+                return failed(&label, Error::InsideSource { folder: true }).into();
+            }
             context.printer.out(format!("reuse {label}/")).await;
             match list_existing(&self.dest, dest_id).await {
                 Ok(existing) => {
@@ -785,8 +804,9 @@ impl Migration {
         if place.existing.contains(&file.id) {
             return failed(&label, Error::SameItem { folder: false }).into();
         }
-        let (outcome, verified) = match place.existing.file(&file) {
+        let (outcome, verified) = match place.existing.file(&file, &self.source_ids) {
             Match::Different => return failed(&label, Error::Conflict).into(),
+            Match::Source => return failed(&label, Error::InsideSource { folder: false }).into(),
             Match::Same { verified } => {
                 context.printer.out(format!("already-there {label}")).await;
                 (Outcome::Unchanged, verified)
@@ -1076,6 +1096,11 @@ pub(crate) enum Error {
     SameItem {
         folder: bool,
     },
+    /// The destination folder or file of the item's name is a source item that is migrated (both
+    /// accounts see it), and not the item itself.
+    InsideSource {
+        folder: bool,
+    },
     /// The source item could not be checked right before it would go to the trash.
     Recheck(Box<google_drive3::Error>),
     GetSource {
@@ -1158,6 +1183,12 @@ impl Display for Error {
                 "the source and the destination are the same {}; nothing to do",
                 if *folder { "folder" } else { "file" }
             ),
+            Error::InsideSource { folder } => write!(
+                f,
+                "the {} of this name in the destination is one of the source items that are \
+                 migrated; nothing to do",
+                if *folder { "folder" } else { "file" }
+            ),
             Error::Recheck(_) => {
                 f.write_str("unable to check the source file before moving it to the trash")
             }
@@ -1210,6 +1241,7 @@ impl error::Error for Error {
             | Error::IncompleteDestination
             | Error::IntoInsideSource(_)
             | Error::SameItem { .. }
+            | Error::InsideSource { .. }
             | Error::NotAFolder(_)
             | Error::Cycle
             | Error::Conflict

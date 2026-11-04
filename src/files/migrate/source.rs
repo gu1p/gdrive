@@ -2,7 +2,10 @@
 //! the walk ([`crate::transfer::walk`]) before anything is migrated, and kept as a compact tree
 //! (the fields a migration needs, not Drive's whole file resource).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
@@ -123,18 +126,20 @@ pub(super) enum SourceNode {
 }
 
 impl SourceNode {
-    /// Whether this is the folder `id` or one below it.
-    pub(super) fn has_folder(&self, id: &str) -> bool {
+    /// Adds the ids of this file or folder and of everything below it to `ids`.
+    pub(super) fn collect_ids(&self, ids: &mut HashSet<String>) {
         let mut pending = vec![self];
         while let Some(node) = pending.pop() {
-            if let SourceNode::Folder(folder) = node {
-                if folder.id == id {
-                    return true;
+            match node {
+                SourceNode::File(item) => {
+                    ids.insert(item.file.id.clone());
                 }
-                pending.extend(&folder.children);
+                SourceNode::Folder(folder) => {
+                    ids.insert(folder.id.clone());
+                    pending.extend(&folder.children);
+                }
             }
         }
-        false
     }
 
     pub(super) fn name(&self) -> &str {
