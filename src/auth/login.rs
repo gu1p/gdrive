@@ -285,17 +285,21 @@ fn code_from_query(url: &Url, expected_state: &str) -> Option<Result<String, Log
         }
     }
 
+    if code.is_none() && error.is_none() {
+        return None;
+    }
+    // Answers and refusals both carry the state of the request they belong to. Another state
+    // means another login: an earlier one (an old tab reloaded) or somebody else's.
+    if state.as_deref() != Some(expected_state) {
+        return Some(Err(LoginError::StateMismatch));
+    }
     if let Some(error) = error {
         return Some(Err(LoginError::Denied {
             error,
             description: error_description,
         }));
     }
-    let code = code?;
-    if state.as_deref() != Some(expected_state) {
-        return Some(Err(LoginError::StateMismatch));
-    }
-    Some(Ok(code))
+    code.map(Ok)
 }
 
 /// Reads pasted redirect URLs from `input` until one holds the code.
@@ -323,6 +327,10 @@ where
             Err(LoginError::NotARedirect) => println!(
                 "That is not the address of the redirect: it must contain code= and state=. \
                  Paste the full address of the page the browser was sent to after the approval."
+            ),
+            Err(LoginError::StateMismatch) => println!(
+                "That address belongs to another login (its state does not match). Open the URL \
+                 printed above, approve, and paste the address the browser lands on."
             ),
             result => return result,
         }
@@ -361,7 +369,8 @@ impl RedirectListener {
     }
 
     /// Serves the loopback port until the redirect of `request` arrives. Other requests (a
-    /// favicon, a preconnect) get a 404 and are ignored.
+    /// favicon, a preconnect) get a 404, and redirects with another `state` (an old tab of an
+    /// earlier login) a 400; both are ignored.
     async fn wait_for_code(
         self,
         request: &AuthorizationRequest,
@@ -433,6 +442,17 @@ async fn serve(
                  the terminal.",
             )
             .await;
+        }
+        Err(LoginError::StateMismatch) => {
+            // Not this login's answer: it must not end the login that is waiting.
+            respond(
+                &mut stream,
+                StatusCode::BAD_REQUEST,
+                "This page belongs to another gdrive login and was ignored. Open the URL that \
+                 gdrive printed last; gdrive is still waiting for it.",
+            )
+            .await;
+            return;
         }
         Err(error) => {
             let message = format!(
@@ -644,10 +664,9 @@ impl Display for LoginError {
             LoginError::NotARedirect => {
                 f.write_str("the text is not the redirect URL; it must contain code= and state=")
             }
-            LoginError::StateMismatch => f.write_str(
-                "the redirect does not belong to this login (its state does not match); run the \
-                 command again and use the URL it prints",
-            ),
+            LoginError::StateMismatch => {
+                f.write_str("the redirect belongs to another login (its state does not match)")
+            }
             LoginError::Denied { error, description } => {
                 write!(f, "the authorization was not granted ({error}")?;
                 if let Some(description) = description {
@@ -833,6 +852,20 @@ mod tests {
         };
         assert_eq!(error, "access_denied");
 
+        // A refusal is only believed with this login's state.
+        for denied in [
+            "http://localhost:8085/?error=access_denied&state=forged",
+            "http://localhost:8085/?error=access_denied",
+        ] {
+            assert!(
+                matches!(
+                    request.code_from_pasted(denied),
+                    Err(LoginError::StateMismatch)
+                ),
+                "{denied}"
+            );
+        }
+
         // The authorization URL itself, or anything else, is not a redirect.
         for pasted in [request.url(), "hello", "https://example.com/"] {
             assert!(
@@ -849,7 +882,8 @@ mod tests {
     async fn manual_input_is_read_until_a_redirect_is_pasted() {
         let request = request("http://localhost:8085");
         let input = format!(
-            "\nnot a url\nhttp://localhost:8085/?code=the-code&state={}\n",
+            "\nnot a url\nhttp://localhost:8085/?code=old&state=earlier-login\n\
+             http://localhost:8085/?code=the-code&state={}\n",
             request.state
         );
         let mut reader = tokio::io::BufReader::new(input.as_bytes());
@@ -1024,26 +1058,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn browser_mode_rejects_a_foreign_state_and_reports_denials() {
-        for (target, expected_status) in [
-            ("/?code=abc&state=forged", "HTTP/1.1 400"),
-            ("/?error=access_denied&state=x", "HTTP/1.1 400"),
-        ] {
-            let listener = RedirectListener::bind(0).await.unwrap();
-            let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.port()));
-            let request = request(&format!("http://localhost:{}", listener.port()));
+    async fn browser_mode_ignores_callbacks_of_another_login() {
+        let listener = RedirectListener::bind(0).await.unwrap();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.port()));
+        let request = request(&format!("http://localhost:{}", listener.port()));
+        let good = format!("/?code=4%2Fgood&state={}", request.state);
 
-            let (result, page) = tokio::join!(
-                listener.wait_for_code(&request, Duration::from_secs(30)),
-                browse(addr, target)
-            );
-            assert!(page.starts_with(expected_status), "{page}");
-            match result {
-                Err(LoginError::StateMismatch) => assert!(target.contains("forged")),
-                Err(LoginError::Denied { error, .. }) => assert_eq!(error, "access_denied"),
-                other => panic!("unexpected result {other:?}"),
+        let browser = async {
+            // An old tab of an earlier login is reloaded: its code, then its refusal.
+            for stale in [
+                "/?code=old&state=earlier-login",
+                "/?error=access_denied&state=earlier-login",
+                "/?error=access_denied",
+            ] {
+                let page = browse(addr, stale).await;
+                assert!(page.starts_with("HTTP/1.1 400"), "{stale}: {page}");
+                assert!(page.contains("still waiting"), "{stale}: {page}");
             }
-        }
+            let page = browse(addr, &good).await;
+            assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        };
+        let (code, ()) = tokio::join!(
+            listener.wait_for_code(&request, Duration::from_secs(30)),
+            browser
+        );
+        assert_eq!(code.unwrap(), "4/good");
+    }
+
+    #[tokio::test]
+    async fn browser_mode_reports_a_refusal_of_this_login() {
+        let listener = RedirectListener::bind(0).await.unwrap();
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, listener.port()));
+        let request = request(&format!("http://localhost:{}", listener.port()));
+        let denied = format!("/?error=access_denied&state={}", request.state);
+
+        let (result, page) = tokio::join!(
+            listener.wait_for_code(&request, Duration::from_secs(30)),
+            browse(addr, &denied)
+        );
+        assert!(page.starts_with("HTTP/1.1 400"), "{page}");
+        let Err(LoginError::Denied { error, .. }) = result else {
+            panic!("expected Denied, got {result:?}");
+        };
+        assert_eq!(error, "access_denied");
     }
 
     #[tokio::test]
