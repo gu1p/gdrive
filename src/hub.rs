@@ -5,6 +5,8 @@ use google_drive3::DriveHub;
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 
+/// Cloning is cheap and shares the connection pool and the credentials (and so the token cache).
+#[derive(Clone)]
 pub(crate) struct Hub(DriveHub<HttpsConnector<HttpConnector>>);
 
 impl Deref for Hub {
