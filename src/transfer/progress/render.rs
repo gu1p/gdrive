@@ -24,6 +24,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    io,
     num::NonZeroUsize,
     sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
@@ -33,7 +34,7 @@ use std::{
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 
 use super::{
-    terminal::{self, Drawing, Mode, Quiet, Stderr, Terminal},
+    terminal::{self, Drawing, Mode, Plain, Quiet, Stderr, Terminal},
     JobId, JobProgress, NoProgress, ProgressEvent, ProgressSink,
 };
 use crate::{
@@ -104,8 +105,11 @@ impl ProgressDisplay {
     }
 
     fn on_stderr(layout: Layout, drawing: Drawing) -> ProgressDisplay {
-        Self::open(layout, drawing, true, |hz| {
-            ProgressDrawTarget::term_like_with_hz(Box::new(Quiet::new(Stderr::new())), hz)
+        Self::open(layout, drawing, true, |hz| match drawing {
+            Drawing::Line => plain_target(io::stderr(), terminal::columns(), hz),
+            Drawing::Live | Drawing::Off => {
+                ProgressDrawTarget::term_like_with_hz(Box::new(Quiet::new(Stderr::new())), hz)
+            }
         })
     }
 
@@ -155,6 +159,15 @@ impl ProgressDisplay {
         self.sink.event(&ProgressEvent::Started { job });
         JobProgress::new(job, self.sink())
     }
+}
+
+/// The target of [`Drawing::Line`]: `out`, `width` columns wide, with nothing but text, spaces
+/// and carriage returns.
+fn plain_target<W>(out: W, width: u16, hz: u8) -> ProgressDrawTarget
+where
+    W: io::Write + Send + 'static,
+{
+    ProgressDrawTarget::term_like_with_hz(Box::new(Quiet::new(Plain::new(out, width))), hz)
 }
 
 /// The sink of a display: the events update the state that the drawing thread reads.

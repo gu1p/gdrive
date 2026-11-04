@@ -15,7 +15,7 @@
 use std::{
     ffi::OsStr,
     fmt,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
     sync::{
         atomic::{AtomicBool, Ordering},
         Mutex, PoisonError,
@@ -120,31 +120,23 @@ pub(crate) enum Drawing {
     Line,
 }
 
-/// stderr as the bars draw on it.
+/// stderr as the bars draw on it when it is a terminal ([`Drawing::Live`]).
 #[derive(Debug)]
 pub(super) struct Stderr {
     term: console::Term,
-    /// The width when stderr is not a terminal: `COLUMNS`, or 80.
-    columns: Option<u16>,
 }
 
 impl Stderr {
     pub(super) fn new() -> Self {
-        let term = console::Term::buffered_stderr();
-        let columns = (!term.is_term()).then(|| {
-            std::env::var("COLUMNS")
-                .ok()
-                .and_then(|columns| columns.trim().parse().ok())
-                .filter(|columns| *columns > 0)
-                .unwrap_or(80)
-        });
-        Stderr { term, columns }
+        Stderr {
+            term: console::Term::buffered_stderr(),
+        }
     }
 }
 
 impl TermLike for Stderr {
     fn width(&self) -> u16 {
-        self.columns.unwrap_or_else(|| self.term.size().1)
+        self.term.size().1
     }
 
     fn height(&self) -> u16 {
@@ -181,6 +173,84 @@ impl TermLike for Stderr {
 
     fn flush(&self) -> io::Result<()> {
         self.term.flush()
+    }
+}
+
+/// A writer that is not a terminal as the bars draw on it ([`Drawing::Line`]: `--progress` into
+/// a CI log, a file, a pipe): one line, rewritten after a carriage return and erased with
+/// spaces. No escape sequence and no cursor movement: a log keeps them as they are.
+pub(super) struct Plain<W> {
+    out: Mutex<W>,
+    width: u16,
+}
+
+impl<W> Plain<W> {
+    pub(super) fn new(out: W, width: u16) -> Self {
+        Plain {
+            out: Mutex::new(out),
+            width,
+        }
+    }
+
+    fn out(&self) -> std::sync::MutexGuard<'_, W> {
+        self.out.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The width of a stderr that is not a terminal: `COLUMNS`, else 80.
+pub(super) fn columns() -> u16 {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| columns.trim().parse().ok())
+        .filter(|columns| *columns > 0)
+        .unwrap_or(80)
+}
+
+impl<W> fmt::Debug for Plain<W> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Plain")
+            .field("width", &self.width)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W: Write + Send> TermLike for Plain<W> {
+    fn width(&self) -> u16 {
+        self.width
+    }
+
+    // One line: there is nowhere to move.
+    fn move_cursor_up(&self, _: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn move_cursor_down(&self, _: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn move_cursor_right(&self, _: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn move_cursor_left(&self, _: usize) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn write_line(&self, s: &str) -> io::Result<()> {
+        writeln!(self.out(), "{s}")
+    }
+
+    fn write_str(&self, s: &str) -> io::Result<()> {
+        self.out().write_all(s.as_bytes())
+    }
+
+    fn clear_line(&self) -> io::Result<()> {
+        let blank = " ".repeat(usize::from(self.width));
+        write!(self.out(), "\r{blank}\r")
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.out().flush()
     }
 }
 

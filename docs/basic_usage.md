@@ -391,7 +391,7 @@ When it shows:
 | Setting | Progress |
 |---|---|
 | (default) | When stderr is a terminal and `TERM` is not `dumb`. With `files download --stdout`, only if stdout is not a terminal as well, so that the bars do not mix with the content. |
-| `--progress` | Always. Where stderr is not a terminal (a CI log, `script`, a file), a single line rewritten after a carriage return once a second. |
+| `--progress` | Always. Where stderr is not a terminal (a CI log, `script`, a file), a single line rewritten after a carriage return once a second, without escape sequences. |
 | `--no-progress` | Never. |
 | `GDRIVE_PROGRESS=1`, `GDRIVE_PROGRESS=0` | Like `--progress` and `--no-progress`, when neither flag is given. Other values are ignored with a warning. |
 

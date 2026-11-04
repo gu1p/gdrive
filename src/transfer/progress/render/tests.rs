@@ -13,15 +13,18 @@ use futures::stream;
 use indicatif::{ProgressDrawTarget, TermLike};
 
 use super::{
-    eta_text, file_line, run_line, shortened, single_line, FileView, Layout, ProgressDisplay, Rate,
-    Shared, State, View, FIRST_DRAW,
+    eta_text, file_line, plain_target, run_line, shortened, single_line, FileView, Layout,
+    ProgressDisplay, Rate, Shared, State, View, FIRST_DRAW,
 };
 use crate::transfer::{
     progress::{
-        terminal::{Mode, Terminal},
+        terminal::{Drawing, Mode, Terminal},
         JobId, ProgressEvent, ProgressSink,
     },
-    scheduler::{capture::output, Job, JobKind, Options, Outcome, Printer, Scheduler, SkipReason},
+    scheduler::{
+        capture::{output, Captured},
+        Job, JobKind, Options, Outcome, Printer, Scheduler, SkipReason,
+    },
 };
 
 const MB: u64 = 1_000_000;
@@ -623,28 +626,37 @@ fn nothing_is_drawn_when_progress_is_off() {
 }
 
 #[test]
-fn forced_progress_off_a_terminal_is_one_line() {
+fn forced_progress_off_a_terminal_is_one_plain_line() {
     let terminal = Terminal {
         stderr: false,
         stdout: false,
     };
-    let screen = Screen::default();
-    let display = on_screen(
-        Layout::Run { files: 2 },
-        Mode::Always,
-        terminal,
-        &screen,
-        false,
-    );
+    let drawing = Mode::Always.drawing(terminal, false);
+    assert_eq!(drawing, Drawing::Line);
+    let out = Captured::default();
+    let target = out.clone();
+    let display = ProgressDisplay::open(Layout::Run { files: 2 }, drawing, false, move |hz| {
+        plain_target(target, 80, hz)
+    });
     feed_some(display.sink().as_ref());
     let started = Instant::now();
-    while screen.rows().is_empty() && started.elapsed() < Duration::from_secs(10) {
+    while !out.text().contains("0/2 files") && started.elapsed() < Duration::from_secs(10) {
         std::thread::sleep(Duration::from_millis(10));
     }
-    let rows = screen.rows();
     display.finish();
-    assert_eq!(rows.len(), 1, "{rows:?}");
-    assert!(rows[0].contains("0/2 files"), "{rows:?}");
+
+    let written = out.text();
+    assert!(
+        written.contains("0/2 files, 250 KB/2 MB (12%)"),
+        "{written:?}"
+    );
+    assert!(
+        !written.contains('\u{1b}'),
+        "no escape sequence: {written:?}"
+    );
+    assert!(!written.contains('\n'), "one line: {written:?}");
+    let blank = format!("\r{}\r", " ".repeat(80));
+    assert!(written.ends_with(&blank), "erased at the end: {written:?}");
 }
 
 /// Waits until `check` holds: other tests that print take the bars off the screen for a moment.
