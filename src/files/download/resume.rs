@@ -25,6 +25,11 @@
 //! are not progress.
 //!
 //! Resume is in-process only.
+//!
+//! The relay of a Drive file to another account (`transfer/relay.rs`) reads the content with
+//! the same requests and checks ([`MediaSource::open`], the `Range` and `ETag` parsing,
+//! [`Identity::changed`]) but keeps its own state: it reads again from any offset the upload
+//! asks for, and fails instead of starting over when the file changed.
 // TODO(sync): resume across runs: persist the received offset with the file's revision and
 // ETag (a sidecar next to the temporary file) and check both before continuing.
 
@@ -151,6 +156,21 @@ impl<'a> Identity<'a> {
         .map_err(|err| MediaError::Metadata(Box::new(err)))?;
         Ok(Revision::of(&file))
     }
+
+    /// Whether the file is at another revision now than the one it started with: a field that
+    /// both revisions know differs. Fields the starting revision does not know are not compared,
+    /// so a caller that leaves out `version` and `modifiedTime` compares the content only.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
+        )
+    )]
+    pub(crate) async fn changed(&self) -> Result<bool, MediaError> {
+        let current = self.fetch().await?;
+        Ok(self.revision.differs_from(&current))
+    }
 }
 
 /// Where a download gets its bytes.
@@ -168,10 +188,10 @@ pub(crate) enum MediaSource<'a> {
 }
 
 /// A reply to a media request.
-struct Reply {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Body,
+pub(crate) struct Reply {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: HeaderMap,
+    pub(crate) body: Body,
 }
 
 impl MediaSource<'_> {
@@ -185,7 +205,7 @@ impl MediaSource<'_> {
 
     /// Requests the content from `offset` on (all of it for 0), retried per `retry`. With
     /// `if_range` (an `ETag`), the server sends the range only if the content is still that one.
-    async fn open(
+    pub(crate) async fn open(
         &mut self,
         offset: u64,
         if_range: Option<&str>,
@@ -510,24 +530,24 @@ fn header_str(headers: &HeaderMap, name: hyper::header::HeaderName) -> Option<&s
 }
 
 /// A strong `ETag` (`"..."`); a weak one (`W/"..."`) cannot be used with `If-Range`.
-fn strong_etag(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn strong_etag(headers: &HeaderMap) -> Option<String> {
     let value = header_str(headers, ETAG)?.trim();
     (value.len() >= 2 && value.starts_with('"') && value.ends_with('"')).then(|| value.to_owned())
 }
 
-fn content_length(headers: &HeaderMap) -> Option<u64> {
+pub(crate) fn content_length(headers: &HeaderMap) -> Option<u64> {
     header_str(headers, CONTENT_LENGTH)?.trim().parse().ok()
 }
 
 /// `Content-Range: bytes <first>-<last>/<total or *>` of a 206.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ContentRange {
-    first: u64,
-    last: u64,
-    total: Option<u64>,
+pub(crate) struct ContentRange {
+    pub(crate) first: u64,
+    pub(crate) last: u64,
+    pub(crate) total: Option<u64>,
 }
 
-fn content_range(headers: &HeaderMap) -> Option<ContentRange> {
+pub(crate) fn content_range(headers: &HeaderMap) -> Option<ContentRange> {
     parse_content_range(header_str(headers, CONTENT_RANGE)?)
 }
 
@@ -555,8 +575,52 @@ fn unsatisfied_range_total(headers: &HeaderMap) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use hyper::header::{HeaderMap, HeaderValue, ETAG};
+    use serde_json::json;
 
-    use super::{parse_content_range, strong_etag, ContentRange, Revision};
+    use super::{
+        parse_content_range, strong_etag, ContentRange, Identity, Revision, REVISION_FIELDS,
+    };
+    use crate::common::mock_server::{MockServer, Response};
+
+    #[tokio::test]
+    async fn an_identity_tells_a_change_of_the_fields_it_knows() {
+        let md5 = md5::compute(b"a");
+        let resource = |version: &str, md5: md5::Digest| {
+            let md5 = format!("{md5:x}");
+            Response::json(
+                200,
+                &json!({"id": "f", "version": version, "md5Checksum": md5, "size": "1"}),
+            )
+        };
+        let server =
+            MockServer::start(vec![resource("8", md5), resource("9", md5::compute(b"b"))]).await;
+        let hub = server.hub();
+        // The content only: no version, no modification time.
+        let identity = Identity::new(
+            &hub,
+            "f",
+            Revision {
+                md5: Some(md5),
+                size: Some(1),
+                ..Revision::default()
+            },
+        );
+
+        assert!(
+            !identity.changed().await.unwrap(),
+            "a new version of the same content"
+        );
+        assert!(identity.changed().await.unwrap(), "another content");
+        let requests = server.requests();
+        assert_eq!(requests[0].path, "/drive/v3/files/f");
+        assert_eq!(
+            requests[0]
+                .query_param("fields")
+                .map(|fields| fields.replace("%2C", ",")),
+            Some(REVISION_FIELDS.to_owned())
+        );
+        assert_eq!(requests[0].query_param("supportsAllDrives"), Some("true"));
+    }
 
     #[test]
     fn revisions_differ_only_in_fields_both_know() {
