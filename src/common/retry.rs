@@ -13,13 +13,10 @@
 //!   used up. Progress ([`RetryState::progress`]) starts a new budget.
 //! - [`Throttle`] is shared by every request of a hub, and later of every scheduler worker.
 //! - [`retry_read`] (reads) and [`retry_api`] (mutations) run a google-drive3 metadata call
-//!   under all of the above. The upload delegate (`delegate.rs`) and the media client
+//!   under all of the above. The uploader (`transfer/upload.rs`) and the media client
 //!   (`media_client.rs`) use the parts directly.
 //!
 //! Google's guidance: <https://developers.google.com/workspace/drive/api/guides/handle-errors>.
-//!
-//! This module only uses `super::` paths and dependencies of the crate, so that
-//! `tests/resumable_upload.rs` can compile it next to `delegate.rs`.
 
 use std::{
     error::Error,
@@ -757,7 +754,8 @@ impl Error for AccessTokenRejected {}
 /// `call` (for example `files.list`). The error of the last attempt is returned unchanged, except
 /// for a 401, which becomes `Error::MissingToken` with a hint to authorize again.
 ///
-/// Media upload bodies do not belong here: their retries are the upload delegate's.
+/// Media upload bodies do not belong here: their retries are the uploader's
+/// (`transfer/upload.rs`).
 #[expect(
     clippy::result_large_err,
     reason = "the error of the wrapped call, unchanged; callers box it where they keep it"

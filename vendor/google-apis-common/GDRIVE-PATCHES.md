@@ -10,6 +10,21 @@ published crate. The crate does not ship a license file, so `LICENSE` is the MIT
 Byron/google-apis-rs repository (`LICENSE-MIT`), which is the license declared in `Cargo.toml`. The
 published `CHANGELOG.md` and `Cargo.lock` are left out; they are not used to build.
 
+## Status: gdrive no longer uploads through the patched helper
+
+gdrive's own uploader (`src/transfer/upload.rs`, milestone 2 item 1 of docs/triage/README.md) now makes
+every media upload: `files upload`, `files update`, `files import` and the files of
+`files upload --recursive` (through `files::upload::upload_file`). It speaks the resumable protocol
+directly over the hub's HTTP client, so `ResumableUploadHelper` and the multipart upload of
+google-drive3's `upload()` are no longer called for file content, and gdrive has no
+google-apis-common `Delegate` for uploads any more (the `UploadDelegate` of `src/common/delegate.rs`
+is gone). google-drive3 7 is still used for every metadata call (and for the empty multipart body of
+`files mkdir`), and it still links the helper, so the patch stays: dropping it would bring the bugs
+below back for any code that calls `upload_resumable` again. `tests/resumable_upload.rs` keeps
+testing the patched helper with a minimal delegate; the same scenarios against gdrive's own uploader
+are in `src/transfer/upload/tests.rs`. The vendored copy can be dropped when nothing in gdrive calls
+google-drive3's upload methods.
+
 ## Why
 
 google-drive3 7 performs resumable uploads (gdrive's `files upload` for files larger than the chunk
@@ -58,21 +73,25 @@ Checked against Google's protocol description,
    past the start of the chunk just sent now counts as a failed attempt: it goes to the delegate's
    `http_failure`, whose `Retry::After` backoff applies before the resend, and `Retry::Abort` returns
    the 308 as the result (google-drive3 reports it as a failure). gdrive's `UploadDelegate`
-   (`src/common/delegate.rs`) retries such a 308 like a 5xx, within the same retry budget.
+   (`src/common/delegate.rs`, removed since) retried such a 308 like a 5xx, within the same retry
+   budget.
 
 Not changed: after a 5xx or 429 the chunk is resent as in gdrive 3.9.1, without a status request first;
 transport errors (no reply at all) were already retried with the same chunk; seeks and reads of the
-local file still `unwrap()`. gdrive's own uploader (milestone 2 in docs/triage/README.md) is meant to
-replace this helper, and the patch should be offered upstream for #438.
+local file still `unwrap()`. gdrive's own uploader (milestone 2 in docs/triage/README.md) has replaced
+this helper for gdrive's uploads (see the status above), and the patch should be offered upstream for
+#438.
 
 ## Tests
 
-`tests/resumable_upload.rs` runs gdrive's upload delegate and the `files.create` call of
-`src/files/upload.rs` against an in-process mock of the protocol: a 503 on the second chunk, a cut
-reply body on the final chunk, and a 308 whose Range covers only part of a chunk. All three fail with
-pristine 8.0.0 and pass with this patch. A fourth case answers every attempt at one chunk with the same
-308 Range and checks that the upload fails after a bounded number of attempts; without change 6 it
-never finishes.
+`tests/resumable_upload.rs` runs a `files.create` resumable upload through the helper, with a minimal
+delegate that retries a failed chunk a few milliseconds later (as gdrive's `UploadDelegate` did),
+against an in-process mock of the protocol: a 503 on the second chunk, a cut reply body on the final
+chunk, and a 308 whose Range covers only part of a chunk. All three fail with pristine 8.0.0 and pass
+with this patch. A fourth case answers every attempt at one chunk with the same 308 Range and checks
+that the upload fails after a bounded number of attempts; without change 6 it never finishes. (Until
+gdrive had its own uploader these tests ran gdrive's delegate, and a fifth case checked its
+`Retry-After` and shared throttle; that case now runs against the own uploader.)
 
 ## Updating
 

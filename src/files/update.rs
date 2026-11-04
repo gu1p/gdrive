@@ -8,11 +8,11 @@ use mime::Mime;
 
 use crate::{
     common::{
-        delegate::{ChunkSize, UploadDelegate, UploadDelegateConfig},
+        delegate::{ChunkSize, MultipartThreshold},
         file_helper,
         file_info::{self, FileInfo},
         hub_helper::{get_hub, GetHubError},
-        retry::{retry_api, RetryPolicy},
+        retry::retry_api,
     },
     files::{
         self,
@@ -20,6 +20,10 @@ use crate::{
         FileResult,
     },
     hub::Hub,
+    transfer::upload::{
+        session::{account_session_dir, account_session_identity},
+        upload_path, UploadError, UploadOptions, UploadTarget,
+    },
 };
 
 pub(crate) struct Config {
@@ -27,6 +31,7 @@ pub(crate) struct Config {
     pub(crate) file_path: Option<PathBuf>,
     pub(crate) mime_type: Option<Mime>,
     pub(crate) chunk_size: ChunkSize,
+    pub(crate) multipart_threshold: MultipartThreshold,
     pub(crate) print_chunk_errors: bool,
     pub(crate) print_chunk_info: bool,
 }
@@ -38,11 +43,18 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
 
     let hub = get_hub().await.map_err(Error::Hub)?;
 
-    let delegate_config = UploadDelegateConfig {
-        chunk_size: config.chunk_size,
-        retry_policy: RetryPolicy::default(),
+    let options = UploadOptions {
+        chunk_size: config.chunk_size.in_bytes(),
+        multipart_threshold: config.multipart_threshold.in_bytes(),
+        verify_md5: true,
         print_chunk_errors: config.print_chunk_errors,
         print_chunk_info: config.print_chunk_info,
+        // A spool of stdin has a new name every time: there is no earlier run to continue.
+        session_dir: config
+            .file_path
+            .as_ref()
+            .and_then(|_| account_session_dir()),
+        session_identity: account_session_identity(),
     };
 
     let mut file_helper = match file_helper::open_file(config.file_path.as_deref()) {
@@ -77,13 +89,19 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
         }
     };
 
-    let reader = std::io::BufReader::new(file);
+    // The file keeps its folders: an update sends only the name and the content.
+    let target = UploadTarget {
+        name: file_info.name.into_owned(),
+        mime: Some(file_info.mime_type.into_owned()),
+        existing_file_id: Some(config.file_id.clone()),
+        ..UploadTarget::default()
+    };
 
     println!("Updating {} with {}", config.file_id, file_path.display());
 
-    let file = update_file(&hub, reader, &config.file_id, file_info, &delegate_config)
+    let file = upload_path(&hub, file_path, &target, &options, None)
         .await
-        .map_err(Error::Update)?;
+        .map_err(|err| Error::Update(Box::new(err)))?;
 
     println!("File successfully updated");
 
@@ -92,7 +110,7 @@ pub(crate) async fn update(config: Config) -> Result<(), Box<Error>> {
     Ok(())
 }
 
-/// The upload reads the path as a seekable byte stream: a directory makes the upload library
+/// The upload reads the path as a seekable byte stream: a directory made the upload library
 /// panic (#18) and a FIFO would block, so only regular files (or symlinks to them) are accepted.
 fn err_if_not_regular_file(path: &Path) -> Result<(), Box<Error>> {
     match std::fs::metadata(path) {
@@ -103,52 +121,6 @@ fn err_if_not_regular_file(path: &Path) -> Result<(), Box<Error>> {
         // A missing or unreadable path is reported when the file is opened.
         _ => Ok(()),
     }
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "Ok variant is bigger, see test next to FileResult"
-)]
-async fn update_file<RS>(
-    hub: &Hub,
-    src_file: RS,
-    file_id: &str,
-    file_info: FileInfo<'_>,
-    delegate_config: &UploadDelegateConfig,
-) -> FileResult
-where
-    RS: google_apis_common::ReadSeek,
-{
-    let dst_file = google_drive3::api::File {
-        name: Some(file_info.name.into_owned()),
-        ..google_drive3::api::File::default()
-    };
-
-    let throttle = &hub.retrier().throttle;
-    let mut delegate = UploadDelegate::new(delegate_config, throttle);
-    throttle.wait().await;
-
-    let req = hub
-        .files()
-        .update(dst_file, file_id)
-        .param(
-            "fields",
-            "id,name,size,createdTime,modifiedTime,md5Checksum,mimeType,parents,shared,\
-            description,webContentLink,webViewLink",
-        )
-        .add_scope(google_drive3::api::Scope::Full)
-        .delegate(&mut delegate)
-        .supports_all_drives(true);
-
-    let (_, file) = if file_info.size > 0 {
-        req.upload_resumable(src_file, file_info.mime_type.into_owned())
-            .await?
-    } else {
-        req.upload(src_file, file_info.mime_type.into_owned())
-            .await?
-    };
-
-    Ok(file)
 }
 
 #[expect(
@@ -187,7 +159,7 @@ pub(crate) enum Error {
     },
     OpenFile(PathBuf, file_helper::OpenFileError),
     GetFile(google_drive3::Error),
-    Update(google_drive3::Error),
+    Update(Box<UploadError>),
 }
 
 impl Display for Error {
@@ -223,7 +195,8 @@ impl error::Error for Error {
             Error::IsDirectory(_) | Error::NotRegularFile(_) => None,
             Error::FileInfo { source, .. } => Some(source),
             Error::OpenFile(_, source) => Some(source),
-            Error::GetFile(source) | Error::Update(source) => Some(source),
+            Error::GetFile(source) => Some(source),
+            Error::Update(source) => Some(source.as_ref()),
         }
     }
 }

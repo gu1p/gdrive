@@ -14,6 +14,13 @@ pub(crate) struct FileInfo<'a> {
     /// `mime_type` is what makes Drive convert the file.
     pub(crate) source_mime_type: Option<&'a mime::Mime>,
     pub(crate) parents: Option<Vec<String>>,
+    /// The size when the file was looked at. The upload does not use it: it measures the file
+    /// when it opens it, as a file can change in between.
+    #[expect(
+        dead_code,
+        reason = "the recursive upload's file tree still fills it in; the scheduler workstream \
+                  owns that code"
+    )]
     pub(crate) size: u64,
 }
 
