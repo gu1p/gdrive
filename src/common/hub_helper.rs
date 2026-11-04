@@ -10,7 +10,11 @@ use crate::{
         account_type::{AccountType, LoadAccountType},
         AppConfig,
     },
-    auth::{self, service::ServiceCredentials, stored::StoredCredentials},
+    auth::{
+        self, adc,
+        service::{self, ServiceCredentials},
+        stored::StoredCredentials,
+    },
     hub::{self, Hub},
 };
 
@@ -28,6 +32,7 @@ pub(crate) async fn get_hub() -> Result<Hub, GetHubError> {
         AccountType::ServiceAccount { subject } => {
             return service_account_hub(&app_cfg, subject).await;
         }
+        AccountType::ApplicationDefaultCredentials => return adc_hub().await,
     }
 
     let secret = app_cfg.load_secret().map_err(GetHubError::LoadSecret)?;
@@ -70,14 +75,30 @@ async fn service_account_hub(
     Hub::new(credentials).map_err(GetHubError::Hub)
 }
 
-/// The hint for a failed command of the current account, if it is a service account that ran
-/// into Drive's rule that service accounts have no storage of their own.
-pub(crate) fn storage_hint(error: &(dyn Error + 'static)) -> Option<&'static str> {
+/// A Drive hub with Application Default Credentials, which are looked up again on every run.
+async fn adc_hub() -> Result<Hub, GetHubError> {
+    let client = hub::token_http_client().map_err(GetHubError::Hub)?;
+    let source = adc::resolve()
+        .await
+        .map_err(|error| GetHubError::Service(service::Error::Adc(error)))?;
+    let credentials = ServiceCredentials::application_default(client, source)
+        .await
+        .map_err(GetHubError::Service)?;
+    credentials
+        .access_token()
+        .await
+        .map_err(GetHubError::Service)?;
+    Hub::new(credentials).map_err(GetHubError::Hub)
+}
+
+/// The hint for a failed command of the current account, if it is a service account or uses
+/// Application Default Credentials and ran into a Drive error typical for those.
+pub(crate) fn account_hint(error: &(dyn Error + 'static)) -> Option<String> {
     let account_type = AppConfig::load_current_account()
         .ok()?
         .account_type()
         .ok()?;
-    auth::service::storage_hint(error, &account_type)
+    auth::service::account_hint(error, &account_type)
 }
 
 #[derive(Debug)]

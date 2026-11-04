@@ -1,10 +1,15 @@
-//! Credentials of service accounts (#49).
+//! Credentials of service accounts (#49) and Application Default Credentials (#37).
 //!
 //! A service account authenticates with the private key of its JSON key file: yup-oauth2's
 //! `ServiceAccountAuthenticator` signs a JWT with it and exchanges that at the key's `token_uri`
 //! for an access token (RFC 7523). There is no refresh token and nothing interactive: when the
 //! cached token expires, a new JWT is signed. With a subject, the token is issued for that
 //! Google Workspace user (domain-wide delegation), which the domain's administrator has to allow.
+//!
+//! Application Default Credentials (see [`super::adc`]) are a service account key, gcloud user
+//! credentials (a refresh token, used with yup-oauth2's `AuthorizedUserAuthenticator`) or the
+//! metadata server of Google Cloud (`ApplicationDefaultCredentialsAuthenticator`). They are
+//! looked up on every run and their tokens are kept in memory only.
 //!
 //! Every token is requested for [`SERVICE_SCOPES`], whatever scope a Drive call asks for: the
 //! full Drive scope covers all of them, and domain-wide delegation must be granted for each scope
@@ -22,11 +27,18 @@ use std::{
 use hyper_util::client::legacy::{connect::Connect, Client};
 use serde_json::{Map, Value};
 use yup_oauth2::{
-    authenticator::Authenticator, error::AuthErrorCode, storage::TokenInfo, AccessToken,
-    CustomHyperClientBuilder, ServiceAccountAuthenticator, ServiceAccountKey,
+    authenticator::{ApplicationDefaultCredentialsTypes, Authenticator},
+    error::AuthErrorCode,
+    storage::TokenInfo,
+    AccessToken, ApplicationDefaultCredentialsAuthenticator, ApplicationDefaultCredentialsFlowOpts,
+    AuthorizedUserAuthenticator, CustomHyperClientBuilder, ServiceAccountAuthenticator,
+    ServiceAccountKey,
 };
 
-use super::store::{TokenFile, TokenStore};
+use super::{
+    adc::{self, AdcSource},
+    store::{TokenFile, TokenStore},
+};
 use crate::{
     app_config::{account_type::AccountType, AppConfig},
     common::json_error::RedactedJsonError,
@@ -37,6 +49,9 @@ pub(crate) const SERVICE_SCOPES: [&str; 1] = ["https://www.googleapis.com/auth/d
 
 /// How long one token request may take before gdrive gives up.
 const TOKEN_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The same for the metadata server, which answers within milliseconds where there is one.
+const METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Checks the content of a service account key file and returns the key.
 ///
@@ -105,19 +120,53 @@ fn is_acceptable_token_uri(token_uri: &str) -> bool {
 
 /// Who the tokens are for, for messages.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Identity {
-    client_email: String,
-    client_id: Option<String>,
-    subject: Option<String>,
+pub(crate) enum Identity {
+    ServiceAccount {
+        client_email: String,
+        client_id: Option<String>,
+        subject: Option<String>,
+        /// Found as Application Default Credentials, not stored by gdrive.
+        adc: bool,
+    },
+    /// gcloud user credentials found as Application Default Credentials.
+    AuthorizedUser { path: PathBuf },
+    /// The default service account of the metadata server (Application Default Credentials).
+    MetadataServer {
+        host: String,
+        /// The gcloud credentials file that was looked for before.
+        gcloud_file: Option<PathBuf>,
+    },
 }
 
 impl Display for Identity {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "service account '{}'", self.client_email)?;
-        if let Some(subject) = &self.subject {
-            write!(f, " acting for '{subject}'")?;
+        match self {
+            Identity::ServiceAccount {
+                client_email,
+                subject,
+                adc,
+                ..
+            } => {
+                write!(f, "service account '{client_email}'")?;
+                if let Some(subject) = subject {
+                    write!(f, " acting for '{subject}'")?;
+                }
+                if *adc {
+                    f.write_str(" (Application Default Credentials)")?;
+                }
+                Ok(())
+            }
+            Identity::AuthorizedUser { path } => write!(
+                f,
+                "the user credentials in '{}' (Application Default Credentials)",
+                path.display()
+            ),
+            Identity::MetadataServer { host, .. } => write!(
+                f,
+                "the service account of the metadata server at {host} (Application Default \
+                 Credentials)"
+            ),
         }
-        Ok(())
     }
 }
 
@@ -129,6 +178,7 @@ where
 {
     auth: Authenticator<C>,
     identity: Arc<Identity>,
+    timeout: Duration,
 }
 
 impl<C> ServiceCredentials<C>
@@ -143,10 +193,21 @@ where
         subject: Option<String>,
         tokens_path: Option<&Path>,
     ) -> Result<Self, Error> {
-        let identity = Arc::new(Identity {
+        Self::from_key(client, key, subject, tokens_path, false).await
+    }
+
+    async fn from_key(
+        client: Client<C, String>,
+        key: ServiceAccountKey,
+        subject: Option<String>,
+        tokens_path: Option<&Path>,
+        adc: bool,
+    ) -> Result<Self, Error> {
+        let identity = Arc::new(Identity::ServiceAccount {
             client_email: key.client_email.clone(),
             client_id: key.client_id.clone(),
             subject: subject.clone(),
+            adc,
         });
 
         let mut builder =
@@ -169,7 +230,67 @@ where
             source,
         })?;
 
-        Ok(ServiceCredentials { auth, identity })
+        Ok(ServiceCredentials {
+            auth,
+            identity,
+            timeout: TOKEN_TIMEOUT,
+        })
+    }
+
+    /// Credentials for Application Default Credentials found at `source`, with tokens in memory
+    /// only. Sends no request.
+    pub(crate) async fn application_default(
+        client: Client<C, String>,
+        source: AdcSource,
+    ) -> Result<Self, Error> {
+        let (auth, identity, timeout) = match source {
+            AdcSource::ServiceAccountKey { key, .. } => {
+                return Self::from_key(client, key, None, None, true).await;
+            }
+            AdcSource::AuthorizedUser { path, secret, .. } => {
+                let identity = Identity::AuthorizedUser { path };
+                let client = CustomHyperClientBuilder::from(client);
+                let auth = AuthorizedUserAuthenticator::with_client(secret, client)
+                    .build()
+                    .await;
+                (auth, identity, TOKEN_TIMEOUT)
+            }
+            AdcSource::MetadataServer {
+                url,
+                host,
+                gcloud_file,
+            } => {
+                let identity = Identity::MetadataServer { host, gcloud_file };
+                let opts = ApplicationDefaultCredentialsFlowOpts {
+                    metadata_url: Some(url),
+                };
+                let client = CustomHyperClientBuilder::from(client);
+                // yup-oauth2 picks a service account key itself when GOOGLE_APPLICATION_CREDENTIALS
+                // is set, but `adc::resolve` takes that path before it gets here.
+                let auth =
+                    match ApplicationDefaultCredentialsAuthenticator::with_client(opts, client)
+                        .await
+                    {
+                        ApplicationDefaultCredentialsTypes::InstanceMetadata(builder) => {
+                            builder.build().await
+                        }
+                        ApplicationDefaultCredentialsTypes::ServiceAccount(_) => {
+                            return Err(Error::Adc(adc::AdcError::Changed));
+                        }
+                    };
+                (auth, identity, METADATA_TIMEOUT)
+            }
+        };
+        let identity = Arc::new(identity);
+        let auth = auth.map_err(|source| Error::Build {
+            identity: Arc::clone(&identity),
+            source,
+        })?;
+        Ok(ServiceCredentials {
+            auth,
+            identity,
+            timeout,
+        })
     }
 
     /// The credentials of the service account `app_cfg`, from its stored key, with tokens cached
@@ -191,15 +312,34 @@ where
     /// An access token for [`SERVICE_SCOPES`]: the cached one while it is valid, otherwise a new
     /// one, which is cached.
     pub(crate) async fn access_token(&self) -> Result<AccessToken, Error> {
-        let result = tokio::time::timeout(TOKEN_TIMEOUT, self.auth.token(&SERVICE_SCOPES))
-            .await
-            .map_err(|_| Error::Timeout {
-                identity: Arc::clone(&self.identity),
-            })?;
-        result.map_err(|source| Error::Token {
-            identity: Arc::clone(&self.identity),
-            source,
-        })
+        let identity = || Arc::clone(&self.identity);
+        let result = tokio::time::timeout(self.timeout, self.auth.token(&SERVICE_SCOPES)).await;
+        match (result, &*self.identity) {
+            (Ok(Ok(token)), _) => Ok(token),
+            // Off Google Cloud the metadata server's name does not resolve, or nothing answers.
+            (Err(_), Identity::MetadataServer { .. }) => Err(Error::NoMetadataServer {
+                identity: identity(),
+                source: None,
+            }),
+            (
+                Ok(Err(
+                    source @ (yup_oauth2::Error::HttpClientError(_)
+                    | yup_oauth2::Error::HttpError(_)),
+                )),
+                Identity::MetadataServer { .. },
+            ) => Err(Error::NoMetadataServer {
+                identity: identity(),
+                source: Some(source),
+            }),
+            (Err(_), _) => Err(Error::Timeout {
+                identity: identity(),
+                timeout: self.timeout,
+            }),
+            (Ok(Err(source)), _) => Err(Error::Token {
+                identity: identity(),
+                source,
+            }),
+        }
     }
 }
 
@@ -238,10 +378,16 @@ fn token_hint(identity: &Identity, error: &yup_oauth2::Error) -> Option<String> 
     let yup_oauth2::Error::AuthError(error) = error else {
         return None;
     };
-    match (&error.error, &identity.subject) {
-        (AuthErrorCode::UnauthorizedClient, Some(_)) => {
-            let client_id = identity
-                .client_id
+    match (identity, &error.error) {
+        (
+            Identity::ServiceAccount {
+                client_id,
+                subject: Some(_),
+                ..
+            },
+            AuthErrorCode::UnauthorizedClient,
+        ) => {
+            let client_id = client_id
                 .as_deref()
                 .unwrap_or("the client ID of the service account");
             Some(format!(
@@ -252,7 +398,7 @@ fn token_hint(identity: &Identity, error: &yup_oauth2::Error) -> Option<String> 
                 SERVICE_SCOPES[0]
             ))
         }
-        (AuthErrorCode::InvalidGrant, subject) => {
+        (Identity::ServiceAccount { subject, adc, .. }, AuthErrorCode::InvalidGrant) => {
             let mut hint = String::from(
                 "Google refuses the key when it was deleted or disabled, or when this computer's \
                  clock is off by more than a few minutes",
@@ -263,24 +409,40 @@ fn token_hint(identity: &Identity, error: &yup_oauth2::Error) -> Option<String> 
                     ", or when '{subject}' is not a user of the Workspace domain"
                 );
             }
-            hint.push_str(
-                ". To use a new key, run `gdrive account add --service-account KEY_JSON` again.",
-            );
+            hint.push_str(if *adc {
+                ". To use a new key, set GOOGLE_APPLICATION_CREDENTIALS to its file."
+            } else {
+                ". To use a new key, run `gdrive account add --service-account KEY_JSON` again."
+            });
             Some(hint)
         }
+        (Identity::AuthorizedUser { .. }, AuthErrorCode::InvalidGrant) => Some(format!(
+            "the gcloud credentials expired or were revoked. Run `{GCLOUD_LOGIN}` again."
+        )),
         _ => None,
     }
 }
 
-/// Writes the messages of `error` and its sources, separated by `: `.
+/// The gcloud command that creates user credentials with the Drive scope.
+pub(crate) const GCLOUD_LOGIN: &str = "gcloud auth application-default login \
+     --scopes=https://www.googleapis.com/auth/drive,https://www.googleapis.com/auth/cloud-platform";
+
+/// Writes the messages of `error` and its sources, separated by `: `. A message that the one
+/// before it includes already (yup-oauth2 and hyper put their source into their own message) is
+/// left out.
 ///
 /// The Drive client wraps token errors in `MissingToken`, whose `source()` is `None`, so the
 /// messages of the sources would be lost; they are part of the message of [`Error`] instead.
 fn write_chain(f: &mut Formatter<'_>, error: &(dyn error::Error + 'static)) -> fmt::Result {
-    write!(f, "{}", error.to_string().trim_end())?;
+    let mut previous = error.to_string().trim_end().to_owned();
+    f.write_str(&previous)?;
     let mut source = error.source();
     while let Some(cause) = source {
-        write!(f, ": {}", cause.to_string().trim_end())?;
+        let message = cause.to_string().trim_end().to_owned();
+        if !previous.contains(&message) {
+            write!(f, ": {message}")?;
+        }
+        previous = message;
         source = cause.source();
     }
     Ok(())
@@ -296,7 +458,12 @@ pub(crate) enum Error {
         path: PathBuf,
         source: KeyError,
     },
+    Adc(adc::AdcError),
     PrivateKey {
+        identity: Arc<Identity>,
+        source: io::Error,
+    },
+    Build {
         identity: Arc<Identity>,
         source: io::Error,
     },
@@ -306,26 +473,35 @@ pub(crate) enum Error {
     },
     Timeout {
         identity: Arc<Identity>,
+        timeout: Duration,
+    },
+    /// The last place to look for Application Default Credentials did not answer.
+    NoMetadataServer {
+        identity: Arc<Identity>,
+        source: Option<yup_oauth2::Error>,
     },
 }
 
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Error::ReadKey { path, .. } => {
-                write!(
-                    f,
-                    "unable to read the service account key '{}'",
-                    path.display()
-                )
-            }
+            Error::ReadKey { path, .. } => write!(
+                f,
+                "unable to read the service account key '{}'",
+                path.display()
+            ),
             Error::Key { path, .. } => write!(
                 f,
                 "'{}' is not a usable service account key",
                 path.display()
             ),
+            Error::Adc(source) => source.fmt(f),
             Error::PrivateKey { identity, source } => {
                 write!(f, "the private key of {identity} cannot be used: ")?;
+                write_chain(f, source)
+            }
+            Error::Build { identity, source } => {
+                write!(f, "unable to set up {identity}: ")?;
                 write_chain(f, source)
             }
             Error::Token { identity, source } => {
@@ -336,11 +512,35 @@ impl Display for Error {
                 }
                 Ok(())
             }
-            Error::Timeout { identity } => write!(
+            Error::Timeout { identity, timeout } => write!(
                 f,
                 "no answer to the token request of {identity} within {} seconds",
-                TOKEN_TIMEOUT.as_secs()
+                timeout.as_secs()
             ),
+            Error::NoMetadataServer { identity, source } => {
+                let Identity::MetadataServer { host, gcloud_file } = &**identity else {
+                    return write!(f, "no answer from {identity}");
+                };
+                f.write_str(
+                    "no Application Default Credentials were found: \
+                     GOOGLE_APPLICATION_CREDENTIALS is not set, ",
+                )?;
+                if let Some(path) = gcloud_file {
+                    write!(f, "'{}' does not exist, ", path.display())?;
+                }
+                write!(f, "and no metadata server answered at {host}")?;
+                if let Some(source) = source {
+                    f.write_str(" (")?;
+                    write_chain(f, source)?;
+                    f.write_str(")")?;
+                }
+                write!(
+                    f,
+                    "\nHint: set GOOGLE_APPLICATION_CREDENTIALS to the key file of a service \
+                     account, run `{GCLOUD_LOGIN}`, or run gdrive on Google Cloud (Compute \
+                     Engine, Cloud Run, GKE)."
+                )
+            }
         }
     }
 }
@@ -350,8 +550,13 @@ impl error::Error for Error {
         match self {
             Error::ReadKey { source, .. } => Some(source),
             Error::Key { source, .. } => Some(source),
+            Error::Adc(source) => source.source(),
             // Part of the message, see `write_chain`.
-            Error::PrivateKey { .. } | Error::Token { .. } | Error::Timeout { .. } => None,
+            Error::PrivateKey { .. }
+            | Error::Build { .. }
+            | Error::Token { .. }
+            | Error::Timeout { .. }
+            | Error::NoMetadataServer { .. } => None,
         }
     }
 }
@@ -387,7 +592,7 @@ impl Display for KeyError {
             KeyError::WrongType(None) => f.write_str(
                 "this is not a service account key: \"type\" is not \"service_account\"",
             ),
-            KeyError::MissingField(field) => write!(f, "the key has no \"{field}\""),
+            KeyError::MissingField(field) => write!(f, "the file has no \"{field}\""),
             KeyError::TokenUri => f.write_str("the \"token_uri\" of the key is not an https URL"),
             KeyError::OptionalFieldType => {
                 f.write_str("a field of the key has the wrong type (all of them are strings)")
@@ -398,27 +603,54 @@ impl Display for KeyError {
 
 impl error::Error for KeyError {}
 
-/// The hint for a Drive error that comes from a service account having no storage of its own,
-/// if `error` is one and the account is a service account.
-pub(crate) fn storage_hint(
+/// The hint for a Drive error that a service account or Application Default Credentials run
+/// into, if `error` is one: a service account has no storage of its own, and ADC may lack the
+/// Drive scope.
+pub(crate) fn account_hint(
     error: &(dyn error::Error + 'static),
     account_type: &AccountType,
-) -> Option<&'static str> {
-    let AccountType::ServiceAccount { subject } = account_type else {
-        return None;
-    };
-    if !find_drive_error(error).is_some_and(is_storage_or_ownership_error) {
-        return None;
+) -> Option<String> {
+    let drive_error = find_drive_error(error)?;
+    match account_type {
+        AccountType::User => None,
+        AccountType::ServiceAccount { subject: Some(_) } => {
+            is_storage_or_ownership_error(drive_error).then(|| {
+                String::from(
+                    "Hint: files a service account creates are owned by the user it acts for \
+                     (--subject); that user's storage may be full, or the files may have to go \
+                     into a shared drive.",
+                )
+            })
+        }
+        AccountType::ServiceAccount { subject: None } => is_storage_or_ownership_error(drive_error)
+            .then(|| {
+                String::from(
+                    "Hint: service accounts have no Drive storage of their own and cannot own \
+                     files. Upload into a shared drive that the service account is a member of \
+                     (--parent with a folder of that drive), or add the account again with \
+                     --subject USER to act for a Google Workspace user (domain-wide \
+                     delegation).",
+                )
+            }),
+        AccountType::ApplicationDefaultCredentials => {
+            if is_scope_error(drive_error) {
+                Some(format!(
+                    "Hint: the Application Default Credentials do not have the Drive scope. For \
+                     gcloud user credentials run `{GCLOUD_LOGIN}`; on Compute Engine, give the \
+                     VM's service account the scope {}.",
+                    SERVICE_SCOPES[0]
+                ))
+            } else {
+                is_storage_or_ownership_error(drive_error).then(|| {
+                    String::from(
+                        "Hint: if the Application Default Credentials are a service account: \
+                         service accounts have no Drive storage of their own and cannot own \
+                         files. Upload into a shared drive that it is a member of.",
+                    )
+                })
+            }
+        }
     }
-    Some(if subject.is_some() {
-        "Hint: files a service account creates are owned by the user it acts for (--subject); \
-         that user's storage may be full, or the files may have to go into a shared drive."
-    } else {
-        "Hint: service accounts have no Drive storage of their own and cannot own files. Upload \
-         into a shared drive that the service account is a member of (--parent with a folder of \
-         that drive), or add the account again with --subject USER to act for a Google Workspace \
-         user (domain-wide delegation)."
-    })
 }
 
 /// The JSON of a Drive API error response in the source chain of `error`.
@@ -454,6 +686,13 @@ fn is_storage_or_ownership_error(value: &Value) -> bool {
     reasons.any(|reason| reason == "storageQuotaExceeded")
         || (error["code"] == 403
             && (message.contains("storage quota") || message.contains("owner")))
+}
+
+/// Drive's 403 for a token without a scope the call needs.
+fn is_scope_error(value: &Value) -> bool {
+    let error = &value["error"];
+    let message = error["message"].as_str().unwrap_or_default().to_lowercase();
+    error["code"] == 403 && message.contains("insufficient authentication scopes")
 }
 
 #[cfg(test)]
@@ -770,7 +1009,7 @@ mod tests {
         }}));
         let service_account = AccountType::ServiceAccount { subject: None };
 
-        let hint = storage_hint(&quota, &service_account).unwrap();
+        let hint = account_hint(&quota, &service_account).unwrap();
         assert!(
             hint.starts_with("Hint: service accounts have no Drive storage"),
             "{hint}"
@@ -782,22 +1021,22 @@ mod tests {
 
         // Found through the source chain of a command error, also when boxed.
         let upload = crate::files::upload::Error::Upload(Box::new(quota));
-        assert!(storage_hint(&upload, &service_account).is_some());
+        assert!(account_hint(&upload, &service_account).is_some());
 
         // Not for user accounts.
-        assert!(storage_hint(&upload, &AccountType::User).is_none());
+        assert!(account_hint(&upload, &AccountType::User).is_none());
 
         let ownership = google_apis_common::Error::BadRequest(json!({"error": {
             "code": 403,
             "message": "Bad Request. User message: \"You can't change the owner of this item.\"",
             "errors": [{"reason": "forbidden"}]
         }}));
-        assert!(storage_hint(&ownership, &service_account).is_some());
+        assert!(account_hint(&ownership, &service_account).is_some());
 
         let not_found = google_apis_common::Error::BadRequest(json!({"error": {
             "code": 404, "message": "File not found: x.", "errors": [{"reason": "notFound"}]
         }}));
-        assert!(storage_hint(&not_found, &service_account).is_none());
+        assert!(account_hint(&not_found, &service_account).is_none());
 
         let delegated = AccountType::ServiceAccount {
             subject: Some(String::from("user@example.com")),
@@ -808,7 +1047,30 @@ mod tests {
                 "errors": [{"reason": "storageQuotaExceeded"}]
             }})),
         ));
-        let hint = storage_hint(&upload, &delegated).unwrap();
+        let hint = account_hint(&upload, &delegated).unwrap();
         assert!(hint.contains("acts for"), "{hint}");
+    }
+
+    #[test]
+    fn adc_without_the_drive_scope_gets_the_gcloud_command() {
+        let insufficient = google_apis_common::Error::BadRequest(json!({"error": {
+            "code": 403,
+            "message": "Request had insufficient authentication scopes.",
+            "errors": [{"message": "Insufficient Permission", "domain": "global", "reason": "insufficientPermissions"}],
+            "status": "PERMISSION_DENIED"
+        }}));
+
+        let hint =
+            account_hint(&insufficient, &AccountType::ApplicationDefaultCredentials).unwrap();
+        assert!(hint.contains(GCLOUD_LOGIN), "{hint}");
+        assert!(hint.contains("Compute Engine"), "{hint}");
+
+        // Not for the others, which always ask for the Drive scope.
+        assert!(account_hint(&insufficient, &AccountType::User).is_none());
+        assert!(account_hint(
+            &insufficient,
+            &AccountType::ServiceAccount { subject: None }
+        )
+        .is_none());
     }
 }

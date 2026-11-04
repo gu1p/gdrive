@@ -1,4 +1,5 @@
-//! `gdrive account add --service-account`: accounts that authenticate with a service account key.
+//! `gdrive account add --service-account` and `--adc`: accounts that authenticate with a service
+//! account key or with Application Default Credentials.
 
 use std::{
     error,
@@ -15,7 +16,10 @@ use crate::{
         account_type::{AccountType, InstallAccount},
         AppConfig,
     },
-    auth::service::{self, ServiceCredentials},
+    auth::{
+        adc::{self, AdcSource},
+        service::{self, ServiceCredentials},
+    },
     hub,
 };
 
@@ -53,6 +57,58 @@ pub(crate) async fn add_service_account(config: &ServiceAccountConfig) -> Result
         );
     }
     Ok(())
+}
+
+/// The account name of `account add --adc` without --name.
+const DEFAULT_ADC_NAME: &str = "adc";
+
+/// Looks up Application Default Credentials and gets a token with them, then stores an account
+/// that looks them up again on every run, and switches to it.
+pub(crate) async fn add_adc(name: Option<String>) -> Result<(), Box<Error>> {
+    let base_path = AppConfig::default_base_path().map_err(Error::DefaultBasePath)?;
+    let client = hub::token_http_client().map_err(Error::HttpClient)?;
+    let source = adc::resolve().await.map_err(Error::FindAdc)?;
+    // Only now is it known that the metadata server, the last place to look, exists.
+    let found = source.to_string();
+    let app_cfg = add_adc_in(base_path, client, source, name).await?;
+    println!("Found Application Default Credentials: {found}");
+
+    app_config::switch_account(&app_cfg).map_err(Error::SwitchAccount)?;
+    println!();
+    println!("Logged in as {}", app_cfg.account.name);
+    println!(
+        "gdrive stores no credentials for this account: it looks up the Application Default \
+         Credentials again on every run."
+    );
+    Ok(())
+}
+
+async fn add_adc_in<C>(
+    base_path: PathBuf,
+    client: Client<C, String>,
+    source: AdcSource,
+    name: Option<String>,
+) -> Result<AppConfig, Box<Error>>
+where
+    C: Connect + Clone + Send + Sync + 'static,
+{
+    let name = name.unwrap_or_else(|| String::from(DEFAULT_ADC_NAME));
+    let app_cfg = AppConfig::named_account_in(base_path, &name).ok_or(Error::InvalidName(name))?;
+    app_cfg.check_replaceable().map_err(Error::Install)?;
+
+    let credentials = ServiceCredentials::application_default(client, source)
+        .await
+        .map_err(Error::AdcCredentials)?;
+    credentials
+        .access_token()
+        .await
+        .map_err(Error::AdcCredentials)?;
+
+    app_cfg
+        .install(&AccountType::ApplicationDefaultCredentials, None, None)
+        .await
+        .map_err(Error::Install)?;
+    Ok(app_cfg)
 }
 
 async fn add_service_account_in<C>(
@@ -113,6 +169,8 @@ pub(crate) enum Error {
     Key(PathBuf, service::KeyError),
     InvalidName(String),
     Credentials(service::Error),
+    FindAdc(adc::AdcError),
+    AdcCredentials(service::Error),
     Install(InstallAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
 }
@@ -123,8 +181,12 @@ impl error::Error for Error {
             Error::DefaultBasePath(source) => Some(source),
             Error::HttpClient(source) | Error::ReadKey(_, source) => Some(source),
             Error::Key(_, source) => Some(source),
-            Error::Credentials(source) => Some(source),
-            // The install error is shown as itself when it says what to do.
+            Error::FindAdc(source) => Some(source),
+            // These are shown as themselves: they say what to do.
+            Error::AdcCredentials(source @ service::Error::NoMetadataServer { .. }) => {
+                source.source()
+            }
+            Error::Credentials(source) | Error::AdcCredentials(source) => Some(source),
             Error::Subject(_)
             | Error::InvalidName(_)
             | Error::Install(InstallAccount::UserAccountExists(_)) => None,
@@ -155,6 +217,11 @@ impl Display for Error {
                  contain '/' or '\\'"
             ),
             Error::Credentials(_) => f.write_str("the service account key does not work"),
+            Error::FindAdc(_) => f.write_str("unable to use the Application Default Credentials"),
+            Error::AdcCredentials(error @ service::Error::NoMetadataServer { .. }) => error.fmt(f),
+            Error::AdcCredentials(_) => {
+                f.write_str("the Application Default Credentials do not work")
+            }
             Error::Install(error @ InstallAccount::UserAccountExists(_)) => error.fmt(f),
             Error::Install(_) => f.write_str("unable to save the account"),
             Error::SwitchAccount(_) => f.write_str("unable to switch to the account"),
@@ -337,7 +404,7 @@ mod tests {
         let message = crate::error_message(&*error);
         assert!(
             message
-                .contains("is not a usable service account key: the key has no \"client_email\""),
+                .contains("is not a usable service account key: the file has no \"client_email\""),
             "{message}"
         );
 

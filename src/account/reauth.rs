@@ -191,6 +191,14 @@ impl Display for Error {
                  To use a new key, run `gdrive account add --service-account KEY_JSON --name \
                  {account}`."
             ),
+            Error::NoLogin {
+                account,
+                account_type: AccountType::ApplicationDefaultCredentials,
+            } => write!(
+                f,
+                "account '{account}' uses Application Default Credentials, which gdrive looks \
+                 up on every run; there is nothing to authorize again"
+            ),
             Error::NoLogin { account, .. } => {
                 write!(f, "account '{account}' does not log in with an OAuth client")
             }

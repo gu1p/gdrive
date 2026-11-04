@@ -1,7 +1,7 @@
-//! The account commands with a service account, run as the gdrive binary against a temporary
-//! home directory and an in-process mock of the token endpoint. The key's `token_uri` points at
-//! the mock, which is what `ServiceAccountAuthenticator` sends the signed JWT to; nothing here
-//! talks to Google.
+//! The account commands with a service account and with Application Default Credentials, run as
+//! the gdrive binary against a temporary home directory and an in-process mock of the token
+//! endpoint. The key's `token_uri` points at the mock, which is what `ServiceAccountAuthenticator`
+//! sends the signed JWT to; nothing here talks to Google.
 
 use std::{
     path::{Path, PathBuf},
@@ -22,15 +22,25 @@ use test_support::{service_account_key_json, verified_jwt_claims, MockServer, TE
 const TOKEN_RESPONSE: &str =
     r#"{"access_token":"ya29.integration","expires_in":3599,"token_type":"Bearer"}"#;
 
-/// Runs gdrive with `home` as its home directory (and working directory) and no proxy.
+/// Runs gdrive with `home` as its home directory (and working directory), no proxy and no
+/// Application Default Credentials.
 async fn gdrive(home: &Path, args: &[&str]) -> Output {
+    gdrive_with_env(home, args, &[]).await
+}
+
+/// [`gdrive`] with the environment variables `vars` set.
+async fn gdrive_with_env(home: &Path, args: &[&str], vars: &[(&str, &str)]) -> Output {
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_gdrive"));
     command
         .args(args)
         .current_dir(home)
         .env("HOME", home)
-        .env("USERPROFILE", home);
+        .env("USERPROFILE", home)
+        .env("APPDATA", home)
+        .env("CLOUDSDK_CONFIG", home.join("gcloud"));
     for var in [
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GCE_METADATA_HOST",
         "ALL_PROXY",
         "all_proxy",
         "HTTPS_PROXY",
@@ -40,6 +50,7 @@ async fn gdrive(home: &Path, args: &[&str]) -> Output {
     ] {
         command.env_remove(var);
     }
+    command.envs(vars.iter().copied());
     command.output().await.expect("gdrive runs")
 }
 
@@ -215,4 +226,81 @@ async fn a_key_that_does_not_work_adds_nothing() {
     assert!(message.contains("Invalid JWT Signature."), "{message}");
     assert!(!message.contains("BEGIN PRIVATE KEY"), "{message}");
     assert!(!account_dir(home, TEST_CLIENT_EMAIL).exists());
+}
+
+#[tokio::test]
+async fn an_adc_account_stores_only_its_type_and_finds_the_credentials_on_each_run() {
+    let server = MockServer::start(vec![(200, String::from(TOKEN_RESPONSE))]).await;
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    let key_path = home.join("ci-key.json");
+    std::fs::write(&key_path, service_account_key_json(&server.url("/token"))).unwrap();
+    let adc_env = [("GOOGLE_APPLICATION_CREDENTIALS", key_path.to_str().unwrap())];
+
+    let added = gdrive_with_env(home, &["account", "add", "--adc"], &adc_env).await;
+    assert!(added.status.success(), "{}", stderr(&added));
+    let out = stdout(&added);
+    assert!(
+        out.starts_with(&format!(
+            "Found Application Default Credentials: the key of service account \
+             '{TEST_CLIENT_EMAIL}' in '{}' named by GOOGLE_APPLICATION_CREDENTIALS\n",
+            key_path.display()
+        )),
+        "{out}"
+    );
+    assert!(out.contains("Logged in as adc"), "{out}");
+    assert_eq!(server.requests().len(), 1);
+
+    let dir = account_dir(home, "adc");
+    let names: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["account.json"]);
+    let account_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("account.json")).unwrap()).unwrap();
+    assert_eq!(
+        account_json,
+        serde_json::json!({"type": "application_default_credentials"})
+    );
+
+    let list = gdrive(home, &["account", "list"]).await;
+    assert_eq!(stdout(&list), "adc\n");
+    let reauth = gdrive(home, &["account", "reauth", "adc"]).await;
+    assert!(
+        stderr(&reauth).starts_with("Error: account 'adc' uses Application Default Credentials"),
+        "{}",
+        stderr(&reauth)
+    );
+}
+
+#[tokio::test]
+async fn adc_without_any_credentials_is_a_clear_error() {
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let metadata_host = closed.local_addr().unwrap().to_string();
+    drop(closed);
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+
+    let added = gdrive_with_env(
+        home,
+        &["account", "add", "--adc", "--name", "ci"],
+        &[("GCE_METADATA_HOST", &metadata_host)],
+    )
+    .await;
+    assert_eq!(added.status.code(), Some(1));
+    let message = stderr(&added);
+    assert!(
+        message.starts_with(
+            "Error: no Application Default Credentials were found: \
+             GOOGLE_APPLICATION_CREDENTIALS is not set, "
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains(&format!("no metadata server answered at {metadata_host}")),
+        "{message}"
+    );
+    assert!(message.contains("\nHint: "), "{message}");
+    assert!(!account_dir(home, "ci").exists());
 }

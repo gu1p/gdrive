@@ -38,10 +38,13 @@ pub(crate) enum AccountType {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subject: Option<String>,
     },
+    /// Application Default Credentials, looked up on every run; nothing else is stored.
+    ApplicationDefaultCredentials,
 }
 
 /// Whether `path` is the directory of an account: gdrive 3.x accounts have `tokens.json`, the
-/// others have `account.json` (a service account has no `tokens.json` until it got a token).
+/// others have `account.json` (a service account has no `tokens.json` until it got a token, an
+/// ADC account never has one).
 pub(super) fn is_account_dir(path: &Path) -> bool {
     path.join(TOKENS_CONFIG_NAME).exists() || path.join(ACCOUNT_CONFIG_NAME).is_file()
 }
@@ -286,6 +289,11 @@ mod tests {
             serde_json::from_str::<AccountType>(&json).unwrap(),
             no_subject
         );
+
+        let adc = AccountType::ApplicationDefaultCredentials;
+        let json = serde_json::to_string(&adc).unwrap();
+        assert_eq!(json, r#"{"type":"application_default_credentials"}"#);
+        assert_eq!(serde_json::from_str::<AccountType>(&json).unwrap(), adc);
     }
 
     #[test]
@@ -398,6 +406,37 @@ mod tests {
         assert_eq!(fs::read(config.service_account_key_path()).unwrap(), b"new");
         assert_eq!(config.account_type().unwrap(), second);
         assert!(!config.tokens_path().exists());
+    }
+
+    #[tokio::test]
+    async fn an_adc_account_is_only_its_account_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = account(dir.path(), "robot");
+        config
+            .install(
+                &AccountType::ServiceAccount { subject: None },
+                Some(b"{}"),
+                None,
+            )
+            .await
+            .unwrap();
+        fs::write(config.tokens_path(), "[]").unwrap();
+
+        // Replacing a service account by ADC drops its key and tokens.
+        config
+            .install(&AccountType::ApplicationDefaultCredentials, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            config.account_type().unwrap(),
+            AccountType::ApplicationDefaultCredentials
+        );
+        assert!(!config.service_account_key_path().exists());
+        assert!(!config.tokens_path().exists());
+        assert_eq!(
+            list_accounts_in(dir.path().to_path_buf()).unwrap(),
+            ["robot"]
+        );
     }
 
     #[tokio::test]

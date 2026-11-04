@@ -79,8 +79,10 @@ enum AccountCommand {
     /// gdrive receives the browser's redirect on port 8085 of localhost (see --port); on a remote
     /// or headless machine use --manual.
     ///
-    /// With --service-account, adds a service account from its JSON key file instead; nothing is
-    /// asked. See `docs/service_accounts.md`.
+    /// With --service-account, adds a service account from its JSON key file instead, and with
+    /// --adc an account that uses Application Default Credentials; nothing is asked then. See
+    /// `docs/service_accounts.md`.
+    #[command(group(clap::ArgGroup::new("no_login").args(["service_account", "adc"])))]
     Add {
         #[command(flatten)]
         login: LoginArgs,
@@ -147,11 +149,24 @@ struct ServiceAccountArgs {
     service_account: Option<PathBuf>,
 
     /// Act for this Google Workspace user (domain-wide delegation, set up by an administrator)
-    #[arg(long, value_name = "EMAIL", requires = "service_account")]
+    #[arg(
+        long,
+        value_name = "EMAIL",
+        requires = "service_account",
+        conflicts_with = "adc"
+    )]
     subject: Option<String>,
 
-    /// Name of the new account [default: the `client_email` of the key]
-    #[arg(long, value_name = "NAME", requires = "service_account")]
+    /// Use Application Default Credentials
+    ///
+    /// The service account key named by `GOOGLE_APPLICATION_CREDENTIALS`, the user credentials of
+    /// `gcloud auth application-default login`, or the metadata server of Google Cloud. gdrive
+    /// stores none of them and looks them up again on every run.
+    #[arg(long, conflicts_with_all = ["manual", "port"])]
+    adc: bool,
+
+    /// Name of the new account [default: the `client_email` of the key, or "adc"]
+    #[arg(long, value_name = "NAME", requires = "no_login")]
     name: Option<String>,
 }
 
@@ -528,9 +543,9 @@ enum PermissionCommand {
 async fn main() -> ExitCode {
     if let Err(err) = run().await {
         let mut message = error_message(err.as_ref());
-        if let Some(hint) = common::hub_helper::storage_hint(err.as_ref()) {
+        if let Some(hint) = common::hub_helper::account_hint(err.as_ref()) {
             message.push('\n');
-            message.push_str(hint);
+            message.push_str(&hint);
         }
         eprintln!("{message}");
         ExitCode::FAILURE
@@ -892,7 +907,9 @@ async fn handle_account_command(
 ) -> Result<(), Box<dyn std::error::Error + 'static>> {
     match command {
         AccountCommand::Add { login, service } => {
-            if let Some(key_path) = service.service_account {
+            if service.adc {
+                account::add_adc(service.name).await?;
+            } else if let Some(key_path) = service.service_account {
                 account::add_service_account(&account::add_service::ServiceAccountConfig {
                     key_path,
                     subject: service.subject,
@@ -1141,6 +1158,16 @@ mod tests {
         assert_eq!(service.name.as_deref(), Some("robot"));
         assert!(!login.manual);
 
+        let cli = parse(&["account", "add", "--adc", "--name", "ci"]).expect("--adc --name");
+        let Command::Account {
+            command: AccountCommand::Add { service, .. },
+        } = cli.command
+        else {
+            panic!("expected account add");
+        };
+        assert!(service.adc);
+        assert_eq!(service.name.as_deref(), Some("ci"));
+
         // The OAuth login still parses as before.
         assert!(parse(&["account", "add"]).is_ok());
         assert!(parse(&["account", "add", "--manual", "--port", "9000"]).is_ok());
@@ -1166,6 +1193,9 @@ mod tests {
                 "--port",
                 "9000",
             ],
+            &["account", "add", "--service-account", "key.json", "--adc"],
+            &["account", "add", "--adc", "--subject", "user@example.com"],
+            &["account", "add", "--adc", "--manual"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should not parse");
         }
