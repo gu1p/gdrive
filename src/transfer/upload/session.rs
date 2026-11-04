@@ -244,6 +244,9 @@ fn unix_now() -> u64 {
 /// The record file of one upload.
 pub(crate) struct RecordFile {
     path: PathBuf,
+    /// The session URL of the record this invocation wrote or continues. Only that record is
+    /// deleted: another invocation may have written its own since.
+    owned: Option<String>,
     /// A save failed: the user was told once, and the record is no longer kept.
     broken: bool,
 }
@@ -266,37 +269,45 @@ impl RecordFile {
             });
         RecordFile {
             path: dir.join(format!("{name}.json")),
+            owned: None,
             broken: false,
         }
     }
 
-    /// The record, if there is a readable one. An unreadable one is deleted.
+    /// The record, if there is a readable one. An unreadable one is left alone: the next save
+    /// replaces it, and pruning deletes it if nothing does.
     pub(crate) async fn load(&self) -> Option<SessionRecord> {
         let content = tokio::fs::read(&self.path).await.ok()?;
-        let record = serde_json::from_slice(&content).ok();
-        if record.is_none() {
-            self.remove().await;
-        }
-        record
+        serde_json::from_slice(&content).ok()
     }
 
-    /// Writes `record` (a whole new file, renamed over the old one). A failure is reported
-    /// once on stderr; the upload goes on without a record.
+    /// The loaded `record` is this invocation's now: it continues its session.
+    pub(crate) fn adopt(&mut self, record: &SessionRecord) {
+        self.owned = Some(record.session_url.clone());
+    }
+
+    /// Writes `record` (a whole new file, renamed over the old one), which makes it this
+    /// invocation's. A failure is reported once on stderr; the upload goes on without a record.
     pub(crate) async fn save(&mut self, record: &SessionRecord) {
         if self.broken {
             return;
         }
-        if let Err(error) = self.write(record).await {
-            self.broken = true;
-            eprintln!(
-                "Warning: unable to save the upload session in '{}', an interrupted upload \
-                 will start over: {error}",
-                self.path.display()
-            );
-            self.remove().await;
+        match self.write(record).await {
+            Ok(()) => self.owned = Some(record.session_url.clone()),
+            Err(error) => {
+                self.broken = true;
+                eprintln!(
+                    "Warning: unable to save the upload session in '{}', an interrupted upload \
+                     will start over: {error}",
+                    self.path.display()
+                );
+                self.remove().await;
+            }
         }
     }
 
+    /// Writes `record` to a new temporary file of its own (created exclusively, so that it is
+    /// neither another writer's nor a planted link) and renames it over the record.
     async fn write(&self, record: &SessionRecord) -> io::Result<()> {
         let content = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
         if let Some(dir) = self.path.parent() {
@@ -306,22 +317,45 @@ impl RecordFile {
             builder.mode(0o700);
             builder.create(dir).await?;
         }
-        let temp = self.path.with_extension("json.tmp");
+        let name = self
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let temp = self
+            .path
+            .with_file_name(format!("{name}.{:016x}.tmp", fastrand::u64(..)));
         let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
+        options.write(true).create_new(true);
         #[cfg(unix)]
         options.mode(0o600);
         let mut file = options.open(&temp).await?;
-        file.write_all(&content).await?;
-        file.flush().await?;
-        drop(file);
-        tokio::fs::rename(&temp, &self.path).await
+        let written = async {
+            file.write_all(&content).await?;
+            file.flush().await?;
+            drop(file);
+            tokio::fs::rename(&temp, &self.path).await
+        }
+        .await;
+        if written.is_err() {
+            let _ = tokio::fs::remove_file(&temp).await;
+        }
+        written
     }
 
-    /// Deletes the record, if there is one.
-    pub(crate) async fn remove(&self) {
-        // A record that cannot be deleted is replaced or found stale by the next run.
-        let _ = tokio::fs::remove_file(&self.path).await;
+    /// Deletes the record if it is still the one this invocation owns.
+    pub(crate) async fn remove(&mut self) {
+        let Some(owned) = self.owned.take() else {
+            return;
+        };
+        if self
+            .load()
+            .await
+            .is_some_and(|record| record.session_url == owned)
+        {
+            // A record that cannot be deleted is found stale by the next run.
+            let _ = tokio::fs::remove_file(&self.path).await;
+        }
     }
 }
 
@@ -518,7 +552,66 @@ mod tests {
 
         std::fs::write(&file.path, b"not json").unwrap();
         assert!(file.load().await.is_none());
-        assert!(!file.path.exists(), "an unreadable record is deleted");
+        assert!(
+            file.path.exists(),
+            "an unreadable record is left to be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_record_is_deleted_only_by_its_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let record =
+            |url: &str| SessionRecord::new(url.into(), source(), target(), 256, identity());
+        let mut first = RecordFile::new(dir.path(), &source(), &target());
+        let mut second = RecordFile::new(dir.path(), &source(), &target());
+
+        first.save(&record("first")).await;
+        // Loading does not make it the second invocation's.
+        assert!(second.load().await.is_some());
+        second.remove().await;
+        assert!(first.path.exists());
+
+        // The second invocation replaces it: the first one's record is gone already.
+        second.save(&record("second")).await;
+        first.remove().await;
+        assert_eq!(first.load().await.unwrap().session_url, "second");
+
+        // Continuing a session makes its record the invocation's.
+        let mut third = RecordFile::new(dir.path(), &source(), &target());
+        let loaded = third.load().await.unwrap();
+        third.adopt(&loaded);
+        third.remove().await;
+        assert!(!third.path.exists());
+    }
+
+    #[tokio::test]
+    async fn saves_write_temporary_files_of_their_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = RecordFile::new(dir.path(), &source(), &target());
+        // What a fixed temporary name would have been, taken by someone else.
+        let planted = file.path.with_extension("json.tmp");
+        std::fs::write(&planted, b"not gdrive's").unwrap();
+
+        let saves = (0..8).map(|n| {
+            let mut file = RecordFile::new(dir.path(), &source(), &target());
+            async move {
+                let record =
+                    SessionRecord::new(format!("url-{n}"), source(), target(), 256, identity());
+                file.save(&record).await;
+                file.broken
+            }
+        });
+        let broken = futures::future::join_all(saves).await;
+
+        assert!(broken.iter().all(|broken| !broken), "every save succeeds");
+        assert!(file.load().await.is_some());
+        assert_eq!(std::fs::read(&planted).unwrap(), b"not gdrive's");
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(names.len(), 2, "the record and the planted file: {names:?}");
     }
 
     #[tokio::test]

@@ -728,6 +728,10 @@ impl<'a> Upload<'a> {
             return Ok(None);
         }
 
+        // This upload continues the session: its record is this invocation's now.
+        if let Some(recording) = &mut self.recording {
+            recording.file.adopt(&record);
+        }
         if !self.is_update() {
             self.file_id.clone_from(&record.target.file_id);
             self.marker.clone_from(&record.target.marker);
@@ -825,7 +829,9 @@ impl<'a> Upload<'a> {
         }
     }
 
-    /// Deletes the record: the session is over.
+    /// Deletes the record if this invocation owns it (wrote or continues it): its session is
+    /// over. The record of another invocation, or one that is not continued, is left to be
+    /// replaced by this upload's own or pruned.
     async fn forget(&mut self) {
         if let Some(recording) = &mut self.recording {
             recording.record = None;
