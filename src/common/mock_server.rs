@@ -38,6 +38,10 @@ impl Request {
             .map(|(_, value)| value.as_str())
     }
 
+    pub(crate) fn body_text(&self) -> String {
+        String::from_utf8_lossy(&self.body).into_owned()
+    }
+
     pub(crate) fn body_json(&self) -> serde_json::Value {
         serde_json::from_slice(&self.body).expect("request body should be JSON")
     }

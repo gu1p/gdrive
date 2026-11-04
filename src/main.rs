@@ -306,7 +306,7 @@ enum FileCommand {
     },
 
     /// Import file as a google document/spreadsheet/presentation.
-    /// Example of file types that can be imported: doc, docx, odt, pdf, html, xls, xlsx, csv, ods, ppt, pptx, odp
+    /// Supported file types: doc, docx, odt, rtf, pdf, html, md, jpg, jpeg, gif, png (document), xls, xlsx, csv, tsv, ods (spreadsheet), ppt, pptx, odp (presentation)
     Import {
         /// Path to file
         file_path: PathBuf,
@@ -325,7 +325,7 @@ enum FileCommand {
         /// File id
         file_id: String,
 
-        /// File path to export to. The file extension will determine the export format
+        /// File path to export to. The file extension will determine the export format. Documents: pdf, odt, docx, epub, rtf, txt, html, md. Spreadsheets: csv, tsv, ods, xlsx, pdf. Presentations: pdf, pptx, odp, txt
         file_path: PathBuf,
 
         /// Overwrite existing files
@@ -744,4 +744,62 @@ async fn handle_account_command(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use clap::CommandFactory;
+
+    use super::Cli;
+    use crate::common::drive_file::DocType;
+
+    fn words(text: &str) -> HashSet<&str> {
+        text.split(|c: char| !c.is_ascii_alphanumeric())
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+
+    fn files_subcommand(name: &str) -> clap::Command {
+        Cli::command()
+            .find_subcommand("files")
+            .and_then(|files| files.find_subcommand(name))
+            .cloned()
+            .unwrap_or_else(|| panic!("files {name} should exist"))
+    }
+
+    #[test]
+    fn import_help_lists_every_supported_type() {
+        let import = files_subcommand("import");
+        let about = import.get_about().unwrap().to_string();
+        let listed = words(&about);
+
+        for extension in DocType::SUPPORTED_INPUT_TYPES {
+            let extension = extension.to_string();
+            assert!(listed.contains(extension.as_str()), "{extension}: {about}");
+        }
+    }
+
+    #[test]
+    fn export_help_lists_every_supported_type() {
+        let export = files_subcommand("export");
+        let file_path = export
+            .get_positionals()
+            .find(|arg| arg.get_id() == "file_path")
+            .unwrap();
+        let help = file_path.get_help().unwrap().to_string();
+        let listed = words(&help);
+
+        for doc_type in [
+            DocType::Document,
+            DocType::Spreadsheet,
+            DocType::Presentation,
+        ] {
+            for extension in doc_type.supported_export_types() {
+                let extension = extension.to_string();
+                assert!(listed.contains(extension.as_str()), "{extension}: {help}");
+            }
+        }
+    }
 }
