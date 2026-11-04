@@ -13,9 +13,12 @@ use hyper::{header::HeaderMap, Method, StatusCode};
 use serde_json::json;
 
 use super::{
+    body::FileSource,
     mock_drive::{Faults, Logged, MockDrive},
-    next_offset, upload_path, upload_reader, Failure, Step, UploadError, UploadOptions,
-    UploadTarget, CHUNK_ALIGNMENT, FILE_FIELDS,
+    next_offset,
+    session::SourceIdentity,
+    upload_path, upload_reader, Failure, FileTimes, ReaderSource, Source, Step, Upload,
+    UploadError, UploadOptions, UploadTarget, CHUNK_ALIGNMENT, FILE_FIELDS,
 };
 use crate::common::{
     drive_file::MIME_TYPE_DRIVE_DOCUMENT,
@@ -1421,5 +1424,182 @@ async fn a_service_account_is_identified_without_a_request() {
             .all(|request| request.path != "/drive/v3/about"),
         "{}",
         state.log_text()
+    );
+}
+
+fn times() -> FileTimes {
+    FileTimes {
+        modified: Some("2024-05-06T07:08:09.123Z".parse().unwrap()),
+        created: Some("2023-01-02T03:04:05Z".parse().unwrap()),
+    }
+}
+
+/// `data` uploaded to `target` through [`Upload`], with [`times`].
+async fn upload_with_times(
+    mock: &MockDrive,
+    data: &[u8],
+    target: &UploadTarget,
+    options: &UploadOptions,
+) -> google_drive3::api::File {
+    let hub = mock.hub();
+    let mut source = ReaderSource::new(Cursor::new(data.to_vec()));
+    Upload::new(
+        &hub,
+        hub.retrier().state(),
+        target,
+        options,
+        None,
+        data.len() as u64,
+        mime::APPLICATION_OCTET_STREAM,
+    )
+    .with_times(times())
+    .run(&mut source)
+    .await
+    .unwrap_or_else(|error| panic!("{error}\n{}", mock.log()))
+}
+
+#[tokio::test]
+async fn the_times_of_a_new_file_go_into_its_metadata_in_both_kinds_of_upload() {
+    let data = test_data(SIZE);
+    let multipart = UploadOptions {
+        multipart_threshold: SIZE,
+        ..options()
+    };
+    for options in [options(), multipart] {
+        let mock = MockDrive::start(Faults::default()).await;
+        let file = upload_with_times(&mock, &data, &target(), &options).await;
+        let state = mock.state();
+        let stored = &state.files[file.id.as_deref().unwrap()];
+        assert_eq!(stored.metadata["modifiedTime"], "2024-05-06T07:08:09.123Z");
+        assert_eq!(stored.metadata["createdTime"], "2023-01-02T03:04:05.000Z");
+        assert_eq!(stored.content, data);
+        let resumable = options.multipart_threshold == 0;
+        assert_eq!(state.sessions.len(), usize::from(resumable));
+    }
+}
+
+#[tokio::test]
+async fn an_update_gets_the_modification_time_only() {
+    let mock = MockDrive::start(Faults::default()).await;
+    let target = UploadTarget {
+        existing_file_id: Some(String::from("existing-id")),
+        ..target()
+    };
+    let options = UploadOptions {
+        multipart_threshold: 1000,
+        ..options()
+    };
+
+    upload_with_times(&mock, b"new content", &target, &options).await;
+
+    let state = mock.state();
+    let metadata = &state.files["existing-id"].metadata;
+    assert_eq!(metadata["modifiedTime"], "2024-05-06T07:08:09.123Z");
+    assert!(metadata.get("createdTime").is_none(), "{metadata}");
+}
+
+#[tokio::test]
+async fn the_times_are_part_of_the_session_record() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = MockDrive::start(Faults {
+        die_after_chunks: Some(2),
+        ..Faults::default()
+    })
+    .await;
+    let hub = mock.hub();
+    let (target, options) = (target(), records.options());
+    let file = tokio::fs::File::open(&fixture.path).await.unwrap();
+    let metadata = file.metadata().await.unwrap();
+    let mut interrupted = Upload::new(
+        &hub,
+        hub.retrier().state(),
+        &target,
+        &options,
+        None,
+        SIZE,
+        mime::APPLICATION_OCTET_STREAM,
+    )
+    .with_times(times());
+    interrupted.record_in(
+        &records.uploads,
+        SourceIdentity::of(&fixture.path, &metadata).await,
+    );
+    interrupted
+        .run(&mut FileSource::new(file))
+        .await
+        .expect_err("the run is interrupted");
+
+    let record = records.record();
+    assert_eq!(
+        record["target"]["modified_time"],
+        "2024-05-06T07:08:09.123Z"
+    );
+    assert_eq!(record["target"]["created_time"], "2023-01-02T03:04:05.000Z");
+
+    // Without the times, it is another upload, which does not continue the session.
+    mock.revive();
+    upload(&mock, &fixture, &target, &options).await.unwrap();
+    assert_eq!(mock.state().sessions.len(), 2);
+}
+
+/// A source that notes the offsets it is read at.
+struct Noting<S> {
+    inner: S,
+    offsets: Vec<u64>,
+}
+
+impl<S: Source> Source for Noting<S> {
+    async fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.offsets.push(offset);
+        self.inner.read_at(offset, buf).await
+    }
+
+    async fn size(&mut self) -> std::io::Result<u64> {
+        self.inner.size().await
+    }
+}
+
+#[tokio::test]
+async fn a_trusted_continued_session_is_not_read_again_to_hash_it() {
+    let fixture = fixture(SIZE);
+    let records = Records::new();
+    let mock = interrupted_run(&fixture, &records, 2).await;
+    let hub = mock.hub();
+    let (target, options) = (target(), records.options());
+    let file = tokio::fs::File::open(&fixture.path).await.unwrap();
+    let metadata = file.metadata().await.unwrap();
+    let mut upload = Upload::new(
+        &hub,
+        hub.retrier().state(),
+        &target,
+        &options,
+        None,
+        SIZE,
+        mime::APPLICATION_OCTET_STREAM,
+    )
+    .trust_continued_content();
+    upload.record_in(
+        &records.uploads,
+        SourceIdentity::of(&fixture.path, &metadata).await,
+    );
+    let mut source = Noting {
+        inner: FileSource::new(file),
+        offsets: Vec::new(),
+    };
+
+    let uploaded = upload
+        .run(&mut source)
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", mock.log()));
+
+    assert_eq!(uploaded.id.as_deref(), Some("gen-id-1"));
+    let state = mock.state();
+    assert_eq!(state.sessions.len(), 1, "the session is continued");
+    assert_eq!(state.files["gen-id-1"].content, fixture.data);
+    assert!(
+        source.offsets.iter().all(|&offset| offset >= 2 * CHUNK),
+        "only what the session lacks is read: {:?}",
+        source.offsets
     );
 }

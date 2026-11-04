@@ -27,6 +27,9 @@
 //!   `md5Checksum` Drive returns.
 //! - With [`UploadOptions::session_dir`], the session of a resumable upload is recorded there
 //!   (`session.rs`), and a later run of the same upload of the unchanged file continues it.
+//! - The content comes from a [`Source`]: a local file ([`upload_path`]), a reader, or the
+//!   content of a Drive file of another account, which the relay (`transfer/relay.rs`) streams
+//!   through [`Upload`] with the times of the source ([`FileTimes`]).
 //!
 //! Requests to the session URL carry no access token: the URL authorizes them, so an upload that
 //! outlasts the token does not depend on refreshing it.
@@ -46,6 +49,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, SecondsFormat, Utc};
 use error_trace::ErrorTrace;
 use http_body_util::BodyExt;
 use hyper::{
@@ -74,7 +78,9 @@ use crate::{
     transfer::progress::{eprintln, println},
 };
 
-use body::{FileSource, Md5Progress, PipeBody, ReaderSource, Segment, Source};
+pub(crate) use body::{ReaderSource, Source};
+
+use body::{FileSource, Md5Progress, PipeBody, Segment};
 use session::{RecordFile, RecordTarget, SessionRecord, SourceIdentity};
 
 const MIB: u64 = 1 << 20;
@@ -123,6 +129,19 @@ pub(crate) struct UploadTarget {
     /// The id the new file gets, from `files.generateIds`. `None`: the upload generates one.
     /// Not used by an update, nor by a conversion (Drive takes no id for those).
     pub(crate) new_file_id: Option<String>,
+}
+
+/// The times a new file gets instead of the time of its upload; a relay gives the copy the
+/// times of its source. Drive takes `createdTime` only when a file is created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct FileTimes {
+    pub(crate) modified: Option<DateTime<Utc>>,
+    pub(crate) created: Option<DateTime<Utc>>,
+}
+
+/// A time as the metadata of a request has it: RFC 3339 in UTC, with milliseconds.
+fn rfc3339(time: &DateTime<Utc>) -> String {
+    time.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
 /// How an upload is made.
@@ -600,8 +619,9 @@ enum ReplyError {
     Invalid,
 }
 
-/// One upload, from the first request to the verified file.
-struct Upload<'a> {
+/// One upload, from the first request to the verified file: [`Upload::new`], optionally
+/// [`Upload::record_in`] and the other settings, then [`Upload::run`] with the source.
+pub(crate) struct Upload<'a> {
     hub: &'a Hub,
     client: MediaClient<'a>,
     retry: RetryState,
@@ -630,10 +650,17 @@ struct Upload<'a> {
     recording: Option<Recording>,
     /// The Google account of the upload, once known (see [`UploadOptions::session_identity`]).
     identity: Option<String>,
+    /// The times the file gets.
+    times: FileTimes,
+    /// A continued session's content is not read again to hash it
+    /// ([`Upload::trust_continued_content`]).
+    trust_continued: bool,
 }
 
 impl<'a> Upload<'a> {
-    fn new(
+    /// An upload of `total` bytes of content of type `media_type` to `target`, with the retry
+    /// state `retry`.
+    pub(crate) fn new(
         hub: &'a Hub,
         retry: RetryState,
         target: &'a UploadTarget,
@@ -672,7 +699,40 @@ impl<'a> Upload<'a> {
             previous_chunk: None,
             recording: None,
             identity: options.session_identity.clone(),
+            times: FileTimes::default(),
+            trust_continued: false,
         }
+    }
+
+    /// The file gets `times` (see [`FileTimes`]).
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
+        )
+    )]
+    pub(crate) fn with_times(mut self, times: FileTimes) -> Self {
+        self.times = times;
+        self
+    }
+
+    /// When a session of an earlier run is continued, the md5 of the content is not checked:
+    /// that would read the bytes Drive holds from the source again, which for a relay means
+    /// downloading them again. The caller checks the file another way (the relay compares
+    /// Drive's md5 with the source's `md5Checksum`). An upload in one run is checked as always.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
+        )
+    )]
+    pub(crate) fn trust_continued_content(mut self) -> Self {
+        self.trust_continued = true;
+        self
     }
 
     /// The Google account the upload runs as: the identity of the options, or the email address
@@ -697,7 +757,7 @@ impl<'a> Upload<'a> {
     }
 
     /// Records the sessions of the upload of `source` in `dir`.
-    fn record_in(&mut self, dir: &Path, source: SourceIdentity) {
+    pub(crate) fn record_in(&mut self, dir: &Path, source: SourceIdentity) {
         let file = RecordFile::new(dir, &source, &self.record_target());
         self.recording = Some(Recording {
             file,
@@ -717,6 +777,8 @@ impl<'a> Upload<'a> {
             convert_to: self.target.convert_to.as_ref().map(ToString::to_string),
             file_id: self.file_id.clone(),
             marker: self.marker.clone(),
+            modified_time: self.times.modified.as_ref().map(rfc3339),
+            created_time: self.times.created.as_ref().map(rfc3339),
         }
     }
 
@@ -767,6 +829,9 @@ impl<'a> Upload<'a> {
                     human_size(offset),
                     human_size(self.total)
                 );
+                if self.trust_continued && offset > 0 {
+                    self.hasher = None;
+                }
                 self.high_water = offset;
                 self.report(offset);
                 let url = record.session_url.clone();
@@ -862,7 +927,8 @@ impl<'a> Upload<'a> {
         }
     }
 
-    async fn run<S: Source>(
+    /// Uploads the content of `source` and returns the Drive file.
+    pub(crate) async fn run<S: Source>(
         mut self,
         source: &mut S,
     ) -> Result<google_drive3::api::File, UploadError> {
@@ -913,7 +979,7 @@ impl<'a> Upload<'a> {
     }
 
     /// The metadata JSON: the name, if any, for an update (the file keeps its type and
-    /// folders), the id, name, type and folders for a new file.
+    /// folders), the id, name, type and folders for a new file; the times of [`FileTimes`].
     fn metadata(&self) -> String {
         let mut metadata = serde_json::Map::new();
         if let Some(id) = self.created_id() {
@@ -922,7 +988,13 @@ impl<'a> Upload<'a> {
         if let Some(name) = &self.target.name {
             metadata.insert("name".into(), name.as_str().into());
         }
+        if let Some(modified) = &self.times.modified {
+            metadata.insert("modifiedTime".into(), rfc3339(modified).into());
+        }
         if !self.is_update() {
+            if let Some(created) = &self.times.created {
+                metadata.insert("createdTime".into(), rfc3339(created).into());
+            }
             let mime_type = self.target.convert_to.as_ref().unwrap_or(&self.media_type);
             metadata.insert("mimeType".into(), mime_type.as_ref().into());
             if !self.target.parents.is_empty() {

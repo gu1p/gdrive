@@ -19,6 +19,13 @@
 //! otherwise the upload starts over in a new session. The record is deleted when the upload completes or the
 //! session turns out to be gone. Records that nothing touched for longer than the session
 //! lifetime are deleted when an upload starts.
+//!
+//! The source of a relay (`transfer/relay.rs`) is a Drive file of another account, not a local
+//! file: its identity is the account it is read as, its file id, its size and its
+//! `md5Checksum` (its `version` when it has none) ([`RemoteSource`]), so that a record is never
+//! continued with the content of another file, another revision or another account. A local
+//! source serializes as before, so the records of earlier versions still load and keep their
+//! names.
 
 use std::{
     fmt::{self, Debug, Formatter, Write},
@@ -86,17 +93,79 @@ pub(crate) struct Mtime {
     pub(crate) nanos: u32,
 }
 
-/// The local file an upload reads. An upload continues only for the same one.
+/// The file an upload reads. An upload continues only for the same one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SourceIdentity {
-    /// The canonical path.
+    /// The canonical path of a local file; for a Drive file, a name made of its account and id
+    /// ([`SourceIdentity::remote`]), which only names the record.
     pub(crate) path: PathBuf,
     pub(crate) size: u64,
-    /// `None` where the file system has none: such a source is never continued.
+    /// `None` where the file system has none, and for a Drive file. A local file without one is
+    /// never continued.
     pub(crate) mtime: Option<Mtime>,
+    /// The Drive file a relay reads; `None` for a local file (and in the records of earlier
+    /// versions, which only had local files).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) remote: Option<RemoteSource>,
+}
+
+/// The Drive file a relay reads, of another account than the one it uploads to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RemoteSource {
+    /// The Google account the file is read as (see [`SessionRecord::identity`]).
+    pub(crate) account: String,
+    pub(crate) file_id: String,
+    /// The `md5Checksum` of the content, when Drive has one.
+    pub(crate) md5: Option<String>,
+    /// The `version`, only without an md5: it also changes with the metadata (a rename, a new
+    /// permission), which the md5 does not, so with an md5 it would only cause needless starts
+    /// from the beginning.
+    pub(crate) version: Option<i64>,
 }
 
 impl SourceIdentity {
+    /// The identity of the Drive file `file_id` of `size` bytes, read as `account`. Without an
+    /// md5 nor a version, nothing tells whether it changed, and its session is not continued.
+    #[must_use]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "used by the relay, which `files migrate` (branch migrate-cmd) calls"
+        )
+    )]
+    pub(crate) fn remote(
+        account: &str,
+        file_id: &str,
+        size: u64,
+        md5: Option<&str>,
+        version: Option<i64>,
+    ) -> Self {
+        SourceIdentity {
+            path: PathBuf::from(format!("drive:{account}/{file_id}")),
+            size,
+            mtime: None,
+            remote: Some(RemoteSource {
+                account: account.to_owned(),
+                file_id: file_id.to_owned(),
+                md5: md5.map(str::to_ascii_lowercase),
+                version: if md5.is_some() { None } else { version },
+            }),
+        }
+    }
+
+    /// Why a session of this source can never be continued: nothing tells whether it changed.
+    fn unverifiable(&self) -> Option<&'static str> {
+        match &self.remote {
+            Some(remote) => (remote.md5.is_none() && remote.version.is_none())
+                .then_some("the Drive file has no md5 or version to tell whether it changed"),
+            None => self
+                .mtime
+                .is_none()
+                .then_some("the file has no modification time to tell whether it changed"),
+        }
+    }
+
     /// The identity of the file at `path` with `metadata`.
     pub(crate) async fn of(path: &Path, metadata: &std::fs::Metadata) -> Self {
         let path = tokio::fs::canonicalize(path)
@@ -114,6 +183,7 @@ impl SourceIdentity {
             path,
             size: metadata.len(),
             mtime,
+            remote: None,
         }
     }
 }
@@ -136,6 +206,13 @@ pub(crate) struct RecordTarget {
     /// takes it over.
     #[serde(default)]
     pub(crate) marker: Option<String>,
+    /// The `modifiedTime` the new file is given (RFC 3339), a relay's copy of the source's.
+    /// Left out when there is none, so that the records of other uploads keep their names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) modified_time: Option<String>,
+    /// The `createdTime` the new file is given, like `modified_time`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) created_time: Option<String>,
 }
 
 impl RecordTarget {
@@ -218,8 +295,8 @@ impl SessionRecord {
         let age = Duration::from_secs(unix_now().saturating_sub(self.created));
         if self.version != RECORD_VERSION {
             Some("it was written by another version of gdrive")
-        } else if self.source.mtime.is_none() {
-            Some("the file has no modification time to tell whether it changed")
+        } else if let Some(why) = self.source.unverifiable() {
+            Some(why)
         } else if self.source != *source {
             Some("the file changed since")
         } else if !self.target.same_upload(target)
@@ -387,7 +464,10 @@ pub(crate) async fn prune(dir: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::{
+        fmt::Write,
+        time::{Duration, SystemTime},
+    };
 
     use super::{prune, Mtime, RecordFile, RecordTarget, SessionRecord, SourceIdentity};
 
@@ -396,6 +476,7 @@ mod tests {
             path: "/data/a.bin".into(),
             size: 10,
             mtime: Some(Mtime { secs: 1, nanos: 2 }),
+            remote: None,
         }
     }
 
@@ -424,7 +505,171 @@ mod tests {
             convert_to: None,
             file_id: Some(String::from("id-1")),
             marker: None,
+            modified_time: None,
+            created_time: None,
         }
+    }
+
+    /// A record as gdrive wrote it before relays: no `remote` source, no file times.
+    const EARLIER_RECORD: &str = r#"{
+        "version": 2,
+        "session_url": "https://upload.example/?upload_id=1",
+        "offset": 512,
+        "source": {"path": "/data/a.bin", "size": 10, "mtime": {"secs": 1, "nanos": 2}},
+        "target": {
+            "parents": ["folder"],
+            "name": "a.bin",
+            "mime": "application/octet-stream",
+            "existing_file_id": null,
+            "convert_to": null,
+            "file_id": "id-1",
+            "marker": null
+        },
+        "chunk_size": 256,
+        "created": 4102444800,
+        "identity": "me@example.com"
+    }"#;
+
+    #[test]
+    fn records_of_local_uploads_written_before_relays_still_load_and_keep_their_names() {
+        let mut record: SessionRecord = serde_json::from_str(EARLIER_RECORD).unwrap();
+        assert_eq!(record.source, source());
+        assert_eq!(record.target, target());
+        record.created = super::unix_now();
+        assert_eq!(record.mismatch(&source(), &target()), None);
+
+        // The name is the digest of the path and the target as the earlier versions
+        // serialized them, which is what they look for.
+        let earlier_key = r#"{"parents":["folder"],"name":"a.bin","mime":"application/octet-stream","existing_file_id":null,"convert_to":null,"file_id":null,"marker":null}"#;
+        let mut hashed = b"/data/a.bin\0".to_vec();
+        hashed.extend_from_slice(earlier_key.as_bytes());
+        let digest = ring::digest::digest(&ring::digest::SHA256, &hashed);
+        let expected = digest
+            .as_ref()
+            .iter()
+            .fold(String::new(), |mut name, byte| {
+                let _ = write!(name, "{byte:02x}");
+                name
+            });
+        let file = RecordFile::new(std::path::Path::new("/uploads"), &source(), &target());
+        assert_eq!(
+            file.path,
+            std::path::Path::new("/uploads").join(format!("{expected}.json"))
+        );
+
+        // And a local record written now is what the earlier versions read.
+        let written = serde_json::to_value(&record).unwrap();
+        assert!(written["source"].get("remote").is_none(), "{written}");
+        assert!(
+            written["target"].get("modified_time").is_none(),
+            "{written}"
+        );
+    }
+
+    fn remote(account: &str, id: &str, md5: Option<&str>, version: Option<i64>) -> SourceIdentity {
+        SourceIdentity::remote(account, id, 10, md5, version)
+    }
+
+    #[test]
+    fn a_relay_continues_only_the_same_revision_of_the_same_file_of_the_same_account() {
+        let md5 = "0123456789abcdef0123456789ABCDEF";
+        let source = remote("a@example.com", "file-1", Some(md5), Some(7));
+        assert_eq!(
+            source.remote.as_ref().unwrap().md5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(
+            source.remote.as_ref().unwrap().version,
+            None,
+            "the md5 identifies the content; the version also counts metadata changes"
+        );
+        let record = SessionRecord::new(
+            String::from("url"),
+            source.clone(),
+            target(),
+            256,
+            identity(),
+        );
+        assert_eq!(record.mismatch(&source, &target()), None);
+        assert_eq!(
+            record.mismatch(
+                &remote("a@example.com", "file-1", Some(md5), Some(8)),
+                &target()
+            ),
+            None,
+            "a rename does not change the content"
+        );
+        for other in [
+            remote("b@example.com", "file-1", Some(md5), Some(7)),
+            remote("a@example.com", "file-2", Some(md5), Some(7)),
+            remote(
+                "a@example.com",
+                "file-1",
+                Some("ffffffffffffffffffffffffffffffff"),
+                Some(7),
+            ),
+            SourceIdentity::remote("a@example.com", "file-1", 11, Some(md5), Some(7)),
+        ] {
+            assert_eq!(
+                record.mismatch(&other, &target()),
+                Some("the file changed since"),
+                "{other:?}"
+            );
+        }
+
+        // Without an md5, the version tells; without either, nothing does.
+        let versioned = remote("a@example.com", "file-1", None, Some(7));
+        let record = SessionRecord::new(
+            String::from("url"),
+            versioned.clone(),
+            target(),
+            256,
+            identity(),
+        );
+        assert_eq!(record.mismatch(&versioned, &target()), None);
+        assert!(record
+            .mismatch(&remote("a@example.com", "file-1", None, Some(8)), &target())
+            .is_some());
+        let unknown = remote("a@example.com", "file-1", None, None);
+        let record = SessionRecord::new(
+            String::from("url"),
+            unknown.clone(),
+            target(),
+            256,
+            identity(),
+        );
+        assert_eq!(
+            record.mismatch(&unknown, &target()),
+            Some("the Drive file has no md5 or version to tell whether it changed")
+        );
+
+        // Each account's file has a record of its own, apart from local uploads.
+        let dir = std::path::Path::new("/uploads");
+        let name = |source: &SourceIdentity| RecordFile::new(dir, source, &target()).path;
+        assert_ne!(
+            name(&source),
+            name(&remote("b@example.com", "file-1", Some(md5), None))
+        );
+        assert_ne!(
+            name(&source),
+            name(&remote("a@example.com", "file-2", Some(md5), None))
+        );
+        assert_ne!(name(&source), name(&super::tests::source()));
+    }
+
+    #[tokio::test]
+    async fn a_relay_record_is_saved_and_loaded_with_its_source_and_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = remote("a@example.com", "file-1", None, Some(3));
+        let target = RecordTarget {
+            modified_time: Some(String::from("2026-01-02T03:04:05.000Z")),
+            created_time: Some(String::from("2025-01-02T03:04:05.000Z")),
+            ..target()
+        };
+        let mut file = RecordFile::new(dir.path(), &source, &target);
+        let record = SessionRecord::new(String::from("url"), source, target, 256, identity());
+        file.save(&record).await;
+        assert_eq!(file.load().await, Some(record));
     }
 
     #[test]
