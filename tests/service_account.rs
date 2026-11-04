@@ -359,3 +359,41 @@ async fn token_requests_go_through_the_proxy_and_bad_proxies_are_clean_errors() 
         assert_eq!(stdout(&listed), "");
     }
 }
+
+#[tokio::test]
+async fn token_uris_and_metadata_hosts_that_would_panic_are_errors() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path();
+    std::fs::write(
+        home.join("key.json"),
+        service_account_key_json("https://oauth2.googleapis.com/to ken"),
+    )
+    .unwrap();
+
+    let added = gdrive(home, &["account", "add", "--service-account", "key.json"]).await;
+    assert_eq!(added.status.code(), Some(1), "{}", stderr(&added));
+    assert!(
+        stderr(&added).starts_with(
+            "Error: 'key.json' is not a usable service account key: the \"token_uri\" of the \
+             key is not an https URL"
+        ),
+        "{}",
+        stderr(&added)
+    );
+
+    let added = gdrive_with_env(
+        home,
+        &["account", "add", "--adc"],
+        &[("GCE_METADATA_HOST", "bad host")],
+    )
+    .await;
+    assert_eq!(added.status.code(), Some(1), "{}", stderr(&added));
+    assert!(
+        stderr(&added).starts_with(
+            "Error: unable to use the Application Default Credentials: GCE_METADATA_HOST is not \
+             a host name or host:port"
+        ),
+        "{}",
+        stderr(&added)
+    );
+}

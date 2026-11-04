@@ -103,6 +103,11 @@ fn known_type(key_type: &str) -> Option<String> {
 }
 
 fn is_acceptable_token_uri(token_uri: &str) -> bool {
+    // yup-oauth2 builds its request from the string with the `http` crate's parser and panics on
+    // what it refuses (a space, for one), which `url` accepts and encodes.
+    if token_uri.parse::<hyper::Uri>().is_err() {
+        return false;
+    }
     let Ok(url) = url::Url::parse(token_uri) else {
         return false;
     };
@@ -889,6 +894,9 @@ mod tests {
             "ftp://127.0.0.1/token",
             "oauth2.googleapis.com/token",
             "https://",
+            // `url` takes these and encodes them; yup-oauth2 panicked on them.
+            "https://oauth2.googleapis.com/to ken",
+            "https://oauth2.googleapis.com/token\t",
         ] {
             assert_eq!(
                 parse(&key_value(uri)).unwrap_err(),

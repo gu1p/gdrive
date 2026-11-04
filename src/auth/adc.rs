@@ -128,12 +128,18 @@ pub(crate) async fn resolve_with(
         }
     }
 
-    let host = env("GCE_METADATA_HOST")
-        .and_then(|host| host.into_string().ok())
-        .filter(|host| !host.trim().is_empty())
-        .unwrap_or_else(|| String::from(DEFAULT_METADATA_HOST));
+    let host = match env("GCE_METADATA_HOST") {
+        Some(host) if !host.is_empty() => host.into_string().map_err(|_| AdcError::MetadataHost)?,
+        _ => String::from(DEFAULT_METADATA_HOST),
+    };
+    let url = format!("http://{host}{METADATA_TOKEN_PATH}");
+    // yup-oauth2 builds its request from the string and panics on what `http` refuses.
+    let is_host = host.parse::<hyper::http::uri::Authority>().is_ok() && !host.contains('@');
+    if !is_host || url.parse::<hyper::Uri>().is_err() {
+        return Err(AdcError::MetadataHost);
+    }
     Ok(AdcSource::MetadataServer {
-        url: format!("http://{host}{METADATA_TOKEN_PATH}"),
+        url,
         host,
         gcloud_file,
     })
@@ -230,6 +236,8 @@ pub(crate) enum AdcError {
         origin: Origin,
         path: PathBuf,
     },
+    /// `GCE_METADATA_HOST` is not a host or `host:port`.
+    MetadataHost,
     /// `GOOGLE_APPLICATION_CREDENTIALS` was set while gdrive was looking.
     Changed,
 }
@@ -278,6 +286,10 @@ impl Display for AdcError {
                  neither \"service_account\" nor \"authorized_user\"",
                 Named(*origin, path)
             ),
+            AdcError::MetadataHost => f.write_str(
+                "GCE_METADATA_HOST is not a host name or host:port\nUnset it, or set it to the \
+                 address of the metadata server, such as 169.254.169.254.",
+            ),
             AdcError::Changed => {
                 f.write_str("GOOGLE_APPLICATION_CREDENTIALS changed while gdrive was reading it")
             }
@@ -293,6 +305,7 @@ impl Error for AdcError {
             AdcError::EmptyEnvVar
             | AdcError::Unsupported { .. }
             | AdcError::UnknownType { .. }
+            | AdcError::MetadataHost
             | AdcError::Changed => None,
         }
     }
@@ -583,6 +596,29 @@ mod tests {
 
         let error = resolve_file(json!({"installed": {}}).to_string()).await;
         assert!(matches!(error, AdcError::UnknownType { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_bad_gce_metadata_host_is_an_error_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        for host in ["bad host", "host/path", "user@host", "host:port:x", "[::1"] {
+            let error = resolve_with(&env(dir.path(), &[("GCE_METADATA_HOST", host)]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, AdcError::MetadataHost),
+                "{host:?}: {error:?}"
+            );
+        }
+        for host in ["169.254.169.254", "metadata.internal:8080", "[::1]:80"] {
+            let source = resolve_with(&env(dir.path(), &[("GCE_METADATA_HOST", host)]))
+                .await
+                .unwrap();
+            assert!(
+                matches!(source, AdcSource::MetadataServer { .. }),
+                "{host:?}"
+            );
+        }
     }
 
     #[tokio::test]
