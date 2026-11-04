@@ -26,6 +26,10 @@ const ID_TAG_HEX_DIGITS: usize = 8;
 
 const REPLACEMENT: char = '_';
 
+/// Temporary download files are named `.gdrive-<id>.part`, see [`temp_file_name`].
+const TEMP_PREFIX: &str = ".gdrive-";
+const TEMP_SUFFIX: &str = ".part";
+
 /// Why a Drive name cannot be turned into a local name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InvalidName {
@@ -172,7 +176,10 @@ impl Rules {
 ///    gets `_` appended to that part: `con.txt` becomes `con_.txt`. This applies on every
 ///    platform so that a download is portable.
 /// 4. A name ending in `.` or a space gets `_` appended.
-/// 5. A name longer than 255 bytes is cut at a UTF-8 character boundary and gets `~` plus the
+/// 5. A name of the form of a temporary download file, starting with `.gdrive-` and ending with
+///    `.part` (ASCII case-insensitively), gets `_` appended, so a downloaded file can never take
+///    the path of another download's temporary file (see [`temp_file_name`]).
+/// 6. A name longer than 255 bytes is cut at a UTF-8 character boundary and gets `~` plus the
 ///    first 8 hex digits of the MD5 of the file id before its extension, so that two long names
 ///    sharing a prefix stay distinct. The extension (from the last `.`, at most 32 bytes) is kept.
 pub(crate) fn local_name(drive_name: &str, file_id: &str) -> Result<String, InvalidName> {
@@ -275,10 +282,20 @@ pub(crate) fn temp_file_name(file_id: &str, attempt: u32) -> String {
     };
 
     if attempt == 0 {
-        format!(".gdrive-{id}.part")
+        format!("{TEMP_PREFIX}{id}{TEMP_SUFFIX}")
     } else {
-        format!(".gdrive-{id}-{attempt}.part")
+        format!("{TEMP_PREFIX}{id}-{attempt}{TEMP_SUFFIX}")
     }
+}
+
+/// Whether `name` has the form of a temporary download file: it starts with `.gdrive-` and ends
+/// with `.part`, compared ASCII case-insensitively. [`local_name`] never returns such a name.
+#[must_use]
+pub(crate) fn is_reserved_temp_name(name: &str) -> bool {
+    let name = name.as_bytes();
+    name.len() >= TEMP_PREFIX.len() + TEMP_SUFFIX.len()
+        && name[..TEMP_PREFIX.len()].eq_ignore_ascii_case(TEMP_PREFIX.as_bytes())
+        && name[name.len() - TEMP_SUFFIX.len()..].eq_ignore_ascii_case(TEMP_SUFFIX.as_bytes())
 }
 
 /// Joins `component` to `base` so that the result is always directly under `base`.
@@ -316,6 +333,11 @@ fn sanitize(name: &str, file_id: &str, rules: Rules) -> Result<String, InvalidNa
     }
 
     if name.ends_with(['.', ' ']) {
+        name.push(REPLACEMENT);
+    }
+
+    // Shortening below keeps the start and the extension, so it cannot make a name reserved.
+    if is_reserved_temp_name(&name) {
         name.push(REPLACEMENT);
     }
 
@@ -449,9 +471,9 @@ mod tests {
     use std::path::{Component, Path};
 
     use super::{
-        id_tag, local_name, safe_join, safe_join_with, sanitize, temp_file_name,
-        unique_local_names_with, InvalidName, NameChange, NameEntry, Rules, UniqueNames,
-        UnusableName, MAX_COMPONENT_BYTES,
+        id_tag, is_reserved_temp_name, local_name, safe_join, safe_join_with, sanitize,
+        temp_file_name, unique_local_names_with, InvalidName, NameChange, NameEntry, Rules,
+        UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
     };
 
     const UNIX: Rules = Rules {
@@ -894,5 +916,58 @@ mod tests {
     fn temp_file_names_differ_per_id() {
         assert_ne!(temp_file_name("id-a", 0), temp_file_name("id-b", 0));
         assert_ne!(temp_file_name("a/b", 0), temp_file_name("a_b", 0));
+    }
+
+    #[test]
+    fn temp_file_names_are_reserved() {
+        for id in ["abc", "1AbC_-x", "a/b", ""] {
+            for attempt in [0, 1, 7, 99] {
+                assert!(is_reserved_temp_name(&temp_file_name(id, attempt)));
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_temp_names_get_underscore() {
+        assert_eq!(unix(".gdrive-abc.part"), ".gdrive-abc.part_");
+        assert_eq!(unix(".gdrive-abc-3.part"), ".gdrive-abc-3.part_");
+        assert_eq!(unix(".GDRIVE-abc.PART"), ".GDRIVE-abc.PART_");
+        assert_eq!(unix(".gdrive-.part"), ".gdrive-.part_");
+        assert_eq!(unix(".gdrive-a/b.part"), ".gdrive-a_b.part_");
+
+        for name in [
+            ".gdrive-abc.part.txt",
+            "gdrive-abc.part",
+            ".gdrive-abc.partx",
+            ".gdrive.part",
+            "x.gdrive-abc.part",
+        ] {
+            assert_eq!(unix(name), name);
+        }
+    }
+
+    #[test]
+    fn local_names_never_alias_temp_files() {
+        let long = format!(".gdrive-{}.part", "x".repeat(300));
+        for name in [
+            temp_file_name("abc", 0),
+            temp_file_name("abc", 2),
+            temp_file_name("a/b", 0),
+            long,
+        ] {
+            for rules in [UNIX, WINDOWS] {
+                let local = sanitize(&name, "other-id", rules).unwrap();
+                assert!(!is_reserved_temp_name(&local), "{name} -> {local}");
+                assert!(local.len() <= MAX_COMPONENT_BYTES);
+            }
+        }
+
+        // Neither can a deduplicated name.
+        let name = temp_file_name("abc", 0);
+        let result = unique(&[("1", &name), ("2", &name)], UNIX);
+        assert!(result
+            .names
+            .iter()
+            .all(|local| !is_reserved_temp_name(local)));
     }
 }

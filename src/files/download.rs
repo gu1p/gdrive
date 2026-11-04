@@ -260,10 +260,25 @@ pub(crate) async fn save_body_to_file(
     result
 }
 
+/// Creates the temporary file for `file_path`. It refuses a `file_path` that has the name of a
+/// temporary file, and a temporary path that exists but is not a regular file: in both cases the
+/// temporary file could alias a final destination.
 async fn create_temp_file(
     file_path: &Path,
     file_id: &str,
 ) -> Result<(PathBuf, File), errors::SaveBodyToFile> {
+    let refuse = |message: String| {
+        errors::SaveBodyToFile::CreateFile(io::Error::new(io::ErrorKind::InvalidInput, message))
+    };
+
+    let file_name = file_path.file_name().map(|name| name.to_string_lossy());
+    if file_name.is_some_and(|name| local_name::is_reserved_temp_name(&name)) {
+        return Err(refuse(format!(
+            "refusing to write '{}': the name is reserved for temporary download files",
+            file_path.display()
+        )));
+    }
+
     let dir = file_path.parent().unwrap_or_else(|| Path::new(""));
 
     for attempt in 0..MAX_TEMP_FILE_ATTEMPTS {
@@ -277,7 +292,17 @@ async fn create_temp_file(
 
         match created {
             Ok(file) => return Ok((tmp_file_path, file)),
-            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                // A regular file is a stale or concurrent temporary file: try the next name.
+                let existing = fs::symlink_metadata(&tmp_file_path).await;
+                if existing.is_ok_and(|metadata| !metadata.is_file()) {
+                    return Err(refuse(format!(
+                        "refusing to use '{}' as a temporary file: it exists and is not a \
+                        regular file",
+                        tmp_file_path.display()
+                    )));
+                }
+            }
             Err(err) => return Err(errors::SaveBodyToFile::CreateFile(err)),
         }
     }
@@ -485,9 +510,19 @@ mod tests {
 
     use super::{
         create_temp_file, err_if_file_exists, err_if_local_file_exists, errors, save_body_to_file,
-        Config, Destination, ExistingFileAction,
+        write_temp_file, Config, Destination, ExistingFileAction,
     };
-    use crate::common::drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT};
+    use crate::common::{
+        drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT},
+        local_name,
+    };
+
+    fn is_refusal(result: &Result<(), errors::SaveBodyToFile>) -> bool {
+        matches!(
+            result,
+            Err(errors::SaveBodyToFile::CreateFile(err)) if err.kind() == std::io::ErrorKind::InvalidInput
+        )
+    }
 
     fn body(content: &'static [u8]) -> Body {
         Full::new(Bytes::from_static(content))
@@ -713,5 +748,72 @@ mod tests {
 
         assert_eq!(std::fs::read(&target).unwrap(), b"long");
         assert_eq!(dir_entries(dir.path()), [name]);
+    }
+
+    #[tokio::test]
+    async fn drive_file_named_like_a_temp_file_cannot_alias_it() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Download B is staging its bytes.
+        let b_target = dir.path().join("b.bin");
+        let (b_tmp, b_file) = create_temp_file(&b_target, "idB").await.unwrap();
+        assert_eq!(b_tmp, dir.path().join(".gdrive-idB.part"));
+
+        // Download A is a Drive file whose name is B's temporary file name.
+        let a_name = local_name::local_name(".gdrive-idB.part", "idA").unwrap();
+        let a_target = local_name::safe_join(dir.path(), &a_name);
+        assert_ne!(a_target, b_tmp);
+        save_body_to_file(body(b"A bytes"), &a_target, "idA", None)
+            .await
+            .unwrap();
+
+        // B finishes with its own bytes in its own destination.
+        let b_md5 = md5::compute(b"B bytes");
+        write_temp_file(body(b"B bytes"), b_file, &b_tmp, &b_target, Some(&b_md5))
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(&a_target).unwrap(), b"A bytes");
+        assert_eq!(std::fs::read(&b_target).unwrap(), b"B bytes");
+        assert_eq!(dir_entries(dir.path()), [".gdrive-idB.part_", "b.bin"]);
+    }
+
+    #[tokio::test]
+    async fn target_with_temp_file_name_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join(".gdrive-x.part");
+
+        let result = save_body_to_file(body(b"data"), &target, "x", None).await;
+
+        assert!(is_refusal(&result), "{result:?}");
+        assert_eq!(dir_entries(dir.path()), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn temp_path_that_is_not_a_regular_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".gdrive-id-a.part")).unwrap();
+
+        let result =
+            save_body_to_file(body(b"data"), &dir.path().join("a.bin"), "id-a", None).await;
+
+        assert!(is_refusal(&result), "{result:?}");
+        assert_eq!(dir_entries(dir.path()), [".gdrive-id-a.part"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn temp_path_that_is_a_symlink_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::os::unix::fs::symlink(&outside, dir.path().join(".gdrive-id-a.part")).unwrap();
+
+        let result =
+            save_body_to_file(body(b"data"), &dir.path().join("a.bin"), "id-a", None).await;
+
+        assert!(is_refusal(&result), "{result:?}");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        assert!(!dir.path().join("a.bin").exists());
     }
 }
