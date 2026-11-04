@@ -15,6 +15,7 @@ mod version;
 use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode};
 
 use clap::{Parser, Subcommand};
+use common::drive_file::FileExtension;
 use common::{
     delegate::{ChunkSize, MultipartThreshold},
     permission,
@@ -514,6 +515,10 @@ enum FileCommand {
         /// Overwrite existing files
         #[arg(short, long)]
         overwrite: bool,
+
+        /// Export to this format, a file extension such as pdf or md, instead of the one the extension of the file path names. The path is then used as given
+        #[arg(long, value_name = "EXTENSION", value_parser = parse_export_format)]
+        format: Option<FileExtension>,
     },
 }
 
@@ -575,6 +580,16 @@ enum PermissionCommand {
 }
 
 /// `--jobs`: 1 to [`Options::MAX_JOBS`].
+/// A `--format` of `files export`: a known file extension, without the dot.
+fn parse_export_format(value: &str) -> Result<FileExtension, String> {
+    FileExtension::from_name(&value.to_ascii_lowercase()).ok_or_else(|| {
+        format!(
+            "unknown format '{value}', use a file extension such as pdf, docx, xlsx, pptx, md or \
+            png"
+        )
+    })
+}
+
 fn parse_jobs(value: &str) -> Result<NonZeroUsize, String> {
     let jobs = value.parse::<usize>().map_err(|err| err.to_string())?;
     NonZeroUsize::new(jobs)
@@ -959,6 +974,7 @@ async fn handle_files_command(
             file_id,
             file_path,
             overwrite,
+            format,
         } => {
             let existing_file_action = if overwrite {
                 files::export::ExistingFileAction::Overwrite
@@ -970,6 +986,7 @@ async fn handle_files_command(
                 file_id,
                 file_path,
                 existing_file_action,
+                format,
             })
             .await?;
         }
@@ -1495,7 +1512,7 @@ mod flag_tests {
     use clap::Parser;
 
     use super::{Cli, Command, FileCommand};
-    use crate::common::drive_file::DocType;
+    use crate::common::drive_file::{DocType, FileExtension};
 
     fn words(text: &str) -> HashSet<&str> {
         text.split(|c: char| !c.is_ascii_alphanumeric())
@@ -1619,6 +1636,17 @@ mod flag_tests {
                 ..
             }
         ));
+        assert!(matches!(
+            parse(&["files", "export", "id", "notes", "--format", "MD"]),
+            FileCommand::Export {
+                format: Some(FileExtension::Md),
+                ..
+            }
+        ));
+        assert!(
+            Cli::try_parse_from(["gdrive", "files", "export", "id", "x", "--format", "exe"])
+                .is_err()
+        );
     }
 
     #[test]

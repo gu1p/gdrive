@@ -37,6 +37,8 @@ pub(crate) struct Config {
     pub(crate) file_id: String,
     pub(crate) file_path: PathBuf,
     pub(crate) existing_file_action: ExistingFileAction,
+    /// The format (`--format`); `None` takes it from the extension of `file_path`.
+    pub(crate) format: Option<FileExtension>,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -64,7 +66,9 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
         return Err(Error::UnsupportedDriveMime(drive_mime));
     };
 
-    let extension = FileExtension::from_path(&config.file_path)
+    let extension = config
+        .format
+        .or_else(|| FileExtension::from_path(&config.file_path))
         .ok_or(Error::UnsupportedExportExtension(doc_type))?;
 
     if doc_type.can_export_to(extension).not() {
@@ -271,7 +275,7 @@ mod tests {
 
     use super::{export_with_hub, Config, ExistingFileAction};
     use crate::common::{
-        drive_file::MIME_TYPE_DRIVE_DOCUMENT,
+        drive_file::{FileExtension, MIME_TYPE_DRIVE_DOCUMENT},
         mock_server::{MockServer, Response},
     };
 
@@ -297,6 +301,7 @@ mod tests {
                 file_id: String::from("doc"),
                 file_path: path.clone(),
                 existing_file_action: ExistingFileAction::Abort,
+                format: None,
             },
         )
         .await
@@ -339,6 +344,7 @@ mod tests {
                 file_id: String::from("doc"),
                 file_path: dir.path().join("big.pdf"),
                 existing_file_action: ExistingFileAction::Abort,
+                format: None,
             },
         )
         .await
@@ -353,10 +359,67 @@ mod tests {
         assert_eq!(server.requests().len(), 2, "not repeated");
     }
 
+    #[tokio::test]
+    async fn format_overrides_the_extension_of_the_path() {
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({"id": "doc", "name": "Notes", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+            ),
+            Response::raw(200, "# Notes\n"),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes");
+
+        export_with_hub(
+            &server.hub(),
+            Config {
+                file_id: String::from("doc"),
+                file_path: path.clone(),
+                existing_file_action: ExistingFileAction::Abort,
+                format: Some(FileExtension::Md),
+            },
+        )
+        .await
+        .unwrap();
+
+        crate::files::download::assert_content(&path, "# Notes\n");
+        let requests = server.requests();
+        assert_eq!(requests[1].query_param("mimeType"), Some("text%2Fmarkdown"));
+    }
+
+    #[tokio::test]
+    async fn a_format_the_type_cannot_export_to_is_refused() {
+        let server = MockServer::start(vec![Response::json(
+            200,
+            &json!({"id": "doc", "name": "Notes", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = export_with_hub(
+            &server.hub(),
+            Config {
+                file_id: String::from("doc"),
+                file_path: dir.path().join("notes.pdf"),
+                existing_file_action: ExistingFileAction::Abort,
+                format: Some(FileExtension::Xlsx),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("export of a document to this file type is not supported"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn export_names_get_the_extension_once() {
-        use crate::common::drive_file::FileExtension;
-
         assert_eq!(
             super::export_file_name("report", FileExtension::Docx),
             "report.docx"
