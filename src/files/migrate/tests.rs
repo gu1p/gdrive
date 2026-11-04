@@ -1567,3 +1567,76 @@ async fn a_destination_file_that_is_a_source_file_is_never_matched() {
     assert!(!trashed_ids(&source).contains(&String::from("h")));
     assert!(!trashed_ids(&source).contains(&String::from("B")));
 }
+
+#[tokio::test]
+async fn the_relay_gets_the_resource_key_and_creation_time_of_each_source_file() {
+    use super::source::{discover, SourceNode};
+
+    const CREATED: &str = "2020-01-02T03:04:05.000Z";
+    let md5 = |content: &str| format!("{:x}", md5::compute(content));
+    let fake = FakeDrive::start(
+        vec![
+            FakeFile::folder("shared", "shared", "root").with_resource_key("rk-folder"),
+            FakeFile::blob("a", "a.txt", "shared", "aaaa").with_resource_key("rk-a"),
+            FakeFile::blob("b", "b.txt", "root", "bb").with_resource_key("rk-b"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    // The fake keeps no `createdTime`: the listing of `shared` and the `files.get` of `b` that ask
+    // for it get it here. A mask without it would go to the fake and find none.
+    let source = Interceptor::start(&fake, move |method, path, params| {
+        let asks = *method == hyper::Method::GET
+            && params
+                .get("fields")
+                .is_some_and(|fields| fields.contains("createdTime"));
+        let listing = path == "/drive/v3/files"
+            && params
+                .get("q")
+                .is_some_and(|q| q.contains("'shared' in parents"));
+        match path {
+            _ if asks && listing => Some(json!({"files": [{
+                "id": "a", "name": "a.txt", "mimeType": "text/plain", "size": "4",
+                "md5Checksum": md5("aaaa"), "parents": ["shared"], "resourceKey": "rk-a",
+                "createdTime": CREATED,
+            }]})),
+            "/drive/v3/files/b" if asks => Some(json!({
+                "id": "b", "name": "b.txt", "mimeType": "text/plain", "size": "2",
+                "md5Checksum": md5("bb"), "resourceKey": "rk-b", "createdTime": CREATED,
+            })),
+            _ => None,
+        }
+    })
+    .await;
+    let created = Some(CREATED.parse::<chrono::DateTime<chrono::Utc>>().unwrap());
+
+    let output = output();
+    let hub = source.hub();
+    let Ok(SourceNode::Folder(folder)) = discover(&hub, "shared", 2, &output.printer).await else {
+        panic!("shared is a folder");
+    };
+    let [SourceNode::File(a)] = folder.children.as_slice() else {
+        panic!("{:?}", folder.children);
+    };
+    let a = a.file.to_drive_file();
+    assert_eq!(a.resource_key.as_deref(), Some("rk-a"));
+    assert_eq!(a.created_time, created);
+    let Ok(SourceNode::File(b)) = discover(&hub, "b", 2, &output.printer).await else {
+        panic!("b is a file");
+    };
+    let b = b.file.to_drive_file();
+    assert_eq!(b.resource_key.as_deref(), Some("rk-b"));
+    assert_eq!(b.created_time, created);
+
+    // And the migration of both goes through.
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let migrated = migrate_through(&source, &dest, settings(&["shared", "b"])).await;
+    migrated.assert_ok();
+    let mut names = dest
+        .created()
+        .into_iter()
+        .map(|file| file.name)
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, ["a.txt", "b.txt", "shared"]);
+}

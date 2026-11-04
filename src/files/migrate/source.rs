@@ -23,7 +23,7 @@ use crate::{
 
 /// The fields of a `FILE_ID` that is migrated.
 const ROOT_FIELDS: &str =
-    "id,name,mimeType,size,md5Checksum,modifiedTime,driveId,resourceKey,trashed";
+    "id,name,mimeType,size,md5Checksum,modifiedTime,createdTime,driveId,resourceKey,trashed";
 
 /// The prefix of the Google Workspace MIME types.
 const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
@@ -37,6 +37,11 @@ pub(super) struct SourceFile {
     pub(super) size: Option<i64>,
     pub(super) md5: Option<String>,
     pub(super) modified_time: Option<DateTime<Utc>>,
+    /// Copied to the new file by the relay.
+    pub(super) created_time: Option<DateTime<Utc>>,
+    /// Needed to read a file that is shared by link only: the relay sends it with every request
+    /// about the source.
+    pub(super) resource_key: Option<String>,
 }
 
 impl SourceFile {
@@ -48,6 +53,8 @@ impl SourceFile {
             size: file.size,
             md5: file.md5_checksum.clone(),
             modified_time: file.modified_time,
+            created_time: file.created_time,
+            resource_key: file.resource_key.clone(),
         }
     }
 
@@ -60,6 +67,8 @@ impl SourceFile {
             size: self.size,
             md5_checksum: self.md5.clone(),
             modified_time: self.modified_time,
+            created_time: self.created_time,
+            resource_key: self.resource_key.clone(),
             ..File::default()
         }
     }

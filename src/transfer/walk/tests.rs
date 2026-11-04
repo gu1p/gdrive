@@ -909,6 +909,7 @@ async fn requests_ask_for_the_walk_fields_and_exclude_trashed_files() {
         "size",
         "md5Checksum",
         "modifiedTime",
+        "createdTime",
         "shortcutDetails",
         "trashed",
         "parents",
