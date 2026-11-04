@@ -1,5 +1,124 @@
 //! Incremental, breadth-first listing of a Drive folder subtree, exposed as a [`Stream`] of
 //! [`WalkItem`]s that a consumer can act on while the walk is still running.
+//!
+//! Milestone 2 items 2 and 3 of docs/triage/README.md: page-by-page discovery with a fixed
+//! `fields` mask, up to 50 parent ids per query, a separate limit for listing requests, a
+//! bounded queue towards the consumer, and `incompleteSearch` honored.
+//!
+//! # Design
+//!
+//! ```text
+//!   Walk::start(Arc<Hub>, WalkRoot, WalkOptions)
+//!       |
+//!       | tokio::spawn (one task; requests are futures it owns, never spawned)
+//!       v
+//!  +--------------------------------- producer task ---------------------------------+
+//!  |                                                                                 |
+//!  |  pending: VecDeque<PendingFolder>           in_flight: FuturesUnordered<page>   |
+//!  |  breadth-first; split batches go to the     at most `listing_jobs` requests     |
+//!  |  front and are listed one folder each                                           |
+//!  |                                                                                 |
+//!  |  [root] [a] [b] [c] ..  -- next_batch -->   files.list                          |
+//!  |     ^    up to 50 ids, same corpus,          q=('a' in parents or 'b' in        |
+//!  |     |    distinct ids                          parents ..) and trashed = false  |
+//!  |     |                                        pageSize=1000 [pageToken] fields   |
+//!  |     |                                        supportsAllDrives,                 |
+//!  |     |                                        includeItemsFromAllDrives,         |
+//!  |     |                                        [corpora=drive&driveId]            |
+//!  |     |                                                  |                        |
+//!  |     |                                                  | pages, in completion   |
+//!  |     |                                                  v order                  |
+//!  |     +-- subfolders and followed      handle_page: route each file by `parents`  |
+//!  |         shortcut targets, each       to its folder(s), build WalkEntry; next    |
+//!  |         with a new FolderKey         page of the batch in the same slot; on an  |
+//!  |                                      error or an unroutable result, split       |
+//!  |                                                  |                              |
+//!  +--------------------------------------------------|------------------------------+
+//!                                                     | sender.send(item).await:
+//!                                                     | waits while the channel is full
+//!                                                     v
+//!                            bounded mpsc channel (`buffer` items)
+//!                                                     |
+//!                                                     v
+//!            consumer: Walk as Stream<Item = WalkItem>; dropping it aborts the task
+//! ```
+//!
+//! The producer loop: start requests while a slot is free and folders are pending, wait for any
+//! page, send its items one by one (each send may wait for the consumer), queue the next page or
+//! the folders it found, repeat. The walk ends when nothing is pending or in flight; the
+//! channel then closes and the stream returns `None`.
+//!
+//! # Invariants
+//!
+//! - At most `listing_jobs` list requests are in flight. A batch's next page takes the slot of
+//!   the page that just finished.
+//! - Backpressure: items reach the consumer only through the bounded channel. While the producer
+//!   waits for room it starts no request, so it runs ahead of the consumer by at most `buffer`
+//!   items plus the pages already in flight. Beyond that it holds the queue of discovered,
+//!   not yet listed folders (one small record per folder) and, for a batch of several folders,
+//!   the ids it emitted so far.
+//! - Order: the entry of a folder (with [`Children::Listed`]) is sent before any item about its
+//!   children: their entries, its [`IncompleteSearch`], [`WalkItem::FolderDone`] or
+//!   [`FolderError`]. Every listed folder location, the root included, ends with exactly one
+//!   `FolderDone` or `FolderError`, and nothing names it afterwards. Across folders the order
+//!   is the completion order of concurrent requests; within a folder it is Drive's order.
+//! - A file is emitted at most once per folder location, also when a batch is split and its
+//!   folders are listed again. A `FolderError` may follow some entries of that folder when a
+//!   later page failed.
+//! - Trashed files are never emitted: `trashed = false` is in every query and a trashed result
+//!   is dropped anyway. `incompleteSearch` is never dropped: it becomes an
+//!   [`IncompleteSearch`] item naming the folders of that query, before the page's entries.
+//! - Termination: a folder that is its own ancestor is not listed again, and a shortcut target
+//!   is listed only if its id was not listed or queued before ([`Children::Cycle`]), so every
+//!   folder id is listed at most once through shortcuts plus once per real location.
+//! - Cancellation: dropping the [`Walk`] aborts the producer task, which drops the requests in
+//!   flight with it; no request is sent afterwards. The stream ends only after the producer
+//!   returned; a panic in the producer is resumed in the consumer, so a crash never looks like
+//!   a complete walk.
+//!
+//! # Batching
+//!
+//! One query lists up to [`MAX_PARENTS_PER_QUERY`] folders, and every result is routed by its
+//! `parents` field to the folders of the batch it names; a file with several parents in the
+//! batch is emitted under each, as one query per folder would return it. The alternative, one
+//! query per parent whenever a file could have several parents, would give up batching
+//! entirely, since any file could. A query only combines folders with the same corpus and
+//! distinct ids: a folder reached twice (a legacy multi-parent folder) waits for the next
+//! batch. Fallbacks:
+//! - a result without `parents` in a batch of several folders cannot be placed, so the batch is
+//!   split and each folder is listed by a query of its own, skipping the ids already emitted;
+//! - an error of a batch of several folders cannot be attributed, so the batch is split the
+//!   same way, and only the folder that fails again yields a [`FolderError`]. Retries of
+//!   transient errors belong to the request layer (see `TODO(retry)`).
+//!
+//! Batches are filled greedily, up to the limit, rather than spread over free slots: it sends
+//! the fewest requests (each `files.list` costs quota), and the latency of a walk is bound by
+//! the depth of the tree anyway. Limits: the pages of one query come one after the other, so a
+//! batch whose folders hold many thousand children is paged in a single slot; splitting costs
+//! one extra request per folder of the failed batch; a small tree uses one slot per level.
+//!
+//! Shared drives: a root with a `driveId` is searched in that drive's corpus (`corpora=drive`,
+//! `driveId`). Its subfolders inherit the corpus; a followed shortcut's target is searched in
+//! the user's corpus, because it may be in another drive.
+//!
+//! # TODO for the scheduler
+//!
+//! - Fields: a download needs `id`, `size`, `md5Checksum` (verification, skip checks) and
+//!   `mimeType` ([`EntryKind`]); skip and update modes need `modifiedTime`; local paths come
+//!   from [`WalkEntry::components`] through `local_name::unique_local_names`, per
+//!   [`WalkEntry::parent`], once [`WalkItem::FolderDone`] says all names of the folder are
+//!   known. Native documents need an export format before they can be transferred. Add
+//!   `resourceKey` or `capabilities/canDownload` to [`FIELDS`] when a transfer needs them.
+//! - Shortcuts to files are not resolved: the shortcut entry carries `shortcutDetails` (target
+//!   id and MIME type); the scheduler gets the target's metadata with `files.get` and the same
+//!   fields, within the listing limit, when it follows shortcuts.
+//! - Errors: a [`FolderError`] is a failed outcome for that folder, and its subtree is unknown,
+//!   not empty: count it, continue with the other folders and exit non-zero at the end. An
+//!   [`IncompleteSearch`] marks the inventories of its folders incomplete. Either one must
+//!   suppress any deletion or sync phase for those folders and their ancestors.
+//! - Concurrency: give the walk its own `listing_jobs`, separate from the transfer jobs, and
+//!   poll it while transfers run (it only lists while the consumer makes room). Keep the
+//!   buffer bounded; a consumer that stops reading pauses the walk, which is intended.
 
 #[cfg(test)]
 mod tests;
