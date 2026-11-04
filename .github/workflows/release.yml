@@ -95,8 +95,9 @@ jobs:
             rustflags: -C target-feature=+crt-static
     runs-on: ${{ matrix.os }}
     env:
-      # build.rs embeds this as the `Commit:` line of `gdrive version`; a tag
-      # checkout is a detached HEAD, which build.rs cannot resolve on its own.
+      # build.rs embeds the commit as the `Commit:` line of `gdrive version`.
+      # It asks `git rev-parse HEAD` first and falls back to this variable
+      # when git is unavailable; the check step below asserts the result.
       GDRIVE_GIT_HASH: ${{ github.sha }}
     # No Swatinem/rust-cache here on purpose: release binaries are built from
     # a clean state, so nothing restored from another workflow's cache can end
@@ -138,11 +139,13 @@ jobs:
           dry-run: true
           dry-run-intended: true
       # Refuse to ship a binary of the wrong architecture or one that needs
-      # libraries the user may not have: the two defects upstream shipped.
+      # libraries the user may not have (the two defects upstream shipped), or
+      # one that does not know its commit (upstream printed "Commit: unknown").
       - name: Check the binary
         shell: bash
         env:
           TARGET: ${{ matrix.target }}
+          EXPECTED_COMMIT: ${{ github.sha }}
         run: |
           set -euo pipefail
           bin="target/$TARGET/release/gdrive"
@@ -175,9 +178,20 @@ jobs:
               fi
               ;;
           esac
-          # The x86_64 macOS binary cannot run on the arm64 runner.
-          if [ "$TARGET" != x86_64-apple-darwin ]; then
-            "$bin" version
+          # The x86_64 macOS binary cannot run on the arm64 runner, so for it
+          # the embedded commit string is searched instead.
+          if [ "$TARGET" = x86_64-apple-darwin ]; then
+            if ! grep -qaF "$EXPECTED_COMMIT" "$bin"; then
+              echo "::error::$bin does not embed commit $EXPECTED_COMMIT"
+              exit 1
+            fi
+          else
+            out=$("$bin" version | tr -d '\r')
+            echo "$out"
+            if ! grep -qFx "Commit: $EXPECTED_COMMIT" <<<"$out"; then
+              echo "::error::gdrive version does not print Commit: $EXPECTED_COMMIT"
+              exit 1
+            fi
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

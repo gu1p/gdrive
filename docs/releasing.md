@@ -59,8 +59,9 @@ SmartScreen may warn on first run.
    - builds the five targets with `cargo build --release --locked`, with the commit SHA passed as
      `GDRIVE_GIT_HASH` so `gdrive version` prints it on its `Commit:` line;
    - checks each binary: Linux binaries must be static, macOS binaries must have the architecture their
-     name says, the Windows binary must not import the VC++ runtime, and every binary that can run on its
-     build machine must answer `gdrive version`;
+     name says, the Windows binary must not import the VC++ runtime, and every binary must carry the
+     release commit (`gdrive version` must print `Commit: <sha>`; the Intel macOS binary, which cannot run
+     on the arm64 build machine, is searched for the hash instead);
    - checks that exactly the five expected asset names exist, writes `SHA256SUMS`, and creates the GitHub
      release with the archives, `SHA256SUMS` and notes generated from the merged pull requests. A tag with a
      `-` suffix becomes a pre-release.
