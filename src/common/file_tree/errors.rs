@@ -40,7 +40,9 @@ pub(crate) enum Folder {
     ReadDir(io::Error),
     ReadDirEntry(io::Error),
     Nested { path: PathBuf, source: Box<Folder> },
-    IsSymlink(PathBuf),
+    BrokenSymlink { path: PathBuf, source: io::Error },
+    Metadata { path: PathBuf, source: io::Error },
+    Canonicalize { path: PathBuf, source: io::Error },
     File { path: PathBuf, source: File },
     UnknownFileType(PathBuf),
 }
@@ -53,13 +55,19 @@ impl Display for Folder {
             Folder::ReadDir(_) => f.write_str("unable to read directory content"),
             Folder::ReadDirEntry(_) => f.write_str("unable to read entry from directory"),
             Folder::Nested { path, source: _ } => {
-                write!(f, "cannot evaluate child directory '{}", path.display())
+                write!(f, "cannot evaluate child directory '{}'", path.display())
             }
-            Folder::IsSymlink(path) => write!(
+            Folder::BrokenSymlink { path, source: _ } => write!(
                 f,
-                "file '{}' is a symlink, symlinks are not supported",
+                "symbolic link '{}' cannot be followed, its target is missing or it loops",
                 path.display()
             ),
+            Folder::Metadata { path, source: _ } => {
+                write!(f, "unable to read metadata of '{}'", path.display())
+            }
+            Folder::Canonicalize { path, source: _ } => {
+                write!(f, "unable to resolve directory '{}'", path.display())
+            }
             Folder::File { path, source: _ } => {
                 write!(f, "unable to evaluate file '{}'", path.display())
             }
@@ -75,9 +83,13 @@ impl Display for Folder {
 impl Error for Folder {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Folder::InvalidPath | Folder::IsSymlink(_) | Folder::UnknownFileType(_) => None,
+            Folder::InvalidPath | Folder::UnknownFileType(_) => None,
             Folder::GenerateId(source) => Some(source),
-            Folder::ReadDir(source) | Folder::ReadDirEntry(source) => Some(source),
+            Folder::ReadDir(source)
+            | Folder::ReadDirEntry(source)
+            | Folder::BrokenSymlink { source, .. }
+            | Folder::Metadata { source, .. }
+            | Folder::Canonicalize { source, .. } => Some(source),
             Folder::Nested { source, .. } => Some(source),
             Folder::File { source, .. } => Some(source),
         }

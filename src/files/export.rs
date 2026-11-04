@@ -68,9 +68,14 @@ pub(crate) async fn export(config: Config) -> Result<(), Error> {
     );
 
     let md5_checksum = file.md5_checksum.as_deref().and_then(parse_md5_digest);
-    files::download::save_body_to_file(body, &config.file_path, md5_checksum.as_ref())
-        .await
-        .map_err(Error::SaveFile)?;
+    files::download::save_body_to_file(
+        body,
+        &config.file_path,
+        &config.file_id,
+        md5_checksum.as_ref(),
+    )
+    .await
+    .map_err(Error::SaveFile)?;
 
     println!("Successfully exported {}", config.file_path.display());
 

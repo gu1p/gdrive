@@ -5,6 +5,7 @@ use md5::Digest;
 use crate::common::{
     file_tree_drive::{self, errors::FileIdentifier},
     hub_helper::GetHubError,
+    local_name::UnusableName,
 };
 
 #[derive(Debug)]
@@ -17,7 +18,9 @@ pub(crate) enum Download {
     )]
     DownloadFile(Box<google_drive3::Error>),
     MissingFileName(FileIdentifier),
+    UnusableName(UnusableName),
     FileExists(FileIdentifier),
+    LocalFileExists(PathBuf),
     IsDirectory(FileIdentifier),
     CreateDirectory(PathBuf, io::Error),
     CreateFileTree(file_tree_drive::errors::FileTreeDrive),
@@ -43,10 +46,18 @@ impl Display for Download {
             Download::MissingFileName(identifier) => {
                 write!(f, "file{} does not have a name", identifier.display())
             }
+            Download::UnusableName(_) => {
+                f.write_str("unable to map the drive name to a local file name")
+            }
             Download::FileExists(identifier) => write!(
                 f,
                 "file{} already exists, use --overwrite to overwrite it",
                 identifier.display()
+            ),
+            Download::LocalFileExists(path) => write!(
+                f,
+                "file '{}' already exists, use --overwrite to overwrite it",
+                path.display()
             ),
             Download::IsDirectory(identifier) => write!(
                 f,
@@ -95,8 +106,10 @@ impl Error for Download {
             Download::Hub(get_hub_error) => Some(get_hub_error),
             Download::GetFile(error) | Download::DownloadFile(error) => Some(error),
             Download::CreateFileTree(error) => Some(error),
+            Download::UnusableName(source) => Some(source),
             Download::MissingFileName(_)
             | Download::FileExists(_)
+            | Download::LocalFileExists(_)
             | Download::IsDirectory(_)
             | Download::DestinationPathDoesNotExist(_)
             | Download::DestinationPathNotADirectory(_)
