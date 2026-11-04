@@ -61,6 +61,7 @@ pub(crate) async fn import(config: Config) -> Result<(), Box<Error>> {
         &file,
         file_info::Config {
             file_path: &config.file_path,
+            name: None,
             mime_type: Some(mime_type),
             parents: config.parents.clone(),
         },
@@ -110,7 +111,7 @@ fn import_target(
 ) -> UploadTarget {
     UploadTarget {
         parents,
-        name,
+        name: Some(name),
         mime: Some(source_mime_type.clone()),
         convert_to: Some(doc_type.mime().clone()),
         ..UploadTarget::default()

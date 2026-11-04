@@ -334,6 +334,10 @@ enum FileCommand {
         /// Path of file to upload
         file_path: Option<PathBuf>,
 
+        /// Name of the file on Drive [default: the name of the local file, a random name for stdin]
+        #[arg(long, value_name = "NAME", conflicts_with = "recursive", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: Option<String>,
+
         /// Force mime type [default: auto-detect]
         #[arg(long, value_name = "MIME_TYPE")]
         mime: Option<Mime>,
@@ -374,6 +378,10 @@ enum FileCommand {
 
         /// Path of file to upload
         file_path: Option<PathBuf>,
+
+        /// New name of the file [default: the name of the local file; with stdin the file keeps its name]
+        #[arg(long, value_name = "NAME", value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        name: Option<String>,
 
         /// Force mime type [default: auto-detect]
         #[arg(long, value_name = "MIME_TYPE")]
@@ -793,6 +801,7 @@ async fn handle_files_command(
 
         FileCommand::Upload {
             file_path,
+            name,
             mime,
             parent,
             recursive,
@@ -804,6 +813,7 @@ async fn handle_files_command(
         } => {
             files::upload(files::upload::Config {
                 file_path,
+                name,
                 mime_type: mime,
                 parents: parent,
                 chunk_size,
@@ -819,6 +829,7 @@ async fn handle_files_command(
         FileCommand::Update {
             file_id,
             file_path,
+            name,
             mime,
             chunk_size,
             multipart_threshold,
@@ -828,6 +839,7 @@ async fn handle_files_command(
             files::update(files::update::Config {
                 file_id,
                 file_path,
+                name,
                 mime_type: mime,
                 chunk_size,
                 multipart_threshold,
@@ -1598,6 +1610,37 @@ mod flag_tests {
                 let result = Cli::try_parse_from(["gdrive", "files", command, "a.md", flag, value]);
                 assert!(result.is_err(), "files {command} {flag} {value}");
             }
+        }
+    }
+
+    #[test]
+    fn upload_and_update_take_a_name() {
+        let FileCommand::Upload { name, .. } = parse(&["files", "upload", "--name", "a b.txt"])
+        else {
+            panic!("expected upload");
+        };
+        assert_eq!(name.as_deref(), Some("a b.txt"));
+        let FileCommand::Upload { name, .. } = parse(&["files", "upload", "local.txt"]) else {
+            panic!("expected upload");
+        };
+        assert_eq!(name, None);
+
+        let FileCommand::Update { file_id, name, .. } =
+            parse(&["files", "update", "id", "--name", "report"])
+        else {
+            panic!("expected update");
+        };
+        assert_eq!((file_id.as_str(), name.as_deref()), ("id", Some("report")));
+
+        for args in [
+            &["files", "upload", "dir", "--recursive", "--name", "x"][..],
+            &["files", "upload", "--name", ""],
+            &["files", "update", "id", "--name", ""],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
+                "{args:?} should be rejected"
+            );
         }
     }
 }

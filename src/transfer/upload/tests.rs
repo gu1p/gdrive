@@ -67,7 +67,7 @@ fn options() -> UploadOptions {
 fn target() -> UploadTarget {
     UploadTarget {
         parents: vec![String::from("folder-id")],
-        name: String::from("data.bin"),
+        name: Some(String::from("data.bin")),
         mime: Some(mime::APPLICATION_OCTET_STREAM),
         ..UploadTarget::default()
     }
@@ -672,11 +672,32 @@ async fn an_update_patches_the_file_without_a_new_id() {
 }
 
 #[tokio::test]
+async fn an_update_without_a_name_keeps_the_name_of_the_file() {
+    for options in [options(), UploadOptions::default()] {
+        let fixture = fixture(SIZE);
+        let mock = MockDrive::start(Faults::default()).await;
+        let target = UploadTarget {
+            name: None,
+            existing_file_id: Some(String::from("existing-id")),
+            ..target()
+        };
+
+        let file = upload(&mock, &fixture, &target, &options).await.unwrap();
+
+        assert_eq!(file.id.as_deref(), Some("existing-id"));
+        let state = mock.state();
+        assert_eq!(state.uploads()[0].method, Method::PATCH);
+        assert_eq!(state.files["existing-id"].metadata, json!({}));
+        assert_eq!(state.files["existing-id"].content, fixture.data);
+    }
+}
+
+#[tokio::test]
 async fn a_conversion_asks_for_the_google_type_and_sends_the_source_type() {
     let fixture = fixture(SIZE);
     let mock = MockDrive::start(Faults::default()).await;
     let target = UploadTarget {
-        name: String::from("notes.md"),
+        name: Some(String::from("notes.md")),
         mime: Some("text/markdown".parse().unwrap()),
         convert_to: Some(MIME_TYPE_DRIVE_DOCUMENT.parse().unwrap()),
         parents: Vec::new(),
@@ -1196,7 +1217,7 @@ async fn failure_logs_come_from_the_held_guard() {
 fn conversion() -> UploadTarget {
     UploadTarget {
         parents: vec![String::from("folder-id")],
-        name: String::from("notes.md"),
+        name: Some(String::from("notes.md")),
         mime: Some("text/markdown".parse().unwrap()),
         convert_to: Some(MIME_TYPE_DRIVE_DOCUMENT.parse().unwrap()),
         ..UploadTarget::default()
