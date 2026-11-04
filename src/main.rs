@@ -73,7 +73,8 @@ enum AccountCommand {
     ///
     /// Use this when the stored authorization expired or was revoked. It runs the same login as
     /// `account add`, with the client credentials stored for the account, and replaces the
-    /// account's tokens.
+    /// account's tokens. Other commands never start a login: when the stored token cannot be
+    /// refreshed, they fail at once and point to this command.
     Reauth {
         /// Account name [default: current account]
         account_name: Option<String>,
