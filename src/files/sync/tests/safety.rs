@@ -896,13 +896,20 @@ async fn an_extra_drive_folder_with_duplicate_names_is_not_trashed_whole() {
     for line in [
         "skip:protected old/",
         "skip:protected old/inner/",
-        "skip:ambiguous old/dup.txt",
-        "skip:ambiguous old/inner/Case.txt",
-        "skip:ambiguous old/inner/case.txt",
         "extra->trash old/other.txt",
         "extra->trash old/inner/keep.txt",
     ] {
         assert!(out.contains(&String::from(line)), "{line}: {out:?}");
+    }
+    for (dir, name) in [
+        ("old/", "dup.txt"),
+        ("old/inner/", "Case.txt"),
+        ("old/inner/", "case.txt"),
+    ] {
+        assert!(
+            super::has_skip(&out, "ambiguous", dir, name),
+            "skip:ambiguous {dir}{name}: {out:?}"
+        );
     }
     assert_eq!(out.len(), 8, "{out:?}");
     let mut trashed = server

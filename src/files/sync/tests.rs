@@ -725,7 +725,7 @@ async fn ambiguous_names_are_skipped_and_never_deleted() {
         let out = synced.lines();
         for name in ["dup.txt", "Case.txt", "case.txt"] {
             assert!(
-                out.contains(&format!("skip:ambiguous {name}")),
+                has_skip(&out, "ambiguous", "", name),
                 "{direction:?} {out:?}"
             );
         }
@@ -1040,4 +1040,24 @@ async fn the_transfers_of_a_sync_show_their_progress() {
         };
         assert_eq!(*shown, expected, "{direction:?}");
     }
+}
+
+/// Whether `out` has `skip:<reason> <dir><name>`, or, on a case-insensitive filesystem where the
+/// local-name mapping gives one of two names differing only in case a `~tag` suffix,
+/// `skip:<reason> <dir><stem>~<8 hex><ext>`.
+pub(super) fn has_skip(out: &[String], reason: &str, dir: &str, name: &str) -> bool {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((stem, ext)) => (stem, format!(".{ext}")),
+        None => (name, String::new()),
+    };
+    let prefix = format!("skip:{reason} {dir}{stem}");
+    out.iter().any(|line| {
+        line.strip_prefix(&prefix).is_some_and(|rest| {
+            rest == ext
+                || (rest.starts_with('~')
+                    && rest.len() == 9 + ext.len()
+                    && rest.ends_with(ext.as_str())
+                    && rest[1..9].bytes().all(|b| b.is_ascii_hexdigit()))
+        })
+    })
 }
