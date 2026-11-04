@@ -84,6 +84,19 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   `--export`, shortcuts, symlinks and unreadable entries are skipped and never deleted. Takes `--jobs`,
   `--continue-on-error`, `--export` (down), `--acknowledge-abuse` (down) and the progress flags.
   See docs/sync.md. Closes the rsync-style requests #84, #16, #116, #69.
+- **Migration between accounts.** `files migrate <FILE_ID>... --to <ACCOUNT> [--from <ACCOUNT>] [--into
+  <FOLDER_ID>]` copies files and folders of one logged-in account (the current one by default) into
+  another, streaming the content through this machine without writing it to disk. Folders are recreated
+  before what goes into them; files are checked by MD5 and keep their modification time; Google Docs,
+  Sheets and Slides are exported and converted back (10 MB export limit); shortcuts and Google types
+  without an export are skipped and listed. Running it again reuses destination folders of the same name
+  and skips files that are already there with the same content; a file of the same name with other content
+  is a failed item, never overwritten. Interrupted large uploads continue on the next run. `--dry-run`
+  only reads the destination; `--trash-source` moves migrated files, and folders whose whole content was
+  migrated, to the source's trash. Prints one line per item (`create`, `reuse`, `convert`,
+  `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the chunk and
+  progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
+  docs/migrate.md.
 
 Accounts and login:
 
