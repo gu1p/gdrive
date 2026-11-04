@@ -9,8 +9,11 @@ use futures::StreamExt;
 
 use super::{errors, Action, Child, ChildKind, ListedChild, ListedFolder, LocalTree, Totals};
 use crate::{
-    common::{drive_file::MIME_TYPE_DRIVE_FOLDER, local_name::InvalidName},
-    files,
+    common::{
+        drive_file::{DocType, FileExtension, MIME_TYPE_DRIVE_DOCUMENT, MIME_TYPE_DRIVE_FOLDER},
+        local_name::{InvalidName, MAX_COMPONENT_BYTES},
+    },
+    files::{self, export::ExportFormats},
     transfer::{
         fake_drive::{Behavior, FakeDrive, FakeFile},
         scheduler::{JobKind, Outcome, SkipReason},
@@ -60,6 +63,7 @@ fn local_names(listed: &ListedFolder) -> Vec<Result<String, &errors::Folder>> {
         .map(|child| match child {
             Ok(ListedChild::Folder { local_name, .. }) => Ok(local_name.clone()),
             Ok(ListedChild::File(file)) => Ok(file.local_name.clone()),
+            Ok(ListedChild::Export(export)) => Ok(export.local_name.clone()),
             Err(failed) => Err(&failed.error),
         })
         .collect()
@@ -86,6 +90,143 @@ fn children_get_safe_unique_names() {
     assert_eq!(names[2], ".._escape");
     assert_eq!(names[3], "plain");
     assert_eq!(listed.changes.len(), 2, "the suffix and the sanitized name");
+}
+
+/// A Google Docs document.
+fn document(id: &str, name: &str) -> google_drive3::api::File {
+    google_drive3::api::File {
+        id: Some(id.to_string()),
+        name: Some(name.to_string()),
+        mime_type: Some(MIME_TYPE_DRIVE_DOCUMENT.to_string()),
+        ..google_drive3::api::File::default()
+    }
+}
+
+#[test]
+fn exports_get_the_extension_of_their_format_and_unique_names() {
+    let long = "x".repeat(300);
+    let mut children = children(&[drive_file("b-report", "report.docx", false)]);
+    for (id, name, format) in [
+        ("d-report", "report", FileExtension::Docx),
+        ("d-notes", "notes.md", FileExtension::Md),
+        ("d-NOTES", "Notes.MD", FileExtension::Docx),
+        ("d-long", long.as_str(), FileExtension::Docx),
+        ("d-dots", "..", FileExtension::Docx),
+    ] {
+        children.push(Child::export(document(id, name), DocType::Document, format));
+    }
+
+    let listed = ListedFolder::finish(children);
+    let names = local_names(&listed);
+
+    assert_eq!(
+        names[0].as_deref().ok(),
+        Some("report.docx"),
+        "the lower id"
+    );
+    let report = names[1].as_deref().unwrap();
+    assert!(
+        report.starts_with("report~") && Path::new(report).extension() == Some("docx".as_ref()),
+        "{report}"
+    );
+    assert_eq!(names[2].as_deref().ok(), Some("notes.md"));
+    assert_eq!(names[3].as_deref().ok(), Some("Notes.MD.docx"));
+    let long = names[4].as_deref().unwrap();
+    assert!(
+        long.len() <= MAX_COMPONENT_BYTES && Path::new(long).extension() == Some("docx".as_ref()),
+        "{long}"
+    );
+    assert!(matches!(
+        names[5],
+        Err(errors::Folder::UnusableName(name))
+            if name.id == "d-dots" && name.source == InvalidName::ParentDir
+    ));
+    assert!(
+        listed.changes.iter().any(|change| change
+            .to_string()
+            .starts_with("'report.docx' (id d-report) is saved as 'report~")),
+        "{:?}",
+        listed.changes
+    );
+}
+
+#[tokio::test]
+async fn documents_are_planned_as_exports_with_export_formats() {
+    let files = vec![
+        FakeFile::native("d", "report", "root", MIME_TYPE_DRIVE_DOCUMENT, "document")
+            .modified("2024-05-06T07:08:09.123Z"),
+        FakeFile::native(
+            "s",
+            "budget",
+            "root",
+            "application/vnd.google-apps.spreadsheet",
+            "sheet",
+        ),
+        FakeFile::native(
+            "f",
+            "survey",
+            "root",
+            "application/vnd.google-apps.form",
+            "",
+        ),
+    ];
+    let server = FakeDrive::start(files, Behavior::default()).await;
+    let (tree, root) = LocalTree::new(root_folder()).unwrap();
+    let formats = ExportFormats::parse("docs=pdf,sheets=skip").unwrap();
+    let mut tree = tree.with_export(Some(formats));
+    let mut actions = tree.take_actions();
+    let mut walk = Walk::start(Arc::new(server.hub()), root, WalkOptions::default());
+    while let Some(item) = walk.next().await {
+        tree.push(item);
+        actions.extend(tree.take_actions());
+    }
+
+    let exports = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Export(export) => Some(export),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(exports.len(), 1);
+    assert_eq!(exports[0].path, Path::new("Root").join("report.pdf"));
+    assert_eq!(
+        (
+            exports[0].id.as_str(),
+            exports[0].doc_type,
+            exports[0].format
+        ),
+        ("d", DocType::Document, FileExtension::Pdf)
+    );
+    assert_eq!(
+        exports[0].modified_time.map(|time| time.timestamp_millis()),
+        Some(1_714_979_289_123)
+    );
+    let skipped = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Done {
+                label,
+                outcome: Outcome::Skipped { reason },
+                ..
+            } => Some((label.as_str(), *reason)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        skipped,
+        [
+            ("Root/budget", SkipReason::GoogleDocument),
+            ("Root/survey", SkipReason::NotExportable),
+        ]
+    );
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        Action::Warning(warning) if warning == "Warning: skipping 'Root/survey' \
+            (application/vnd.google-apps.form): gdrive has no export format for this type"
+    )));
+    assert_eq!(tree.totals().exports, 1);
+    assert_eq!(tree.totals().files, 0);
 }
 
 #[test]
@@ -195,6 +336,11 @@ impl Planned {
                     self.ordered &= parent.is_some_and(|parent| self.dirs.contains(&parent));
                     self.downloads.push(slashed(&file.path));
                 }
+                Action::Export(export) => {
+                    let parent = export.path.parent().map(Path::to_path_buf);
+                    self.ordered &= parent.is_some_and(|parent| self.dirs.contains(&parent));
+                    self.downloads.push(slashed(&export.path));
+                }
                 Action::Done {
                     kind,
                     label,
@@ -223,6 +369,9 @@ impl Planned {
                     Outcome::Skipped {
                         reason: SkipReason::Shortcut,
                     } => "shortcut",
+                    Outcome::Skipped {
+                        reason: SkipReason::NotExportable,
+                    } => "not exportable",
                     Outcome::Failed { .. } => "failed",
                     Outcome::Cancelled => "cancelled",
                     Outcome::Transferred { .. } | Outcome::Unchanged => "transferred",
@@ -327,6 +476,7 @@ async fn three_levels_of_8_folders_take_3_batched_requests() {
         totals,
         Totals {
             files: 8,
+            exports: 0,
             folders: 8,
             bytes: 4 + 1 + 1 + 1 + 2 + 2 + 2 + 2,
             incomplete: false,

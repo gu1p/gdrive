@@ -5,8 +5,9 @@
 //! ```text
 //!   Walk (listing, `metadata_jobs` requests at once, bounded channel)
 //!     -> LocalTree (local names per folder on FolderDone, see common::file_tree_drive)
-//!     -> Source: creates each local directory as its path becomes known, turns files into
-//!        jobs, documents and shortcuts into skipped items, listing errors into failures
+//!     -> Source: creates each local directory as its path becomes known, turns files and,
+//!        with `--export`, documents into jobs, other documents and shortcuts into skipped
+//!        items, listing errors into failures
 //!     -> Scheduler (`jobs` downloads at once, bounded queue: a full queue pauses the walk)
 //! ```
 //!
@@ -15,6 +16,12 @@
 //! `save_to_file`, which writes a temporary file and renames it once size and md5 match. A job
 //! that is aborted (a failure elsewhere, Ctrl-C) removes the temporary files it created, and only
 //! those.
+//!
+//! An export (`--export`) is a media job too: `files.export` in the chosen format, saved through
+//! the same temporary file. Exports have no md5 or size on Drive: only the size the server
+//! announces (`Content-Length`, when it sends one) is checked. Drive exports at most 10 MB per
+//! file; a larger export fails with a message that says so. The exported file gets the
+//! document's `modifiedTime` as its modification time.
 
 #[cfg(test)]
 mod tests;
@@ -31,15 +38,16 @@ use tokio::fs;
 
 use super::{
     err_if_local_file_exists, errors, file_content, local_file_is_identical, remove_temp_file,
-    resume::{Identity, ResumableDownload, Revision},
+    resume::{Expected, Identity, ResumableDownload, Revision},
     save_through, Config, ExistingFileAction, MAX_TEMP_FILE_ATTEMPTS,
 };
 use crate::{
     common::{
-        file_tree_drive::{self, Action, LocalTree, PlannedFile, Totals},
+        file_tree_drive::{self, Action, LocalTree, PlannedExport, PlannedFile, Totals},
         human_size::human_size,
         local_name,
     },
+    files::export::{export_content, is_export_too_large, set_modified_time, ExportTooLarge},
     hub::Hub,
     transfer::{
         scheduler::{
@@ -61,8 +69,9 @@ pub(super) async fn download_directory(
     use errors::Download as E;
 
     let root_path = config.canonical_destination_root()?;
-    let (mut tree, root) = LocalTree::new(file)
+    let (tree, root) = LocalTree::new(file)
         .map_err(|err| E::CreateFileTree(file_tree_drive::errors::FileTreeDrive(err)))?;
+    let mut tree = tree.with_export(config.export);
     let walk_options = WalkOptions {
         listing_jobs: config.transfer.metadata_jobs.get(),
         ..WalkOptions::default()
@@ -113,6 +122,11 @@ async fn finish(
                 human_size(totals.bytes)
             ))
             .await;
+        if totals.exports > 0 {
+            printer
+                .out(format!("Exported {}", google_docs(totals.exports)))
+                .await;
+        }
     }
     let documents = report.skipped(SkipReason::GoogleDocument);
     if documents > 0 {
@@ -120,6 +134,20 @@ async fn finish(
         printer
             .err(format!(
                 "{documents} skipped; use `gdrive files export` to download them"
+            ))
+            .await;
+    }
+    let unsupported = report.skipped(SkipReason::NotExportable);
+    if unsupported > 0 {
+        let unsupported = plural(
+            unsupported,
+            "Google Workspace file",
+            "Google Workspace files",
+        );
+        printer
+            .err(format!(
+                "{unsupported} skipped; gdrive has no export format for their types (Forms, \
+                Sites, My Maps, Apps Script, ...)"
             ))
             .await;
     }
@@ -140,6 +168,11 @@ async fn finish(
         .map_err(errors::Download::WriteOutput)?;
 
     result
+}
+
+/// `1 Google Docs file`, `2 Google Docs files`.
+fn google_docs(count: u64) -> String {
+    plural(count, "Google Docs file", "Google Docs files")
 }
 
 /// The jobs of a recursive download, from the walk.
@@ -174,6 +207,7 @@ impl Source {
                         }
                     }
                     Action::Download(file) => return Some(self.files.job(file)),
+                    Action::Export(export) => return Some(self.files.export_job(export)),
                     Action::Done {
                         kind,
                         label,
@@ -198,6 +232,11 @@ impl Source {
                         human_size(totals.bytes),
                     ))
                     .await;
+                if totals.exports > 0 {
+                    self.printer
+                        .out(format!("Found {} to export", google_docs(totals.exports)))
+                        .await;
+                }
                 *self.totals.lock().unwrap_or_else(PoisonError::into_inner) = Some(totals);
             }
             self.actions.extend(self.tree.take_actions());
@@ -308,6 +347,96 @@ impl Files {
         context.progress.bytes(file.size);
 
         Ok(Outcome::Transferred { bytes: file.size })
+    }
+}
+
+impl Files {
+    fn export_job(self: &Arc<Self>, export: PlannedExport) -> Job {
+        let files = Arc::clone(self);
+        let label = export.path.display().to_string();
+        let partial = PartialFiles::new(self.root_path.join(&export.path), &export.id);
+        let cleanup = partial.clone();
+        Job::new(JobKind::Media, label, move |context| async move {
+            files.export(export, &partial, &context).await.into()
+        })
+        .on_cancel(move || async move { cleanup.remove().await })
+    }
+
+    async fn export(
+        &self,
+        export: PlannedExport,
+        partial: &PartialFiles,
+        context: &JobContext,
+    ) -> Outcome {
+        match self.try_export(&export, partial, context).await {
+            Ok(outcome) => outcome,
+            Err(source) => Outcome::failed(errors::Download::RecursiveExport {
+                path: export.path,
+                source: Box::new(source),
+            }),
+        }
+    }
+
+    async fn try_export(
+        &self,
+        export: &PlannedExport,
+        partial: &PartialFiles,
+        context: &JobContext,
+    ) -> Result<Outcome, errors::Download> {
+        use errors::Download as E;
+
+        let abs_file_path = self.root_path.join(&export.path);
+        err_if_local_file_exists(&abs_file_path, self.existing_file_action).await?;
+
+        let label = format!("export of '{}'", export.path.display());
+        let mime_type = export.format.get_export_mime();
+        let source = export_content(&self.hub, &export.id, mime_type, label)
+            .map_err(|err| E::ExportFile(Box::new(err)))?;
+        // Nothing to check but the size the server announces, if it does.
+        let mut download =
+            ResumableDownload::new(source, self.hub.retrier().state(), Expected::default());
+        let first = download.next().await.map_err(|err| {
+            if is_export_too_large(&err) {
+                E::ExportTooLarge(ExportTooLarge(Box::new(err)))
+            } else {
+                E::ExportFile(Box::new(err))
+            }
+        })?;
+
+        context
+            .printer
+            .out(format!(
+                "Exporting {} '{}'",
+                export.doc_type,
+                export.path.display()
+            ))
+            .await;
+        save_through(download, first, &abs_file_path, &export.id, |file| {
+            partial.track(file)
+        })
+        .await
+        .map_err(|source| E::SaveBodyToFile {
+            path: abs_file_path.clone(),
+            source,
+        })?;
+
+        if let Some(modified_time) = export.modified_time {
+            if let Err(err) = set_modified_time(&abs_file_path, modified_time).await {
+                context
+                    .printer
+                    .err(format!(
+                        "Warning: unable to set the modification time of '{}': {err}",
+                        abs_file_path.display()
+                    ))
+                    .await;
+            }
+        }
+        let bytes = fs::metadata(&abs_file_path)
+            .await
+            .map_or(0, |metadata| metadata.len());
+        context.progress.bytes(bytes);
+
+        Ok(Outcome::Transferred { bytes })
     }
 }
 

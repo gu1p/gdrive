@@ -19,6 +19,7 @@ use common::{
     delegate::{ChunkSize, MultipartThreshold},
     permission,
 };
+use files::export::ExportFormats;
 use files::list::{ListQuery, ListSortOrder};
 use mime::Mime;
 use transfer::scheduler::Options;
@@ -336,6 +337,10 @@ enum FileCommand {
         /// With --recursive: when a file fails, go on with the others instead of stopping. The command still exits with an error
         #[arg(long)]
         continue_on_error: bool,
+
+        /// With --recursive: export Google Docs, Sheets, Slides and Drawings instead of skipping them. SPEC is a profile, `default` (docs=docx, sheets=xlsx, slides=pptx, drawings=png) or `md` (docs=md, the rest as default), and/or TYPE=FORMAT overrides separated by commas, for example `md,sheets=ods` or `docs=pdf,drawings=skip`. Types: docs, sheets, slides, drawings; formats as for `files export`, or skip
+        #[arg(long, value_name = "SPEC", requires = "recursive", value_parser = ExportFormats::parse)]
+        export: Option<ExportFormats>,
     },
 
     /// Upload file
@@ -503,7 +508,7 @@ enum FileCommand {
         /// File id
         file_id: String,
 
-        /// File path to export to. The file extension will determine the export format. Documents: pdf, odt, docx, epub, rtf, txt, html, md. Spreadsheets: csv, tsv, ods, xlsx, pdf. Presentations: pdf, pptx, odp, txt
+        /// File path to export to. The file extension will determine the export format. Documents: pdf, odt, docx, epub, rtf, txt, html, md. Spreadsheets: csv, tsv, ods, xlsx, pdf. Presentations: pdf, pptx, odp, txt. Drawings: pdf, jpg (or jpeg), png, svg
         file_path: PathBuf,
 
         /// Overwrite existing files
@@ -799,6 +804,7 @@ async fn handle_files_command(
             acknowledge_abuse,
             jobs,
             continue_on_error,
+            export,
         } => {
             let existing_file_action = if overwrite {
                 files::download::ExistingFileAction::Overwrite
@@ -822,6 +828,7 @@ async fn handle_files_command(
                 destination: dst,
                 acknowledge_abuse,
                 transfer: Options::new(jobs, continue_on_error),
+                export,
             })
             .await?;
         }
@@ -1154,8 +1161,8 @@ mod tests {
     use clap::{CommandFactory, Parser};
 
     use super::{
-        parse_jobs, parse_positive_usize, AccountCommand, Cli, Command, DriveCommand, FileCommand,
-        PermissionCommand,
+        parse_jobs, parse_positive_usize, AccountCommand, Cli, Command, DriveCommand,
+        ExportFormats, FileCommand, PermissionCommand,
     };
     use crate::files::list::ListQuery;
 
@@ -1268,6 +1275,45 @@ mod tests {
             panic!("expected files upload");
         };
         assert_eq!((jobs.get(), continue_on_error), (2, true));
+    }
+
+    #[test]
+    fn export_takes_a_spec_and_needs_recursive() {
+        let parse = |args: &[&str]| {
+            Cli::try_parse_from(["gdrive", "files", "download", "id"].iter().chain(args))
+        };
+        let export = |args: &[&str]| {
+            let Command::Files {
+                command: FileCommand::Download { export, .. },
+            } = parse(args).expect("valid flags").command
+            else {
+                panic!("expected files download");
+            };
+            export
+        };
+
+        assert_eq!(export(&["-r"]), None);
+        assert_eq!(
+            export(&["-r", "--export", "default"]),
+            Some(ExportFormats::DEFAULT)
+        );
+        assert_eq!(
+            export(&["-r", "--export", "md"]),
+            Some(ExportFormats::MARKDOWN)
+        );
+        let error = parse(&["--export", "default"]).err().unwrap();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+        let error = parse(&["-r", "--export", "sheets=md"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("sheets cannot be exported as 'md'"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -1623,11 +1669,7 @@ mod flag_tests {
         let help = file_path.get_help().unwrap().to_string();
         let listed = words(&help);
 
-        for doc_type in [
-            DocType::Document,
-            DocType::Spreadsheet,
-            DocType::Presentation,
-        ] {
+        for doc_type in DocType::ALL {
             for extension in doc_type.supported_export_types() {
                 let extension = extension.to_string();
                 assert!(listed.contains(extension.as_str()), "{extension}: {help}");

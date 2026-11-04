@@ -8,7 +8,9 @@
 //! request and the most requests it had in flight at once. `files.get` of a stored file returns
 //! the fields its `fields` mask names, so a test can check what a metadata request asks for;
 //! with `alt=media` it returns the content of a blob ([`FakeFile::blob`]), counted apart from
-//! the other requests.
+//! the other requests. `files.export` of a Workspace document ([`FakeFile::native`]) returns its
+//! content in whatever format is asked for, without `Content-Length` as Drive sends exports, and
+//! records the format ([`FakeDrive::exports`]).
 //!
 //! For recursive uploads it answers `files.generateIds`, multipart `files.create` (the uploads
 //! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
@@ -56,8 +58,10 @@ pub(crate) struct FakeFile {
     pub(crate) shortcut_target: Option<(String, String)>,
     pub(crate) target_resource_key: Option<String>,
     pub(crate) resource_key: Option<String>,
-    /// What a media download of a blob returns.
+    /// What a media download of a blob, or an export of a Workspace document, returns.
     pub(crate) content: Option<String>,
+    /// `modifiedTime`, RFC 3339.
+    pub(crate) modified_time: Option<String>,
 }
 
 impl FakeFile {
@@ -93,6 +97,32 @@ impl FakeFile {
             mime_type: String::from("application/vnd.google-apps.document"),
             parents: vec![parent.to_owned()],
             ..Self::default()
+        }
+    }
+
+    /// A Workspace document of `mime_type` whose exports return `content`.
+    pub(crate) fn native(
+        id: &str,
+        name: &str,
+        parent: &str,
+        mime_type: &str,
+        content: &str,
+    ) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            mime_type: mime_type.to_owned(),
+            parents: vec![parent.to_owned()],
+            content: Some(content.to_owned()),
+            ..Self::default()
+        }
+    }
+
+    /// With `modifiedTime` (RFC 3339).
+    pub(crate) fn modified(self, time: &str) -> Self {
+        Self {
+            modified_time: Some(time.to_owned()),
+            ..self
         }
     }
 
@@ -167,6 +197,9 @@ impl FakeFile {
         if let Some(drive_id) = &self.drive_id {
             file.insert("driveId".into(), json!(drive_id));
         }
+        if let Some(modified_time) = &self.modified_time {
+            file.insert("modifiedTime".into(), json!(modified_time));
+        }
         if let Some(resource_key) = &self.resource_key {
             file.insert("resourceKey".into(), json!(resource_key));
         }
@@ -217,6 +250,8 @@ pub(crate) struct Behavior {
     /// Media downloads of these file ids send half of the content and then nothing more, like
     /// a transfer that is still running.
     pub(crate) media_stalled: HashSet<String>,
+    /// Exports of these file ids fail with Drive's 403 for exports over 10 MB.
+    pub(crate) export_too_large: HashSet<String>,
     /// How long the create of a file (not a folder) takes before its reply.
     pub(crate) upload_delay: Duration,
     /// Creates of files with these names fail with 400.
@@ -295,6 +330,8 @@ struct State {
     max_in_flight: AtomicUsize,
     /// The file ids of media downloads.
     media: Mutex<Vec<String>>,
+    /// The file ids and MIME types of exports.
+    exports: Mutex<Vec<(String, String)>>,
     media_in_flight: AtomicUsize,
     media_max_in_flight: AtomicUsize,
     /// When the first media download arrived.
@@ -340,6 +377,7 @@ impl FakeDrive {
             in_flight: AtomicUsize::new(0),
             max_in_flight: AtomicUsize::new(0),
             media: Mutex::new(Vec::new()),
+            exports: Mutex::new(Vec::new()),
             media_in_flight: AtomicUsize::new(0),
             media_max_in_flight: AtomicUsize::new(0),
             first_media: Mutex::new(None),
@@ -398,6 +436,11 @@ impl FakeDrive {
     /// The file ids of the media downloads, in arrival order.
     pub(crate) fn media(&self) -> Vec<String> {
         self.state.media.lock().expect("media lock").clone()
+    }
+
+    /// The file ids and requested MIME types of the exports, in arrival order.
+    pub(crate) fn exports(&self) -> Vec<(String, String)> {
+        self.state.exports.lock().expect("exports lock").clone()
     }
 
     /// The most media downloads that were being answered at the same time.
@@ -507,6 +550,9 @@ async fn handle(
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
+        if let Some(id) = id.strip_suffix("/export") {
+            return Ok(export(&state, id, &params));
+        }
         if params
             .iter()
             .any(|(key, value)| key == "alt" && value == "media")
@@ -899,6 +945,46 @@ async fn media(state: &State, id: &str) -> FakeResponse {
         .header("content-type", "application/octet-stream")
         .header("content-length", length)
         .body(body)
+        .expect("valid response")
+}
+
+/// `files.export`: the document's content, sent in chunks without `Content-Length`.
+fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
+    let mime_type = params
+        .iter()
+        .find(|(key, _)| key == "mimeType")
+        .map(|(_, mime_type)| mime_type.clone())
+        .unwrap_or_default();
+    state
+        .exports
+        .lock()
+        .expect("exports lock")
+        .push((id.to_owned(), mime_type));
+
+    if state.behavior.export_too_large.contains(id) {
+        let message = "This file is too large to be exported.";
+        let body = json!({"error": {
+            "code": 403,
+            "message": message,
+            "errors": [{"domain": "global", "reason": "exportSizeLimitExceeded", "message": message}],
+        }});
+        return json_response(StatusCode::FORBIDDEN, &body);
+    }
+    let content = state
+        .files
+        .iter()
+        .find(|file| file.id == id && file.mime_type.starts_with("application/vnd.google-apps."))
+        .and_then(|file| file.content.clone());
+    let Some(content) = content else {
+        return error(StatusCode::NOT_FOUND, "File not found.");
+    };
+    let frames = stream::iter([Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(
+        content,
+    )))]);
+    hyper::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .body(BodyExt::boxed(StreamBody::new(frames)))
         .expect("valid response")
 }
 

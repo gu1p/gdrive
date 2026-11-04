@@ -1,11 +1,18 @@
+mod formats;
+
 use std::{
     error,
     fmt::{Display, Formatter},
+    io,
     ops::Not,
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::SystemTime,
 };
 
+use chrono::{DateTime, Utc};
 use mime::Mime;
+
+pub(crate) use formats::ExportFormats;
 
 use crate::{
     common::{
@@ -13,6 +20,7 @@ use crate::{
         hub_helper::{get_hub, GetHubError},
         media_client::{MediaClient, MediaError},
         parse_md5_digest,
+        retry::{is_reason, StopReason},
     },
     files::{
         self,
@@ -78,10 +86,13 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
         size: None,
     };
     let mut download = ResumableDownload::new(source, hub.retrier().state(), expected);
-    let first = download
-        .next()
-        .await
-        .map_err(|err| Error::ExportFile(Box::new(err)))?;
+    let first = download.next().await.map_err(|err| {
+        if is_export_too_large(&err) {
+            Error::TooLarge(ExportTooLarge(Box::new(err)))
+        } else {
+            Error::ExportFile(Box::new(err))
+        }
+    })?;
 
     println!(
         "Exporting {} '{}' to {}",
@@ -101,7 +112,7 @@ async fn export_with_hub(hub: &Hub, config: Config) -> Result<(), Error> {
 
 /// The export of a Workspace document as `mime_type` (`files.export`). Exports ignore `Range`:
 /// a download that breaks off starts over, through the same path as file downloads.
-fn export_content<'a>(
+pub(crate) fn export_content<'a>(
     hub: &'a Hub,
     file_id: &str,
     mime_type: &Mime,
@@ -115,12 +126,81 @@ fn export_content<'a>(
     Ok(MediaSource::Drive { client, url, label })
 }
 
+/// The local name of the export of a Drive file named `name` as `format`, before it goes through
+/// `local_name` like any Drive name: `name` with the format's extension appended, unless it ends
+/// with that extension already (ASCII case-insensitively). So `report` exported as docx is
+/// `report.docx`, `notes.md` exported as md stays `notes.md`, and as docx it is `notes.md.docx`.
+#[must_use]
+pub(crate) fn export_file_name(name: &str, format: FileExtension) -> String {
+    let extension = format!(".{format}");
+    let has_extension = name.len() > extension.len()
+        && name
+            .get(name.len() - extension.len()..)
+            .is_some_and(|end| end.eq_ignore_ascii_case(&extension));
+    if has_extension {
+        name.to_owned()
+    } else {
+        format!("{name}{extension}")
+    }
+}
+
+/// The `reason` of Drive's 403 for an export over the `files.export` size limit.
+const EXPORT_SIZE_LIMIT_REASON: &str = "exportSizeLimitExceeded";
+
+/// Whether Drive refused an export because the result is larger than `files.export` returns.
+#[must_use]
+pub(crate) fn is_export_too_large(error: &MediaError) -> bool {
+    matches!(
+        error,
+        MediaError::Status {
+            stop: Some(StopReason::Forbidden { reason: Some(reason) }),
+            ..
+        } if is_reason(reason, EXPORT_SIZE_LIMIT_REASON)
+    )
+}
+
+/// Drive refused an export over the 10 MB limit of `files.export`; the source is Drive's reply.
+#[derive(Debug)]
+pub(crate) struct ExportTooLarge(pub(crate) Box<MediaError>);
+
+impl Display for ExportTooLarge {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "the exported file would be larger than the 10 MB that the Drive API exports; try \
+            another format, or download the file from drive.google.com",
+        )
+    }
+}
+
+impl error::Error for ExportTooLarge {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
+/// Sets the modification time of the file at `path` to `time`, the Drive file's `modifiedTime`.
+pub(crate) async fn set_modified_time(path: &Path, time: DateTime<Utc>) -> io::Result<()> {
+    let path = path.to_owned();
+    let time = SystemTime::from(time);
+    // As tokio::fs does: the blocking calls on the blocking pool. Windows needs write access to
+    // change the time.
+    tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_modified(time)
+    })
+    .await
+    .map_err(io::Error::other)?
+}
+
 #[derive(Debug)]
 pub(crate) enum Error {
     Hub(GetHubError),
     FileExists(PathBuf),
     GetFile(Box<google_drive3::Error>),
     ExportFile(Box<MediaError>),
+    TooLarge(ExportTooLarge),
     MissingDriveMime,
     UnsupportedDriveMime(String),
     UnsupportedExportExtension(DocType),
@@ -139,7 +219,7 @@ impl Display for Error {
                 )
             }
             Error::GetFile(_) => f.write_str("unable to get file"),
-            Error::ExportFile(_) => f.write_str("unable to export file"),
+            Error::ExportFile(_) | Error::TooLarge(_) => f.write_str("unable to export file"),
             Error::MissingDriveMime => f.write_str("drive file does not have a mime type"),
             Error::UnsupportedDriveMime(mime) => {
                 write!(f, "mime type on drive file '{mime}' is not supported")
@@ -180,6 +260,7 @@ impl error::Error for Error {
             | Error::UnsupportedExportExtension(_) => None,
             Error::GetFile(source) => Some(source),
             Error::ExportFile(source) => Some(source),
+            Error::TooLarge(source) => Some(source),
         }
     }
 }
@@ -232,5 +313,66 @@ mod tests {
         assert_eq!(requests[2].header("range"), Some("bytes=5000-"));
         let entries: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(entries.len(), 1, "no temporary file is left");
+    }
+
+    #[tokio::test]
+    async fn an_export_over_the_size_limit_says_so() {
+        let message = "This file is too large to be exported.";
+        let server = MockServer::start(vec![
+            Response::json(
+                200,
+                &json!({"id": "doc", "name": "Big", "mimeType": MIME_TYPE_DRIVE_DOCUMENT}),
+            ),
+            Response::json(
+                403,
+                &json!({"error": {"code": 403, "message": message, "errors": [
+                    {"domain": "global", "reason": "exportSizeLimitExceeded", "message": message}
+                ]}}),
+            ),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let error = export_with_hub(
+            &server.hub(),
+            Config {
+                file_id: String::from("doc"),
+                file_path: dir.path().join("big.pdf"),
+                existing_file_action: ExistingFileAction::Abort,
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            crate::error_message(&error),
+            "Error: unable to export file: the exported file would be larger than the 10 MB that \
+            the Drive API exports; try another format, or download the file from \
+            drive.google.com: Drive answered 403 Forbidden: This file is too large to be exported."
+        );
+        assert_eq!(server.requests().len(), 2, "not repeated");
+    }
+
+    #[test]
+    fn export_names_get_the_extension_once() {
+        use crate::common::drive_file::FileExtension;
+
+        assert_eq!(
+            super::export_file_name("report", FileExtension::Docx),
+            "report.docx"
+        );
+        assert_eq!(
+            super::export_file_name("notes.MD", FileExtension::Md),
+            "notes.MD"
+        );
+        assert_eq!(
+            super::export_file_name("notes.md", FileExtension::Docx),
+            "notes.md.docx"
+        );
+        assert_eq!(super::export_file_name(".md", FileExtension::Md), ".md.md");
+        assert_eq!(
+            super::export_file_name("é.pdf", FileExtension::Pdf),
+            "é.pdf"
+        );
     }
 }

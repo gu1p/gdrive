@@ -9,6 +9,7 @@ use crate::{
         local_name::UnusableName,
         media_client::MediaError,
     },
+    files::export::ExportTooLarge,
     transfer::scheduler::{Incomplete, OutputError},
 };
 
@@ -21,6 +22,10 @@ pub(crate) enum Download {
         reason = "this is the actual download operation"
     )]
     DownloadFile(Box<MediaError>),
+    /// The export of a Workspace document failed.
+    ExportFile(Box<MediaError>),
+    /// Drive refused an export over its size limit.
+    ExportTooLarge(ExportTooLarge),
     MissingFileName(FileIdentifier),
     UnusableName(UnusableName),
     FileExists(FileIdentifier),
@@ -44,6 +49,12 @@ pub(crate) enum Download {
         path: PathBuf,
         source: Box<Download>,
     },
+    /// A Workspace document of a recursive download could not be exported; `path` is the local
+    /// path of the export, relative to the destination.
+    RecursiveExport {
+        path: PathBuf,
+        source: Box<Download>,
+    },
     /// Files or folders of a recursive download failed, or it was interrupted.
     Incomplete(Incomplete),
     /// Drive reported `incompleteSearch` while listing a recursive download.
@@ -58,6 +69,9 @@ impl Display for Download {
             Download::Hub(_) => f.write_str("unable to get drive hub"),
             Download::GetFile(_) => f.write_str("unable to get file info"),
             Download::DownloadFile(_) => f.write_str("unable to download file from drive"),
+            Download::ExportFile(_) => f.write_str("unable to export the file from drive"),
+            // The message of the source, which the error message then leaves out.
+            Download::ExportTooLarge(source) => source.fmt(f),
             Download::MissingFileName(identifier) => {
                 write!(f, "file{} does not have a name", identifier.display())
             }
@@ -114,6 +128,9 @@ impl Display for Download {
             Download::RecursiveFile { path, source: _ } => {
                 write!(f, "unable to download '{}'", path.display())
             }
+            Download::RecursiveExport { path, source: _ } => {
+                write!(f, "unable to export '{}'", path.display())
+            }
             Download::Incomplete(_) => f.write_str("the recursive download is incomplete"),
             Download::WriteOutput(_) => {
                 f.write_str("unable to write the output of the recursive download")
@@ -131,7 +148,8 @@ impl Error for Download {
         match self {
             Download::Hub(get_hub_error) => Some(get_hub_error),
             Download::GetFile(error) => Some(error),
-            Download::DownloadFile(error) => Some(error),
+            Download::DownloadFile(error) | Download::ExportFile(error) => Some(error),
+            Download::ExportTooLarge(source) => Some(source),
             Download::CreateFileTree(error) => Some(error),
             Download::UnusableName(source) => Some(source),
             Download::MissingFileName(_)
@@ -148,7 +166,9 @@ impl Error for Download {
             | Download::CanonicalizeDestinationPath(_, source) => Some(source),
             Download::SaveBodyToStdout(save_body_to_stdout) => Some(save_body_to_stdout),
             Download::SaveBodyToFile { source, .. } => Some(source),
-            Download::RecursiveFile { source, .. } => Some(source),
+            Download::RecursiveFile { source, .. } | Download::RecursiveExport { source, .. } => {
+                Some(source)
+            }
             Download::Incomplete(source) => Some(source),
             Download::WriteOutput(source) => Some(source),
         }
