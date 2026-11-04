@@ -2,6 +2,7 @@
 //! trees.
 //!
 //! - [`walk`]: an incremental, breadth-first listing of a Drive folder subtree as a stream.
+//! - [`upload`]: gdrive's own uploader, resumable sessions and multipart requests.
 
 // The scheduler workstream consumes the whole walk API; until it lands, the recursive download
 // (`common::file_tree_drive`) uses only part of it and the rest is exercised by the tests.
@@ -12,4 +13,5 @@
 
 #[cfg(test)]
 pub(crate) mod fake_drive;
+pub(crate) mod upload;
 pub(crate) mod walk;
