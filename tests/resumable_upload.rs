@@ -47,7 +47,9 @@ use hyper_util::{
 };
 use tokio::net::TcpListener;
 
-#[expect(
+// `allow`, not `expect`: whether the unused parts count as dead code differs between rustc
+// releases (1.88, the MSRV, does not report them).
+#[allow(
     dead_code,
     reason = "only the upload delegate of this gdrive module is used by the tests"
 )]
