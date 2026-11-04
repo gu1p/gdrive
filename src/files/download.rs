@@ -19,6 +19,7 @@ use crate::{
         drive_file,
         file_tree_drive::{self, errors::FileIdentifier, FileTreeDrive},
         hub_helper::get_hub,
+        local_name::{self, NameChange, UnusableName},
         md5_writer::Md5Writer,
         parse_md5_digest, FileTreeLike, FolderLike,
     },
@@ -132,12 +133,10 @@ async fn download_regular(
     if config.destination == Destination::Stdout {
         save_body_to_stdout(body).await?;
     } else {
-        let file_name = file
-            .name
-            .as_deref()
-            .ok_or_else(|| E::MissingFileName(FileIdentifier::from(file)))?;
-        let mut abs_file_path = config.canonical_destination_root()?;
-        abs_file_path.push(file_name);
+        let file_name = local_file_name(file, config)?;
+        warn_if_renamed(file, config, &file_name);
+        let abs_file_path =
+            local_name::safe_join(&config.canonical_destination_root()?, &file_name);
 
         println!("Downloading {file_name}");
         let md5_checksum = file.md5_checksum.as_deref().and_then(parse_md5_digest);
@@ -187,6 +186,8 @@ async fn download_directory(
         for file in folder.files() {
             let file_path = file.relative_path();
             let abs_file_path = root_path.join(&file_path);
+
+            err_if_local_file_exists(&abs_file_path, config.existing_file_action).await?;
 
             if local_file_is_identical(&abs_file_path, &file).await {
                 continue;
@@ -290,31 +291,73 @@ async fn save_body_to_stdout(body: Body) -> Result<(), errors::SaveBodyToStdout>
     Ok(())
 }
 
+/// Safe local name of a single downloaded file or of the root of a recursive download.
+fn local_file_name(
+    file: &google_drive3::api::File,
+    config: &Config,
+) -> Result<String, errors::Download> {
+    let name = file
+        .name
+        .as_deref()
+        .ok_or_else(|| errors::Download::MissingFileName(FileIdentifier::from(file)))?;
+    let id = file.id.as_deref().unwrap_or(&config.file_id);
+
+    local_name::local_name(name, id)
+        .map_err(|source| errors::Download::UnusableName(UnusableName::new(name, id, source)))
+}
+
+fn warn_if_renamed(file: &google_drive3::api::File, config: &Config, local_name: &str) {
+    let Some(name) = file.name.as_deref() else {
+        return;
+    };
+
+    if name != local_name {
+        let change = NameChange::Sanitized {
+            id: file.id.clone().unwrap_or_else(|| config.file_id.clone()),
+            drive_name: name.to_owned(),
+            local_name: local_name.to_owned(),
+        };
+        eprintln!("Warning: {change}");
+    }
+}
+
 fn err_if_file_exists(
     file: &google_drive3::api::File,
     config: &Config,
 ) -> Result<(), errors::Download> {
-    let file_name = file
-        .name
-        .as_deref()
-        .ok_or_else(|| errors::Download::MissingFileName(FileIdentifier::from(file)))?;
+    // A followed shortcut is checked under the name of its target.
+    if drive_file::is_shortcut(file) {
+        return Ok(());
+    }
 
-    let file_path = match &config.destination {
-        Destination::CurrentDir => Some(Path::new(".").join(file_name)),
-        Destination::Path(path) => Some(path.join(file_name)),
-        Destination::Stdout => None,
+    let destination = match &config.destination {
+        Destination::CurrentDir => Path::new("."),
+        Destination::Path(path) => path.as_path(),
+        Destination::Stdout => return Ok(()),
     };
 
-    match file_path {
-        Some(path) => {
-            if path.exists() && config.existing_file_action == ExistingFileAction::Abort {
-                Err(errors::Download::FileExists(FileIdentifier::from(file)))
-            } else {
-                Ok(())
-            }
-        }
+    let path = local_name::safe_join(destination, &local_file_name(file, config)?);
 
-        None => Ok(()),
+    // symlink_metadata: a dangling symlink is an existing entry too.
+    if config.existing_file_action == ExistingFileAction::Abort
+        && std::fs::symlink_metadata(&path).is_ok()
+    {
+        Err(errors::Download::FileExists(FileIdentifier::from(file)))
+    } else {
+        Ok(())
+    }
+}
+
+/// The `--overwrite` check for each file of a recursive download.
+async fn err_if_local_file_exists(
+    path: &Path,
+    existing_file_action: ExistingFileAction,
+) -> Result<(), errors::Download> {
+    if existing_file_action == ExistingFileAction::Abort && fs::symlink_metadata(path).await.is_ok()
+    {
+        Err(errors::Download::LocalFileExists(path.to_path_buf()))
+    } else {
+        Ok(())
     }
 }
 
@@ -359,4 +402,132 @@ where
     }
 
     Ok(context.compute())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        err_if_file_exists, err_if_local_file_exists, errors, Config, Destination,
+        ExistingFileAction,
+    };
+    use crate::common::drive_file::{MIME_TYPE_DRIVE_FOLDER, MIME_TYPE_DRIVE_SHORTCUT};
+
+    fn config(destination: &Path, existing_file_action: ExistingFileAction) -> Config {
+        Config {
+            file_id: "file-id".to_string(),
+            existing_file_action,
+            follow_shortcuts: false,
+            download_directories: true,
+            destination: Destination::Path(destination.to_path_buf()),
+        }
+    }
+
+    fn drive_file(name: &str, mime_type: Option<&str>) -> google_drive3::api::File {
+        google_drive3::api::File {
+            id: Some("file-id".to_string()),
+            name: Some(name.to_string()),
+            mime_type: mime_type.map(str::to_string),
+            ..google_drive3::api::File::default()
+        }
+    }
+
+    #[test]
+    fn existing_file_aborts_without_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"old").unwrap();
+        let file = drive_file("a.txt", None);
+
+        let abort = config(dir.path(), ExistingFileAction::Abort);
+        assert!(matches!(
+            err_if_file_exists(&file, &abort),
+            Err(errors::Download::FileExists(_))
+        ));
+
+        let overwrite = config(dir.path(), ExistingFileAction::Overwrite);
+        assert!(err_if_file_exists(&file, &overwrite).is_ok());
+
+        let other = drive_file("b.txt", None);
+        assert!(err_if_file_exists(&other, &abort).is_ok());
+    }
+
+    #[test]
+    fn existing_directory_aborts_recursive_download() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("folder")).unwrap();
+        let folder = drive_file("folder", Some(MIME_TYPE_DRIVE_FOLDER));
+
+        let abort = config(dir.path(), ExistingFileAction::Abort);
+        assert!(matches!(
+            err_if_file_exists(&folder, &abort),
+            Err(errors::Download::FileExists(_))
+        ));
+    }
+
+    #[test]
+    fn existence_check_uses_the_sanitized_name() {
+        let dest = tempfile::tempdir().unwrap();
+        let inner = dest.path().join("inner");
+        std::fs::create_dir(&inner).unwrap();
+        // `../victim` must be checked as `inner/.._victim`, never as `dest/victim`.
+        std::fs::write(dest.path().join("victim"), b"keep").unwrap();
+        let abort = config(&inner, ExistingFileAction::Abort);
+
+        assert!(err_if_file_exists(&drive_file("../victim", None), &abort).is_ok());
+
+        std::fs::write(inner.join(".._victim"), b"").unwrap();
+        assert!(matches!(
+            err_if_file_exists(&drive_file("../victim", None), &abort),
+            Err(errors::Download::FileExists(_))
+        ));
+    }
+
+    #[test]
+    fn unusable_name_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let abort = config(dir.path(), ExistingFileAction::Abort);
+        assert!(matches!(
+            err_if_file_exists(&drive_file("..", None), &abort),
+            Err(errors::Download::UnusableName(_))
+        ));
+    }
+
+    #[test]
+    fn shortcut_is_checked_under_its_target_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("link"), b"").unwrap();
+        let abort = config(dir.path(), ExistingFileAction::Abort);
+        let shortcut = drive_file("link", Some(MIME_TYPE_DRIVE_SHORTCUT));
+        assert!(err_if_file_exists(&shortcut, &abort).is_ok());
+    }
+
+    #[test]
+    fn stdout_destination_skips_the_check() {
+        let mut stdout = config(Path::new("."), ExistingFileAction::Abort);
+        stdout.destination = Destination::Stdout;
+        assert!(err_if_file_exists(&drive_file("..", None), &stdout).is_ok());
+    }
+
+    #[tokio::test]
+    async fn recursive_files_honor_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.txt");
+        std::fs::write(&existing, b"old").unwrap();
+
+        assert!(matches!(
+            err_if_local_file_exists(&existing, ExistingFileAction::Abort).await,
+            Err(errors::Download::LocalFileExists(path)) if path == existing
+        ));
+        assert!(
+            err_if_local_file_exists(&existing, ExistingFileAction::Overwrite)
+                .await
+                .is_ok()
+        );
+        assert!(
+            err_if_local_file_exists(&dir.path().join("new.txt"), ExistingFileAction::Abort)
+                .await
+                .is_ok()
+        );
+    }
 }

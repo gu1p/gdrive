@@ -4,7 +4,7 @@ use std::{
     num::TryFromIntError,
 };
 
-use crate::files;
+use crate::{common::local_name::UnusableName, files};
 
 #[derive(Debug)]
 pub(crate) struct FileTreeDrive(pub(crate) Folder);
@@ -87,6 +87,7 @@ pub(crate) enum Folder {
         identifier: FileIdentifier,
         source: File,
     },
+    UnusableName(UnusableName),
 }
 
 impl Display for Folder {
@@ -102,6 +103,7 @@ impl Display for Folder {
             } => {
                 write!(f, "unable to process file{}", identifier.display())
             }
+            Folder::UnusableName(_) => f.write_str("unable to map a drive name to a local name"),
         }
     }
 }
@@ -112,6 +114,7 @@ impl Error for Folder {
             Folder::MissingFileName | Folder::NotDirectory | Folder::MissingFileId => None,
             Folder::ListFiles(error) => Some(error),
             Folder::File { source, .. } => Some(source),
+            Folder::UnusableName(source) => Some(source),
         }
     }
 }

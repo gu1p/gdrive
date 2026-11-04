@@ -3,18 +3,13 @@
 //! Drive accepts almost any string as a file name: `/`, `..`, control characters, names that
 //! Windows reserves for devices, and names longer than local filesystems allow. Every Drive name
 //! that becomes part of a local path goes through [`local_name`] and is joined with
-//! [`safe_join`], so the result is always a single component directly under its parent.
-
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the download path starts using this module in the following commit"
-    )
-)]
+//! [`safe_join`], so the result is always a single component directly under its parent. The
+//! children of one Drive folder go through [`unique_local_names`], which also keeps two Drive
+//! files with the same name from overwriting each other.
 
 use std::{
     borrow::Cow,
+    collections::{hash_map, HashMap, HashSet},
     error,
     fmt::{self, Display, Formatter},
     path::{Path, PathBuf},
@@ -51,16 +46,118 @@ impl Display for InvalidName {
 
 impl error::Error for InvalidName {}
 
+/// A Drive file whose name cannot be used locally, with the hint to rename it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnusableName {
+    pub(crate) name: String,
+    pub(crate) id: String,
+    pub(crate) source: InvalidName,
+}
+
+impl UnusableName {
+    #[must_use]
+    pub(crate) fn new(name: &str, id: &str, source: InvalidName) -> Self {
+        Self {
+            name: name.to_owned(),
+            id: id.to_owned(),
+            source,
+        }
+    }
+}
+
+impl Display for UnusableName {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "the name '{}' of file {} cannot be used as a local file name, rename it with \
+            `gdrive files rename {} <NEW_NAME>`",
+            printable(&self.name),
+            self.id,
+            self.id,
+        )
+    }
+}
+
+impl error::Error for UnusableName {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// A Drive file that is saved under a different local name, reported as a warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NameChange {
+    /// The Drive name is not a valid local name and was changed by [`local_name`].
+    Sanitized {
+        id: String,
+        drive_name: String,
+        local_name: String,
+    },
+    /// Another file in the same folder (`kept_id`) keeps the local name; this one gets a suffix.
+    Duplicate {
+        id: String,
+        kept_id: String,
+        drive_name: String,
+        local_name: String,
+    },
+}
+
+impl Display for NameChange {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            NameChange::Sanitized {
+                id,
+                drive_name,
+                local_name,
+            } => write!(
+                f,
+                "'{}' (id {id}) is saved as '{local_name}' because the name is not a valid local \
+                file name",
+                printable(drive_name),
+            ),
+            NameChange::Duplicate {
+                id,
+                kept_id,
+                drive_name,
+                local_name,
+            } => write!(
+                f,
+                "'{}' (id {id}) is saved as '{local_name}' because id {kept_id} has the same local \
+                name in this folder",
+                printable(drive_name),
+            ),
+        }
+    }
+}
+
+/// One child of a Drive folder, input of [`unique_local_names`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct NameEntry<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) name: &'a str,
+}
+
+/// Result of [`unique_local_names`]: one name per entry, in input order, and the changes to warn
+/// about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UniqueNames {
+    pub(crate) names: Vec<String>,
+    pub(crate) changes: Vec<NameChange>,
+}
+
 /// Platform behavior that changes which names are safe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rules {
     /// Replace the characters that Windows forbids in file names: `< > : " | ? *`.
     windows_chars: bool,
+    /// Names that differ only in letter case refer to the same file (Windows and macOS defaults).
+    case_insensitive: bool,
 }
 
 impl Rules {
     const HOST: Self = Self {
         windows_chars: cfg!(windows),
+        case_insensitive: cfg!(any(windows, target_os = "macos")),
     };
 }
 
@@ -80,6 +177,84 @@ impl Rules {
 ///    sharing a prefix stay distinct. The extension (from the last `.`, at most 32 bytes) is kept.
 pub(crate) fn local_name(drive_name: &str, file_id: &str) -> Result<String, InvalidName> {
     sanitize(drive_name, file_id, Rules::HOST)
+}
+
+/// Maps the children of one Drive folder to local names that are safe and unique in the folder.
+///
+/// Every name goes through [`local_name`]. Entries whose local names collide (on Windows and
+/// macOS also when they differ only in letter case) are ordered by file id: the first keeps the
+/// name, every other one gets `~` plus 8 hex digits of the MD5 of its file id before the
+/// extension (`report~1a2b3c4d.pdf`), and `-2`, `-3`, ... after that in the unlikely case that
+/// this name is taken too. The result does not depend on the order of `entries`.
+pub(crate) fn unique_local_names(entries: &[NameEntry<'_>]) -> Result<UniqueNames, UnusableName> {
+    unique_local_names_with(entries, Rules::HOST)
+}
+
+fn unique_local_names_with(
+    entries: &[NameEntry<'_>],
+    rules: Rules,
+) -> Result<UniqueNames, UnusableName> {
+    let mut names = entries
+        .iter()
+        .map(|entry| {
+            sanitize(entry.name, entry.id, rules)
+                .map_err(|source| UnusableName::new(entry.name, entry.id, source))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut by_id = (0..entries.len()).collect::<Vec<_>>();
+    by_id.sort_by(|&a, &b| entries[a].id.cmp(entries[b].id).then(a.cmp(&b)));
+
+    // The first entry (by id) with a given local name keeps it.
+    let mut owners = HashMap::new();
+    let mut duplicates = Vec::new();
+    for &index in &by_id {
+        match owners.entry(collision_key(&names[index], rules)) {
+            hash_map::Entry::Vacant(vacant) => {
+                vacant.insert(index);
+            }
+            hash_map::Entry::Occupied(occupied) => duplicates.push((index, *occupied.get())),
+        }
+    }
+
+    let mut taken = owners.into_keys().collect::<HashSet<_>>();
+    let mut kept_by = vec![None; entries.len()];
+    for (index, kept) in duplicates {
+        let id = entries[index].id;
+        // Every attempt yields a different candidate and `taken` is finite, so this ends.
+        let mut attempt = 0;
+        let unique = loop {
+            let candidate = with_tag(&names[index], &duplicate_tag(id, attempt));
+            if taken.insert(collision_key(&candidate, rules)) {
+                break candidate;
+            }
+            attempt += 1;
+        };
+        names[index] = unique;
+        kept_by[index] = Some(kept);
+    }
+
+    let changes = entries
+        .iter()
+        .zip(&names)
+        .zip(&kept_by)
+        .filter(|((entry, name), _)| entry.name != name.as_str())
+        .map(|((entry, name), kept)| match kept {
+            Some(kept) => NameChange::Duplicate {
+                id: entry.id.to_owned(),
+                kept_id: entries[*kept].id.to_owned(),
+                drive_name: entry.name.to_owned(),
+                local_name: name.clone(),
+            },
+            None => NameChange::Sanitized {
+                id: entry.id.to_owned(),
+                drive_name: entry.name.to_owned(),
+                local_name: name.clone(),
+            },
+        })
+        .collect();
+
+    Ok(UniqueNames { names, changes })
 }
 
 /// Joins `component` to `base` so that the result is always directly under `base`.
@@ -178,6 +353,43 @@ fn id_tag(file_id: &str) -> String {
     format!("~{}", &hash[..ID_TAG_HEX_DIGITS])
 }
 
+/// [`id_tag`], then `-2`, `-3`, ... for the following attempts.
+fn duplicate_tag(file_id: &str, attempt: u32) -> String {
+    let tag = id_tag(file_id);
+    if attempt == 0 {
+        tag
+    } else {
+        format!("{tag}-{}", attempt + 1)
+    }
+}
+
+fn collision_key(name: &str, rules: Rules) -> String {
+    if rules.case_insensitive {
+        name.to_lowercase()
+    } else {
+        name.to_owned()
+    }
+}
+
+/// `name` with control characters escaped, safe to print to a terminal.
+fn printable(name: &str) -> Cow<'_, str> {
+    if name.chars().any(char::is_control) {
+        Cow::Owned(
+            name.chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_default().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(name)
+    }
+}
+
 /// Inserts `tag` before the extension of `name`, shortening the stem so that the result fits in
 /// [`MAX_COMPONENT_BYTES`].
 fn with_tag(name: &str, tag: &str) -> String {
@@ -213,15 +425,17 @@ mod tests {
     use std::path::{Component, Path};
 
     use super::{
-        id_tag, local_name, safe_join, safe_join_with, sanitize, InvalidName, Rules,
-        MAX_COMPONENT_BYTES,
+        id_tag, local_name, safe_join, safe_join_with, sanitize, unique_local_names_with,
+        InvalidName, NameChange, NameEntry, Rules, UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
     };
 
     const UNIX: Rules = Rules {
         windows_chars: false,
+        case_insensitive: false,
     };
     const WINDOWS: Rules = Rules {
         windows_chars: true,
+        case_insensitive: true,
     };
 
     fn unix(name: &str) -> String {
@@ -478,5 +692,151 @@ mod tests {
             assert_eq!(safe_join(base, &local).parent(), Some(base));
             assert_eq!(safe_join(base, &local), base.join(&local));
         }
+    }
+
+    fn entries<'a>(pairs: &[(&'a str, &'a str)]) -> Vec<NameEntry<'a>> {
+        pairs
+            .iter()
+            .map(|&(id, name)| NameEntry { id, name })
+            .collect()
+    }
+
+    fn unique(pairs: &[(&str, &str)], rules: Rules) -> UniqueNames {
+        unique_local_names_with(&entries(pairs), rules).unwrap()
+    }
+
+    #[test]
+    fn unique_names_without_collisions_are_unchanged() {
+        let result = unique(&[("1", "a.pdf"), ("2", "b.pdf"), ("3", "dir")], UNIX);
+        assert_eq!(result.names, ["a.pdf", "b.pdf", "dir"]);
+        assert_eq!(result.changes, []);
+    }
+
+    #[test]
+    fn duplicates_keep_first_by_id_and_suffix_the_rest() {
+        // md5("abc") = 900150983cd24fb0..., md5("abd") = 4911e516e5aa21d3...
+        let result = unique(&[("abd", "a.pdf"), ("abc", "a.pdf")], UNIX);
+        assert_eq!(result.names, ["a~4911e516.pdf", "a.pdf"]);
+        assert_eq!(
+            result.changes,
+            [NameChange::Duplicate {
+                id: "abd".to_owned(),
+                kept_id: "abc".to_owned(),
+                drive_name: "a.pdf".to_owned(),
+                local_name: "a~4911e516.pdf".to_owned(),
+            }]
+        );
+        let warning = result.changes[0].to_string();
+        assert!(
+            warning.contains("abd") && warning.contains("abc"),
+            "{warning}"
+        );
+    }
+
+    #[test]
+    fn duplicate_mapping_does_not_depend_on_listing_order() {
+        let forward = [("id1", "x"), ("id2", "x"), ("id3", "x"), ("id4", "y")];
+        let mut backward = forward;
+        backward.reverse();
+
+        let forward_result = unique(&forward, UNIX);
+        let backward_result = unique(&backward, UNIX);
+
+        let mut forward_pairs = forward
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(forward_result.names)
+            .collect::<Vec<_>>();
+        let mut backward_pairs = backward
+            .iter()
+            .map(|(id, _)| *id)
+            .zip(backward_result.names)
+            .collect::<Vec<_>>();
+        forward_pairs.sort();
+        backward_pairs.sort();
+        assert_eq!(forward_pairs, backward_pairs);
+
+        assert_eq!(forward_pairs[0], ("id1", "x".to_owned()));
+        assert_eq!(forward_pairs[3], ("id4", "y".to_owned()));
+        assert_ne!(forward_pairs[1].1, forward_pairs[2].1);
+    }
+
+    #[test]
+    fn names_that_collide_after_sanitizing_are_deduplicated() {
+        let result = unique(&[("2", "a/b"), ("1", "a_b")], UNIX);
+        assert_eq!(result.names[1], "a_b");
+        assert_ne!(result.names[0], "a_b");
+        assert!(result.names[0].starts_with("a_b~"));
+        assert!(matches!(
+            result.changes.as_slice(),
+            [NameChange::Duplicate { id, kept_id, .. }] if id == "2" && kept_id == "1"
+        ));
+    }
+
+    #[test]
+    fn files_and_folders_share_one_namespace() {
+        // A folder `data` and a file `data` cannot both exist in one local directory.
+        let result = unique(&[("folder", "data"), ("file", "data")], UNIX);
+        assert_eq!(result.names[0], format!("data{}", id_tag("folder")));
+        assert_eq!(result.names[1], "data");
+    }
+
+    #[test]
+    fn case_collisions_depend_on_platform() {
+        let pairs = [("1", "Report.pdf"), ("2", "report.pdf")];
+        assert_eq!(unique(&pairs, UNIX).names, ["Report.pdf", "report.pdf"]);
+
+        let insensitive = unique(&pairs, WINDOWS);
+        assert_eq!(insensitive.names[0], "Report.pdf");
+        assert_eq!(insensitive.names[1], format!("report{}.pdf", id_tag("2")));
+    }
+
+    #[test]
+    fn suffixed_name_that_is_taken_gets_counter() {
+        let tagged = format!("a{}.pdf", id_tag("2"));
+        let result = unique(&[("1", "a.pdf"), ("2", "a.pdf"), ("0", &tagged)], UNIX);
+        assert_eq!(result.names[0], "a.pdf");
+        assert_eq!(result.names[2], tagged);
+        assert_eq!(result.names[1], format!("a{}-2.pdf", id_tag("2")));
+    }
+
+    #[test]
+    fn long_duplicates_stay_within_limit() {
+        let name = format!("{}.txt", "n".repeat(250));
+        let result = unique(&[("1", &name), ("2", &name)], UNIX);
+        assert_ne!(result.names[0], result.names[1]);
+        for local in &result.names {
+            assert!(local.len() <= MAX_COMPONENT_BYTES);
+            assert_eq!(&local[local.len() - 4..], ".txt");
+        }
+    }
+
+    #[test]
+    fn sanitized_names_are_reported() {
+        let result = unique(&[("1", "a/b"), ("2", "ok")], UNIX);
+        assert_eq!(
+            result.changes,
+            [NameChange::Sanitized {
+                id: "1".to_owned(),
+                drive_name: "a/b".to_owned(),
+                local_name: "a_b".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn unusable_names_fail_the_folder() {
+        let err = unique_local_names_with(&entries(&[("1", "ok"), ("2", "..")]), UNIX).unwrap_err();
+        assert_eq!(err, UnusableName::new("..", "2", InvalidName::ParentDir));
+        let message = err.to_string();
+        assert!(message.contains("gdrive files rename 2"), "{message}");
+    }
+
+    #[test]
+    fn warnings_escape_control_characters() {
+        let result = unique(&[("1", "evil\u{1b}[2Jname")], UNIX);
+        let warning = result.changes[0].to_string();
+        assert!(!warning.contains('\u{1b}'), "{warning}");
+        assert!(warning.contains("\\u{1b}"), "{warning}");
     }
 }
