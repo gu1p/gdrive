@@ -15,12 +15,12 @@ use super::retry::RetryPolicy;
 use crate::transfer::upload::{UploadOptions, DEFAULT_MULTIPART_THRESHOLD};
 
 /// The configuration of `files::upload::upload_file`, which uploads through
-/// [`transfer::upload::upload_reader`](crate::transfer::upload::upload_reader) with the default
-/// multipart threshold. New callers use `transfer::upload::upload_path` with
-/// [`UploadOptions`].
+/// [`transfer::upload::upload_reader`](crate::transfer::upload::upload_reader). New callers use
+/// `transfer::upload::upload_path` with [`UploadOptions`].
 #[derive(Debug, Clone, Default)]
 pub(crate) struct UploadDelegateConfig {
     pub(crate) chunk_size: ChunkSize,
+    pub(crate) multipart_threshold: MultipartThreshold,
     /// The budget of one upload; a chunk the server accepts starts a new one.
     pub(crate) retry_policy: RetryPolicy,
     pub(crate) print_chunk_errors: bool,
@@ -28,12 +28,13 @@ pub(crate) struct UploadDelegateConfig {
 }
 
 impl UploadDelegateConfig {
-    /// The uploader's options for this configuration: its chunk size and messages, the default
-    /// multipart threshold, md5 verification, no session records.
+    /// The uploader's options for this configuration: its chunk size, multipart threshold and
+    /// messages, md5 verification, no session records.
     #[must_use]
     pub(crate) fn options(&self) -> UploadOptions {
         UploadOptions {
             chunk_size: self.chunk_size.in_bytes(),
+            multipart_threshold: self.multipart_threshold.in_bytes(),
             print_chunk_errors: self.print_chunk_errors,
             print_chunk_info: self.print_chunk_info,
             ..UploadOptions::default()
@@ -214,15 +215,19 @@ mod tests {
     }
 
     #[test]
-    fn upload_file_keeps_its_chunk_size_and_messages() {
+    fn upload_file_keeps_its_chunk_size_threshold_and_messages() {
+        let options = UploadDelegateConfig::default().options();
+        assert_eq!(options.multipart_threshold, 5 << 20);
+
         let options = UploadDelegateConfig {
             chunk_size: ChunkSize::Approx8,
+            multipart_threshold: "1".parse().unwrap(),
             print_chunk_info: true,
             ..UploadDelegateConfig::default()
         }
         .options();
         assert_eq!(options.chunk_size, 8 << 20);
-        assert_eq!(options.multipart_threshold, 5 << 20);
+        assert_eq!(options.multipart_threshold, 1 << 20);
         assert!(options.print_chunk_info && !options.print_chunk_errors);
         assert!(options.verify_md5);
         assert_eq!(options.session_dir, None);

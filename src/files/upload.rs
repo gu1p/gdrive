@@ -84,6 +84,7 @@ impl Config {
             file_path,
             UploadDelegateConfig {
                 chunk_size,
+                multipart_threshold,
                 // Bounded: a chunk the server accepts starts a new budget, so a long upload
                 // survives many transient errors, but a dead connection ends it (it used to be
                 // 100,000 retries).
@@ -354,8 +355,8 @@ async fn upload_directory(
 }
 
 /// Uploads `src_file` as a new file with the pre-generated id `file_id`, if given, through
-/// gdrive's uploader (multipart up to 5 MiB, resumable above, md5 checked; sessions are not kept
-/// across runs). The content is all of `src_file`, measured when the upload starts, not
+/// gdrive's uploader (multipart up to the configured threshold, resumable above, md5 checked;
+/// sessions are not kept across runs). The content is all of `src_file`, measured when the upload starts, not
 /// `file_info.size` (which may be older); a size change during the upload is an error. A `file_info.source_mime_type` makes it a
 /// conversion to `file_info.mime_type`. Errors are google-drive3's, as they were when
 /// google-drive3 made the upload (see [`UploadError::into_drive_error`]).
@@ -469,11 +470,11 @@ impl Display for Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{borrow::Cow, io::Cursor};
+    use std::{borrow::Cow, io::Cursor, path::PathBuf};
 
     use serde_json::json;
 
-    use super::upload_file;
+    use super::{upload_file, Config};
     use crate::common::{
         delegate::UploadDelegateConfig,
         file_info::FileInfo,
@@ -526,6 +527,63 @@ mod tests {
             "{body}"
         );
         assert!(body.contains("\r\n\r\nhello\r\n"), "{body}");
+    }
+
+    /// `files upload --recursive --multipart-threshold 0 --chunk-size 1`: the configuration
+    /// the recursive upload gets.
+    fn recursive_config() -> UploadDelegateConfig {
+        let (_, _, delegate_config, _) = Config {
+            file_path: Some(PathBuf::from("dir")),
+            mime_type: None,
+            parents: None,
+            chunk_size: "1".parse().unwrap(),
+            multipart_threshold: "0".parse().unwrap(),
+            print_chunk_errors: false,
+            print_chunk_info: false,
+            upload_directories: true,
+            print_only_id: false,
+        }
+        .split();
+        delegate_config
+    }
+
+    #[test]
+    fn the_recursive_upload_gets_the_selected_threshold() {
+        let options = recursive_config().options();
+        assert_eq!(options.multipart_threshold, 0);
+        assert_eq!(options.chunk_size, 1 << 20);
+    }
+
+    #[tokio::test]
+    async fn upload_file_follows_the_selected_threshold() {
+        // A 5-byte file is resumable with a threshold of 0.
+        let content = b"hello";
+        let server = MockServer::start(vec![
+            Response::json(200, &json!({})).with_header("Location", "{root}upload-session"),
+            Response::json(
+                200,
+                &json!({
+                    "id": "pre-id",
+                    "size": "5",
+                    "md5Checksum": format!("{:x}", md5::compute(content)),
+                }),
+            ),
+        ])
+        .await;
+
+        upload_file(
+            &server.hub(),
+            Cursor::new(content.to_vec()),
+            Some(String::from("pre-id")),
+            file_info(5),
+            &recursive_config(),
+        )
+        .await
+        .unwrap();
+
+        let requests = server.requests();
+        assert_eq!(requests[0].query_param("uploadType"), Some("resumable"));
+        assert_eq!(requests[1].header("content-range"), Some("bytes 0-4/5"));
     }
 
     /// The recursive upload measures its files while it discovers them, earlier than it uploads
