@@ -132,7 +132,7 @@ fn root_local_name(name: &str, file_id: &str) -> Result<String, errors::Folder> 
     let local_name = local_name::local_name(name, file_id)
         .map_err(|source| errors::Folder::UnusableName(UnusableName::new(name, file_id, source)))?;
 
-    if local_name != name {
+    if local_name::is_renamed(name, &local_name) {
         let change = NameChange::Sanitized {
             id: file_id.to_owned(),
             drive_name: name.to_owned(),

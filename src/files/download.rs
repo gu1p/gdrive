@@ -407,7 +407,7 @@ fn warn_if_renamed(file: &google_drive3::api::File, config: &Config, local_name:
         return;
     };
 
-    if name != local_name {
+    if local_name::is_renamed(name, local_name) {
         let change = NameChange::Sanitized {
             id: file.id.clone().unwrap_or_else(|| config.file_id.clone()),
             drive_name: name.to_owned(),

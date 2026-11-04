@@ -15,6 +15,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use unicode_normalization::{is_nfc, UnicodeNormalization};
+
 /// Longest path component, in bytes, that common local filesystems accept.
 pub(crate) const MAX_COMPONENT_BYTES: usize = 255;
 
@@ -168,6 +170,9 @@ impl Rules {
 /// Maps the Drive name of the file `file_id` to a safe single local path component.
 ///
 /// The rules, applied in this order:
+/// 0. The name is converted to Unicode NFC (canonical composition): `e` followed by a combining
+///    acute accent becomes `é`. macOS treats both spellings as one file name, and the 255-byte
+///    limit below applies to the NFC form that is written.
 /// 1. An empty name, `.` and `..` are rejected.
 /// 2. `/`, `\`, NUL and every other control character (Unicode category Cc) become `_`. On
 ///    Windows, `< > : " | ? *` become `_` too.
@@ -188,11 +193,12 @@ pub(crate) fn local_name(drive_name: &str, file_id: &str) -> Result<String, Inva
 
 /// Maps the children of one Drive folder to local names that are safe and unique in the folder.
 ///
-/// Every name goes through [`local_name`]. Entries whose local names collide (on Windows and
-/// macOS also when they differ only in letter case) are ordered by file id: the first keeps the
-/// name, every other one gets `~` plus 8 hex digits of the MD5 of its file id before the
-/// extension (`report~1a2b3c4d.pdf`), and `-2`, `-3`, ... after that in the unlikely case that
-/// this name is taken too. The result does not depend on the order of `entries`.
+/// Every name goes through [`local_name`], so names are compared in NFC. Entries whose local
+/// names collide (on Windows and macOS also when they differ only in letter case) are ordered by
+/// file id: the first keeps the name, every other one gets `~` plus 8 hex digits of the MD5 of
+/// its file id before the extension (`report~1a2b3c4d.pdf`), and `-2`, `-3`, ... after that in
+/// the unlikely case that this name is taken too. The result does not depend on the order of
+/// `entries`. A name that only changed by NFC normalization is not reported as a change.
 pub(crate) fn unique_local_names(entries: &[NameEntry<'_>]) -> Result<UniqueNames, UnusableName> {
     unique_local_names_with(entries, Rules::HOST)
 }
@@ -245,7 +251,7 @@ fn unique_local_names_with(
         .iter()
         .zip(&names)
         .zip(&kept_by)
-        .filter(|((entry, name), _)| entry.name != name.as_str())
+        .filter(|((entry, name), _)| is_renamed(entry.name, name))
         .map(|((entry, name), kept)| match kept {
             Some(kept) => NameChange::Duplicate {
                 id: entry.id.to_owned(),
@@ -318,15 +324,22 @@ fn safe_join_with(base: &Path, component: &str, rules: Rules) -> PathBuf {
     base.join(component.as_ref())
 }
 
+/// Whether the local name differs from the Drive name by more than NFC normalization.
+#[must_use]
+pub(crate) fn is_renamed(drive_name: &str, local_name: &str) -> bool {
+    to_nfc(drive_name) != local_name
+}
+
 fn sanitize(name: &str, file_id: &str, rules: Rules) -> Result<String, InvalidName> {
-    match name {
+    let name = to_nfc(name);
+    match name.as_ref() {
         "" => return Err(InvalidName::Empty),
         "." => return Err(InvalidName::CurrentDir),
         ".." => return Err(InvalidName::ParentDir),
         _ => {}
     }
 
-    let mut name = replace_chars(name, rules).into_owned();
+    let mut name = replace_chars(&name, rules).into_owned();
 
     if let Some(stem_end) = reserved_device_stem_end(&name) {
         name.insert(stem_end, REPLACEMENT);
@@ -409,9 +422,19 @@ fn duplicate_tag(file_id: &str, attempt: u32) -> String {
     }
 }
 
+fn to_nfc(name: &str) -> Cow<'_, str> {
+    if is_nfc(name) {
+        Cow::Borrowed(name)
+    } else {
+        Cow::Owned(name.nfc().collect())
+    }
+}
+
+/// `name` is already in NFC (it comes from [`sanitize`] or [`with_tag`]); lowercasing can leave
+/// NFC, so the case-folded key is normalized again.
 fn collision_key(name: &str, rules: Rules) -> String {
     if rules.case_insensitive {
-        name.to_lowercase()
+        to_nfc(&name.to_lowercase()).into_owned()
     } else {
         name.to_owned()
     }
@@ -470,8 +493,10 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 mod tests {
     use std::path::{Component, Path};
 
+    use unicode_normalization::is_nfc;
+
     use super::{
-        id_tag, is_reserved_temp_name, local_name, safe_join, safe_join_with, sanitize,
+        id_tag, is_renamed, is_reserved_temp_name, local_name, safe_join, safe_join_with, sanitize,
         temp_file_name, unique_local_names_with, InvalidName, NameChange, NameEntry, Rules,
         UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
     };
@@ -622,7 +647,8 @@ mod tests {
 
     #[test]
     fn truncation_respects_multibyte_boundaries() {
-        for unit in ["é", "日", "😀", "e\u{301}"] {
+        // `q` plus a combining accent has no precomposed form, so it stays two characters.
+        for unit in ["é", "日", "😀", "q\u{301}"] {
             let name = format!("{}.txt", unit.repeat(200));
             let local = sanitize(&name, "abc", UNIX).unwrap();
             assert!(
@@ -969,5 +995,77 @@ mod tests {
             .names
             .iter()
             .all(|local| !is_reserved_temp_name(local)));
+    }
+
+    const E_ACUTE_NFC: &str = "\u{e9}";
+    const E_ACUTE_NFD: &str = "e\u{301}";
+    const CAPITAL_E_ACUTE_NFC: &str = "\u{c9}";
+
+    #[test]
+    fn local_names_are_nfc() {
+        assert_eq!(unix(&format!("caf{E_ACUTE_NFD}.txt")), "caf\u{e9}.txt");
+        assert_eq!(unix(&format!("caf{E_ACUTE_NFC}.txt")), "caf\u{e9}.txt");
+        // Hangul jamo compose to a syllable.
+        assert_eq!(unix("\u{1100}\u{1161}"), "\u{ac00}");
+        assert!(is_nfc(&unix(&format!("{E_ACUTE_NFD}/x"))));
+    }
+
+    #[test]
+    fn normalization_variants_collide() {
+        let nfc = format!("{E_ACUTE_NFC}.txt");
+        let nfd = format!("{E_ACUTE_NFD}.txt");
+        for rules in [UNIX, WINDOWS] {
+            let result = unique(&[("1", &nfc), ("2", &nfd)], rules);
+            assert_eq!(result.names[0], nfc);
+            assert_eq!(result.names[1], format!("{E_ACUTE_NFC}{}.txt", id_tag("2")));
+            assert!(matches!(
+                result.changes.as_slice(),
+                [NameChange::Duplicate { id, kept_id, .. }] if id == "2" && kept_id == "1"
+            ));
+        }
+    }
+
+    #[test]
+    fn case_and_normalization_variants_collide_where_case_insensitive() {
+        let upper_nfc = format!("{CAPITAL_E_ACUTE_NFC}.txt");
+        let lower_nfd = format!("{E_ACUTE_NFD}.txt");
+        let pairs = [("1", upper_nfc.as_str()), ("2", lower_nfd.as_str())];
+
+        let sensitive = unique(&pairs, UNIX);
+        assert_eq!(
+            sensitive.names,
+            [upper_nfc.clone(), format!("{E_ACUTE_NFC}.txt")]
+        );
+
+        let insensitive = unique(&pairs, WINDOWS);
+        assert_eq!(insensitive.names[0], upper_nfc);
+        assert_eq!(
+            insensitive.names[1],
+            format!("{E_ACUTE_NFC}{}.txt", id_tag("2"))
+        );
+    }
+
+    #[test]
+    fn length_limit_applies_to_nfc() {
+        // 300 bytes in NFD, 200 bytes in NFC: fits, no suffix.
+        let short_nfc = unix(&E_ACUTE_NFD.repeat(100));
+        assert_eq!(short_nfc, E_ACUTE_NFC.repeat(100));
+
+        // 402 bytes in NFD, 268 bytes in NFC: shortened, and still NFC.
+        let long = sanitize(&E_ACUTE_NFD.repeat(134), "abc", UNIX).unwrap();
+        assert!(long.len() <= MAX_COMPONENT_BYTES);
+        assert!(long.ends_with("~90015098"), "{long}");
+        assert!(is_nfc(&long));
+    }
+
+    #[test]
+    fn normalization_alone_is_not_a_reported_change() {
+        let nfd = format!("{E_ACUTE_NFD}.txt");
+        let result = unique(&[("1", &nfd)], UNIX);
+        assert_eq!(result.names, [format!("{E_ACUTE_NFC}.txt")]);
+        assert_eq!(result.changes, []);
+
+        assert!(!is_renamed(&nfd, &result.names[0]));
+        assert!(is_renamed("a/b", "a_b"));
     }
 }
