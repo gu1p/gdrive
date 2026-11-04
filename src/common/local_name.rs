@@ -199,6 +199,12 @@ pub(crate) fn local_name(drive_name: &str, file_id: &str) -> Result<String, Inva
 /// its file id before the extension (`report~1a2b3c4d.pdf`), and `-2`, `-3`, ... after that in
 /// the unlikely case that this name is taken too. The result does not depend on the order of
 /// `entries`. A name that only changed by NFC normalization is not reported as a change.
+///
+/// Limitation: the assignment is computed from the current listing only and is not persisted.
+/// If a file with a colliding name and a lower id appears on Drive between two runs, it takes the
+/// plain name and a file downloaded earlier under that name gets a suffix on the next run.
+// TODO(manifest): persist the Drive id to local name assignments with the transfer engine and
+// sync work (milestone 2), so that a file keeps its local name across runs.
 pub(crate) fn unique_local_names(entries: &[NameEntry<'_>]) -> Result<UniqueNames, UnusableName> {
     unique_local_names_with(entries, Rules::HOST)
 }
