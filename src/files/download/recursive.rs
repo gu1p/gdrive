@@ -33,7 +33,10 @@ use std::{
     collections::VecDeque,
     future::Future,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, PoisonError},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, PoisonError,
+    },
 };
 
 use futures::{stream, Stream, StreamExt};
@@ -84,17 +87,19 @@ pub(super) async fn download_directory(
     let walk = Walk::start(Arc::new(hub.clone()), root, walk_options);
 
     let totals = Arc::new(Mutex::new(None));
+    let files = Arc::new(Files {
+        hub: hub.clone(),
+        root_path,
+        existing_file_action: config.existing_file_action,
+        acknowledge_abuse: config.acknowledge_abuse,
+        exports: ExportCounts::default(),
+    });
     let source = Source {
         walk: Some(walk),
         actions: tree.take_actions().into(),
         tree,
         printer: printer.clone(),
-        files: Arc::new(Files {
-            hub: hub.clone(),
-            root_path,
-            existing_file_action: config.existing_file_action,
-            acknowledge_abuse: config.acknowledge_abuse,
-        }),
+        files: Arc::clone(&files),
         totals: Arc::clone(&totals),
     };
     let report = Scheduler::new(config.transfer, printer.clone())
@@ -102,13 +107,22 @@ pub(super) async fn download_directory(
         .await;
 
     let totals = totals.lock().unwrap_or_else(PoisonError::into_inner).take();
-    finish(&report, totals, config.transfer.continue_on_error, printer).await
+    let exports = files.exports.snapshot();
+    finish(
+        &report,
+        totals,
+        exports,
+        config.transfer.continue_on_error,
+        printer,
+    )
+    .await
 }
 
 /// Prints the end of a recursive download and tells whether it failed.
 async fn finish(
     report: &Report,
     totals: Option<Totals>,
+    exports: ExportTotals,
     continue_on_error: bool,
     printer: &Printer,
 ) -> Result<(), errors::Download> {
@@ -127,10 +141,15 @@ async fn finish(
                 human_size(totals.bytes)
             ))
             .await;
-        if totals.exports > 0 {
-            printer
-                .out(format!("Exported {}", google_docs(totals.exports)))
-                .await;
+        if exports.exported > 0 || exports.unchanged > 0 {
+            let exported = google_docs(exports.exported);
+            let line = match exports.unchanged {
+                0 => format!("Exported {exported}"),
+                unchanged => {
+                    format!("Exported {exported}; {unchanged} unchanged, not exported again")
+                }
+            };
+            printer.out(line).await;
         }
     }
     let documents = report.skipped(SkipReason::GoogleDocument);
@@ -273,6 +292,40 @@ struct Files {
     root_path: PathBuf,
     existing_file_action: ExistingFileAction,
     acknowledge_abuse: bool,
+    exports: ExportCounts,
+}
+
+/// How the export jobs ended so far, for the last line of the download.
+#[derive(Debug, Default)]
+struct ExportCounts {
+    exported: AtomicU64,
+    unchanged: AtomicU64,
+}
+
+impl ExportCounts {
+    fn record(&self, outcome: &Outcome) {
+        let count = match outcome {
+            Outcome::Transferred { .. } => &self.exported,
+            Outcome::Unchanged => &self.unchanged,
+            Outcome::Skipped { .. } | Outcome::Failed { .. } | Outcome::Cancelled => return,
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read once every job has ended.
+    fn snapshot(&self) -> ExportTotals {
+        ExportTotals {
+            exported: self.exported.load(Ordering::Relaxed),
+            unchanged: self.unchanged.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// The exports of a finished download: transferred, and found unchanged.
+#[derive(Debug, Clone, Copy, Default)]
+struct ExportTotals {
+    exported: u64,
+    unchanged: u64,
 }
 
 impl Files {
@@ -374,7 +427,10 @@ impl Files {
         context: &JobContext,
     ) -> Outcome {
         match self.try_export(&export, partial, context).await {
-            Ok(outcome) => outcome,
+            Ok(outcome) => {
+                self.exports.record(&outcome);
+                outcome
+            }
             Err(source) => Outcome::failed(errors::Download::RecursiveExport {
                 path: export.path,
                 source: Box::new(source),

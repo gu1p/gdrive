@@ -1047,6 +1047,11 @@ async fn an_unchanged_export_is_not_exported_again() {
                 summary,
                 "Summary: 1 transferred (1 B), 1 unchanged, 0 skipped, 0 failed, 0 cancelled"
             );
+            // Completed exports, not found ones.
+            assert_eq!(
+                again.out.lines().last().unwrap(),
+                "Exported 1 Google Docs file; 1 unchanged, not exported again"
+            );
         } else {
             // The undated export exists and cannot be told unchanged.
             assert_eq!(
