@@ -16,6 +16,11 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+    ignore:
+      # Vendored under vendor/ with gdrive's resumable-upload fixes and
+      # applied through [patch.crates-io]; it is updated by hand, together
+      # with google-drive3, and the fixes re-applied.
+      - dependency-name: google-apis-common
     commit-message:
       prefix: build
 
