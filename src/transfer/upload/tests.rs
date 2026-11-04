@@ -1603,3 +1603,49 @@ async fn a_trusted_continued_session_is_not_read_again_to_hash_it() {
         source.offsets
     );
 }
+
+/// The content [`test_data`] has at `offset`.
+fn expected_test_data(offset: u64, buf: &mut [u8]) {
+    for (at, byte) in (offset..).zip(buf.iter_mut()) {
+        *byte = u8::try_from((at * 7 + at / 4096) % 251).expect("below 251");
+    }
+}
+
+#[tokio::test]
+async fn a_checking_mock_compares_the_content_instead_of_keeping_it() {
+    let mock = MockDrive::start_checking(Faults::default(), expected_test_data).await;
+    let hub = mock.hub();
+    let policy = RetryPolicy::for_tests();
+    let data = test_data(SIZE);
+
+    let file = upload_reader(&hub, Cursor::new(data), &target(), &options(), policy, None)
+        .await
+        .unwrap_or_else(|error| panic!("{error}\n{}", mock.log()));
+
+    let mut other = test_data(SIZE);
+    other[usize::try_from(3 * CHUNK + 10).unwrap()] ^= 1;
+    upload_reader(
+        &hub,
+        Cursor::new(other),
+        &target(),
+        &options(),
+        policy,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let state = mock.state();
+    assert_eq!(state.sessions[0].first_mismatch, None);
+    assert_eq!(state.sessions[0].committed, SIZE);
+    assert!(state.sessions[0].received.is_empty(), "nothing is kept");
+    assert!(state
+        .session_log()
+        .iter()
+        .all(|request| request.body.is_empty()));
+    let stored = &state.files[file.id.as_deref().unwrap()];
+    assert_eq!(stored.checked_size, Some(SIZE));
+    assert_eq!(file.size, Some(i64::try_from(SIZE).unwrap()));
+    assert_eq!(file.md5_checksum, None, "no md5 without the content");
+    assert_eq!(state.sessions[1].first_mismatch, Some(3 * CHUNK + 10));
+}

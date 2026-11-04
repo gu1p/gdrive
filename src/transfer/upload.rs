@@ -36,7 +36,7 @@
 
 mod body;
 #[cfg(test)]
-mod mock_drive;
+pub(crate) mod mock_drive;
 pub(crate) mod session;
 #[cfg(test)]
 mod tests;
