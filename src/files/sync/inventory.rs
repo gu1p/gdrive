@@ -92,6 +92,34 @@ pub(crate) struct LocalNode {
     pub(crate) kind: LocalKind,
 }
 
+/// A local file as it was read: its size, modification time and identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FileState {
+    pub(crate) size: u64,
+    pub(crate) modified: Option<SystemTime>,
+    pub(crate) id: Option<FileId>,
+}
+
+impl FileState {
+    #[must_use]
+    pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
+        FileState {
+            size: metadata.len(),
+            modified: metadata.modified().ok(),
+            id: FileId::of(metadata),
+        }
+    }
+
+    /// Whether `other` is this file as it was: same size and time, and the same identity where
+    /// it is known.
+    #[must_use]
+    pub(crate) fn same(&self, other: &FileState) -> bool {
+        self.size == other.size
+            && self.modified == other.modified
+            && FileId::same(self.id, other.id)
+    }
+}
+
 /// What identifies a local file or directory while it exists: its device and inode on Unix.
 /// Elsewhere it is unknown (`None`), and only the type, size and modification time are compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

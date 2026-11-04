@@ -54,8 +54,8 @@ use chrono::{DateTime, Utc};
 use unicode_normalization::UnicodeNormalization;
 
 use super::inventory::{
-    same_time, FileId, Inventory, Listing, LocalKind, LocalNode, RemoteFolder, RemoteKind,
-    RemoteNode, LOCAL_TRASH,
+    same_time, FileId, FileState, Inventory, Listing, LocalKind, LocalNode, RemoteFolder,
+    RemoteKind, RemoteNode, LOCAL_TRASH,
 };
 use crate::{
     common::{
@@ -215,12 +215,18 @@ pub(crate) enum FileWork {
     },
 }
 
-/// Set the modification time of the local file `path` to Drive's `modified`.
+/// Set the modification time of the local file `path` to Drive's `modified`, if it is still the
+/// file that was read for its md5.
 #[derive(Debug, Clone)]
 pub(crate) struct Touch {
     pub(crate) path: PathBuf,
     pub(crate) modified: DateTime<Utc>,
+    /// The file as it was read; `None` until it was.
+    pub(crate) read: Option<FileState>,
 }
+
+/// The md5 of a local file, and the file as it was read.
+pub(crate) type Digest = io::Result<(md5::Digest, FileState)>;
 
 /// A deletion candidate.
 #[derive(Debug, Clone)]
@@ -300,7 +306,7 @@ impl Plan {
     /// returned with the items' labels.
     pub(crate) fn resolve(
         &mut self,
-        mut digests: Vec<Option<io::Result<md5::Digest>>>,
+        mut digests: Vec<Option<Digest>>,
     ) -> Vec<(String, PathBuf, io::Error)> {
         let mut errors = Vec::new();
         resolve_items(&mut self.items, &self.compares, &mut digests, &mut errors);
@@ -311,7 +317,7 @@ impl Plan {
 fn resolve_items(
     items: &mut [Item],
     compares: &[(PathBuf, md5::Digest)],
-    digests: &mut [Option<io::Result<md5::Digest>>],
+    digests: &mut [Option<Digest>],
     errors: &mut Vec<(String, PathBuf, io::Error)>,
 ) {
     for item in items {
@@ -330,7 +336,12 @@ fn resolve_items(
                     continue;
                 };
                 item.work = match result {
-                    Some(Ok(digest)) if digest == *expected => Work::Unchanged(touch),
+                    Some(Ok((digest, read))) if digest == *expected => {
+                        Work::Unchanged(touch.map(|touch| Touch {
+                            read: Some(read),
+                            ..touch
+                        }))
+                    }
                     Some(Ok(_)) => Work::Update(differ),
                     Some(Err(error)) => {
                         errors.push((item.label.clone(), path.clone(), error));
@@ -820,6 +831,7 @@ impl Builder<'_> {
                 let touch = modified.map(|modified| Touch {
                     path: local.path.clone(),
                     modified,
+                    read: None,
                 });
                 match md5 {
                     Some(md5) => self.compare(local, *md5, differ, touch),

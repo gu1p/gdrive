@@ -957,3 +957,53 @@ async fn the_suffixed_exports_of_duplicate_documents_are_never_deleted() {
 async fn server_of(files: Vec<FakeFile>) -> FakeDrive {
     FakeDrive::start(files, Behavior::default()).await
 }
+
+#[tokio::test]
+async fn a_file_edited_after_its_md5_was_compared_keeps_its_time() {
+    // One transfer at a time: `same.txt`, unchanged by md5, gets Drive's time only after the
+    // download of `a.bin`, which the test holds while it edits `same.txt`.
+    let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+    let behavior = Behavior {
+        content_gate: Some(std::sync::Arc::clone(&gate)),
+        ..Behavior::default()
+    };
+    let files = drive(vec![
+        FakeFile::blob("a", "a.bin", "root", "a"),
+        FakeFile::blob("same", "same.txt", "root", "same").modified("2024-05-06T07:08:09.123Z"),
+    ]);
+    let server = FakeDrive::start(files, behavior).await;
+    let dir = tempfile::tempdir().unwrap();
+    write(dir.path(), &[("same.txt", "same")]);
+    let config = Config {
+        transfer: Options::new(NonZeroUsize::new(1).unwrap(), true),
+        ..config(Direction::Down, dir.path())
+    };
+    let path = dir.path().join("same.txt");
+
+    let run = sync(&server, &config);
+    let meanwhile = async {
+        while !server.media().contains(&String::from("a")) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        std::fs::write(&path, "edited locally").unwrap();
+        gate.add_permits(100);
+    };
+    let (synced, ()) = tokio::join!(run, meanwhile);
+
+    assert!(
+        synced.error().contains("1 item failed"),
+        "{}",
+        synced.error()
+    );
+    assert!(
+        synced.err.text().contains("changed since the inventory"),
+        "{}",
+        synced.err.text()
+    );
+    assert_eq!(read(dir.path(), "same.txt"), "edited locally");
+    let stamped = chrono::DateTime::parse_from_rfc3339("2024-05-06T07:08:09.123Z").unwrap();
+    let modified = chrono::DateTime::<chrono::Utc>::from(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+    );
+    assert_ne!(modified, stamped);
+}

@@ -21,6 +21,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex, PoisonError,
     },
+    time::SystemTime,
 };
 
 use futures::{stream, Stream};
@@ -28,6 +29,7 @@ use tokio::fs;
 
 use super::{
     errors::{self, ItemError},
+    inventory::FileState,
     plan::{self, Direction, FileWork, Item, Touch, Work},
 };
 use crate::{
@@ -369,15 +371,69 @@ impl Transfers {
 
     /// `down`: an unchanged file that was compared by md5 gets Drive's time, so that the next
     /// run does not read it again.
+    ///
+    /// The time is set through a handle on the file, once that handle shows the file as it was
+    /// read (size, time and, where known, identity): a file that changed since, or that another
+    /// file replaced, keeps its time and fails as changed.
     fn touch_job(self: &Arc<Self>, label: String, touch: Touch) -> Job {
         let transfers = Arc::clone(self);
         Job::new(JobKind::Media, label.clone(), move |context| async move {
             context.printer.out(format!("unchanged {label}")).await;
-            keep_time(&touch.path, touch.modified, &context).await;
+            match stamp(touch.clone()).await {
+                Ok(()) => {}
+                Err(Stamp::Changed) => {
+                    return Outcome::failed(errors::Item {
+                        label,
+                        source: ItemError::Changed(touch.path),
+                    })
+                    .into();
+                }
+                Err(Stamp::Io(err)) => {
+                    context
+                        .printer
+                        .err(format!(
+                            "Warning: unable to set the modification time of '{}': {err}",
+                            touch.path.display()
+                        ))
+                        .await;
+                }
+            }
             Done::add(&transfers.done.unchanged);
             Outcome::Unchanged.into()
         })
     }
+}
+
+/// Why [`stamp`] did not set the time.
+enum Stamp {
+    /// The file is not the one that was read.
+    Changed,
+    Io(io::Error),
+}
+
+/// Sets the time of `touch`, through a handle that shows the file as it was read.
+async fn stamp(touch: Touch) -> Result<(), Stamp> {
+    tokio::task::spawn_blocking(move || {
+        // Windows needs write access to change the time; nothing is written.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&touch.path)
+            .map_err(|err| {
+                if err.kind() == io::ErrorKind::NotFound {
+                    Stamp::Changed
+                } else {
+                    Stamp::Io(err)
+                }
+            })?;
+        let now = FileState::of(&file.metadata().map_err(Stamp::Io)?);
+        if !touch.read.is_some_and(|read| read.same(&now)) {
+            return Err(Stamp::Changed);
+        }
+        file.set_modified(SystemTime::from(touch.modified))
+            .map_err(Stamp::Io)
+    })
+    .await
+    .map_err(|err| Stamp::Io(io::Error::other(err)))?
 }
 
 /// Gives the local file Drive's modification time; a failure is a warning, the content is
@@ -551,4 +607,85 @@ pub(crate) fn new_ids(items: &[Item]) -> usize {
         }
     }
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::{stamp, Stamp, Touch};
+    use crate::files::sync::inventory::FileState;
+
+    fn read_now(path: &std::path::Path) -> FileState {
+        FileState::of(&std::fs::metadata(path).unwrap())
+    }
+
+    fn drive_time() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+    }
+
+    #[tokio::test]
+    async fn the_time_is_set_only_on_the_file_that_was_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "same").unwrap();
+        let touch = Touch {
+            path: path.clone(),
+            modified: drive_time(),
+            read: Some(read_now(&path)),
+        };
+
+        // Edited since it was read.
+        std::fs::write(&path, "edited").unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(matches!(stamp(touch.clone()).await, Err(Stamp::Changed)));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+
+        // Gone.
+        std::fs::remove_file(&path).unwrap();
+        assert!(matches!(stamp(touch).await, Err(Stamp::Changed)));
+
+        // Unchanged.
+        std::fs::write(&path, "same").unwrap();
+        let touch = Touch {
+            path: path.clone(),
+            modified: drive_time(),
+            read: Some(read_now(&path)),
+        };
+        assert!(stamp(touch).await.is_ok());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            SystemTime::from(drive_time())
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn another_file_with_the_same_size_and_time_keeps_its_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        std::fs::write(&path, "same").unwrap();
+        let read = Some(read_now(&path));
+        let time = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // Created while the first exists: another inode.
+        std::fs::write(dir.path().join("b"), "diff").unwrap();
+        std::fs::rename(dir.path().join("b"), &path).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+
+        let touch = Touch {
+            path: path.clone(),
+            modified: drive_time(),
+            read,
+        };
+        assert!(matches!(stamp(touch).await, Err(Stamp::Changed)));
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), time);
+    }
 }

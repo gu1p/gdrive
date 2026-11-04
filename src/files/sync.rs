@@ -59,7 +59,7 @@ use crate::{
         upload::UploadOptions,
     },
 };
-use inventory::{Inventory, LocalTree};
+use inventory::{FileState, Inventory, LocalTree};
 use plan::{Plan, Tally};
 
 /// A sync to run.
@@ -473,10 +473,7 @@ async fn new_ids(hub: &Hub, count: usize) -> Result<Vec<String>, errors::Sync> {
 }
 
 /// The md5 of each local file of `compares`, `jobs` files at a time, in order.
-async fn hash_all(
-    compares: &[(PathBuf, md5::Digest)],
-    jobs: usize,
-) -> Vec<Option<io::Result<md5::Digest>>> {
+async fn hash_all(compares: &[(PathBuf, md5::Digest)], jobs: usize) -> Vec<Option<plan::Digest>> {
     let hashes = compares.iter().map(|(path, _)| {
         let path = path.clone();
         async move {
@@ -492,17 +489,24 @@ async fn hash_all(
         .await
 }
 
-/// The md5 of the file at `path`, read in 1 MiB pieces.
-fn md5_of(path: &Path) -> io::Result<md5::Digest> {
+/// The md5 of the file at `path`, read in 1 MiB pieces, and the file as it was read. A file
+/// that changed while it was read is an error.
+fn md5_of(path: &Path) -> plan::Digest {
     let mut file = std::fs::File::open(path)?;
+    let before = FileState::of(&file.metadata()?);
     let mut context = md5::Context::new();
     let mut buffer = vec![0; 1 << 20];
     loop {
         match file.read(&mut buffer) {
-            Ok(0) => return Ok(context.compute()),
+            Ok(0) => break,
             Ok(read) => context.consume(&buffer[..read]),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
             Err(err) => return Err(err),
         }
+    }
+    if before.same(&FileState::of(&file.metadata()?)) {
+        Ok((context.compute(), before))
+    } else {
+        Err(io::Error::other("it changed while it was read"))
     }
 }
