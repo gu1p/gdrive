@@ -10,7 +10,10 @@ pub(crate) mod file_tree_like;
 pub(crate) mod hub_helper;
 pub(crate) mod id_gen;
 pub(crate) mod md5_writer;
+pub(crate) mod paginate;
 pub(crate) mod permission;
+#[cfg(test)]
+pub(crate) mod stub_server;
 pub(crate) mod table;
 
 pub(crate) use file_tree_like::{FileLike, FileTreeLike, FolderInfoLike, FolderLike};

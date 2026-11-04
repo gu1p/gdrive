@@ -33,12 +33,16 @@ pub(crate) async fn list(config: Config) -> Result<(), Error> {
         .await
         .map_err(Error::ListPermissions)?;
 
-    print_permissions_table(&config, &permissions);
+    write_permissions_table(io::stdout(), &config, &permissions).map_err(Error::WriteOutput)?;
 
     Ok(())
 }
 
-fn print_permissions_table(config: &Config, permissions: &[google_drive3::api::Permission]) {
+fn write_permissions_table(
+    writer: impl io::Write,
+    config: &Config,
+    permissions: &[google_drive3::api::Permission],
+) -> Result<(), io::Error> {
     let values = permissions
         .iter()
         .map(|permission| {
@@ -58,14 +62,14 @@ fn print_permissions_table(config: &Config, permissions: &[google_drive3::api::P
         values,
     };
 
-    let _ = table::write(
-        io::stdout(),
+    table::ignore_broken_pipe(table::write(
+        writer,
         table,
         &table::DisplayConfig {
             skip_header: config.skip_header,
             separator: &config.field_separator,
         },
-    );
+    ))
 }
 
 pub(crate) async fn list_permissions(
@@ -96,6 +100,7 @@ pub(crate) enum Error {
     Hub(GetHubError),
     GetFile(Box<google_drive3::Error>),
     ListPermissions(Box<google_drive3::Error>),
+    WriteOutput(io::Error),
 }
 
 impl error::Error for Error {
@@ -103,6 +108,7 @@ impl error::Error for Error {
         match self {
             Error::Hub(source) => Some(source),
             Error::GetFile(source) | Error::ListPermissions(source) => Some(source),
+            Error::WriteOutput(source) => Some(source),
         }
     }
 }
@@ -113,6 +119,49 @@ impl Display for Error {
             Error::Hub(_) => f.write_str("unable to get drive hub"),
             Error::GetFile(_) => f.write_str("unable to get file"),
             Error::ListPermissions(_) => f.write_str("unable to list permissions"),
+            Error::WriteOutput(_) => f.write_str("unable to write the permission list to stdout"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::{write_permissions_table, Config};
+    use crate::common::table::FailingWriter;
+
+    fn sample() -> (Config, Vec<google_drive3::api::Permission>) {
+        let config = Config {
+            file_id: String::from("f"),
+            skip_header: false,
+            field_separator: String::from("\t"),
+        };
+        let permissions = vec![google_drive3::api::Permission {
+            id: Some(String::from("anyoneWithLink")),
+            type_: Some(String::from("anyone")),
+            role: Some(String::from("reader")),
+            ..Default::default()
+        }];
+        (config, permissions)
+    }
+
+    #[test]
+    fn closed_stdout_ends_the_listing_successfully() {
+        let (config, permissions) = sample();
+
+        let writer = FailingWriter(io::ErrorKind::BrokenPipe);
+        assert!(write_permissions_table(writer, &config, &permissions).is_ok());
+
+        let writer = FailingWriter(io::ErrorKind::StorageFull);
+        let err = write_permissions_table(writer, &config, &permissions)
+            .expect_err("other write errors are reported");
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+
+        let mut out = Vec::new();
+        write_permissions_table(&mut out, &config, &permissions).expect("write to vec");
+        assert!(String::from_utf8(out)
+            .expect("utf-8")
+            .starts_with("Id               Type     Role     Email   Domain   Discoverable\n"));
     }
 }
