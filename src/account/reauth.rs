@@ -8,8 +8,10 @@ use crate::{
     account::add::{authorized_email, token_hub},
     app_config::{self, account_type::AccountType, AppConfig},
     auth::{
-        self, login,
-        store::{self, TokenFile},
+        self,
+        lock::{AccountLock, LOCK_TIMEOUT},
+        login,
+        store::TokenFile,
     },
     hub::Hub,
 };
@@ -146,21 +148,23 @@ async fn save_reauthorized(
     }
 
     // Google leaves out the refresh token when the grant still exists; keep the stored one then.
-    // The stored tokens are read and replaced under the lock of the file, in one step for the
-    // other gdrive processes: a refresh that is under way finishes first, and one that starts
-    // now sees the new tokens.
-    let saved = store::with_lock(app_cfg.tokens_path(), async |locked| {
-        let previous = app_cfg.tokens_of_client(&secret.client_id).await;
-        let login_tokens = login::tokens_after_login(previous.as_ref(), authorization, asked)
-            .map_err(Error::Login)?;
-        login_tokens
-            .tokens
-            .save_locked(locked)
-            .await
-            .map_err(Error::SaveTokens)?;
-        Ok(login_tokens)
-    })
-    .await;
+    // The stored tokens are read and replaced in one change under the lock of the account (see
+    // `auth::lock`): a refresh that is under way finishes first, and one that starts now sees
+    // the new tokens.
+    let lock = AccountLock::new(&app_cfg.base_path, account_name).map_err(Error::SaveTokens)?;
+    let (account, client_id) = (app_cfg.clone(), secret.client_id.clone());
+    let saved = lock
+        .hold_blocking(LOCK_TIMEOUT, move |held| {
+            let previous = account.tokens_of_client(&client_id);
+            let login_tokens = login::tokens_after_login(previous.as_ref(), authorization, asked)
+                .map_err(Error::Login)?;
+            login_tokens
+                .tokens
+                .write_locked(held)
+                .map_err(Error::SaveTokens)?;
+            Ok(login_tokens)
+        })
+        .await;
     let login::LoginTokens { tokens, audit_log } = match saved {
         Ok(saved) => saved.map_err(Box::new)?,
         Err(error) => return Err(Error::SaveTokens(error.into()).into()),
@@ -553,6 +557,68 @@ mod tests {
             Some("new-access")
         );
         assert_eq!(saved.refresh_token(), Some("new-refresh"));
+    }
+
+    #[tokio::test]
+    async fn reauth_builds_the_new_tokens_from_the_file_it_finds_under_the_lock() {
+        use crate::auth::lock::test_hooks::{when_waiting, within, Elsewhere};
+
+        let dir = tempfile::tempdir().unwrap();
+        let (app_cfg, secret) = account(dir.path(), Some(OLD_TOKENS));
+        let server = MockServer::start(vec![about_me()]).await;
+
+        // Another process holds the lock, and saves a new authorization (r2).
+        let lock = AccountLock::new(dir.path(), "me@example.com").unwrap();
+        let elsewhere = Elsewhere::hold(lock, |held| {
+            TokenFile::after_login(
+                None,
+                &auth::DRIVE_SCOPES,
+                TokenInfo {
+                    refresh_token: Some(String::from("r2")),
+                    ..new_token()
+                },
+            )
+            .write_locked(held)
+            .unwrap();
+        })
+        .await;
+
+        // The reauthorization, which Google answered without a refresh token, waits for the lock
+        // and builds the new tokens from the file it finds then: it keeps r2.
+        let waiting = when_waiting(app_cfg.tokens_path());
+        let reauth = tokio::spawn({
+            let (app_cfg, hub) = (app_cfg.clone(), server.hub());
+            async move {
+                let authorization = login::Authorization {
+                    token: TokenInfo {
+                        refresh_token: None,
+                        ..new_token()
+                    },
+                    audit_log: false,
+                };
+                save_reauthorized(&app_cfg, &secret, &hub, authorization, login::AuditLog::No).await
+            }
+        });
+        within("the wait of the reauthorization", waiting.notified()).await;
+        elsewhere.finish().await;
+        within("the reauthorization", reauth)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let saved = TokenFile::load(app_cfg.tokens_path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.refresh_token(), Some("r2"));
+        assert_eq!(
+            saved
+                .get(&auth::DRIVE_SCOPES)
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new-access")
+        );
     }
 
     #[tokio::test]

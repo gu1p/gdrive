@@ -9,7 +9,12 @@ use yup_oauth2::storage::TokenInfo;
 
 use crate::{
     app_config::{self, account_type::AccountType},
-    auth::{self, login, store::TokenFile},
+    auth::{
+        self,
+        lock::{AccountLock, LOCK_TIMEOUT},
+        login,
+        store::TokenFile,
+    },
     common::retry::retry_read,
     hub,
 };
@@ -56,26 +61,17 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
         .map_err(|error| Error::About(*error))?
         .map_or(Cow::Borrowed("unknown"), Into::into);
 
-    let existing = app_config::AppConfig::load_account(&email).map_err(Error::LoadAccount)?;
-    if !matches!(existing.account_type(), Ok(AccountType::User)) {
+    let app_cfg = app_config::AppConfig::load_account(&email).map_err(Error::LoadAccount)?;
+    if !matches!(app_cfg.account_type(), Ok(AccountType::User)) {
         return Err(Error::NotAUserAccount(email.into_owned()).into());
     }
 
-    // Adding an account again replaces its authorization, with whichever client.
-    let had_audit_log = TokenFile::audit_log_granted_at(existing.tokens_path()).await;
     let granted_by_google = authorization.audit_log;
-
-    // When the account is added again with the same client, Google may leave out the refresh
-    // token; keep the stored one then. (Read without the lock of the file: `add_account` writes
-    // under it, and a refresh in between only renews a token of the replaced authorization.)
-    let previous = existing.tokens_of_client(&secret.client_id).await;
-    let login::LoginTokens { tokens, audit_log } =
-        login::tokens_after_login(previous.as_ref(), authorization, asked).map_err(Error::Login)?;
+    let Added {
+        had_audit_log,
+        tokens: login::LoginTokens { tokens, audit_log },
+    } = save_added(app_cfg.clone(), secret, authorization, asked).await?;
     auth::warn_if_no_refresh_token(&tokens, &email);
-
-    let app_cfg = app_config::add_account(&email, &secret, &tokens)
-        .await
-        .map_err(Error::AddAccount)?;
 
     println!();
     println!(
@@ -100,6 +96,62 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
     }
 
     Ok(())
+}
+
+/// What [`save_added`] stored.
+struct Added {
+    /// Whether the replaced tokens of the account recorded the audit-log grant.
+    had_audit_log: bool,
+    tokens: login::LoginTokens,
+}
+
+/// Stores the account `app_cfg` after a login, in one change under the lock of the account
+/// (see `auth::lock`): reads the tokens it replaces, builds the new ones
+/// ([`login::tokens_after_login`]), and writes the secret and the tokens. A refresh that is under
+/// way finishes first, and one that starts now sees the new tokens; nothing is written when the
+/// login cannot be saved.
+async fn save_added(
+    app_cfg: app_config::AppConfig,
+    secret: app_config::Secret,
+    authorization: login::Authorization,
+    asked: login::AuditLog,
+) -> Result<Added, Box<Error>> {
+    use app_config::errors::{AddAccount, InitAccount};
+
+    // The lock lives in the config root, which the first `account add` creates.
+    tokio::fs::create_dir_all(&app_cfg.base_path)
+        .await
+        .map_err(|error| {
+            Error::AddAccount(AddAccount::InitAccount(InitAccount::CreateAccountDir(
+                error,
+            )))
+        })?;
+    let lock = AccountLock::new(&app_cfg.base_path, &app_cfg.account.name)
+        .map_err(|error| Error::AddAccount(AddAccount::SaveTokens(error)))?;
+    let saved = lock
+        .hold_blocking(LOCK_TIMEOUT, move |held| {
+            // Adding an account again replaces its authorization, with whichever client.
+            let had_audit_log = TokenFile::read(app_cfg.tokens_path())
+                .ok()
+                .flatten()
+                .is_some_and(|tokens| tokens.audit_log_granted());
+            // When the account is added again with the same client, Google may leave out the
+            // refresh token; keep the stored one then.
+            let previous = app_cfg.tokens_of_client(&secret.client_id);
+            let tokens = login::tokens_after_login(previous.as_ref(), authorization, asked)
+                .map_err(|error| Box::new(Error::Login(error)))?;
+            app_config::add_account(&app_cfg, &secret, &tokens.tokens, held)
+                .map_err(|error| Box::new(Error::AddAccount(error)))?;
+            Ok(Added {
+                had_audit_log,
+                tokens,
+            })
+        })
+        .await;
+    match saved {
+        Ok(added) => added,
+        Err(error) => Err(Error::AddAccount(AddAccount::SaveTokens(error.into())).into()),
+    }
 }
 
 /// A Drive hub that uses the access token of a login that just happened.
@@ -192,4 +244,128 @@ fn prompt_input(msg: &str) -> Result<String, io::Error> {
     io::stdin().read_line(&mut input)?;
 
     Ok(input.trim().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use time::{Duration, OffsetDateTime};
+
+    use super::*;
+    use crate::auth::lock::test_hooks::{when_waiting, within, Elsewhere};
+
+    fn token(access: &str, refresh: Option<&str>) -> TokenInfo {
+        TokenInfo {
+            access_token: Some(access.to_owned()),
+            refresh_token: refresh.map(str::to_owned),
+            expires_at: Some(OffsetDateTime::now_utc() + Duration::hours(1)),
+            id_token: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn account_add_builds_the_new_tokens_from_the_file_it_finds_under_the_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_cfg =
+            app_config::AppConfig::named_account_in(dir.path().to_path_buf(), "me@example.com")
+                .unwrap();
+        let secret = app_config::Secret {
+            client_id: String::from("id"),
+            client_secret: String::from("secret"),
+        };
+        let lock = AccountLock::new(dir.path(), "me@example.com").unwrap();
+        // The account exists with a Drive-only authorization (r1).
+        lock.clone()
+            .hold_blocking(LOCK_TIMEOUT, {
+                let (app_cfg, secret) = (app_cfg.clone(), secret.clone());
+                move |held| {
+                    let tokens =
+                        TokenFile::after_login(None, &auth::DRIVE_SCOPES, token("old", Some("r1")));
+                    app_config::add_account(&app_cfg, &secret, &tokens, held)
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Another process holds the lock, and saves a new authorization (r2, with the audit log).
+        let r2 = TokenFile::after_login(
+            None,
+            &auth::DRIVE_AND_AUDIT_LOG_SCOPES,
+            token("other", Some("r2")),
+        );
+        let elsewhere = Elsewhere::hold(lock, {
+            let r2 = r2.clone();
+            move |held| r2.write_locked(held).unwrap()
+        })
+        .await;
+
+        // The login, which Google answered without a refresh token, waits for the lock ...
+        let waiting = when_waiting(app_cfg.tokens_path());
+        let authorization = login::Authorization {
+            token: token("new", None),
+            audit_log: false,
+        };
+        let add = tokio::spawn(save_added(
+            app_cfg.clone(),
+            secret,
+            authorization,
+            login::AuditLog::No,
+        ));
+        within("the wait of the login", waiting.notified()).await;
+        elsewhere.finish().await;
+
+        // ... and builds the new tokens from the file it found then: it keeps r2, not r1.
+        let added = within("the login", add).await.unwrap().unwrap();
+        assert!(added.had_audit_log);
+        assert!(!added.tokens.audit_log);
+        let saved = TokenFile::load(app_cfg.tokens_path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.refresh_token(), Some("r2"));
+        assert_eq!(
+            saved
+                .get(&auth::DRIVE_SCOPES)
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new")
+        );
+        assert!(!saved.audit_log_granted());
+        assert_eq!(app_cfg.load_secret().unwrap().client_id, "id");
+    }
+
+    #[tokio::test]
+    async fn account_add_that_cannot_be_saved_writes_nothing() {
+        // `--audit-log`, no refresh token from Google, none of the grant stored: nothing at all
+        // is written, not even the secret or the account directory.
+        let dir = tempfile::tempdir().unwrap();
+        let app_cfg =
+            app_config::AppConfig::named_account_in(dir.path().to_path_buf(), "me@example.com")
+                .unwrap();
+        let authorization = login::Authorization {
+            token: token("new", None),
+            audit_log: true,
+        };
+        let error = save_added(
+            app_cfg.clone(),
+            app_config::Secret {
+                client_id: String::from("id"),
+                client_secret: String::from("secret"),
+            },
+            authorization,
+            login::AuditLog::Required,
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(
+            matches!(
+                &*error,
+                Error::Login(login::LoginError::AuditLogWithoutRefreshToken)
+            ),
+            "{error:?}"
+        );
+        assert!(!app_cfg.account_base_path().exists());
+    }
 }

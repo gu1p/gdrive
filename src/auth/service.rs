@@ -37,6 +37,7 @@ use yup_oauth2::{
 
 use super::{
     adc::{self, AdcSource},
+    lock::AccountLock,
     store::{TokenFile, TokenStore},
 };
 use crate::{
@@ -224,13 +225,17 @@ where
             builder = builder.subject(subject);
         }
         if let Some(path) = tokens_path {
+            let lock = AccountLock::of_tokens_file(path).map_err(|source| Error::Build {
+                identity: Arc::clone(&identity),
+                source,
+            })?;
             let cached = TokenFile::load(path)
                 .await
                 .ok()
                 .flatten()
                 .unwrap_or_default();
             builder = builder.with_storage(Box::new(TokenStore::for_credential(
-                path.to_path_buf(),
+                lock,
                 cached,
                 credential.clone(),
             )));
@@ -989,7 +994,7 @@ mod tests {
         ])
         .await;
         let dir = tempfile::tempdir().unwrap();
-        let tokens_path = dir.path().join("tokens.json");
+        let tokens_path = crate::auth::test_support::account_tokens_path(dir.path());
         let key = || parse(&key_value(&server.url("/token"))).unwrap();
 
         // Expires within the minute yup-oauth2 keeps in reserve, so the next run renews it.
@@ -1080,7 +1085,7 @@ mod tests {
             ] {
                 let server = MockServer::start(vec![(status, String::from(body))]).await;
                 let dir = tempfile::tempdir().unwrap();
-                let tokens_path = dir.path().join("tokens.json");
+                let tokens_path = crate::auth::test_support::account_tokens_path(dir.path());
                 let key = parse(&key_value(&server.url("/token"))).unwrap();
                 let credentials = ServiceCredentials::service_account(
                     http_client(),

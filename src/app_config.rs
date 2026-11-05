@@ -11,7 +11,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    auth::store::{self, TokenFile},
+    auth::{
+        lock::{AccountLock, Held, LOCK_TIMEOUT},
+        store::{self, TokenFile},
+    },
     common::json_error::RedactedJsonError,
 };
 
@@ -31,26 +34,25 @@ pub(crate) struct AppConfig {
     tokens_path: OnceLock<PathBuf>,
 }
 
-pub(crate) async fn add_account(
-    account_name: &str,
+/// Stores the OAuth user account `config` with `secret` and `tokens`, in a change that holds
+/// the account's lock (`held`): creates the account directory if needed, then replaces the
+/// secret and the tokens, each atomically.
+pub(crate) fn add_account(
+    config: &AppConfig,
     secret: &Secret,
     tokens: &TokenFile,
-) -> Result<AppConfig, errors::AddAccount> {
-    let config = AppConfig::init_account(account_name).map_err(errors::AddAccount::InitAccount)?;
-    // Under the lock of the tokens file, which other gdrive processes write: a login that cannot
-    // get it changes neither the secret nor the tokens.
-    store::with_lock(config.tokens_path(), async |locked| {
-        config
-            .save_secret(secret)
-            .map_err(errors::AddAccount::SaveSecret)?;
-        tokens
-            .save_locked(locked)
-            .await
-            .map_err(errors::AddAccount::SaveTokens)
-    })
-    .await
-    .map_err(|error| errors::AddAccount::SaveTokens(error.into()))??;
-    Ok(config)
+    held: &Held<'_>,
+) -> Result<(), errors::AddAccount> {
+    debug_assert_eq!(held.account().tokens_path(), config.tokens_path());
+    config
+        .create_account_dir()
+        .map_err(|error| errors::AddAccount::InitAccount(error.into()))?;
+    config
+        .save_secret(secret)
+        .map_err(errors::AddAccount::SaveSecret)?;
+    tokens
+        .write_locked(held)
+        .map_err(errors::AddAccount::SaveTokens)
 }
 
 pub(crate) fn switch_account(config: &AppConfig) -> Result<(), errors::SaveAccountConfig> {
@@ -178,13 +180,7 @@ impl AppConfig {
     }
 
     pub(crate) fn remove_account(&self) -> Result<(), errors::RemoveAccount> {
-        let path = self.account_base_path();
-        if let Err(source) = fs::remove_dir_all(path) {
-            return Err(errors::RemoveAccount::RemoveDirectory {
-                path: path.to_path_buf(),
-                source,
-            });
-        }
+        self.remove_account_dir(LOCK_TIMEOUT)?;
 
         let account_config =
             AppConfig::load_account_config().map_err(errors::RemoveAccount::LoadConfig)?;
@@ -201,22 +197,36 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Deletes the account directory, under the account's lock (waiting at most `timeout` for
+    /// another gdrive process): a change that is under way finishes first, and nothing is removed
+    /// when the lock cannot be had.
+    pub(crate) fn remove_account_dir(
+        &self,
+        timeout: std::time::Duration,
+    ) -> Result<(), errors::RemoveAccount> {
+        let path = self.account_base_path();
+        let error = |source| errors::RemoveAccount::RemoveDirectory {
+            path: path.to_path_buf(),
+            source,
+        };
+        AccountLock::new(&self.base_path, &self.account.name)
+            .map_err(error)?
+            .hold(timeout, |_| fs::remove_dir_all(path))
+            .map_err(|lock_error| error(lock_error.into()))?
+            .map_err(error)
+    }
+
+    /// Replaces `secret.json` atomically, with mode 0600 on Unix from the start.
     fn save_secret(&self, secret: &Secret) -> Result<(), errors::SaveSecret> {
         let content =
             serde_json::to_string_pretty(&secret).map_err(errors::SaveSecret::Serialize)?;
         let path = self.secret_path();
-        if let Err(source) = fs::write(path, content) {
-            return Err(errors::SaveSecret::Write {
+        store::write_private_file_blocking(path, content.as_bytes()).map_err(|source| {
+            errors::SaveSecret::Write {
                 path: path.to_path_buf(),
                 source,
-            });
-        }
-
-        if let Err(err) = set_file_permissions(path) {
-            eprintln!("Warning: Failed to set file permissions on secrets file: {err}");
-        }
-
-        Ok(())
+            }
+        })
     }
 
     pub(crate) fn load_secret(&self) -> Result<Secret, errors::LoadSecret> {
@@ -240,13 +250,14 @@ impl AppConfig {
     }
 
     /// The stored tokens of this account, if there are any and they were issued to the OAuth
-    /// client `client_id`. A refresh token of another client is of no use.
-    pub(crate) async fn tokens_of_client(&self, client_id: &str) -> Option<TokenFile> {
+    /// client `client_id`. A refresh token of another client is of no use. Blocks the thread: for
+    /// a change under the account lock.
+    pub(crate) fn tokens_of_client(&self, client_id: &str) -> Option<TokenFile> {
         let secret = self.load_secret().ok()?;
         if secret.client_id != client_id {
             return None;
         }
-        TokenFile::load(self.tokens_path()).await.ok().flatten()
+        TokenFile::read(self.tokens_path()).ok().flatten()
     }
 
     fn load_account_config() -> Result<AccountConfig, errors::LoadAccountConfig> {
@@ -369,11 +380,11 @@ mod tests {
 
     const TOKENS: &str = r#"[{"scopes":["https://www.googleapis.com/auth/drive"],"token":{"access_token":"a","refresh_token":"r","expires_at":null,"id_token":null}}]"#;
 
-    #[tokio::test]
-    async fn tokens_of_client_requires_the_same_client_id() {
+    #[test]
+    fn tokens_of_client_requires_the_same_client_id() {
         let dir = tempfile::tempdir().unwrap();
         let config = AppConfig::new(dir.path().to_path_buf(), Account::new("me@example.com"));
-        assert!(config.tokens_of_client("id").await.is_none());
+        assert!(config.tokens_of_client("id").is_none());
 
         config.create_account_dir().unwrap();
         config
@@ -384,9 +395,9 @@ mod tests {
             .unwrap();
         fs::write(config.tokens_path(), TOKENS).unwrap();
 
-        let tokens = config.tokens_of_client("id").await.unwrap();
+        let tokens = config.tokens_of_client("id").unwrap();
         assert_eq!(tokens.refresh_token(), Some("r"));
-        assert!(config.tokens_of_client("other-id").await.is_none());
+        assert!(config.tokens_of_client("other-id").is_none());
     }
 
     #[test]

@@ -137,6 +137,14 @@ async fn read_request(stream: &mut TcpStream) -> Option<RecordedRequest> {
     })
 }
 
+/// The tokens file of an account `me@example.com` in the config root `dir`, whose directory is
+/// created: the layout gdrive uses, so that the lock of the account lives in `dir` too.
+pub(crate) fn account_tokens_path(dir: &std::path::Path) -> std::path::PathBuf {
+    let account = dir.join("me@example.com");
+    std::fs::create_dir_all(&account).unwrap();
+    account.join("tokens.json")
+}
+
 /// A connector that sends every request, whatever its host and scheme, over plain TCP to one
 /// address. Used for code that has a Google URL built in (yup-oauth2's authorized-user flow).
 #[derive(Clone)]

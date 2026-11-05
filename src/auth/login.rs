@@ -1175,7 +1175,7 @@ mod tests {
 
         // Stored like `account add` does, the token is used by the refresh-only path as is.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = crate::auth::test_support::account_tokens_path(dir.path());
         TokenFile::after_login(None, &DRIVE_SCOPES, token)
             .save(&path)
             .await

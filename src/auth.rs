@@ -10,6 +10,7 @@
 //! [`store::TokenFile::audit_log_granted`]).
 
 pub(crate) mod adc;
+pub(crate) mod lock;
 pub(crate) mod login;
 pub(crate) mod service;
 pub(crate) mod store;

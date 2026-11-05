@@ -18,25 +18,31 @@
 //! authorization, which may lack the audit log or be revoked; [`TokenStore`] keeps what it
 //! refreshes in memory then and leaves the file to the new authorization.
 //!
-//! Every write of the file is one step for the other gdrive processes: it happens under the lock
-//! of the file ([`with_lock`]), and a refresh reads, checks and writes under one lock. A login
-//! waits for a refresh that is under way, and a refresh that starts during a login sees the new
-//! file.
+//! Every write of the file is one change under the lock of the account (see [`super::lock`]): a
+//! refresh reads, checks and writes under one lock, a login waits for a refresh that is under
+//! way, and a refresh that starts during a login sees the new file.
 
 use std::{
     error::Error,
+    ffi::OsStr,
     fmt::{self, Display, Formatter},
-    io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
-use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
+use tokio::sync::Mutex;
 use yup_oauth2::storage::{TokenInfo, TokenStorage, TokenStorageError};
 
-use super::AUDIT_LOG_SCOPE;
+#[cfg(test)]
+use super::lock::test_hooks;
+use super::{
+    lock::{AccountLock, Held, LockError, LOCK_TIMEOUT},
+    AUDIT_LOG_SCOPE,
+};
 use crate::common::json_error::RedactedJsonError;
 
 /// One `tokens.json` entry: a token and the scopes it was issued for.
@@ -262,227 +268,114 @@ impl TokenFile {
             }
         };
 
-        // Neither the content nor the serde_json error, which can quote it: it holds the tokens.
-        Self::from_json(&content)
-            .map(Some)
-            .map_err(|error| LoadError::Parse {
-                path: path.to_path_buf(),
-                error: RedactedJsonError::from(&error),
-            })
+        Self::parse(path, &content).map(Some)
     }
 
-    /// Replaces `path` atomically, under its lock ([`with_lock`]): writes a temporary file next
-    /// to it (mode 0600 on Unix) and renames it over `path`. When another gdrive process holds
-    /// the lock for longer than [`LOCK_TIMEOUT`], nothing is written. Outside tests the file is
-    /// written only with [`TokenFile::save_locked`], inside an update that holds the lock.
+    /// [`TokenFile::load`], blocking the thread: for a change under the account lock.
+    pub(crate) fn read(path: &Path) -> Result<Option<Self>, LoadError> {
+        match std::fs::read(path) {
+            Ok(content) => Self::parse(path, &content).map(Some),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(source) => Err(LoadError::Read {
+                path: path.to_path_buf(),
+                source,
+            }),
+        }
+    }
+
+    /// Neither the content nor the `serde_json` error, which can quote it: it holds the tokens.
+    fn parse(path: &Path, content: &[u8]) -> Result<Self, LoadError> {
+        Self::from_json(content).map_err(|error| LoadError::Parse {
+            path: path.to_path_buf(),
+            error: RedactedJsonError::from(&error),
+        })
+    }
+
+    /// Replaces the tokens file of the account whose lock is held, atomically: writes a
+    /// temporary file next to it (mode 0600 on Unix) and renames it over the file. Temporary
+    /// files that a killed writer left behind are removed first; under the lock no other one is
+    /// being written.
+    pub(crate) fn write_locked(&self, held: &Held<'_>) -> io::Result<()> {
+        let path = held.account().tokens_path();
+        let json = self.to_json().map_err(io::Error::other)?;
+        remove_stale_temp_files(&path);
+        replace_file(&path, json.as_bytes(), write_and_sync)
+    }
+
+    /// Replaces `path`, the tokens file of an account, under the lock of the account. For tests:
+    /// gdrive writes tokens only inside a change that holds the lock ([`TokenFile::write_locked`]).
     #[cfg(test)]
     pub(crate) async fn save(&self, path: &Path) -> io::Result<()> {
-        with_lock(path, async |locked| self.save_locked(locked).await).await?
-    }
-
-    /// Replaces the tokens file whose lock the caller holds atomically: writes a temporary file
-    /// next to it (mode 0600 on Unix) and renames it over the file.
-    pub(crate) async fn save_locked(&self, locked: &Locked<'_>) -> io::Result<()> {
-        let json = self.to_json().map_err(io::Error::other)?;
-        replace_file(locked.tokens_path, json.as_bytes(), write_and_sync).await
+        let file = self.clone();
+        AccountLock::of_tokens_file(path)?
+            .hold_blocking(LOCK_TIMEOUT, move |held| file.write_locked(held))
+            .await?
     }
 }
 
-/// The lock file of `tokens.json`, in the account's directory. It is empty: it only carries the
-/// lock. Account exports leave it out.
-pub(crate) const LOCK_FILE_NAME: &str = "tokens.json.lock";
-
-/// How long a writer of a tokens file waits for another gdrive process to finish its update.
-/// An update holds the lock for a read and a write of a small file, never across a request.
-pub(crate) const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// How often a waiting writer tries the lock again.
-const LOCK_RETRY: Duration = Duration::from_millis(20);
-
-/// Proof that this process holds the lock of a tokens file, handed to the update of
-/// [`with_lock`]: the tokens file can only be written with it ([`TokenFile::save_locked`]).
-pub(crate) struct Locked<'a> {
-    tokens_path: &'a Path,
-}
-
-/// Runs `update` while this process holds the lock of the tokens file `tokens_path`, an
-/// exclusive advisory lock (`flock` on Unix, `LockFileEx` on Windows) on [`LOCK_FILE_NAME`]
-/// next to it. The operating system releases it when the process ends, also when it is killed,
-/// so no lock is ever left behind. Waits at most [`LOCK_TIMEOUT`] for another process.
-pub(crate) async fn with_lock<T>(
-    tokens_path: &Path,
-    update: impl AsyncFnOnce(&Locked<'_>) -> T,
-) -> Result<T, LockError> {
-    with_lock_within(tokens_path, LOCK_TIMEOUT, update).await
-}
-
-/// [`with_lock`], waiting at most `timeout`.
-async fn with_lock_within<T>(
-    tokens_path: &Path,
-    timeout: Duration,
-    update: impl AsyncFnOnce(&Locked<'_>) -> T,
-) -> Result<T, LockError> {
-    let lock_path = tokens_path.with_file_name(LOCK_FILE_NAME);
-    let lock_error = |source| LockError::Io {
-        path: lock_path.clone(),
-        source,
-    };
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    options.mode(0o600);
-    let file = options
-        .open(&lock_path)
-        .await
-        .map_err(lock_error)?
-        .into_std()
-        .await;
-    let mut lock = fd_lock::RwLock::new(file);
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut waiting = false;
-    loop {
-        match lock.try_write() {
-            Ok(_guard) => return Ok(update(&Locked { tokens_path }).await),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(lock_error(error)),
-        }
-        if !waiting {
-            waiting = true;
-            #[cfg(test)]
-            test_hooks::waiting(tokens_path);
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(LockError::Timeout {
-                path: tokens_path.to_path_buf(),
-            });
-        }
-        tokio::time::sleep(LOCK_RETRY).await;
-    }
-}
-
-/// The lock of a tokens file could not be taken.
-#[derive(Debug)]
-pub(crate) enum LockError {
-    /// Another gdrive process held it for longer than the writer waits.
-    Timeout {
-        path: PathBuf,
-    },
-    Io {
-        path: PathBuf,
-        source: io::Error,
-    },
-}
-
-impl Display for LockError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        match self {
-            LockError::Timeout { path } => write!(
-                f,
-                "another gdrive process is updating '{}'; nothing was written, try again",
-                path.display()
-            ),
-            LockError::Io { path, .. } => write!(f, "unable to lock '{}'", path.display()),
-        }
-    }
-}
-
-impl Error for LockError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            LockError::Timeout { .. } => None,
-            LockError::Io { source, .. } => Some(source),
-        }
-    }
-}
-
-impl From<LockError> for io::Error {
-    fn from(error: LockError) -> Self {
-        let kind = match &error {
-            LockError::Timeout { .. } => io::ErrorKind::TimedOut,
-            LockError::Io { source, .. } => source.kind(),
-        };
-        io::Error::new(kind, error)
-    }
-}
-
-/// Hooks that let tests stop a writer at the steps that matter, to make overlaps certain.
-#[cfg(test)]
-pub(crate) mod test_hooks {
-    use std::{
-        collections::HashMap,
-        path::{Path, PathBuf},
-        sync::{Arc, LazyLock, Mutex},
-    };
-
-    use tokio::sync::Notify;
-
-    static WAITING: LazyLock<Mutex<HashMap<PathBuf, Arc<Notify>>>> = LazyLock::new(Mutex::default);
-
-    /// Notified when a writer of the tokens file `tokens_path` finds its lock held and waits.
-    pub(crate) fn when_waiting(tokens_path: &Path) -> Arc<Notify> {
-        Arc::clone(
-            WAITING
-                .lock()
-                .unwrap()
-                .entry(tokens_path.to_path_buf())
-                .or_default(),
-        )
-    }
-
-    pub(super) fn waiting(tokens_path: &Path) {
-        if let Some(notify) = WAITING.lock().unwrap().get(tokens_path) {
-            notify.notify_one();
-        }
-    }
-
-    /// Stops a [`super::TokenStore`] after it read and checked the file under the lock, before
-    /// it writes: it notifies `checked` and waits for `resume`.
-    #[derive(Clone, Default)]
-    pub(crate) struct Pause {
-        pub(crate) checked: Arc<Notify>,
-        pub(crate) resume: Arc<Notify>,
-    }
-}
-
-/// Replaces `path` atomically with `content`, like [`TokenFile::save_locked`]: the file is created with
-/// mode 0600 on Unix from the start, never made private after the fact. For other files that hold
-/// credentials, such as a service account key.
+/// Replaces `path` atomically with `content`, like [`TokenFile::write_locked`]: the file is
+/// created with mode 0600 on Unix from the start, never made private after the fact. For other
+/// files that hold credentials, such as a service account key.
 pub(crate) async fn write_private_file(path: &Path, content: &[u8]) -> io::Result<()> {
-    replace_file(path, content, write_and_sync).await
+    let (path, content) = (path.to_path_buf(), content.to_vec());
+    tokio::task::spawn_blocking(move || replace_file(&path, &content, write_and_sync))
+        .await
+        .map_err(io::Error::other)?
+}
+
+/// [`write_private_file`], blocking the thread: for a change under the account lock.
+pub(crate) fn write_private_file_blocking(path: &Path, content: &[u8]) -> io::Result<()> {
+    replace_file(path, content, write_and_sync)
 }
 
 /// Replaces `path` with `content`. `write` fills a new temporary file next to `path`, which is
 /// renamed over `path` only when `write` succeeded. On any error the temporary file is removed
 /// and `path` keeps its previous content.
-async fn replace_file<W>(path: &Path, content: &[u8], write: W) -> io::Result<()>
+fn replace_file<W>(path: &Path, content: &[u8], write: W) -> io::Result<()>
 where
-    W: AsyncFnOnce(&mut File, &[u8]) -> io::Result<()>,
+    W: FnOnce(&mut fs::File, &[u8]) -> io::Result<()>,
 {
-    let (temp_path, mut file) = create_temp_file(path).await?;
-    let written = write(&mut file, content).await;
+    let (temp_path, mut file) = create_temp_file(path)?;
+    let written = write(&mut file, content);
     // Closed before the rename, which Windows refuses for an open file.
     drop(file);
-    let result = match written {
-        Ok(()) => tokio::fs::rename(&temp_path, path).await,
-        Err(error) => Err(error),
-    };
+    let result = written.and_then(|()| fs::rename(&temp_path, path));
     if result.is_err() {
-        let _ = tokio::fs::remove_file(&temp_path).await;
+        let _ = fs::remove_file(&temp_path);
     }
     result
 }
 
-/// Writes all of `content` to `file` and makes it durable.
-///
-/// tokio's `File` hands each write to a background thread and reports its error only with the
-/// next operation: `write_all` can return before the data is written, and `sync_all` does not
-/// report a pending write error, but `flush` does. Without the flush a full disk (ENOSPC) could
-/// go unnoticed and an empty file would replace a working tokens.json.
-async fn write_and_sync(file: &mut File, content: &[u8]) -> io::Result<()> {
-    file.write_all(content).await?;
-    file.flush().await?;
-    file.sync_all().await
+/// Writes all of `content` to `file` and makes it durable. `write_all` reports the error of each
+/// write (a full disk, ENOSPC), so an empty file never replaces a working tokens.json.
+fn write_and_sync(file: &mut fs::File, content: &[u8]) -> io::Result<()> {
+    file.write_all(content)?;
+    file.sync_all()
+}
+
+/// Removes the temporary files of `path` ([`create_temp_file`]) that a writer left behind when
+/// it was killed between writing and renaming one. Only under the account lock, which every
+/// writer of `path` holds.
+fn remove_stale_temp_files(path: &Path) {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name().and_then(OsStr::to_str)) else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let is_temp = file_name
+            .to_str()
+            .and_then(|file_name| file_name.strip_prefix(name)?.strip_prefix('.'))
+            .and_then(|rest| rest.strip_suffix(".tmp"))
+            .is_some_and(|suffix| {
+                suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+        if is_temp {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Whether `entry` is stored for a scope set that includes [`AUDIT_LOG_SCOPE`].
@@ -522,7 +415,7 @@ const TEMP_FILE_ATTEMPTS: usize = 8;
 /// symlink is never followed. With a random name, two gdrive processes that share the config
 /// directory never write into the same file, even when they have the same PID (PID 1 in two
 /// containers). A name that exists already is skipped.
-async fn create_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
+fn create_temp_file(path: &Path) -> io::Result<(PathBuf, fs::File)> {
     let random = SystemRandom::new();
     let suffixes = std::iter::repeat_with(|| {
         let mut bytes = [0; 8];
@@ -531,13 +424,13 @@ async fn create_temp_file(path: &Path) -> io::Result<(PathBuf, File)> {
             .map_err(|_| io::Error::other("unable to get random bytes from the system"))?;
         Ok(format!("{:016x}", u64::from_le_bytes(bytes)))
     });
-    create_temp_file_named(path, suffixes).await
+    create_temp_file_named(path, suffixes)
 }
 
-async fn create_temp_file_named(
+fn create_temp_file_named(
     path: &Path,
     suffixes: impl Iterator<Item = io::Result<String>>,
-) -> io::Result<(PathBuf, File)> {
+) -> io::Result<(PathBuf, fs::File)> {
     let mut clash = None;
     for suffix in suffixes.take(TEMP_FILE_ATTEMPTS) {
         let mut name = path
@@ -547,7 +440,7 @@ async fn create_temp_file_named(
         name.push(format!(".{}.tmp", suffix?));
         let temp_path = path.with_file_name(name);
 
-        match open_new_file(&temp_path).await {
+        match open_new_file(&temp_path) {
             Ok(file) => return Ok((temp_path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => clash = Some(error),
             Err(error) => return Err(error),
@@ -556,12 +449,12 @@ async fn create_temp_file_named(
     Err(clash.unwrap_or_else(|| io::Error::from(io::ErrorKind::AlreadyExists)))
 }
 
-async fn open_new_file(path: &Path) -> io::Result<File> {
-    let mut options = tokio::fs::OpenOptions::new();
+fn open_new_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
-    options.mode(0o600);
-    options.open(path).await
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(path)
 }
 
 /// `tokens.json` exposed to yup-oauth2 as its token storage.
@@ -572,13 +465,15 @@ async fn open_new_file(path: &Path) -> io::Result<File> {
 /// was authorized again (`account add`, `account reauth`), the file belongs to the new
 /// authorization, and this store keeps its tokens in memory for the rest of the process. Its
 /// refresh token may lack scopes the new authorization has, such as the audit log, or be
-/// revoked, so neither it nor a token refreshed with it may end up in the new file.
+/// revoked, so neither it nor a token refreshed with it may end up in the new file. Nor does
+/// the store write anything once the account was removed.
 ///
-/// The read, the check and the write of an update are one step under the lock of the file
-/// ([`with_lock`]). When another process holds the lock for longer than [`LOCK_TIMEOUT`], the
+/// The read, the check and the write of an update are one change under the lock of the account
+/// ([`AccountLock`]), run on a blocking thread so that it ends as one even if yup-oauth2's
+/// future is dropped. When another process holds the lock for longer than [`LOCK_TIMEOUT`], the
 /// refreshed token is kept in memory and the command goes on.
 pub(crate) struct TokenStore {
-    path: PathBuf,
+    lock: AccountLock,
     state: Mutex<StoreState>,
     /// The credential of a service account whose tokens these are; see [`TokenEntry`].
     credential: Option<String>,
@@ -598,10 +493,10 @@ struct StoreState {
 }
 
 impl TokenStore {
-    /// The tokens of an OAuth user account.
-    pub(crate) fn new(path: PathBuf, file: TokenFile, refresh_token: Option<String>) -> Self {
+    /// The tokens of an OAuth user account, in the tokens file of `lock`'s account.
+    pub(crate) fn new(lock: AccountLock, file: TokenFile, refresh_token: Option<String>) -> Self {
         TokenStore {
-            path,
+            lock,
             state: Mutex::new(StoreState {
                 file,
                 refresh_token,
@@ -615,10 +510,10 @@ impl TokenStore {
 
     /// The tokens of the service account credential `credential`: only its entries are read,
     /// and its tokens are stored with it.
-    pub(crate) fn for_credential(path: PathBuf, file: TokenFile, credential: String) -> Self {
+    pub(crate) fn for_credential(lock: AccountLock, file: TokenFile, credential: String) -> Self {
         TokenStore {
             credential: Some(credential),
-            ..TokenStore::new(path, file, None)
+            ..TokenStore::new(lock, file, None)
         }
     }
 
@@ -628,25 +523,110 @@ impl TokenStore {
         self
     }
 
+    /// Stops every update after it read and checked the file under the lock, before it writes.
     #[cfg(test)]
     fn with_pause(mut self, pause: test_hooks::Pause) -> Self {
         self.pause = Some(pause);
         self
     }
+}
 
-    /// Stores `token` for `scopes` in `file`. Not a token asked for the audit log of an account
-    /// that was not granted it: yup-oauth2 refreshes and stores a token for any scope set it is
-    /// asked for, and such an entry would claim a grant Google never gave (a refresh brings
-    /// only the scopes of the grant). Returns whether it was stored.
-    fn store_in(&self, file: &mut TokenFile, scopes: &[&str], token: TokenInfo) -> bool {
-        if self.credential.is_none()
-            && scopes.contains(&AUDIT_LOG_SCOPE)
-            && !file.audit_log_granted()
-        {
-            return false;
-        }
-        file.set_for(self.credential.as_deref(), scopes, token);
-        true
+/// Stores `token` for `scopes` in `file`. Not a token asked for the audit log of an account that
+/// was not granted it: yup-oauth2 refreshes and stores a token for any scope set it is asked
+/// for, and such an entry would claim a grant Google never gave (a refresh brings only the scopes
+/// of the grant). Returns whether it was stored.
+fn store_in(
+    credential: Option<&str>,
+    file: &mut TokenFile,
+    scopes: &[&str],
+    token: TokenInfo,
+) -> bool {
+    if credential.is_none() && scopes.contains(&AUDIT_LOG_SCOPE) && !file.audit_log_granted() {
+        return false;
+    }
+    file.set_for(credential, scopes, token);
+    true
+}
+
+/// A refreshed token to store: one change of the account's files under its lock, which
+/// [`TokenStore::set`] runs on a blocking thread.
+struct Refresh {
+    lock: AccountLock,
+    credential: Option<String>,
+    /// The refresh token of the authorization whose file the store may write.
+    identity: Option<String>,
+    /// The tokens of the process.
+    memory: TokenFile,
+    scopes: Vec<String>,
+    token: TokenInfo,
+    timeout: Duration,
+    #[cfg(test)]
+    pause: Option<test_hooks::Pause>,
+}
+
+impl Refresh {
+    /// The tokens of the process after the change, and whether the file was written.
+    fn run(self) -> (TokenFile, io::Result<bool>) {
+        let mut memory = self.memory;
+        let credential = self.credential.as_deref();
+        let identity = self.identity.as_deref();
+        let scopes: Vec<&str> = self.scopes.iter().map(String::as_str).collect();
+        let token = self.token;
+        let fallback = token.clone();
+        #[cfg(test)]
+        let pause = self.pause;
+
+        let changed = self.lock.hold(self.timeout, |held| {
+            // The account was removed: write nothing, and do not create its directory again.
+            if !held.account().account_dir().is_dir() {
+                store_in(credential, &mut memory, &scopes, token);
+                return Ok(false);
+            }
+            let superseded = match TokenFile::read(&held.account().tokens_path()) {
+                // Merge into what is on disk now, so that the update of another gdrive process
+                // that ran in the meantime is kept; but not into the file of a newer
+                // authorization.
+                Ok(Some(on_disk))
+                    if credential.is_none() && on_disk.refresh_token() != identity =>
+                {
+                    true
+                }
+                Ok(Some(on_disk)) => {
+                    memory = on_disk;
+                    false
+                }
+                // No tokens yet (a service account gets its tokens.json with its first token),
+                // or unreadable ones: the tokens of this process are written.
+                Ok(None) | Err(_) => false,
+            };
+            if !store_in(credential, &mut memory, &scopes, token) {
+                return Ok(false);
+            }
+            #[cfg(test)]
+            if let Some(pause) = &pause {
+                pause.stop();
+            }
+            if superseded {
+                return Ok(false);
+            }
+            memory.write_locked(held).map(|()| true)
+        });
+
+        let result = match changed {
+            Ok(result) => result,
+            // Another process is changing the account's files, or the config root was removed:
+            // keep the token for this process only.
+            Err(LockError::Timeout { .. }) => {
+                store_in(credential, &mut memory, &scopes, fallback);
+                Ok(false)
+            }
+            Err(LockError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+                store_in(credential, &mut memory, &scopes, fallback);
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        };
+        (memory, result)
     }
 }
 
@@ -661,7 +641,6 @@ impl TokenStorage for TokenStore {
             return Ok(());
         }
         let mut state = self.state.lock().await;
-        let state = &mut *state;
         // A refresh token in the answer replaces the authorization's (Google does not do that
         // for this flow today). This store then writes the file of the new one, once it is in
         // the file. yup-oauth2's authenticator keeps refreshing with the refresh token it was
@@ -672,55 +651,35 @@ impl TokenStorage for TokenStore {
         if token.refresh_token.is_none() {
             token.refresh_token.clone_from(&state.refresh_token);
         }
-        let identity = state.refresh_token.clone();
-        let fallback = token.clone();
-
-        let written = with_lock_within(&self.path, self.lock_timeout, async |locked| {
-            // Merge into what is on disk now, so that the update of another gdrive process that
-            // ran in the meantime is kept; but not into the file of a newer authorization.
-            let superseded = match TokenFile::load(&self.path).await {
-                Ok(Some(on_disk))
-                    if self.credential.is_none()
-                        && on_disk.refresh_token() != identity.as_deref() =>
-                {
-                    true
-                }
-                Ok(Some(on_disk)) => {
-                    state.file = on_disk;
-                    false
-                }
-                Ok(None) | Err(_) => false,
-            };
-            if !self.store_in(&mut state.file, scopes, token) {
-                return Ok(false);
-            }
+        let refresh = Refresh {
+            lock: self.lock.clone(),
+            credential: self.credential.clone(),
+            identity: state.refresh_token.clone(),
+            memory: state.file.clone(),
+            scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
+            token,
+            timeout: self.lock_timeout,
             #[cfg(test)]
-            if let Some(pause) = &self.pause {
-                pause.checked.notify_one();
-                pause.resume.notified().await;
-            }
-            if superseded {
-                return Ok(false);
-            }
-            state.file.save_locked(locked).await.map(|()| true)
-        })
-        .await;
+            pause: self.pause.clone(),
+        };
 
-        match written {
-            Ok(Ok(true)) => {
+        // On a blocking thread: should this future be dropped (the refresh timeout of
+        // `StoredCredentials`, Ctrl-C), the change still runs to its end under the lock.
+        let (memory, result) = match tokio::task::spawn_blocking(move || refresh.run()).await {
+            Ok(outcome) => outcome,
+            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+            Err(error) => return Err(TokenStorageError::Io(io::Error::other(error))),
+        };
+        state.file = memory;
+        match result {
+            Ok(true) => {
                 if brought.is_some() {
                     state.refresh_token = brought;
                 }
                 Ok(())
             }
-            Ok(Ok(false)) => Ok(()),
-            Ok(Err(error)) => Err(TokenStorageError::Io(error)),
-            // Another process is updating the file: keep the token for this process only.
-            Err(LockError::Timeout { .. }) => {
-                self.store_in(&mut state.file, scopes, fallback);
-                Ok(())
-            }
-            Err(error) => Err(TokenStorageError::Io(error.into())),
+            Ok(false) => Ok(()),
+            Err(error) => Err(TokenStorageError::Io(error)),
         }
     }
 
@@ -772,10 +731,18 @@ impl Error for LoadError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use time::{Duration, OffsetDateTime};
 
     use super::*;
-    use crate::auth::DRIVE_SCOPES;
+    use crate::{
+        app_config::AppConfig,
+        auth::{
+            lock::test_hooks::{when_waiting, within, Elsewhere, Pause},
+            DRIVE_SCOPES,
+        },
+    };
 
     const DRIVE: &str = "https://www.googleapis.com/auth/drive";
     const METADATA: &str = "https://www.googleapis.com/auth/drive.metadata.readonly";
@@ -1005,8 +972,24 @@ mod tests {
         assert_eq!(merged.refresh_token(), None);
     }
 
-    /// The names of a directory listing, in order (the lock file stays next to tokens.json).
-    fn sorted(mut names: Vec<std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    /// The tokens file of the account `me@example.com` in the config root `dir`, whose
+    /// directory is created.
+    fn tokens_path(dir: &Path) -> PathBuf {
+        let account = dir.join("me@example.com");
+        std::fs::create_dir_all(&account).unwrap();
+        account.join("tokens.json")
+    }
+
+    fn lock(path: &Path) -> AccountLock {
+        AccountLock::of_tokens_file(path).unwrap()
+    }
+
+    /// The names in the account directory of the tokens file `path`, in order.
+    fn account_entries(path: &Path) -> Vec<String> {
+        let mut names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
         names.sort();
         names
     }
@@ -1088,7 +1071,7 @@ mod tests {
 
         // Nor does a missing or invalid file.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         assert!(!TokenFile::audit_log_granted_at(&path).await);
         tokio::fs::write(&path, "not json").await.unwrap();
         assert!(!TokenFile::audit_log_granted_at(&path).await);
@@ -1108,13 +1091,13 @@ mod tests {
     #[tokio::test]
     async fn store_never_records_an_audit_log_grant_that_was_not_given() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
         loaded.save(&path).await.unwrap();
         let before = tokio::fs::read(&path).await.unwrap();
 
         // What yup-oauth2 stores after a refresh it ran for a scope set that no entry covers.
-        let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+        let store = TokenStore::new(lock(&path), loaded, Some(String::from("r1")));
         for scopes in [&[AUDIT][..], &DRIVE_AND_AUDIT] {
             store
                 .set(scopes, token("refreshed", None, Duration::hours(1)))
@@ -1138,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn store_caches_audit_log_tokens_while_the_account_has_the_grant() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let loaded = TokenFile::after_login(
             None,
             &DRIVE_AND_AUDIT,
@@ -1146,7 +1129,7 @@ mod tests {
         );
         loaded.save(&path).await.unwrap();
 
-        let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+        let store = TokenStore::new(lock(&path), loaded, Some(String::from("r1")));
         store
             .set(&[AUDIT], token("audit", None, Duration::hours(1)))
             .await
@@ -1260,14 +1243,14 @@ mod tests {
         ];
         for (loaded_scopes, login_scopes, asked) in cases {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("tokens.json");
+            let path = tokens_path(dir.path());
             let loaded = TokenFile::after_login(
                 None,
                 loaded_scopes,
                 token("old", Some("r1"), Duration::hours(-1)),
             );
             loaded.save(&path).await.unwrap();
-            let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+            let store = TokenStore::new(lock(&path), loaded, Some(String::from("r1")));
 
             // The account is authorized again: with a new refresh token, or with none at all.
             for new_refresh_token in [Some("r2"), None] {
@@ -1304,10 +1287,10 @@ mod tests {
     #[tokio::test]
     async fn store_writes_into_the_file_of_a_login_that_kept_its_refresh_token() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
         loaded.save(&path).await.unwrap();
-        let store = TokenStore::new(path.clone(), loaded.clone(), Some(String::from("r1")));
+        let store = TokenStore::new(lock(&path), loaded.clone(), Some(String::from("r1")));
 
         // `account reauth --audit-log`, and Google left out the refresh token: the login kept
         // r1, so this is still the authorization the process refreshes with.
@@ -1328,13 +1311,6 @@ mod tests {
         assert_eq!(refresh_tokens(&on_disk), [Some("r1"), Some("r1")]);
     }
 
-    /// Bounds a step that only finishes if the other writer behaves as it must.
-    async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(10), future)
-            .await
-            .unwrap_or_else(|_| panic!("{what} did not happen"))
-    }
-
     /// (scopes of the authorization a process loaded, of the login that replaces it)
     const REAUTHORIZATIONS: [(&[&str], &[&str]); 2] = [
         (&DRIVE_SCOPES, &DRIVE_AND_AUDIT),
@@ -1345,32 +1321,32 @@ mod tests {
     async fn a_login_waits_for_a_refresh_that_already_passed_its_check() {
         for (loaded_scopes, login_scopes) in REAUTHORIZATIONS {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("tokens.json");
+            let path = tokens_path(dir.path());
             let loaded = TokenFile::after_login(
                 None,
                 loaded_scopes,
                 token("old", Some("r1"), Duration::hours(-1)),
             );
             loaded.save(&path).await.unwrap();
-            let pause = test_hooks::Pause::default();
-            let store = std::sync::Arc::new(
-                TokenStore::new(path.clone(), loaded, Some(String::from("r1")))
+            let pause = Pause::default();
+            let store = Arc::new(
+                TokenStore::new(lock(&path), loaded, Some(String::from("r1")))
                     .with_pause(pause.clone()),
             );
 
             // The older process has read the file and checked it, and stops before it writes.
             let refresh = tokio::spawn({
-                let store = std::sync::Arc::clone(&store);
+                let store = Arc::clone(&store);
                 async move {
                     store
                         .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
                         .await
                 }
             });
-            within("the check of the refresh", pause.checked.notified()).await;
+            within("the check of the refresh", pause.reached.notified()).await;
 
             // Now the login saves: it has to wait ...
-            let waiting = test_hooks::when_waiting(&path);
+            let waiting = when_waiting(&path);
             let login = TokenFile::after_login(
                 None,
                 login_scopes,
@@ -1410,54 +1386,36 @@ mod tests {
     async fn a_refresh_waits_for_a_login_that_holds_the_lock_and_then_leaves_its_file_alone() {
         for (loaded_scopes, login_scopes) in REAUTHORIZATIONS {
             let dir = tempfile::tempdir().unwrap();
-            let path = dir.path().join("tokens.json");
+            let path = tokens_path(dir.path());
             let loaded = TokenFile::after_login(
                 None,
                 loaded_scopes,
                 token("old", Some("r1"), Duration::hours(-1)),
             );
             loaded.save(&path).await.unwrap();
-            let store = TokenStore::new(path.clone(), loaded.clone(), Some(String::from("r1")));
+            let store = TokenStore::new(lock(&path), loaded.clone(), Some(String::from("r1")));
             let login = TokenFile::after_login(
                 Some(&loaded),
                 login_scopes,
                 token("login", Some("r2"), Duration::hours(1)),
             );
 
-            // The login holds the lock: it read the previous tokens and is about to write.
-            let (held, release) = (
-                std::sync::Arc::new(tokio::sync::Notify::new()),
-                std::sync::Arc::new(tokio::sync::Notify::new()),
-            );
-            let save = tokio::spawn({
-                let (held, release) = (held.clone(), release.clone());
-                let (login, path) = (login.clone(), path.clone());
-                async move {
-                    with_lock(&path, async |locked| {
-                        assert!(TokenFile::load(&path).await.unwrap().is_some());
-                        held.notify_one();
-                        release.notified().await;
-                        login.save_locked(locked).await
-                    })
-                    .await
-                }
-            });
-            within("the lock of the login", held.notified()).await;
+            // The login holds the lock: it is about to write.
+            let elsewhere = Elsewhere::hold(lock(&path), {
+                let login = login.clone();
+                move |held| login.write_locked(held).unwrap()
+            })
+            .await;
 
             // The older process refreshes now: it waits for the login ...
-            let waiting = test_hooks::when_waiting(&path);
+            let waiting = when_waiting(&path);
             let refresh = store.set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)));
-            let refreshed = async {
+            let login_finishes = async {
                 within("the wait of the refresh", waiting.notified()).await;
-                release.notify_one();
+                elsewhere.finish().await;
             };
-            let (result, ()) = tokio::join!(refresh, refreshed);
+            let (result, ()) = tokio::join!(refresh, login_finishes);
             result.unwrap();
-            within("the save of the login", save)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
 
             // ... and then finds the file of the new authorization: it keeps its token to itself.
             let case = format!("{loaded_scopes:?} -> {login_scopes:?}");
@@ -1468,102 +1426,217 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_writer_that_cannot_get_the_lock_in_time_writes_nothing() {
+    async fn a_refresh_whose_caller_is_dropped_still_finishes_under_the_lock() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
+        loaded.save(&path).await.unwrap();
+        let pause = Pause::default();
+        let store = Arc::new(
+            TokenStore::new(lock(&path), loaded, Some(String::from("r1")))
+                .with_pause(pause.clone()),
+        );
+
+        // The refresh read and checked the file under the lock; then its caller goes away, as on
+        // the refresh timeout of `StoredCredentials` or Ctrl-C.
+        let caller = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
+                    .await
+            }
+        });
+        within("the check of the refresh", pause.reached.notified()).await;
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+
+        // The change goes on under the lock: an operation that starts now waits for it ...
+        let waiting = when_waiting(&path);
+        let reader = tokio::spawn(lock(&path).hold_blocking(LOCK_TIMEOUT, |held| {
+            TokenFile::read(&held.account().tokens_path())
+                .unwrap()
+                .unwrap()
+        }));
+        within("the wait of the other operation", waiting.notified()).await;
+        pause.resume.notify_one();
+
+        // ... and then sees the whole of it: the refreshed token, in the file of the account.
+        let seen = within("the other operation", reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(access(&seen, &DRIVE_SCOPES), Some("refreshed"));
+        assert_eq!(seen.refresh_token(), Some("r1"));
+        assert_eq!(account_entries(&path), ["tokens.json"]);
+    }
+
+    #[tokio::test]
+    async fn removing_and_adding_an_account_again_keeps_one_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_cfg =
+            AppConfig::named_account_in(dir.path().to_path_buf(), "me@example.com").unwrap();
+        let path = app_cfg.tokens_path().to_path_buf();
+        std::fs::create_dir_all(app_cfg.account_base_path()).unwrap();
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
+        loaded.save(&path).await.unwrap();
+        let pause = Pause::default();
+        let store = Arc::new(
+            TokenStore::new(lock(&path), loaded, Some(String::from("r1")))
+                .with_pause(pause.clone()),
+        );
+
+        // A refresh has read and checked the file, and stops before it writes.
+        let refresh = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move {
+                store
+                    .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
+                    .await
+            }
+        });
+        within("the check of the refresh", pause.reached.notified()).await;
+
+        // `account remove` waits for it, and then removes the directory.
+        let waiting = when_waiting(&path);
+        let remove = tokio::task::spawn_blocking({
+            let app_cfg = app_cfg.clone();
+            move || app_cfg.remove_account_dir(LOCK_TIMEOUT)
+        });
+        within("the wait of the removal", waiting.notified()).await;
+        pause.resume.notify_one();
+        within("the refresh", refresh).await.unwrap().unwrap();
+        within("the removal", remove).await.unwrap().unwrap();
+        assert!(!app_cfg.account_base_path().exists());
+
+        // `account add` again, with a new authorization, under the same lock.
+        let login = TokenFile::after_login(
+            None,
+            &DRIVE_AND_AUDIT,
+            token("login", Some("r2"), Duration::hours(1)),
+        );
+        lock(&path)
+            .hold_blocking(LOCK_TIMEOUT, {
+                let (app_cfg, login) = (app_cfg.clone(), login.clone());
+                move |held| {
+                    let secret = crate::app_config::Secret {
+                        client_id: String::from("id"),
+                        client_secret: String::from("secret"),
+                    };
+                    crate::app_config::add_account(&app_cfg, &secret, &login, held)
+                }
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The older process refreshes again: it finds the new file and writes nothing.
+        pause.resume.notify_one();
+        store
+            .set(&DRIVE_SCOPES, token("later", None, Duration::hours(1)))
+            .await
+            .unwrap();
+        assert_eq!(TokenFile::load(&path).await.unwrap(), Some(login));
+        assert_eq!(account_entries(&path), ["secret.json", "tokens.json"]);
+    }
+
+    #[tokio::test]
+    async fn a_refresh_of_a_removed_account_writes_nothing_and_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("config");
+        let path = tokens_path(&base);
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
+        loaded.save(&path).await.unwrap();
+        let store = TokenStore::new(lock(&path), loaded, Some(String::from("r1")));
+
+        // The account directory is removed, then the whole config root.
+        for removed in [path.parent().unwrap(), &base] {
+            std::fs::remove_dir_all(removed).unwrap();
+            store
+                .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
+                .await
+                .unwrap();
+            assert!(!removed.exists(), "{}", removed.display());
+            // The process goes on with what it refreshed.
+            let kept = store.get(&DRIVE_SCOPES).await.unwrap();
+            assert_eq!(kept.access_token.as_deref(), Some("refreshed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_operation_that_cannot_get_the_lock_in_time_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_cfg =
+            AppConfig::named_account_in(dir.path().to_path_buf(), "me@example.com").unwrap();
+        let path = app_cfg.tokens_path().to_path_buf();
+        std::fs::create_dir_all(app_cfg.account_base_path()).unwrap();
         let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
         loaded.save(&path).await.unwrap();
         let before = tokio::fs::read(&path).await.unwrap();
-        let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")))
+        let store = TokenStore::new(lock(&path), loaded, Some(String::from("r1")))
             .with_lock_timeout(std::time::Duration::from_millis(50));
+        let short = std::time::Duration::from_millis(50);
+
+        // Another process holds the lock all along.
+        let elsewhere = Elsewhere::hold(lock(&path), |_| ()).await;
+
+        // A refresh keeps its token in memory and goes on.
+        store
+            .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
+            .await
+            .unwrap();
+        let kept = store.get(&DRIVE_SCOPES).await.unwrap();
+        assert_eq!(kept.access_token.as_deref(), Some("refreshed"));
+
+        // A login fails, as a login reports it.
         let login = file(&[(
             &DRIVE_SCOPES,
             token("login", Some("r2"), Duration::hours(1)),
         )]);
-
-        // Another process holds the lock all along.
-        let (refreshed, saved) = with_lock(&path, async |_| {
-            // A refresh keeps its token in memory and goes on.
-            let refreshed = store
-                .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
-                .await;
-            // A login fails.
-            let saved = with_lock_within(&path, std::time::Duration::from_millis(50), async |l| {
-                login.save_locked(l).await
-            })
-            .await;
-            (refreshed, saved)
-        })
-        .await
-        .unwrap();
-
-        refreshed.unwrap();
-        let kept = store.get(&DRIVE_SCOPES).await.unwrap();
-        assert_eq!(kept.access_token.as_deref(), Some("refreshed"));
-        let Err(error) = saved else {
-            panic!("the login got the lock");
-        };
+        let error = lock(&path)
+            .hold_blocking(short, move |held| login.write_locked(held))
+            .await
+            .unwrap_err();
         assert!(matches!(error, LockError::Timeout { .. }), "{error:?}");
-        // As a login reports it.
         let error = io::Error::from(error);
         assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        let expected = "another gdrive process is updating the files of account \
+                        'me@example.com'; nothing was changed, try again in a moment";
+        assert_eq!(crate::error_message(&error), format!("Error: {expected}"));
+
+        // `account remove` fails the same way.
+        let error = app_cfg.remove_account_dir(short).unwrap_err();
         let message = crate::error_message(&error);
-        assert_eq!(
-            message,
-            format!(
-                "Error: another gdrive process is updating '{}'; nothing was written, try again",
-                path.display()
-            )
-        );
+        assert!(message.ends_with(expected), "{message}");
+        assert!(app_cfg.account_base_path().exists());
         assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
 
-        // Once the lock is free, both write again.
+        // Once the lock is free, the refresh writes again.
+        elsewhere.finish().await;
         store
             .set(&DRIVE_SCOPES, token("next", None, Duration::hours(1)))
             .await
             .unwrap();
         let on_disk = TokenFile::load(&path).await.unwrap().unwrap();
         assert_eq!(access(&on_disk, &DRIVE_SCOPES), Some("next"));
-        login.save(&path).await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn the_lock_file_holds_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
-        file(&[(
-            &DRIVE_SCOPES,
-            token("secret-access", Some("1//secret"), Duration::hours(1)),
-        )])
-        .save(&path)
-        .await
-        .unwrap();
-        let lock = dir.path().join(LOCK_FILE_NAME);
-        assert_eq!(std::fs::metadata(&lock).unwrap().len(), 0);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&lock).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600);
-        }
     }
 
     #[tokio::test]
     async fn save_replaces_the_file_atomically_and_load_reads_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         assert_eq!(TokenFile::load(&path).await.unwrap(), None);
 
         tokio::fs::write(&path, "stale content").await.unwrap();
         let expected = file(&[(&DRIVE_SCOPES, token("a", Some("r"), Duration::hours(1)))]);
         expected.save(&path).await.unwrap();
 
-        assert_eq!(TokenFile::load(&path).await.unwrap(), Some(expected));
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(sorted(names), ["tokens.json", LOCK_FILE_NAME]);
+        assert_eq!(
+            TokenFile::load(&path).await.unwrap(),
+            Some(expected.clone())
+        );
+        assert_eq!(TokenFile::read(&path).unwrap(), Some(expected));
+        assert_eq!(account_entries(&path), ["tokens.json"]);
 
         #[cfg(unix)]
         {
@@ -1574,40 +1647,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_write_removes_the_temporary_files_a_killed_writer_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = tokens_path(dir.path());
+        let account = path.parent().unwrap();
+        for name in [
+            "tokens.json.0123456789abcdef.tmp",
+            "tokens.json.other.tmp",
+            "secret.json.0123456789abcdef.tmp",
+        ] {
+            std::fs::write(account.join(name), "half").unwrap();
+        }
+
+        file(&[(&DRIVE_SCOPES, token("a", Some("r"), Duration::hours(1)))])
+            .save(&path)
+            .await
+            .unwrap();
+        assert_eq!(
+            account_entries(&path),
+            [
+                "secret.json.0123456789abcdef.tmp",
+                "tokens.json",
+                "tokens.json.other.tmp"
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn failed_write_keeps_the_previous_file() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let previous = file(&[(&DRIVE_SCOPES, token("a", Some("keep"), Duration::hours(1)))]);
         previous.save(&path).await.unwrap();
         let before = tokio::fs::read(&path).await.unwrap();
 
         // The disk fills up halfway through the new content.
         let new_content = br#"[{"scopes":[],"token":{}}]"#;
-        let error = replace_file(
-            &path,
-            new_content,
-            async |file: &mut File, content: &[u8]| {
-                file.write_all(&content[..content.len() / 2]).await?;
-                file.flush().await?;
-                Err(io::Error::from(io::ErrorKind::StorageFull))
-            },
-        )
-        .await
+        let error = replace_file(&path, new_content, |file: &mut fs::File, content: &[u8]| {
+            file.write_all(&content[..content.len() / 2])?;
+            Err(io::Error::from(io::ErrorKind::StorageFull))
+        })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
 
         assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(sorted(names), ["tokens.json", LOCK_FILE_NAME]);
+        assert_eq!(account_entries(&path), ["tokens.json"]);
     }
 
-    #[tokio::test]
-    async fn temp_files_never_reuse_an_existing_name_or_follow_a_symlink() {
+    #[test]
+    fn temp_files_never_reuse_an_existing_name_or_follow_a_symlink() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
+        let account = path.parent().unwrap();
         let names = |names: &[&str]| {
             names
                 .iter()
@@ -1617,39 +1708,35 @@ mod tests {
         };
 
         // Another process's temporary file.
-        let other = dir.path().join("tokens.json.aaaa.tmp");
-        tokio::fs::write(&other, "other process").await.unwrap();
+        let other = account.join("tokens.json.aaaa.tmp");
+        std::fs::write(&other, "other process").unwrap();
         // A symlink planted where a temporary file would go.
-        let victim = dir.path().join("victim");
-        tokio::fs::write(&victim, "victim").await.unwrap();
+        let victim = account.join("victim");
+        std::fs::write(&victim, "victim").unwrap();
         #[cfg(unix)]
-        std::os::unix::fs::symlink(&victim, dir.path().join("tokens.json.bbbb.tmp")).unwrap();
+        std::os::unix::fs::symlink(&victim, account.join("tokens.json.bbbb.tmp")).unwrap();
 
-        let (temp_path, mut file) = create_temp_file_named(&path, names(&["aaaa", "bbbb", "cccc"]))
-            .await
-            .unwrap();
-        file.write_all(b"mine").await.unwrap();
-        file.flush().await.unwrap();
+        let (temp_path, mut file) =
+            create_temp_file_named(&path, names(&["aaaa", "bbbb", "cccc"])).unwrap();
+        file.write_all(b"mine").unwrap();
         drop(file);
 
         let expected = if cfg!(unix) { "cccc" } else { "bbbb" };
         assert_eq!(
             temp_path,
-            dir.path().join(format!("tokens.json.{expected}.tmp"))
+            account.join(format!("tokens.json.{expected}.tmp"))
         );
-        assert_eq!(tokio::fs::read(&other).await.unwrap(), b"other process");
-        assert_eq!(tokio::fs::read(&victim).await.unwrap(), b"victim");
+        assert_eq!(std::fs::read(&other).unwrap(), b"other process");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"victim");
 
-        let error = create_temp_file_named(&path, names(&["aaaa"]))
-            .await
-            .unwrap_err();
+        let error = create_temp_file_named(&path, names(&["aaaa"])).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
     }
 
     #[tokio::test]
     async fn concurrent_saves_do_not_mix_their_files() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let files: Vec<_> = (0..16)
             .map(|i| {
                 let access = format!("access-{i}-{}", "x".repeat(4096));
@@ -1664,39 +1751,24 @@ mod tests {
 
         let saved = TokenFile::load(&path).await.unwrap().unwrap();
         assert!(files.contains(&saved));
-        let names: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name())
-            .collect();
-        assert_eq!(sorted(names), ["tokens.json", LOCK_FILE_NAME]);
+        assert_eq!(account_entries(&path), ["tokens.json"]);
     }
 
-    /// Why `write_and_sync` flushes: on a full device tokio's `write_all` succeeds and only the
-    /// flush reports ENOSPC.
+    /// A full device is reported, so an empty file never replaces a working tokens.json.
     #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn write_errors_of_a_full_disk_are_reported() {
-        async fn open_full() -> io::Result<File> {
-            tokio::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/full")
-                .await
-        }
-        let Ok(mut file) = open_full().await else {
+    #[test]
+    fn write_errors_of_a_full_disk_are_reported() {
+        let Ok(mut file) = fs::OpenOptions::new().write(true).open("/dev/full") else {
             return;
         };
-        file.write_all(b"[]").await.unwrap();
-        let error = file.flush().await.unwrap_err();
+        let error = write_and_sync(&mut file, b"[]").unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::StorageFull);
-
-        let mut file = open_full().await.unwrap();
-        assert!(write_and_sync(&mut file, b"[]").await.is_err());
     }
 
     #[tokio::test]
     async fn load_reports_invalid_content_without_echoing_it() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         // The second and third make serde_json quote the token in its own message.
         for content in [
             r#"{"refresh_token": "secret"}"#,
@@ -1770,7 +1842,7 @@ mod tests {
         )])
         .await;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
 
         // yup-oauth2 writes the file ...
         let auth =
@@ -1815,12 +1887,12 @@ mod tests {
     #[tokio::test]
     async fn store_never_caches_a_token_without_access_token_or_a_service_token_without_expiry() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(1)))]);
         loaded.save(&path).await.unwrap();
         let before = tokio::fs::read(&path).await.unwrap();
 
-        let user = TokenStore::new(path.clone(), loaded.clone(), Some(String::from("r1")));
+        let user = TokenStore::new(lock(&path), loaded.clone(), Some(String::from("r1")));
         for access_token in [None, Some(String::new())] {
             let empty = TokenInfo {
                 access_token,
@@ -1829,7 +1901,7 @@ mod tests {
             user.set(&DRIVE_SCOPES, empty).await.unwrap();
         }
 
-        let service = TokenStore::for_credential(path.clone(), loaded, String::from("robot"));
+        let service = TokenStore::for_credential(lock(&path), loaded, String::from("robot"));
         let no_expiry = TokenInfo {
             expires_at: None,
             ..token("forever", None, Duration::hours(1))
@@ -1850,11 +1922,11 @@ mod tests {
     #[tokio::test]
     async fn store_merges_into_the_current_file_and_keeps_the_refresh_token() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tokens.json");
+        let path = tokens_path(dir.path());
         let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
         loaded.save(&path).await.unwrap();
 
-        let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+        let store = TokenStore::new(lock(&path), loaded, Some(String::from("r1")));
         store
             .set(&DRIVE_SCOPES, token("fresh", None, Duration::hours(1)))
             .await
