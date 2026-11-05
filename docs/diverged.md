@@ -105,7 +105,7 @@ matched one to one and set aside. Then, when **one** file of the origin of that 
 | the copy has no file of its name left (for a folder: no folder of its name). Everything in an added folder is added too, one row each | `added`, and `edited` if it was modified after its creation (see below) |
 | a file of its name left in the copy has its content (under another time) | nothing |
 | the files of its name left in the copy all have other content and are all older than the origin's last modification | `edited` |
-| one of them is newer, or a time is missing: a revision of one of them holds the origin's present content | nothing: the copy once held that content |
+| one of them is newer or equally recent, or a time is missing: a revision of one of them holds the origin's present content | nothing: the copy once held that content |
 | as above, but no revision holds it, or the revisions cannot be read | `differs` |
 | an added file whose size, MD5 checksum and creation time are those of a file of the copy that no origin file was matched or compared with | `moved`, with where it is in the copy: `PATH (was OLD_PATH)` |
 | someone moved it to the trash, from a folder of the origin | `trashed` (see [In the trash](#in-the-trash)) |
@@ -117,6 +117,10 @@ content and no revision counts as evidence there: each of those origin files get
 otherwise `differs`, with its own last modification and who made it. A `differs` row is preferred over a
 guess. Those copies are not used for `moved` either. When the copy has no file of that name left, each is
 new (`added`, and `edited`).
+
+One tie stays open: two files of the origin of one name with the same content and the same modification
+time, against a single such file in the copy. One of them is taken for the copied file and the other is
+reported as `added`; which one is arbitrary, so the person named in that row can be either file's.
 
 **The same content** is the migration's own rule for a file with content (a photo, a PDF, an office file):
 the same size and MD5 checksum. A Google Docs, Sheets or Slides file has no checksum, and its copy was
