@@ -218,7 +218,7 @@ impl RelayError {
     }
 
     /// The relay error of a failed upload: a failed read of the source is the source's.
-    fn of_upload(error: UploadError) -> Self {
+    pub(super) fn of_upload(error: UploadError) -> Self {
         match error {
             UploadError::Read(error) => match SourceFailure::take(error) {
                 Ok(SourceFailure::Media(error)) => RelayError::Source(error),
@@ -362,7 +362,7 @@ pub(crate) async fn relay_file(
 }
 
 /// The Google account `hub` acts as, as Drive names it.
-async fn account_of(hub: &Hub) -> Result<Option<String>, Box<google_drive3::Error>> {
+pub(super) async fn account_of(hub: &Hub) -> Result<Option<String>, Box<google_drive3::Error>> {
     let (_, about) = retry_read(hub.retrier(), "about.get", |mut delegate| async move {
         hub.about()
             .get()
@@ -549,7 +549,7 @@ impl Relay<'_> {
 /// The export of the Workspace file `id` as `format`, read into memory: at most
 /// [`EXPORT_LIMIT`] bytes, the reading stops as soon as more arrive. Exports ignore `Range`, so
 /// one that breaks off is requested again from the start, within the hub's retry policy.
-async fn read_export(
+pub(crate) async fn read_export(
     hub: &Hub,
     id: &str,
     resource_key: Option<&str>,
@@ -693,6 +693,10 @@ impl Stream {
 ///
 /// A read that is dropped half-way (the uploader's request ended) loses nothing: the reply
 /// stays where it was, or is requested again if it was being opened.
+///
+/// An archive (`archive.rs`) reads many files, one reply open at a time: it drops the reader
+/// of a file when it moves on, and a later reader of that file takes over what the earlier one
+/// found out ([`Requested`]).
 pub(super) struct DriveSource<'a> {
     media: MediaSource<'a>,
     /// The source's content as its metadata describes it, compared before every new reply.
@@ -711,10 +715,18 @@ pub(super) struct DriveSource<'a> {
     high_water: u64,
 }
 
+/// What a [`DriveSource`] found out once it requested the content, for a later reader of the
+/// same content: that its next request is not the first (the metadata is checked before it),
+/// and the strong `ETag` that `If-Range` sends back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Requested {
+    etag: Option<String>,
+}
+
 impl<'a> DriveSource<'a> {
     /// The content of `file`, `size` bytes, with its id and resource key; warnings name the
     /// transfer `label`.
-    fn new(
+    pub(super) fn new(
         hub: &'a Hub,
         file: &google_drive3::api::File,
         (id, resource_key): (&str, Option<&str>),
@@ -811,6 +823,27 @@ impl<'a> DriveSource<'a> {
     /// Whether the metadata shows another content now.
     async fn changed(&self) -> Result<bool, SourceFailure> {
         self.identity.changed().await.map_err(SourceFailure::Media)
+    }
+
+    /// Whether the metadata shows another content now than the listing gave, as the relay asks
+    /// when Drive's md5 of a copy is not the source's: `false` when that cannot be told.
+    pub(super) async fn changed_since_listing(&self) -> bool {
+        matches!(self.changed().await, Ok(true))
+    }
+
+    /// What a later reader of the content takes over, once this one requested it.
+    pub(super) fn requested(&self) -> Option<Requested> {
+        self.opened.then(|| Requested {
+            etag: self.etag.clone(),
+        })
+    }
+
+    /// Continues where an earlier reader of the same content left off ([`Self::requested`]).
+    #[must_use]
+    pub(super) fn after(mut self, requested: Requested) -> Self {
+        self.opened = true;
+        self.etag = requested.etag;
+        self
     }
 
     /// A reply with the content from `offset` on, or one from the start that is read up to
