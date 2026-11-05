@@ -120,6 +120,11 @@
 //! warning and a non-zero exit, and the walk lists with its own `listing_jobs` while the
 //! scheduler's bounded queue paces it.
 //!
+//! `files diverged` walks the origin of a migration with a wider mask
+//! ([`Walk::start_with_fields`]: who last modified and who owns each file), and lists single
+//! levels of folders (the copy, the trash of the origin's folders) with [`children_query`] and
+//! [`request_page`], batched the same way.
+//!
 //! Still to do:
 //!
 //! - A file with a `resourceKey` (shared by link only) must be downloaded with the

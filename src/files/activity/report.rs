@@ -360,8 +360,9 @@ pub(super) fn by_event(tally: &Tally, paths: &HashMap<String, String>) -> Vec<[S
 /// The report as text: aligned columns as `files list` prints them, or tab-separated values.
 /// Names, paths, addresses and event names come from Drive and the audit log: control
 /// characters are escaped (`\n`, `\u{1b}`), and in tab-separated values a tab, newline,
-/// carriage return or backslash is `\t`, `\n`, `\r` or `\\` first.
-pub(super) fn render<const N: usize>(
+/// carriage return or backslash is `\t`, `\n`, `\r` or `\\` first. `files diverged` prints
+/// its reports with it too.
+pub(crate) fn render<const N: usize>(
     header: [&str; N],
     rows: Vec<[String; N]>,
     output: &Output,
