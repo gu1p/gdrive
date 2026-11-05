@@ -105,24 +105,59 @@ pub(crate) fn warn_if_no_refresh_token(tokens: &store::TokenFile, account: &str)
     }
 }
 
+/// Why a login took away the account's read access to the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuditLogLoss {
+    /// The login did not ask for it (`account add` without `--audit-log`).
+    NotAsked,
+    /// The login asked for it again and Google did not grant it.
+    NotGranted,
+    /// Google granted it but returned no refresh token, and the stored one was not issued with
+    /// it (see `login::tokens_after_login`).
+    NoRefreshToken,
+}
+
 /// The warning for a login that took away the account's read access to the audit log: the
 /// account had it, and the new authorization, which replaces the old one, does not include it.
-/// `asked` says whether the login asked for it again (and Google did not grant it).
-pub(crate) fn audit_log_lost_warning(account: &str, asked: bool) -> String {
-    if asked {
-        format!(
+pub(crate) fn audit_log_lost_warning(account: &str, loss: AuditLogLoss) -> String {
+    match loss {
+        AuditLogLoss::NotAsked => format!(
+            "Warning: account '{account}' could read the audit log of its organization, and this \
+             login did not ask for that access, so 'gdrive files activity' no longer works with \
+             it. To get the access back, run 'gdrive account reauth {account} --audit-log'"
+        ),
+        AuditLogLoss::NotGranted => format!(
             "Warning: Google did not grant read access to the audit log this time, so 'gdrive \
              files activity' no longer works with account '{account}'; its Drive authorization \
              was saved. To get the access back, run 'gdrive account reauth {account} \
              --audit-log' and leave the box for the audit log ticked (the Google account must be \
              an administrator of the organization)"
-        )
+        ),
+        AuditLogLoss::NoRefreshToken => format!(
+            "Warning: Google returned no refresh token, and the stored one does not include read \
+             access to the audit log, so 'gdrive files activity' no longer works with account \
+             '{account}'; its Drive authorization was saved. To get the access back, remove \
+             gdrive's access at https://myaccount.google.com/permissions, then run 'gdrive \
+             account reauth {account} --audit-log'"
+        ),
+    }
+}
+
+/// Why the login of `account`, which had the audit log, took it away; `None` when the new
+/// tokens record the grant too.
+pub(crate) fn audit_log_loss(
+    asked: login::AuditLog,
+    granted_by_google: bool,
+    recorded: bool,
+) -> Option<AuditLogLoss> {
+    if recorded {
+        None
+    } else if asked == login::AuditLog::No {
+        Some(AuditLogLoss::NotAsked)
+    } else if granted_by_google {
+        Some(AuditLogLoss::NoRefreshToken)
     } else {
-        format!(
-            "Warning: account '{account}' could read the audit log of its organization, and this \
-             login did not ask for that access, so 'gdrive files activity' no longer works with \
-             it. To get the access back, run 'gdrive account reauth {account} --audit-log'"
-        )
+        Some(AuditLogLoss::NotGranted)
     }
 }
 
@@ -186,8 +221,10 @@ mod tests {
 
     #[test]
     fn the_audit_log_warnings_name_the_command_that_brings_the_access_back() {
-        for asked in [true, false] {
-            let warning = audit_log_lost_warning("me@example.com", asked);
+        use AuditLogLoss::{NoRefreshToken, NotAsked, NotGranted};
+
+        for loss in [NotAsked, NotGranted, NoRefreshToken] {
+            let warning = audit_log_lost_warning("me@example.com", loss);
             assert!(warning.starts_with("Warning: "), "{warning}");
             assert!(
                 warning.contains("'gdrive account reauth me@example.com --audit-log'"),
@@ -195,8 +232,21 @@ mod tests {
             );
             assert!(warning.contains("'gdrive files activity'"), "{warning}");
         }
-        assert!(audit_log_lost_warning("me@example.com", true)
-            .contains("its Drive authorization was saved"));
+        for loss in [NotGranted, NoRefreshToken] {
+            assert!(audit_log_lost_warning("me@example.com", loss)
+                .contains("its Drive authorization was saved"));
+        }
+        assert!(audit_log_lost_warning("me@example.com", NoRefreshToken)
+            .contains("https://myaccount.google.com/permissions"));
+
+        let asked = login::AuditLog::Optional;
+        assert_eq!(audit_log_loss(asked, true, true), None);
+        assert_eq!(audit_log_loss(asked, false, false), Some(NotGranted));
+        assert_eq!(audit_log_loss(asked, true, false), Some(NoRefreshToken));
+        assert_eq!(
+            audit_log_loss(login::AuditLog::No, false, false),
+            Some(NotAsked)
+        );
     }
 
     #[derive(Debug)]

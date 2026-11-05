@@ -144,6 +144,18 @@ impl TokenFile {
         self.user_entries().any(records_audit_log)
     }
 
+    /// Whether the account's refresh token ([`TokenFile::refresh_token`]) is that of an entry
+    /// that records the audit-log grant: an authorization that was granted the audit log issued
+    /// it, so a refresh with it brings a token for the audit log.
+    pub(crate) fn refresh_token_has_audit_log(&self) -> bool {
+        let Some(refresh_token) = self.refresh_token() else {
+            return false;
+        };
+        self.user_entries().any(|entry| {
+            records_audit_log(entry) && entry.token.refresh_token.as_deref() == Some(refresh_token)
+        })
+    }
+
     /// [`TokenFile::audit_log_granted`] of the tokens file at `path`; `false` when it is missing
     /// or cannot be read.
     pub(crate) async fn audit_log_granted_at(path: &Path) -> bool {

@@ -23,12 +23,12 @@ pub(crate) struct Config {
 }
 
 pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
-    let audit_log = if config.audit_log {
+    let asked = if config.audit_log {
         login::AuditLog::Required
     } else {
         login::AuditLog::No
     };
-    let options = login::Options::new(config.mode, config.port, None).with_audit_log(audit_log);
+    let options = login::Options::new(config.mode, config.port, None).with_audit_log(asked);
     options.check().map_err(Error::Login)?;
 
     println!("To add an account you need a Google Client ID and Client Secret.");
@@ -63,16 +63,14 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
 
     // Adding an account again replaces its authorization, with whichever client.
     let had_audit_log = TokenFile::audit_log_granted_at(existing.tokens_path()).await;
-    let granted_audit_log = authorization.audit_log;
+    let granted_by_google = authorization.audit_log;
 
     // When the account is added again with the same client, Google may leave out the refresh
-    // token; keep the stored one then.
+    // token; keep the stored one then. (Read without the lock of the file: `add_account` writes
+    // under it, and a refresh in between only renews a token of the replaced authorization.)
     let previous = existing.tokens_of_client(&secret.client_id).await;
-    let tokens = TokenFile::after_login(
-        previous.as_ref(),
-        authorization.scopes(),
-        authorization.token,
-    );
+    let login::LoginTokens { tokens, audit_log } =
+        login::tokens_after_login(previous.as_ref(), authorization, asked).map_err(Error::Login)?;
     auth::warn_if_no_refresh_token(&tokens, &email);
 
     let app_cfg = app_config::add_account(&email, &secret, &tokens)
@@ -92,12 +90,13 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
     app_config::switch_account(&app_cfg).map_err(Error::SwitchAccount)?;
     println!();
     println!("Logged in as {}", app_cfg.account.name);
-    if had_audit_log && !granted_audit_log {
-        // A login that asked for the audit log and was not granted it failed before this.
-        eprintln!(
-            "{}",
-            auth::audit_log_lost_warning(&app_cfg.account.name, config.audit_log)
-        );
+    if let Some(loss) = auth::audit_log_loss(asked, granted_by_google, audit_log) {
+        if had_audit_log {
+            eprintln!(
+                "{}",
+                auth::audit_log_lost_warning(&app_cfg.account.name, loss)
+            );
+        }
     }
 
     Ok(())

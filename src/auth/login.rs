@@ -41,7 +41,7 @@ use tokio::{
 use url::Url;
 use yup_oauth2::storage::TokenInfo;
 
-use super::{AUDIT_LOG_SCOPE, DRIVE_AND_AUDIT_LOG_SCOPES, DRIVE_SCOPES};
+use super::{store::TokenFile, AUDIT_LOG_SCOPE, DRIVE_AND_AUDIT_LOG_SCOPES, DRIVE_SCOPES};
 use crate::{app_config::Secret, hub};
 
 /// The default port of the loopback redirect URI, as in gdrive 3.x (SSH tunnels rely on it).
@@ -173,6 +173,43 @@ impl Authorization {
             &DRIVE_SCOPES
         }
     }
+}
+
+/// The tokens to save after a login.
+pub(crate) struct LoginTokens {
+    pub(crate) tokens: TokenFile,
+    /// Whether they record the audit-log grant.
+    pub(crate) audit_log: bool,
+}
+
+/// The tokens file after `authorization`, a login that asked for `asked`, which replaces
+/// `previous`: the tokens of the same account and OAuth client, if there are any.
+///
+/// The audit-log grant is recorded only with a refresh token of an authorization that was
+/// granted it: the one in this login's answer, or a kept one whose own entry records the grant.
+/// When Google returns no refresh token (#150), [`TokenFile::after_login`] keeps the stored
+/// one, which was granted what its own login asked for, whatever the new access token may do:
+/// a refresh with a Drive-only refresh token brings a Drive-only token. With `--audit-log`
+/// ([`AuditLog::Required`]) the login then fails with [`LoginError::AuditLogWithoutRefreshToken`]
+/// and nothing is saved; when `account reauth` asked again by itself ([`AuditLog::Optional`]),
+/// the Drive authorization is saved without the grant.
+pub(crate) fn tokens_after_login(
+    previous: Option<&TokenFile>,
+    mut authorization: Authorization,
+    asked: AuditLog,
+) -> Result<LoginTokens, LoginError> {
+    let refresh_token_has_grant = authorization.token.refresh_token.is_some()
+        || previous.is_some_and(TokenFile::refresh_token_has_audit_log);
+    if authorization.audit_log && !refresh_token_has_grant {
+        if asked == AuditLog::Required {
+            return Err(LoginError::AuditLogWithoutRefreshToken);
+        }
+        authorization.audit_log = false;
+    }
+    Ok(LoginTokens {
+        tokens: TokenFile::after_login(previous, authorization.scopes(), authorization.token),
+        audit_log: authorization.audit_log,
+    })
 }
 
 /// Asks the user to authorize gdrive and returns what Google granted.
@@ -725,6 +762,9 @@ pub(crate) enum LoginError {
     DriveScopeNotGranted,
     /// `--audit-log` was given and the user unticked the audit log on the consent screen.
     AuditLogNotGranted,
+    /// `--audit-log` was given and Google granted it, but returned no refresh token, and the
+    /// stored one was not issued with the audit log ([`tokens_after_login`]).
+    AuditLogWithoutRefreshToken,
 }
 
 impl Display for LoginError {
@@ -811,6 +851,11 @@ impl Display for LoginError {
                  Workspace organization, so nothing was saved; run the command again and leave \
                  the box for the audit log ticked on the consent screen (the Google account must \
                  be an administrator of the organization)",
+            ),
+            LoginError::AuditLogWithoutRefreshToken => f.write_str(
+                "Google returned no refresh token, and the stored one does not include read \
+                 access to the audit log, so nothing was saved; remove gdrive's access at \
+                 https://myaccount.google.com/permissions, then run the command again",
             ),
         }
     }
@@ -1315,6 +1360,114 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_is_recorded_only_with_a_refresh_token_that_was_granted_it() {
+        // Google grants the audit log, but its answer carries no refresh token (#150).
+        let body = serde_json::json!({
+            "access_token": "ya29.secret-access",
+            "expires_in": 3599,
+            "scope": ALL_GRANTED,
+            "token_type": "Bearer",
+        })
+        .to_string();
+        let stored = |scopes: &[&str], refresh: Option<&str>| {
+            TokenFile::after_login(
+                None,
+                scopes,
+                TokenInfo {
+                    access_token: Some(String::from("old")),
+                    refresh_token: refresh.map(str::to_owned),
+                    expires_at: None,
+                    id_token: None,
+                },
+            )
+        };
+        // (stored tokens, whether a refresh token of the grant is kept)
+        let cases = [
+            (None, false),
+            (Some(stored(&DRIVE_SCOPES, Some("1//drive-only"))), false),
+            (Some(stored(&DRIVE_AND_AUDIT_LOG_SCOPES, None)), false),
+            (
+                Some(stored(&DRIVE_AND_AUDIT_LOG_SCOPES, Some("1//granted"))),
+                true,
+            ),
+        ];
+        for (previous, kept_has_grant) in &cases {
+            for asked in [AuditLog::Required, AuditLog::Optional] {
+                let server = MockServer::start(vec![(200, body.clone())]).await;
+                let request = request_for("http://localhost:8085", asked);
+                let authorization = exchange_code(
+                    &http_client(),
+                    &server.url("/token"),
+                    &secret(),
+                    &request,
+                    "code",
+                )
+                .await
+                .unwrap();
+                assert!(authorization.audit_log);
+                assert!(authorization.token.refresh_token.is_none());
+
+                let case = format!("{asked:?}, kept grant {kept_has_grant}");
+                let result = tokens_after_login(previous.as_ref(), authorization, asked);
+                match (asked, kept_has_grant) {
+                    (_, true) => {
+                        let LoginTokens { tokens, audit_log } = result.unwrap();
+                        assert!(audit_log, "{case}");
+                        assert!(tokens.audit_log_granted(), "{case}");
+                        assert_eq!(tokens.refresh_token(), Some("1//granted"), "{case}");
+                    }
+                    (AuditLog::Required, false) => {
+                        let Err(error) = result else {
+                            panic!("{case}: saved without a refresh token of the grant");
+                        };
+                        assert!(
+                            matches!(error, LoginError::AuditLogWithoutRefreshToken),
+                            "{case}: {error:?}"
+                        );
+                        let message = crate::error_message(&error);
+                        assert!(
+                            message.starts_with("Error: Google returned no refresh token"),
+                            "{message}"
+                        );
+                        assert!(message.contains("https://myaccount.google.com/permissions"));
+                        assert!(!message.contains("secret"), "{message}");
+                    }
+                    (_, false) => {
+                        // `account reauth` asked again by itself: the Drive authorization, with
+                        // the refresh token kept, and no grant.
+                        let LoginTokens { tokens, audit_log } = result.unwrap();
+                        assert!(!audit_log, "{case}");
+                        assert!(!tokens.audit_log_granted(), "{case}");
+                        assert_eq!(
+                            tokens.refresh_token(),
+                            previous.as_ref().and_then(TokenFile::refresh_token),
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // With a refresh token in the answer, the grant is recorded whatever was stored.
+        let with_refresh_token = token_response(Some(ALL_GRANTED));
+        let server = MockServer::start(vec![(200, with_refresh_token)]).await;
+        let request = request_for("http://localhost:8085", AuditLog::Required);
+        let authorization = exchange_code(
+            &http_client(),
+            &server.url("/token"),
+            &secret(),
+            &request,
+            "code",
+        )
+        .await
+        .unwrap();
+        let LoginTokens { tokens, audit_log } =
+            tokens_after_login(cases[1].0.as_ref(), authorization, AuditLog::Required).unwrap();
+        assert!(audit_log);
+        assert_eq!(tokens.refresh_token(), Some("1//secret-refresh"));
     }
 
     /// Sends a GET to the listener like a browser and returns the response.
