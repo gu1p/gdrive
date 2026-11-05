@@ -67,6 +67,17 @@ pub(crate) async fn get_hub_for(app_cfg: &AppConfig) -> Result<Hub, GetHubError>
     Ok(hub)
 }
 
+// STUB(activity-auth): replaced at merge
+/// A hub for the account `app_cfg` whose credentials can give tokens for
+/// [`auth::AUDIT_LOG_SCOPE`], besides the Drive scopes. Fails, before any request to the Reports
+/// API, when the account was not authorized for the audit log (`GetHubError::AuditLogNotGranted`,
+/// whose message names `gdrive account reauth <ACCOUNT> --audit-log`) or is not a user account
+/// (`GetHubError::AuditLogUnsupported`: service accounts and Application Default Credentials are
+/// not supported yet). Never starts an interactive authorization.
+pub(crate) async fn get_audit_hub_for(app_cfg: &AppConfig) -> Result<Hub, GetHubError> {
+    get_hub_for(app_cfg).await
+}
+
 /// The account named `account_name`, one of those `gdrive account list` prints. Fails with
 /// [`GetHubError::AccountNotFound`], which names it and the commands that list and add
 /// accounts, when there is no such account.
