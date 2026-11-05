@@ -11,8 +11,9 @@ use std::{
 use bytes::Bytes;
 
 use super::{
-    decode, encode, header, pax_record, ArchiveError, ArchiveSource, Blob, CachedExport, Content,
-    Entry, EntryError, EntryFailure, ExportsCache, Layout, Part, END_OF_ARCHIVE,
+    decode, encode, field, header, hex, pax_record, ArchiveError, ArchiveSource, Blob,
+    CachedExport, Content, Entry, EntryError, EntryFailure, ExportsCache, Layout, Manifest, Part,
+    END_OF_ARCHIVE,
 };
 use crate::transfer::{
     fake_drive::{Behavior, FakeDrive, FakeFile},
@@ -790,4 +791,36 @@ async fn a_read_inside_a_blob_hashes_it_from_its_first_byte() {
         matches!(failure.error, EntryError::Corrupt { .. }),
         "{failure:?}"
     );
+}
+
+#[test]
+fn a_blob_without_md5_is_told_apart_by_its_modification_time_in_the_manifest() {
+    let digest = |md5: Option<&str>, modified: &str| {
+        let mut manifest = Manifest::new();
+        manifest.blob(
+            "root/a.bin",
+            &Blob {
+                id: String::from("a"),
+                size: 3,
+                md5: md5.map(str::to_owned),
+                resource_key: None,
+                modified_time: Some(modified.parse().unwrap()),
+            },
+        );
+        manifest.finish()
+    };
+    let (one, two) = ("2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z");
+    assert_ne!(digest(None, one), digest(None, two));
+
+    // With an md5, the time is no part of it: the input is what it was.
+    let md5 = "0123456789ABCDEF0123456789abcdef";
+    assert_eq!(digest(Some(md5), one), digest(Some(md5), two));
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"gdrive archive manifest 1\n");
+    context.update(b"f");
+    field(&mut context, b"root/a.bin");
+    field(&mut context, b"a");
+    context.update(&3_u64.to_be_bytes());
+    field(&mut context, md5.to_ascii_lowercase().as_bytes());
+    assert_eq!(digest(Some(md5), one), hex(context.finish().as_ref()));
 }

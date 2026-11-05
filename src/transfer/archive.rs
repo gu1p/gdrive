@@ -389,8 +389,9 @@ fn digits(n: usize) -> usize {
 
 /// The digest of what an archive is made from, computable from the listing alone (without
 /// exporting anything): per entry, in the order of the archive, its path and kind; for a blob
-/// its id, size and md5; for an exported Workspace file its id, `modifiedTime` and export
-/// format. A destination file whose `appProperties` carry it is that archive.
+/// its id, size and md5 (and its `modifiedTime` when it has no md5); for an exported Workspace
+/// file its id, `modifiedTime` and export format. A destination file whose `appProperties`
+/// carry it is that archive.
 pub(crate) struct Manifest {
     context: ring::digest::Context,
 }
@@ -415,6 +416,14 @@ impl Manifest {
         self.context.update(&blob.size.to_be_bytes());
         let md5 = blob.md5.as_deref().unwrap_or_default().to_ascii_lowercase();
         field(&mut self.context, md5.as_bytes());
+        if blob.md5.is_none() {
+            // Without md5, the modification time tells another content apart, as DriveSource
+            // compares it before reading again.
+            field(
+                &mut self.context,
+                rfc3339(blob.modified_time.as_ref()).as_bytes(),
+            );
+        }
     }
 
     /// A Workspace file `id`, modified at `modified_time`, exported as `format` (an extension).
@@ -428,10 +437,7 @@ impl Manifest {
         self.context.update(b"e");
         field(&mut self.context, path.as_bytes());
         field(&mut self.context, id.as_bytes());
-        let modified = modified_time
-            .map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
-            .unwrap_or_default();
-        field(&mut self.context, modified.as_bytes());
+        field(&mut self.context, rfc3339(modified_time).as_bytes());
         field(&mut self.context, format.as_bytes());
     }
 
@@ -440,6 +446,12 @@ impl Manifest {
     pub(crate) fn finish(self) -> String {
         hex(self.context.finish().as_ref())
     }
+}
+
+/// `time` in RFC 3339 with milliseconds; empty without one.
+fn rfc3339(time: Option<&DateTime<Utc>>) -> String {
+    time.map(|time| time.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_default()
 }
 
 /// Feeds `bytes` to `context` after its length, so that fields cannot run into each other.
