@@ -1310,6 +1310,93 @@ async fn windows_and_pages_lose_no_event_and_count_none_twice() {
 }
 
 #[tokio::test]
+async fn identical_events_of_one_record_count_once_each_however_often_it_is_returned() {
+    // A bulk action: one record with two events of the same name about the same item, both
+    // primary (one marked so, one without the parameter).
+    let bulk = |time: &str| {
+        record(
+            time,
+            Some("ana@example.com"),
+            vec![
+                with_primary(event("download", "a"), true),
+                event("download", "a"),
+            ],
+        )
+    };
+    let since = at("2026-10-06T00:00:00Z");
+    let until = at("2026-11-05T00:00:00Z");
+    // Inside the second of window 1 that window 0 reaches into.
+    let border = bulk("2026-10-07T00:00:00.500Z");
+    let inside = bulk("2026-11-01T12:00:00Z");
+    for (case, log, read) in [
+        // The same record on two pages of one window: both copies are read.
+        ("pages", vec![inside.clone(), inside.clone()], 4),
+        // One record that two overlapping windows return: read by the later one only.
+        ("windows", vec![border.clone()], 2),
+        // Both: two copies, each returned by two windows.
+        ("pages and windows", vec![border.clone(), border.clone()], 4),
+    ] {
+        let drive = FakeDrive::start(
+            tree(),
+            Behavior {
+                audit_page_size: Some(1),
+                ..behavior(log)
+            },
+        )
+        .await;
+        let range = |by| Settings {
+            by,
+            since: When::At(since),
+            until: Some(When::At(until)),
+            active_only: true,
+            ..settings(&["old"])
+        };
+
+        let ran = activity(&drive, range(By::User)).await;
+        ran.assert_ok();
+        assert_eq!(ran.rows().len(), 1, "{case}");
+        assert_eq!(
+            ran.rows()[0][4..],
+            ["0", "2", "0", "0", "1"].map(String::from),
+            "{case}: views, downloads, edits, other, files"
+        );
+        assert!(
+            ran.err.lines().contains(&format!(
+                "Read {read} events of the audit log, 2 of them about these items"
+            )),
+            "{case}: {}",
+            ran.err.text()
+        );
+        // The record is inside the ranges of the first two windows.
+        let ranges = windows(&drive);
+        assert_eq!(
+            (ranges[0].1.as_str(), ranges[1].0.as_str()),
+            ("2026-10-07T00:00:01.000Z", "2026-10-07T00:00:00.000Z"),
+            "{case}"
+        );
+        if case != "windows" {
+            assert!(
+                drive
+                    .audit_requests()
+                    .iter()
+                    .any(|request| request.param("pageToken").is_some()),
+                "{case}: the second copy is on a page of its own"
+            );
+        }
+
+        let ran = activity(&drive, range(By::Event)).await;
+        ran.assert_ok();
+        let events = ran
+            .rows()
+            .into_iter()
+            .map(|row| (row[2].clone(), row[3].clone()))
+            .collect::<Vec<_>>();
+        let download = (String::from("download"), String::from("old/a.txt"));
+        assert_eq!(events, [download.clone(), download], "{case}");
+    }
+}
+
+#[tokio::test]
 async fn a_since_older_than_the_audit_log_is_clamped_with_a_warning() {
     let drive = FakeDrive::start(tree(), Behavior::default()).await;
 
