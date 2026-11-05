@@ -824,3 +824,61 @@ fn a_blob_without_md5_is_told_apart_by_its_modification_time_in_the_manifest() {
     field(&mut context, md5.to_ascii_lowercase().as_bytes());
     assert_eq!(digest(Some(md5), one), hex(context.finish().as_ref()));
 }
+
+#[tokio::test]
+async fn prepare_hashes_the_start_of_a_blob_before_a_request_reads_inside_it() {
+    let (drive, layout, reference) = source_archive(three_blobs(), Behavior::default()).await;
+    let hub = drive.hub();
+    let mut source = ArchiveSource::new(&hub, &layout);
+    // Nothing to do at bytes in memory, nor at the first byte of a blob.
+    source.prepare(0).await.unwrap();
+    source.prepare(blob_start(&layout, 1)).await.unwrap();
+    assert_eq!(drive.media_ranges(), []);
+
+    // Inside a blob: its start is read now, before any request of the uploader is open.
+    let offset = blob_start(&layout, 0) + 1000;
+    source.prepare(offset).await.unwrap();
+    assert_eq!(drive.media_ranges(), [(String::from("one"), None)]);
+    source.prepare(offset).await.unwrap();
+    let mut buf = vec![0; 500];
+    let read = source.read_at(offset, &mut buf).await.unwrap();
+    let at = usize::try_from(offset).unwrap();
+    assert_eq!(&buf[..read], &reference[at..at + read]);
+    assert_eq!(
+        drive.media_ranges(),
+        [(String::from("one"), None)],
+        "the read asks for nothing before its offset"
+    );
+
+    // The md5 of a blob prepared that way is still compared at its end.
+    let (listed, served) = wrong_blob();
+    let layout = Layout::new(vec![folder("root"), blob_of("root/one.txt", &listed)]);
+    let drive = FakeDrive::start(vec![served], Behavior::default()).await;
+    let hub = drive.hub();
+    let mut source = ArchiveSource::new(&hub, &layout);
+    let mut offset = blob_start(&layout, 0) + 1000;
+    source.prepare(offset).await.unwrap();
+    let error = loop {
+        match source.read_at(offset, &mut buf).await {
+            Ok(0) => panic!("the archive was read whole"),
+            Ok(read) => offset += read as u64,
+            Err(error) => break error,
+        }
+    };
+    assert!(
+        matches!(entry_failure(error).error, EntryError::Corrupt { .. }),
+        "the md5 is compared"
+    );
+    // And once it failed, preparing a request inside it fails the same way.
+    let failure = entry_failure(
+        source
+            .prepare(blob_start(&layout, 0) + 10)
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(failure.path, "root/one.txt");
+    assert!(
+        matches!(failure.error, EntryError::Corrupt { .. }),
+        "{failure:?}"
+    );
+}

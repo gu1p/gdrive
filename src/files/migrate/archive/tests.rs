@@ -815,3 +815,94 @@ async fn a_doc_whose_export_is_too_large_is_one_skipped_item() {
          0 cancelled"
     );
 }
+
+#[tokio::test]
+async fn a_continued_run_reads_the_start_of_the_file_before_it_sends_a_chunk() {
+    let dir = tempfile::tempdir().unwrap();
+    let uploads = dir.path().join("uploads");
+    let options = UploadOptions {
+        chunk_size: CHUNK_ALIGNMENT,
+        multipart_threshold: 0,
+        session_dir: Some(uploads.clone()),
+        ..UploadOptions::default()
+    };
+    let files = || {
+        vec![
+            FakeFile::folder("big", "big", "root"),
+            FakeFile::blob(
+                "b",
+                "b.bin",
+                "big",
+                &std::iter::repeat_n('b', 900_000).collect::<String>(),
+            ),
+        ]
+    };
+    let source = FakeDrive::start(files(), Behavior::default()).await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            chunks_stalled_from: Some(CHUNK_ALIGNMENT),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let first = migrate_with(
+        &source,
+        &dest,
+        settings(&["big"]),
+        &options,
+        dest.wait_for_stalled_chunks(1),
+    )
+    .await;
+    assert!(
+        first.summary().ends_with("; interrupted"),
+        "{}",
+        first.summary()
+    );
+
+    // The next run continues inside b.bin, which cannot be read now: the start of b.bin is read
+    // before the continued chunk is sent, so that chunk is never sent.
+    dest.stop_stalling();
+    let unreadable = FakeDrive::start(
+        files(),
+        Behavior {
+            media_missing: std::collections::HashMap::from([(String::from("b"), Duration::ZERO)]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let writes_before = dest.writes().len();
+    let second = migrate_with(
+        &unreadable,
+        &dest,
+        settings(&["big"]),
+        &options,
+        std::future::pending(),
+    )
+    .await;
+
+    assert!(second.result.is_err());
+    let text = second.err.text();
+    assert!(
+        text.contains(
+            "Error: unable to migrate 'big.tar': unable to read 'big/b.bin' from the source; run \
+             the command again"
+        ),
+        "{text}"
+    );
+    // Every request that is not a GET, as it arrives: only the question where the session
+    // stands, an empty PUT; no chunk was sent.
+    assert_eq!(
+        dest.writes()[writes_before..],
+        ["PUT /upload-session/0"],
+        "{text}"
+    );
+    assert_eq!(dest.chunks().last().map(|chunk| chunk.first), Some(None));
+    assert_eq!(unreadable.media_ranges(), [(String::from("b"), None)]);
+    assert!(
+        files_in(&uploads)
+            .iter()
+            .any(|name| Path::new(name).extension().is_some_and(|ext| ext == "json")),
+        "the session is kept for the next run"
+    );
+}

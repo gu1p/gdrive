@@ -26,14 +26,16 @@
 //!
 //! What a run checks:
 //! - Every blob with an md5 is hashed from its first byte, and at its last byte the md5 is
-//!   compared with the listed `md5Checksum`. A read that starts past the bytes hashed so far
-//!   (the first read of a continued session, inside a blob) first reads the blob from there up
-//!   to its offset. The read that would return the last byte fails instead when the md5s
-//!   differ, and so does every later read of that blob, so the archive is never completed with
-//!   it: the error names the entry and tells whether the file changed in the source (its
-//!   metadata shows another content, as the relay asks) or the bytes read are not the listed
-//!   ones. A changed size, a deleted file and a failed read fail the same way. A blob without
-//!   an md5 is archived unchecked, as the relay copies one.
+//!   compared with the listed `md5Checksum`. When the uploader is about to send a request that
+//!   reads from inside a blob hashed only up to an earlier byte (the first chunk of a continued
+//!   session), `Source::prepare` reads the blob from there up to that offset first, with no
+//!   request open (a line on stderr says so when that is more than 4 MiB); a read that still
+//!   starts past the bytes hashed does the same. The read that would return the last byte
+//!   fails instead when the md5s differ, and so does every later read of that blob, so the
+//!   archive is never completed with it: the error names the entry and tells whether the file
+//!   changed in the source (its metadata shows another content, as the relay asks) or the
+//!   bytes read are not the listed ones. A changed size, a deleted file and a failed read fail
+//!   the same way. A blob without an md5 is archived unchecked, as the relay copies one.
 //! - In a run that sends the whole archive, the uploader compares the md5 of the bytes it read
 //!   with Drive's md5 of the archive. Only such a run does.
 //! - A run that continues the session of an earlier run (the uploader's `record_in`, with
@@ -66,7 +68,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 
 use crate::{
-    common::parse_md5_digest,
+    common::{human_size::human_size, parse_md5_digest},
     hub::Hub,
     // Warnings go above the progress bars.
     transfer::{
@@ -477,6 +479,9 @@ struct Hashing {
 /// The bytes read at a time to hash the start of a blob that a read does not begin at.
 const CATCH_UP: usize = 256 * 1024;
 
+/// A catch-up that reads more than this says so on stderr first.
+const CATCH_UP_NOTICE: u64 = 4 << 20;
+
 /// What is known of the md5 of a blob that has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Check {
@@ -542,9 +547,9 @@ impl<'a> ArchiveSource<'a> {
     }
 
     /// Reads the blob `index` at `offset` of its content. A blob with an md5 is hashed from its
-    /// first byte: a read past the bytes hashed so far (the first read of a continued session)
-    /// reads what lies between from the source first. Once its md5 failed, every read of the
-    /// blob fails.
+    /// first byte: a read past the bytes hashed so far reads what lies between from the source
+    /// first ([`Self::catch_up`]; the uploader has [`Source::prepare`] do that before its
+    /// request). Once its md5 failed, every read of the blob fails.
     async fn read_blob(
         &mut self,
         index: usize,
@@ -567,39 +572,7 @@ impl<'a> ArchiveSource<'a> {
             Check::Failed { .. } => return Err(failure(self.mismatch(index, expected).await)),
         }
 
-        if self
-            .hashing
-            .as_ref()
-            .is_none_or(|hashing| hashing.blob != index)
-        {
-            self.hashing = Some(Hashing {
-                blob: index,
-                context: md5::Context::new(),
-                hashed: 0,
-            });
-        }
-        let mut scratch = Vec::new();
-        while let Some(hashed) = self
-            .hashing
-            .as_ref()
-            .map(|hashing| hashing.hashed)
-            .filter(|&hashed| hashed < offset)
-        {
-            if scratch.is_empty() {
-                scratch = vec![0; CATCH_UP];
-            }
-            let len = usize::try_from(offset - hashed)
-                .map_or(scratch.len(), |left| left.min(scratch.len()));
-            let read = self
-                .read_source(index, hashed, &mut scratch[..len])
-                .await
-                .map_err(failure)?;
-            // Only once the read returned: a read dropped on the way loses nothing.
-            if let Some(hashing) = &mut self.hashing {
-                hashing.context.consume(&scratch[..read]);
-                hashing.hashed += read as u64;
-            }
-        }
+        self.catch_up(index, offset).await.map_err(failure)?;
         let read = self
             .read_source(index, offset, buf)
             .await
@@ -637,6 +610,91 @@ impl<'a> ArchiveSource<'a> {
             changed: None,
         };
         Err(failure(self.mismatch(index, expected).await))
+    }
+
+    /// Hashes the blob `index`, whose check is pending, up to `offset` of its content: from the
+    /// bytes hashed so far (its first byte when its hashing has not started), read from the
+    /// source. The hash state moves on only once each read returned, so a call dropped on the
+    /// way loses nothing and the next one goes on from there.
+    async fn catch_up(&mut self, index: usize, offset: u64) -> Result<(), EntryError> {
+        if self
+            .hashing
+            .as_ref()
+            .is_none_or(|hashing| hashing.blob != index)
+        {
+            self.hashing = Some(Hashing {
+                blob: index,
+                context: md5::Context::new(),
+                hashed: 0,
+            });
+        }
+        let mut scratch = Vec::new();
+        while let Some(hashed) = self
+            .hashing
+            .as_ref()
+            .map(|hashing| hashing.hashed)
+            .filter(|&hashed| hashed < offset)
+        {
+            if scratch.is_empty() {
+                if offset - hashed > CATCH_UP_NOTICE {
+                    eprintln!(
+                        "Reading '{}' again from its start to check it ({} before the upload \
+                         continues)",
+                        self.layout.blobs[index].path,
+                        human_size(offset - hashed)
+                    );
+                }
+                scratch = vec![0; CATCH_UP];
+            }
+            let len = usize::try_from(offset - hashed)
+                .map_or(scratch.len(), |left| left.min(scratch.len()));
+            let read = self.read_source(index, hashed, &mut scratch[..len]).await?;
+            // Only once the read returned: a read dropped on the way loses nothing.
+            if let Some(hashing) = &mut self.hashing {
+                hashing.context.consume(&scratch[..read]);
+                hashing.hashed += read as u64;
+            }
+        }
+        Ok(())
+    }
+
+    /// Before a request that reads from `offset`: when that is inside a blob with an md5 whose
+    /// hashing is behind it (a continued session), hashes the blob up to there now, while no
+    /// request is open. A blob whose md5 failed fails here already.
+    async fn prepare_at(&mut self, offset: u64) -> Result<(), EntryFailure> {
+        if offset >= self.layout.size {
+            return Ok(());
+        }
+        let layout = self.layout;
+        let (segment, _) = layout.segment_at(offset);
+        let segment = &layout.segments[segment];
+        let Part::Blob(index) = segment.part else {
+            return Ok(());
+        };
+        let laid = &layout.blobs[index];
+        let failure = |error| EntryFailure {
+            path: laid.path.clone(),
+            error,
+        };
+        let Some(expected) = laid.blob.md5.as_deref() else {
+            return Ok(());
+        };
+        let at = offset - segment.start;
+        match &self.checks[index] {
+            Check::Verified => Ok(()),
+            Check::Failed { .. } => Err(failure(self.mismatch(index, expected).await)),
+            Check::Pending => {
+                let hashed = self
+                    .hashing
+                    .as_ref()
+                    .filter(|hashing| hashing.blob == index)
+                    .map_or(0, |hashing| hashing.hashed);
+                if hashed >= at {
+                    return Ok(());
+                }
+                self.catch_up(index, at).await.map_err(failure)
+            }
+        }
     }
 
     /// Reads the blob `index` at `offset` from the source; never 0 bytes.
@@ -731,6 +789,10 @@ impl Source for ArchiveSource<'_> {
 
     fn size(&mut self) -> impl std::future::Future<Output = io::Result<u64>> {
         std::future::ready(Ok(self.layout.size))
+    }
+
+    async fn prepare(&mut self, offset: u64) -> io::Result<()> {
+        self.prepare_at(offset).await.map_err(io::Error::other)
     }
 }
 
