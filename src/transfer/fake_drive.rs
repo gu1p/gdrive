@@ -28,6 +28,16 @@
 //! returns what the test started the fake with. Every request that is not a `GET` is also in
 //! [`FakeDrive::writes`], which is empty for an account that was only read.
 //!
+//! For `files activity` it answers `permissions.list` of a stored file from
+//! [`Behavior::permissions`] (paged with `pageSize` and `pageToken`), and the audit log of the
+//! Admin SDK Reports API (`GET /admin/reports/v1/activity/users/all/applications/drive`) from
+//! the records of [`Behavior::audit_log`]: newest first, within `startTime` (included, unless
+//! [`Behavior::audit_exclusive_start`]) and `endTime` (excluded), with `filters` of `name==value`
+//! terms over event parameters (a record matches when one of its events has all of them), paged
+//! with `maxResults` and `pageToken`. Both record their requests ([`FakeDrive::audit_requests`],
+//! [`FakeDrive::permission_requests`]); [`Behavior::audit_error`] and
+//! [`Behavior::audit_rate_limited`] make the audit log fail.
+//!
 //! A test that checks how many requests were in flight at once does not rely on delays: the
 //! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
 //! listing until a download has started, so the overlap happens however slow the machine is.
@@ -63,6 +73,8 @@ const ABOUT_PATH: &str = "/drive/v3/about";
 const GENERATE_IDS_PATH: &str = "/drive/v3/files/generateIds";
 const UPLOAD_PATH: &str = "/upload/drive/v3/files";
 const SESSION_PATH: &str = "/upload-session/";
+const AUDIT_PATH: &str = "/admin/reports/v1/activity/users/all/applications/drive";
+const PERMISSIONS_SUFFIX: &str = "/permissions";
 
 /// A file stored by the fake.
 #[derive(Debug, Clone, Default)]
@@ -309,6 +321,22 @@ pub(crate) struct Behavior {
     pub(crate) list_after_media: HashSet<String>,
     /// The email address `about.get` reports; `fake@example.com` without one.
     pub(crate) account_email: Option<String>,
+    /// The records of the audit log, as the Reports API returns them in `items`.
+    pub(crate) audit_log: Vec<Value>,
+    /// The most audit records per page; `None` honors `maxResults`.
+    pub(crate) audit_page_size: Option<usize>,
+    /// `startTime` leaves out a record of that very time, as `endTime` always does.
+    pub(crate) audit_exclusive_start: bool,
+    /// Every audit log request is answered with this status and JSON body.
+    pub(crate) audit_error: Option<(u16, Value)>,
+    /// The first this many audit log requests are answered with 429, a rate limit.
+    pub(crate) audit_rate_limited: usize,
+    /// The first this many audit log requests are held until all of them have arrived.
+    pub(crate) audit_rendezvous: usize,
+    /// The sharing list of these file ids: the permissions `permissions.list` returns.
+    pub(crate) permissions: HashMap<String, Vec<Value>>,
+    /// `permissions.list` of these file ids fails with 403.
+    pub(crate) permissions_unreadable: HashSet<String>,
 }
 
 /// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
@@ -402,6 +430,26 @@ impl ListRequest {
     }
 }
 
+/// An audit log or `permissions.list` request as the fake saw it, with percent-decoded
+/// parameters.
+#[derive(Debug, Clone)]
+pub(crate) struct ApiRequest {
+    /// For `permissions.list`, the file id; empty for the audit log.
+    pub(crate) file_id: String,
+    pub(crate) params: Vec<(String, String)>,
+    /// The `Authorization` header.
+    pub(crate) authorization: Option<String>,
+}
+
+impl ApiRequest {
+    pub(crate) fn param(&self, name: &str) -> Option<&str> {
+        self.params
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+}
+
 struct State {
     /// The stored files; creates, content updates and metadata updates change them.
     files: Mutex<Vec<FakeFile>>,
@@ -455,6 +503,13 @@ struct State {
     media_arrived: watch::Sender<bool>,
     /// The chunks held without a reply ([`Behavior::chunks_stalled_from`]).
     stalled_chunks: watch::Sender<usize>,
+    audit_requests: Mutex<Vec<ApiRequest>>,
+    /// The 429 replies still to send ([`Behavior::audit_rate_limited`]).
+    audit_rate_limited_left: Mutex<usize>,
+    audit_in_flight: AtomicUsize,
+    audit_max_in_flight: AtomicUsize,
+    audit_rendezvous: Rendezvous,
+    permission_requests: Mutex<Vec<ApiRequest>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -473,6 +528,8 @@ impl FakeDrive {
         let upload_rendezvous = Rendezvous::new(behavior.upload_rendezvous);
         let media_rendezvous = Rendezvous::new(behavior.media_rendezvous);
         let list_rendezvous = Rendezvous::new(behavior.list_rendezvous.len());
+        let audit_rendezvous = Rendezvous::new(behavior.audit_rendezvous);
+        let audit_rate_limited_left = Mutex::new(behavior.audit_rate_limited);
         let state = Arc::new(State {
             files: Mutex::new(files),
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
@@ -507,6 +564,12 @@ impl FakeDrive {
             list_rendezvous,
             media_arrived: watch::channel(false).0,
             stalled_chunks: watch::channel(0).0,
+            audit_requests: Mutex::new(Vec::new()),
+            audit_rate_limited_left,
+            audit_in_flight: AtomicUsize::new(0),
+            audit_max_in_flight: AtomicUsize::new(0),
+            audit_rendezvous,
+            permission_requests: Mutex::new(Vec::new()),
         });
 
         let server_state = Arc::clone(&state);
@@ -633,6 +696,29 @@ impl FakeDrive {
         self.state.uploads_max_in_flight.load(Ordering::SeqCst)
     }
 
+    /// The requests to the audit log, in arrival order.
+    pub(crate) fn audit_requests(&self) -> Vec<ApiRequest> {
+        self.state
+            .audit_requests
+            .lock()
+            .expect("audit requests lock")
+            .clone()
+    }
+
+    /// The most audit log requests that were being answered at the same time.
+    pub(crate) fn audit_max_in_flight(&self) -> usize {
+        self.state.audit_max_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// The `permissions.list` requests, in arrival order.
+    pub(crate) fn permission_requests(&self) -> Vec<ApiRequest> {
+        self.state
+            .permission_requests
+            .lock()
+            .expect("permission requests lock")
+            .clone()
+    }
+
     /// When the first media download arrived and when the last list reply was sent.
     pub(crate) fn first_media_and_last_list(&self) -> (Option<Instant>, Option<Instant>) {
         (
@@ -736,11 +822,17 @@ async fn handle(
     if path == GENERATE_IDS_PATH {
         return Ok(generate_ids(&state, &params));
     }
+    if path == AUDIT_PATH {
+        return Ok(audit(&state, params, request.headers()).await);
+    }
     if let Some(id) = path
         .as_str()
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
+        if let Some(id) = id.strip_suffix(PERMISSIONS_SUFFIX) {
+            return Ok(permissions(&state, id, params, request.headers()));
+        }
         if let Some(id) = id.strip_suffix("/export") {
             return Ok(export(&state, id, &params).await);
         }
@@ -1569,6 +1661,229 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     json_response(StatusCode::OK, &body)
 }
 
+/// The `Authorization` header of a request.
+fn authorization(headers: &hyper::HeaderMap) -> Option<String> {
+    headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(String::from)
+}
+
+/// `permissions.list` of the stored file `id`: its [`Behavior::permissions`], `pageSize` (100
+/// without one) at a time.
+fn permissions(
+    state: &State,
+    id: &str,
+    params: Vec<(String, String)>,
+    headers: &hyper::HeaderMap,
+) -> FakeResponse {
+    let request = ApiRequest {
+        file_id: id.to_owned(),
+        params,
+        authorization: authorization(headers),
+    };
+    state
+        .permission_requests
+        .lock()
+        .expect("permission requests lock")
+        .push(request.clone());
+    if state.file(id).is_none() {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
+    }
+    if state.behavior.permissions_unreadable.contains(id) {
+        return error(
+            StatusCode::FORBIDDEN,
+            "The user does not have sufficient permissions for this file.",
+        );
+    }
+    let all = state
+        .behavior
+        .permissions
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    let offset = match request.param("pageToken") {
+        None => 0,
+        Some(token) => match parse_token(token, id) {
+            Some(offset) => offset,
+            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
+        },
+    };
+    let requested = request
+        .param("pageSize")
+        .and_then(|size| size.parse::<usize>().ok())
+        .unwrap_or(100);
+    let page_size = state
+        .behavior
+        .page_size
+        .unwrap_or(requested)
+        .min(requested)
+        .max(1);
+    let end = (offset + page_size).min(all.len());
+    let mut body = json!({
+        "kind": "drive#permissionList",
+        "permissions": all.get(offset..end).unwrap_or_default(),
+    });
+    if end < all.len() {
+        body["nextPageToken"] = json!(token(end, id));
+    }
+    json_response(StatusCode::OK, &body)
+}
+
+/// The audit log of the Reports API: the records of [`Behavior::audit_log`] that the request's
+/// time range and `filters` select, newest first, `maxResults` (1 to 1000) at a time.
+async fn audit(
+    state: &State,
+    params: Vec<(String, String)>,
+    headers: &hyper::HeaderMap,
+) -> FakeResponse {
+    let _in_flight = InFlight::new(&state.audit_in_flight, &state.audit_max_in_flight);
+    let request = ApiRequest {
+        file_id: String::new(),
+        params,
+        authorization: authorization(headers),
+    };
+    state
+        .audit_requests
+        .lock()
+        .expect("audit requests lock")
+        .push(request.clone());
+    state.audit_rendezvous.join().await;
+    tokio::time::sleep(state.behavior.delay).await;
+
+    let behavior = &state.behavior;
+    if let Some((status, body)) = &behavior.audit_error {
+        let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        return json_response(status, body);
+    }
+    let limited = {
+        let mut left = state
+            .audit_rate_limited_left
+            .lock()
+            .expect("rate limit lock");
+        let limited = *left > 0;
+        *left = left.saturating_sub(1);
+        limited
+    };
+    if limited {
+        let message = "Quota exceeded for quota metric 'Queries' of service \
+                       'admin.googleapis.com'.";
+        return json_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &json!({"error": {
+                "code": 429,
+                "message": message,
+                "errors": [{"domain": "global", "reason": "rateLimitExceeded", "message": message}],
+            }}),
+        );
+    }
+
+    let time = |name: &str| match request.param(name) {
+        None => Ok(None),
+        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
+            .map(|time| Some(time.with_timezone(&chrono::Utc)))
+            .map_err(|_| error(StatusCode::BAD_REQUEST, &format!("Invalid value '{name}'"))),
+    };
+    let (start, end) = match (time("startTime"), time("endTime")) {
+        (Ok(start), Ok(end)) => (start, end),
+        (Err(response), _) | (_, Err(response)) => return response,
+    };
+    if let (Some(start), Some(end)) = (start, end) {
+        if start > end {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "Start time must be less than or equal to the end time.",
+            );
+        }
+    }
+    let max_results = match request.param("maxResults").map(str::parse::<usize>) {
+        None => 1000,
+        Some(Ok(max)) if (1..=1000).contains(&max) => max,
+        Some(_) => return error(StatusCode::BAD_REQUEST, "Invalid value 'maxResults'"),
+    };
+    let filters = request.param("filters").unwrap_or_default();
+    let mut terms = Vec::new();
+    for term in filters.split(',').filter(|term| !term.is_empty()) {
+        let Some((name, value)) = term.split_once("==") else {
+            return error(StatusCode::BAD_REQUEST, "Invalid value 'filters'");
+        };
+        terms.push((name.to_owned(), value.to_owned()));
+    }
+
+    let record_time = |record: &Value| {
+        record["id"]["time"]
+            .as_str()
+            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+            .map(|time| time.with_timezone(&chrono::Utc))
+    };
+    let in_range = |record: &Value| {
+        let Some(time) = record_time(record) else {
+            return true;
+        };
+        let after_start = start.is_none_or(|start| {
+            if behavior.audit_exclusive_start {
+                time > start
+            } else {
+                time >= start
+            }
+        });
+        after_start && end.is_none_or(|end| time < end)
+    };
+    let has_terms = |record: &Value| {
+        terms.is_empty()
+            || record["events"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|event| {
+                    terms.iter().all(|(name, value)| {
+                        event["parameters"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .any(|parameter| {
+                                parameter["name"] == name.as_str()
+                                    && parameter["value"] == value.as_str()
+                            })
+                    })
+                })
+    };
+    let mut records = behavior
+        .audit_log
+        .iter()
+        .filter(|record| in_range(record) && has_terms(record))
+        .collect::<Vec<_>>();
+    records.sort_by_key(|record| std::cmp::Reverse(record_time(record)));
+
+    let query = format!(
+        "{:?} {:?} {filters} {max_results}",
+        request.param("startTime"),
+        request.param("endTime")
+    );
+    let offset = match request.param("pageToken") {
+        None => 0,
+        Some(token) => match parse_token(token, &query) {
+            Some(offset) => offset,
+            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
+        },
+    };
+    let page_size = behavior
+        .audit_page_size
+        .unwrap_or(max_results)
+        .min(max_results);
+    let end = (offset + page_size).min(records.len());
+    let items = records.get(offset..end).unwrap_or_default();
+    let mut body = json!({"kind": "admin#reports#activities"});
+    // Google leaves `items` out of an empty page.
+    if !items.is_empty() {
+        body["items"] = json!(items);
+    }
+    if end < records.len() {
+        body["nextPageToken"] = json!(token(end, &query));
+    }
+    json_response(StatusCode::OK, &body)
+}
+
 /// `files.get`: the stored file with the top-level fields of the `fields` mask (all without one).
 fn get(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
     let Some(file) = state.file(id) else {
@@ -1662,6 +1977,8 @@ mod tests {
     use http_body_util::BodyExt;
     use hyper::{Request, StatusCode};
 
+    use serde_json::json;
+
     use super::{parent_ids, Behavior, FakeDrive, FakeFile};
     use crate::common::media_client::MediaClient;
 
@@ -1747,6 +2064,197 @@ mod tests {
             about.user.and_then(|user| user.email_address).as_deref(),
             Some("me@example.com")
         );
+    }
+
+    /// The `items` of the audit log pages for `query`, one page per request, and the requests'
+    /// statuses.
+    async fn audit_pages(drive: &FakeDrive, query: &[(&str, &str)]) -> (Vec<Vec<String>>, u16) {
+        let hub = drive.hub();
+        let client = MediaClient::new(&hub);
+        let mut pages = Vec::new();
+        let mut token = None::<String>;
+        loop {
+            let mut url = url::Url::parse(hub.reports_base_url())
+                .unwrap()
+                .join("activity/users/all/applications/drive")
+                .unwrap();
+            url.query_pairs_mut().extend_pairs(query);
+            if let Some(token) = &token {
+                url.query_pairs_mut().append_pair("pageToken", token);
+            }
+            let request = Request::get(url.as_str())
+                .body(google_apis_common::to_body::<String>(None))
+                .unwrap();
+            let response = client.send(request).await.unwrap();
+            let status = response.status().as_u16();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if status != 200 {
+                return (pages, status);
+            }
+            let times = body["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|item| item["id"]["time"].as_str().unwrap().to_owned())
+                .collect();
+            pages.push(times);
+            token = body["nextPageToken"].as_str().map(String::from);
+            if token.is_none() {
+                return (pages, status);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_is_selected_by_time_and_parameters_and_paged() {
+        let record = |time: &str, doc: &str, drive: &str| {
+            json!({
+                "id": {"time": time, "uniqueQualifier": "1"},
+                "actor": {"email": "ana@example.com"},
+                "events": [{"name": "view", "parameters": [
+                    {"name": "doc_id", "value": doc},
+                    {"name": "shared_drive_id", "value": drive},
+                ]}],
+            })
+        };
+        let behavior = Behavior {
+            audit_log: vec![
+                record("2026-11-01T00:00:00Z", "a", "d1"),
+                record("2026-11-03T00:00:00Z", "a", "d2"),
+                record("2026-11-02T00:00:00Z", "b", "d1"),
+            ],
+            audit_page_size: Some(1),
+            ..Behavior::default()
+        };
+        let drive = FakeDrive::start(Vec::new(), behavior.clone()).await;
+        let range = [
+            ("startTime", "2026-11-01T00:00:00Z"),
+            ("endTime", "2026-11-03T00:00:00Z"),
+        ];
+
+        let (pages, status) = audit_pages(&drive, &range).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            pages,
+            [["2026-11-02T00:00:00Z"], ["2026-11-01T00:00:00Z"]],
+            "newest first, the end excluded"
+        );
+        let (pages, _) = audit_pages(&drive, &[("filters", "doc_id==a")]).await;
+        assert_eq!(pages, [["2026-11-03T00:00:00Z"], ["2026-11-01T00:00:00Z"]]);
+        let (pages, _) = audit_pages(&drive, &[("filters", "shared_drive_id==d2")]).await;
+        assert_eq!(pages, [["2026-11-03T00:00:00Z"]]);
+        let (pages, _) = audit_pages(&drive, &[("filters", "doc_id==none")]).await;
+        assert_eq!(pages, [Vec::<String>::new()]);
+        for bad in [
+            &[("filters", "doc_id<>a")][..],
+            &[("maxResults", "1001")],
+            &[
+                ("startTime", "2026-11-02T00:00:00Z"),
+                ("endTime", "2026-11-01T00:00:00Z"),
+            ],
+            &[("startTime", "yesterday")],
+        ] {
+            assert_eq!(audit_pages(&drive, bad).await.1, 400, "{bad:?}");
+        }
+        assert_eq!(drive.audit_requests().len(), 2 + 2 + 1 + 1 + 4);
+        assert_eq!(
+            drive.audit_requests()[0].authorization.as_deref(),
+            Some("Bearer mock-token")
+        );
+        assert_eq!(drive.writes(), Vec::<String>::new());
+
+        let exclusive = FakeDrive::start(
+            Vec::new(),
+            Behavior {
+                audit_exclusive_start: true,
+                ..behavior
+            },
+        )
+        .await;
+        let (pages, _) = audit_pages(&exclusive, &range).await;
+        assert_eq!(pages, [["2026-11-02T00:00:00Z"]]);
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_answers_the_errors_it_is_given() {
+        let drive = FakeDrive::start(
+            Vec::new(),
+            Behavior {
+                audit_rate_limited: 1,
+                ..Behavior::default()
+            },
+        )
+        .await;
+        assert_eq!(audit_pages(&drive, &[]).await.1, 429);
+        assert_eq!(audit_pages(&drive, &[]).await.1, 200);
+
+        let body = json!({"error": {"code": 403, "message": "No."}});
+        let drive = FakeDrive::start(
+            Vec::new(),
+            Behavior {
+                audit_error: Some((403, body)),
+                ..Behavior::default()
+            },
+        )
+        .await;
+        assert_eq!(audit_pages(&drive, &[]).await.1, 403);
+    }
+
+    #[tokio::test]
+    async fn sharing_lists_are_paged() {
+        let permission =
+            |email: &str| json!({"type": "user", "role": "reader", "emailAddress": email});
+        let drive = FakeDrive::start(
+            vec![
+                FakeFile::folder("f", "f", "root"),
+                FakeFile::folder("g", "g", "root"),
+            ],
+            Behavior {
+                permissions: [(
+                    String::from("f"),
+                    vec![permission("a@x"), permission("b@x"), permission("c@x")],
+                )]
+                .into(),
+                permissions_unreadable: [String::from("g")].into(),
+                ..Behavior::default()
+            },
+        )
+        .await;
+        let hub = drive.hub();
+        let (_, first) = hub
+            .permissions()
+            .list("f")
+            .page_size(2)
+            .doit()
+            .await
+            .unwrap();
+        let emails = |list: &google_drive3::api::PermissionList| {
+            list.permissions
+                .iter()
+                .flatten()
+                .map(|permission| permission.email_address.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(emails(&first), ["a@x", "b@x"]);
+        let token = first.next_page_token.unwrap();
+        let (_, second) = hub
+            .permissions()
+            .list("f")
+            .page_size(2)
+            .page_token(&token)
+            .doit()
+            .await
+            .unwrap();
+        assert_eq!(emails(&second), ["c@x"]);
+        assert!(second.next_page_token.is_none());
+        assert!(hub.permissions().list("g").doit().await.is_err());
+        assert!(hub.permissions().list("missing").doit().await.is_err());
+        let requests = drive.permission_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[1].file_id, "f");
+        assert_eq!(requests[1].param("pageToken"), Some(token.as_str()));
+        assert!(drive.gets().is_empty(), "not a files.get");
     }
 
     #[test]
