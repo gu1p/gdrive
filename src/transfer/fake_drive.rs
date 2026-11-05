@@ -32,8 +32,9 @@
 //! (`trashed = true`), with `explicitlyTrashed`, `trashedTime` and `trashingUser`
 //! ([`FakeFile::trashed_by`]), returns `lastModifyingUser` and `owners` ([`FakeFile::modified_by`],
 //! [`FakeFile::owned_by`]), and answers `revisions.list` of a stored file from
-//! [`Behavior::revisions`] ([`FakeDrive::revision_requests`]); [`Behavior::revisions_refused`]
-//! makes it fail and [`Behavior::unreadable_trash`] fails the listings of the trash.
+//! [`Behavior::revisions`], paged ([`FakeDrive::revision_requests`]);
+//! [`Behavior::revisions_refused`] and [`Behavior::revisions_fail_after_first_page`] make it fail,
+//! and [`Behavior::unreadable_trash`] fails the listings of the trash.
 //!
 //! For `files activity` it answers `permissions.list` of a stored file from
 //! [`Behavior::permissions`] (paged with `pageSize` and `pageToken`), and the audit log of the
@@ -465,6 +466,8 @@ pub(crate) struct Behavior {
     pub(crate) revisions: HashMap<String, Vec<Value>>,
     /// `revisions.list` of these file ids fails with this status (403, 404, ...).
     pub(crate) revisions_refused: HashMap<String, u16>,
+    /// `revisions.list` of these file ids fails with 500 on every page after the first.
+    pub(crate) revisions_fail_after_first_page: HashSet<String>,
 }
 
 /// Which ends of its time range an audit log request includes.
@@ -1941,6 +1944,9 @@ fn revisions(
             None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
         },
     };
+    if offset > 0 && state.behavior.revisions_fail_after_first_page.contains(id) {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error");
+    }
     let requested = request
         .param("pageSize")
         .and_then(|size| size.parse::<usize>().ok())
