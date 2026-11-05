@@ -100,13 +100,13 @@ origin's modification time: the two are the same when their modification times a
 
 **Changed on both sides.** People who moved to the new place edit the copy, which is expected, and makes the
 copy the newer side. The origin may still have been edited after the migration, before the copy was. gdrive
-reads the revisions of the copy (only for these files): the first one is what the migration wrote. The origin
-changed after the migration if it was modified later than that revision, and for a file with content only if
-its checksum differs from that revision's too. Then it is `edited`; if the origin is what the migration
-copied, nothing is reported. When the revisions cannot tell (Drive returns none, refuses them, or the
-first one cannot be what the migration wrote because older revisions were deleted), the file is reported
-as `differs`, so that nothing is hidden. With several files of its name in the copy, the one with the oldest
-first revision is taken for the migration's copy.
+reads the revisions of the copy (only for these files, every page, since Drive does not list the oldest
+first): the oldest one is what the migration wrote. The origin changed after the migration if it was modified
+later than that revision, and for a file with content only if its checksum differs from that revision's too.
+Then it is `edited`; if the origin is what the migration copied, nothing is reported. When the revisions
+cannot tell (Drive returns none, refuses them, or the oldest one cannot be what the migration wrote because
+Drive deleted the older ones), the file is reported as `differs`, so that nothing is hidden. With several
+files of its name in the copy, the one with the oldest revision is taken for the migration's copy.
 
 **Moved and renamed files.** Drive does not tell who renamed or moved a file, and neither changes its
 modification time: a `moved` row has no time and no person. Each file of the copy is used for one `moved` row
@@ -161,8 +161,10 @@ Said plainly, the limits of this way of looking:
 - **Renames and moves have no person and no time** (`moved`).
 - **What is only in the copy is not reported.**
 - **A file edited in both places** is settled by the copy's revisions while Drive still has them. Drive
-  deletes old revisions of files with content after 30 days or beyond 100 revisions, unless they are kept
-  forever, and merges old revisions of Google files; then the file `differs`.
+  deletes old revisions of files with content after about 30 days, or earlier once a file has 100 of them,
+  unless they are kept forever; then the file `differs`. For a Google file with a long history Drive may not
+  list its oldest revisions: an edit of the origin made before the oldest revision listed is then taken for
+  what the migration copied.
 - **A Google file's copy is a conversion**: only the times are compared, not the content.
 - **Matched by name**, as the migration matches: a renamed folder in the origin is `added` with everything in
   it, since the copy's folder of the old name is not looked into.

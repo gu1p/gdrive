@@ -378,7 +378,7 @@ async fn each_change_of_the_origin_after_the_migration_is_a_row_and_what_is_as_c
     assert_eq!(revisions[0].file_id, "notes2");
     assert_eq!(
         revisions[0].param("fields"),
-        Some("revisions(id,modifiedTime,md5Checksum,size)")
+        Some("nextPageToken,revisions(id,modifiedTime,md5Checksum,size)")
     );
     assert_asks_for_the_users_and_the_trash(&origin);
     assert_read_only(&[&origin, &copy]);
@@ -552,22 +552,24 @@ async fn google_files_are_compared_by_their_times() {
 }
 
 /// The revisions of the copies of `revisions_settle_a_file_changed_on_both_sides_or_it_differs`:
-/// the migration's and a later one, none, refused, gone, and only later ones.
+/// the migration's and a later one, listed newest first and one per page as Drive may list them,
+/// none, refused, gone, and only later ones.
 fn revisions_behavior() -> Behavior {
     Behavior {
+        page_size: Some(1),
         revisions: [
             (
                 String::from("kept2"),
                 vec![
-                    revision("v1", MIGRATION),
                     revision("v9", "2026-11-04T00:00:00Z"),
+                    revision("v1", MIGRATION),
                 ],
             ),
             (
                 String::from("both2"),
                 vec![
-                    revision("v1", MIGRATION),
                     revision("v9", "2026-11-04T00:00:00Z"),
+                    revision("v1", MIGRATION),
                 ],
             ),
             (
@@ -660,7 +662,18 @@ async fn revisions_settle_a_file_changed_on_both_sides_or_it_differs() {
              name; they do not tell whether 4 files of the origin changed after the migration \
              (differs)"
     )));
-    assert_eq!(copy.revision_requests().len(), 6);
+    let requests = copy.revision_requests();
+    let files = requests
+        .iter()
+        .map(|request| request.file_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(files.len(), 6, "{files:?}");
+    // Every page is read: the oldest revision is not listed first.
+    let pages = requests
+        .iter()
+        .filter(|request| request.file_id == "both2")
+        .count();
+    assert_eq!(pages, 2);
     assert_read_only(&[&origin, &copy]);
 }
 

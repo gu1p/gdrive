@@ -16,7 +16,8 @@
 //! The last case is a file that someone changed in the copy, which is expected; the origin may
 //! have changed after the migration as well. The first revision of the copy is what the
 //! migration wrote: the origin changed after it if its `modifiedTime` is later and, for a blob,
-//! its md5 is another. When the revisions cannot tell (none, refused, or a first revision that
+//! its md5 is another. Drive lists revisions in no guaranteed order, so every page is read and the
+//! oldest is taken. When the revisions cannot tell (none, refused, or an oldest revision that
 //! cannot be the migrated content), the item `differs`.
 //!
 //! An added blob with the size and md5 of a file of the copy that has no file of its name in the
@@ -49,7 +50,11 @@ pub(super) const COPY_FIELDS: &str =
      trashed)";
 
 /// What the revisions of a file of the copy are read for.
-pub(super) const REVISION_FIELDS: &str = "revisions(id,modifiedTime,md5Checksum,size)";
+pub(super) const REVISION_FIELDS: &str =
+    "nextPageToken,revisions(id,modifiedTime,md5Checksum,size)";
+
+/// The largest page of `revisions.list`.
+const REVISION_PAGE_SIZE: i32 = 1000;
 
 /// A file or folder of the copy.
 #[derive(Debug, Clone)]
@@ -435,7 +440,7 @@ impl Comparison {
             .map(|ambiguous| async move {
                 let mut firsts = Vec::new();
                 for id in &ambiguous.copies {
-                    firsts.push(first_revision(copy, id).await);
+                    firsts.push(oldest_revision(copy, id).await);
                 }
                 (ambiguous, firsts)
             })
@@ -517,21 +522,42 @@ fn edited(node: &Node, kind: Kind) -> Change {
     }
 }
 
-/// The first revision of the file `id` of the copy; `None` when there is none or it cannot be
-/// read (a 403 for a file the account may not edit, a 404, or any other failure).
-async fn first_revision(hub: &Hub, id: &str) -> Option<Revision> {
-    let (_, list) = retry_read(hub.retrier(), "revisions.list", |mut delegate| async move {
-        hub.revisions()
-            .list(id)
-            .param("fields", REVISION_FIELDS)
-            .add_scope(google_drive3::api::Scope::Full)
-            .delegate(&mut delegate)
-            .doit()
-            .await
-    })
-    .await
-    .ok()?;
-    list.revisions?.into_iter().next()
+/// The oldest revision of the file `id` of the copy, by `modifiedTime`: Drive does not list the
+/// oldest first, so every page is read. `None` when there is none with a time, or the revisions
+/// cannot be read (a 403 for a file the account may not edit, a 404, or any other failure).
+async fn oldest_revision(hub: &Hub, id: &str) -> Option<Revision> {
+    let mut oldest: Option<Revision> = None;
+    let mut page_token: Option<String> = None;
+    loop {
+        let token = page_token.as_deref();
+        let (_, list) = retry_read(hub.retrier(), "revisions.list", |mut delegate| async move {
+            let mut call = hub
+                .revisions()
+                .list(id)
+                .page_size(REVISION_PAGE_SIZE)
+                .param("fields", REVISION_FIELDS)
+                .add_scope(google_drive3::api::Scope::Full);
+            if let Some(token) = token {
+                call = call.page_token(token);
+            }
+            call.delegate(&mut delegate).doit().await
+        })
+        .await
+        .ok()?;
+        for revision in list.revisions.unwrap_or_default() {
+            let older = revision.modified_time.is_some()
+                && oldest
+                    .as_ref()
+                    .is_none_or(|oldest| revision.modified_time < oldest.modified_time);
+            if older {
+                oldest = Some(revision);
+            }
+        }
+        page_token = list.next_page_token;
+        if page_token.is_none() {
+            return oldest;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1900,23 +1900,24 @@ async fn activity_route(
     Some(permissions(state, id, params.to_vec(), request.headers()))
 }
 
-/// `revisions.list` of the stored file `id`: its [`Behavior::revisions`], all on one page, or
-/// the status of [`Behavior::revisions_refused`].
+/// `revisions.list` of the stored file `id`: its [`Behavior::revisions`] in their order,
+/// `pageSize` (200 without one) at a time, or the status of [`Behavior::revisions_refused`].
 fn revisions(
     state: &State,
     id: &str,
     params: Vec<(String, String)>,
     headers: &hyper::HeaderMap,
 ) -> FakeResponse {
+    let request = ApiRequest {
+        file_id: id.to_owned(),
+        params,
+        authorization: authorization(headers),
+    };
     state
         .revision_requests
         .lock()
         .expect("revision requests lock")
-        .push(ApiRequest {
-            file_id: id.to_owned(),
-            params,
-            authorization: authorization(headers),
-        });
+        .push(request.clone());
     if state.file(id).is_none() {
         return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
     }
@@ -1927,16 +1928,38 @@ fn revisions(
             "The user does not have sufficient permissions for this file.",
         );
     }
-    let revisions = state
+    let all = state
         .behavior
         .revisions
         .get(id)
         .cloned()
         .unwrap_or_default();
-    json_response(
-        StatusCode::OK,
-        &json!({"kind": "drive#revisionList", "revisions": revisions}),
-    )
+    let offset = match request.param("pageToken") {
+        None => 0,
+        Some(token) => match parse_token(token, id) {
+            Some(offset) => offset,
+            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
+        },
+    };
+    let requested = request
+        .param("pageSize")
+        .and_then(|size| size.parse::<usize>().ok())
+        .unwrap_or(200);
+    let page_size = state
+        .behavior
+        .page_size
+        .unwrap_or(requested)
+        .min(requested)
+        .max(1);
+    let end = (offset + page_size).min(all.len());
+    let mut body = json!({
+        "kind": "drive#revisionList",
+        "revisions": all.get(offset..end).unwrap_or_default(),
+    });
+    if end < all.len() {
+        body["nextPageToken"] = json!(token(end, id));
+    }
+    json_response(StatusCode::OK, &body)
 }
 
 /// What an audit log request selects.
