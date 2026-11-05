@@ -134,7 +134,8 @@ Run `gdrive <command> --help` for the options, for example `gdrive files list --
   moves things to a trash: [Sync a folder one way](docs/sync.md).
 - Migration of files and folders to another Google account that is logged in too, streamed through this
   machine without local copies, safe to run again, with `--dry-run` and `--trash-source`:
-  [Migrate files to another account](docs/migrate.md).
+  [Migrate files to another account](docs/migrate.md). With `--archive`, each folder arrives as one tar
+  file, made on the fly.
 
 - Service accounts and Application Default Credentials, for CI and servers:
   [Service accounts](docs/service_accounts.md).
