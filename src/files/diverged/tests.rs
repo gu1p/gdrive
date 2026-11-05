@@ -838,8 +838,8 @@ async fn items_a_migration_does_not_copy_are_left_out_unless_since_reports_them(
     assert_eq!(
         err[left_out..],
         [
-            "Left out 3 items, which a migration does not copy: they are never in the copy \
-             (--since reports those created or modified since a time):",
+            "Left out 3 items that a migration does not copy and the copy never has (--since \
+             reports those created or modified since a time):",
             "  Projects/Sketch: Google Drawings cannot be copied: Drive converts no export back \
              to a drawing",
             "  Projects/Survey: Google Forms cannot be exported",
@@ -1575,9 +1575,8 @@ async fn an_item_that_both_accounts_see_is_never_compared_with_itself() {
     assert_eq!(
         err[left_out..],
         [
-            "Left out 3 items that both accounts see: the folder of the copy holds the item \
-             itself, or one of the origin's items has its name there, which is not compared \
-             with itself:",
+            "Left out 3 items that both accounts see, not compared with themselves: the copy's \
+             folder holds the item itself, or another item of the origin under its name:",
             "  Projects/doc.txt",
             "  Projects/e.txt",
             "  Projects/shared",

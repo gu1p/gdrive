@@ -569,8 +569,8 @@ impl LeftOut {
             self.unsupported.sort_by(|a, b| a.path.cmp(&b.path));
             printer
                 .err(format!(
-                    "Left out {}, which a migration does not copy: they are never in the copy \
-                     (--since reports those created or modified since a time):",
+                    "Left out {} that a migration does not copy and the copy never has (--since \
+                     reports those created or modified since a time):",
                     plural(count(self.unsupported.len()), "item", "items"),
                 ))
                 .await;
@@ -589,9 +589,9 @@ impl LeftOut {
             self.shared.sort();
             printer
                 .err(format!(
-                    "Left out {} that both accounts see: the folder of the copy holds the item \
-                     itself, or one of the origin's items has its name there, which is not \
-                     compared with itself:",
+                    "Left out {} that both accounts see, not compared with themselves: the \
+                     copy's folder holds the item itself, or another item of the origin under its \
+                     name:",
                     plural(count(self.shared.len()), "item", "items"),
                 ))
                 .await;
