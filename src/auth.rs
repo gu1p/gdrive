@@ -35,6 +35,11 @@ pub(crate) const DRIVE_SCOPES: [&str; 2] = [
 pub(crate) const AUDIT_LOG_SCOPE: &str =
     "https://www.googleapis.com/auth/admin.reports.audit.readonly";
 
+/// The scopes of a login with `--audit-log`: [`DRIVE_SCOPES`] and [`AUDIT_LOG_SCOPE`]. When Google
+/// granted both, the token is stored under this scope set.
+pub(crate) const DRIVE_AND_AUDIT_LOG_SCOPES: [&str; 3] =
+    [DRIVE_SCOPES[0], DRIVE_SCOPES[1], AUDIT_LOG_SCOPE];
+
 /// The stored authorization of an account cannot be used any more; only a new login helps.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReauthRequired {

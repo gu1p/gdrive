@@ -153,7 +153,11 @@ struct ServiceAccountArgs {
     /// directory. Service accounts have no Drive storage of their own: they work in shared drives
     /// they are a member of and on files shared with them, or, with --subject, as a Google
     /// Workspace user.
-    #[arg(long, value_name = "KEY_JSON", conflicts_with_all = ["manual", "port"])]
+    #[arg(
+        long,
+        value_name = "KEY_JSON",
+        conflicts_with_all = ["manual", "port", "audit_log"]
+    )]
     service_account: Option<PathBuf>,
 
     /// Act for this Google Workspace user (domain-wide delegation, set up by an administrator)
@@ -170,7 +174,7 @@ struct ServiceAccountArgs {
     /// The service account key named by `GOOGLE_APPLICATION_CREDENTIALS`, the user credentials of
     /// `gcloud auth application-default login`, or the metadata server of Google Cloud. gdrive
     /// stores none of them and looks them up again on every run.
-    #[arg(long, conflicts_with_all = ["manual", "port"])]
+    #[arg(long, conflicts_with_all = ["manual", "port", "audit_log"])]
     adc: bool,
 
     /// Name of the new account [default: the `client_email` of the key, or "adc"]
@@ -196,6 +200,15 @@ struct LoginArgs {
     /// 0 picks a free port. Desktop app clients accept any port.
     #[arg(long, value_name = "PORT", default_value_t = auth::login::DEFAULT_PORT)]
     port: u16,
+
+    /// Also ask for read access to the audit log of the Google Workspace organization, which
+    /// `gdrive files activity` needs
+    ///
+    /// The Google account must be an administrator of the organization. The access is read-only.
+    /// Service accounts and Application Default Credentials (--service-account, --adc) are not
+    /// supported for the audit log yet.
+    #[arg(long)]
+    audit_log: bool,
 }
 
 impl LoginArgs {
@@ -1356,6 +1369,7 @@ async fn handle_account_command(
                 account::add(&account::add::Config {
                     mode: login.mode(),
                     port: login.port,
+                    audit_log: login.audit_log,
                 })
                 .await?;
             }
@@ -1381,6 +1395,7 @@ async fn handle_account_command(
                 account_name,
                 mode: login.mode(),
                 port: login.port,
+                audit_log: login.audit_log,
             })
             .await?;
         }
@@ -1765,6 +1780,72 @@ mod tests {
             &["account", "add", "--adc", "--manual"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn the_login_commands_take_audit_log() {
+        let cli = parse(&["account", "add", "--audit-log", "--manual"]).expect("account add");
+        let Command::Account {
+            command: AccountCommand::Add { login, service },
+        } = cli.command
+        else {
+            panic!("expected account add");
+        };
+        assert!(login.audit_log);
+        assert!(login.manual);
+        assert!(service.service_account.is_none() && !service.adc);
+
+        let cli =
+            parse(&["account", "reauth", "me@example.com", "--audit-log"]).expect("account reauth");
+        let Command::Account {
+            command:
+                AccountCommand::Reauth {
+                    account_name,
+                    login,
+                },
+        } = cli.command
+        else {
+            panic!("expected account reauth");
+        };
+        assert_eq!(account_name.as_deref(), Some("me@example.com"));
+        assert!(login.audit_log);
+
+        // Off by default.
+        for args in [&["account", "add"][..], &["account", "reauth"]] {
+            let cli = parse(args).expect("no flags");
+            let Command::Account {
+                command: AccountCommand::Add { login, .. } | AccountCommand::Reauth { login, .. },
+            } = cli.command
+            else {
+                panic!("expected a login command");
+            };
+            assert!(!login.audit_log, "{args:?}");
+        }
+    }
+
+    #[test]
+    fn audit_log_does_not_mix_with_service_accounts_or_adc() {
+        for args in [
+            &[
+                "account",
+                "add",
+                "--service-account",
+                "key.json",
+                "--audit-log",
+            ][..],
+            &["account", "add", "--audit-log", "--adc"],
+            &["account", "add", "--adc", "--name", "ci", "--audit-log"],
+        ] {
+            let Err(error) = parse(args) else {
+                panic!("{args:?} should not parse");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{args:?}"
+            );
+            assert!(error.to_string().contains("--audit-log"), "{error}");
         }
     }
 

@@ -18,10 +18,17 @@ use crate::{
 pub(crate) struct Config {
     pub(crate) mode: login::Mode,
     pub(crate) port: u16,
+    /// `--audit-log`: also ask for read access to the audit log of the organization.
+    pub(crate) audit_log: bool,
 }
 
 pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
-    let options = login::Options::new(config.mode, config.port, None);
+    let audit_log = if config.audit_log {
+        login::AuditLog::Required
+    } else {
+        login::AuditLog::No
+    };
+    let options = login::Options::new(config.mode, config.port, None).with_audit_log(audit_log);
     options.check().map_err(Error::Login)?;
 
     println!("To add an account you need a Google Client ID and Client Secret.");
@@ -39,11 +46,11 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
 
     let secret = secret_prompt().map_err(Error::Prompt)?;
 
-    let token = login::login(&secret, &options)
+    let authorization = login::login(&secret, &options)
         .await
         .map_err(Error::Login)?;
 
-    let hub = token_hub(&token).map_err(Error::HubCreation)?;
+    let hub = token_hub(&authorization.token).map_err(Error::HubCreation)?;
     let email = authorized_email(&hub)
         .await
         .map_err(|error| Error::About(*error))?
@@ -57,7 +64,11 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
     // When the account is added again with the same client, Google may leave out the refresh
     // token; keep the stored one then.
     let previous = existing.tokens_of_client(&secret.client_id).await;
-    let tokens = TokenFile::after_login(previous.as_ref(), &auth::DRIVE_SCOPES, token);
+    let tokens = TokenFile::after_login(
+        previous.as_ref(),
+        authorization.scopes(),
+        authorization.token,
+    );
     auth::warn_if_no_refresh_token(&tokens, &email);
 
     let app_cfg = app_config::add_account(&email, &secret, &tokens)
