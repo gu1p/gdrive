@@ -6,17 +6,22 @@
 //! origin cannot be known, so folders are compared in groups: all the origin's folders of one
 //! name under one parent group, against all the copy's folders of that name under the copy of
 //! that group. Their children are pooled and matched by name; one folder on each side is a group
-//! of one. Inside one name, files are matched one to one: each origin file is paired with a file
-//! of the copy with the same content, each used once. An origin file left without a partner is
-//! compared with the files of its name that are left:
+//! of one. Inside one name, an origin file and a file of the copy with the same content and the
+//! same modification time are an untouched pair, matched one to one. When one origin file of the
+//! name is left, it is compared with the files of the copy left:
 //!
 //! ```text
 //!   none is left (or none has its name)                     added (and edited), and all below
+//!   one left has its content                                nothing
 //!   the origin was modified later than every one left       edited
 //!   one left is newer, or a time is missing                 a revision of one of them holds the
 //!                                                           origin's present content: nothing;
 //!                                                           else differs
 //! ```
+//!
+//! When several are left and so are files of the copy, which copy is whose cannot be known: no
+//! content and no revision is evidence, and each origin file left is `edited` (other content than
+//! all, and later than all) or `differs`.
 //!
 //! The same content is that of a blob with the same size and md5, and for a Google file (no md5,
 //! its copy is a conversion) the same `modifiedTime`, which the migration gave the copy. Times are
@@ -463,10 +468,20 @@ impl Comparison {
     }
 
     /// Matches the origin's files `files` of one name with the copy's files of that name,
-    /// `candidates`, one to one by content, first those that have the same modification time too
-    /// (the migration gave the copy the origin's): of two origin files with one content, the one
-    /// that kept its time is the copy's partner. Compares each origin file left with the
-    /// candidates left. The candidates that no origin file was matched or compared with.
+    /// `candidates`. A pair with the same content and the same modification time (which the
+    /// migration gave the copy) is an untouched file: each such pair, one to one, is removed.
+    /// What is left is judged without guessing which copy belongs to which origin file:
+    ///
+    /// - one origin file left: the same content as a copy left is nothing; later than every
+    ///   copy left with other content is `edited`; otherwise the copies' revisions decide
+    ///   (nothing or `differs`);
+    /// - no copy left: each origin file left is new (`added`, and `edited`);
+    /// - several origin files and copies left: which copy is whose cannot be known, so no
+    ///   content or revision is evidence. Each gets its own row: `edited` when its content is
+    ///   none of the copies' and it is later than all of them, else `differs`.
+    ///
+    /// The copies that no origin file was matched or compared with: only those left over when
+    /// every origin file found its exact partner, or the one origin file left its content's.
     fn match_files<'a>(
         &mut self,
         files: &[&Node],
@@ -475,58 +490,60 @@ impl Comparison {
         let mut files = files.to_vec();
         files.sort_by(|a, b| a.item.id.cmp(&b.item.id));
         let mut used = vec![false; candidates.len()];
-        let mut paired = vec![false; files.len()];
-        for exact in [true, false] {
-            for (node, paired) in files.iter().zip(paired.iter_mut()) {
-                if *paired {
-                    continue;
-                }
-                let partner = candidates.iter().enumerate().position(|(n, copy)| {
-                    !used[n]
-                        && same(&node.item, copy)
-                        && (!exact || same_time(node.item.modified, copy.modified))
-                });
-                if let Some(n) = partner {
-                    used[n] = true;
-                    *paired = true;
-                }
+        let mut unmatched = Vec::new();
+        for node in files {
+            let partner = candidates.iter().enumerate().position(|(n, copy)| {
+                !used[n] && same(&node.item, copy) && same_time(node.item.modified, copy.modified)
+            });
+            match partner {
+                Some(n) => used[n] = true,
+                None => unmatched.push(node),
             }
         }
-        let unmatched = files
-            .iter()
-            .zip(&paired)
-            .filter(|(_, paired)| !**paired)
-            .map(|(node, _)| *node)
-            .collect::<Vec<_>>();
-        let left = candidates
+        let mut left = candidates
             .iter()
             .zip(&used)
             .filter(|(_, used)| !**used)
             .map(|(copy, _)| *copy)
             .collect::<Vec<_>>();
-        if unmatched.is_empty() {
-            return left;
-        }
-        for node in unmatched {
-            if left.is_empty() {
-                self.added(node);
-            } else if newer(&node.item, &left) {
-                self.changes.push(Change {
-                    kind: Kind::Edited,
-                    when: node.item.modified,
-                    who: node.item.editor(),
-                    path: node.path.clone(),
-                    id: node.item.id.clone(),
-                });
-            } else {
-                self.ambiguous.push(Ambiguous {
-                    item: node.item.clone(),
-                    path: node.path.clone(),
-                    copies: left.iter().map(|copy| copy.id.clone()).collect(),
-                });
+        match unmatched.as_slice() {
+            [] => left,
+            _ if left.is_empty() => {
+                for node in unmatched {
+                    self.added(node);
+                }
+                Vec::new()
+            }
+            [node] => {
+                if let Some(n) = left.iter().position(|copy| same(&node.item, copy)) {
+                    // Its content is in the copy, under another time: the others are left over.
+                    left.remove(n);
+                    return left;
+                }
+                if newer(&node.item, &left) {
+                    self.changes.push(row(node, Kind::Edited));
+                } else {
+                    self.ambiguous.push(Ambiguous {
+                        item: node.item.clone(),
+                        path: node.path.clone(),
+                        copies: left.iter().map(|copy| copy.id.clone()).collect(),
+                    });
+                }
+                Vec::new()
+            }
+            several => {
+                for node in several {
+                    let other = !left.iter().any(|copy| same(&node.item, copy));
+                    let kind = if other && newer(&node.item, &left) {
+                        Kind::Edited
+                    } else {
+                        Kind::Differs
+                    };
+                    self.changes.push(row(node, kind));
+                }
+                Vec::new()
             }
         }
-        Vec::new()
     }
 
     /// `node`, which has no copy, and everything below it: `added`, and `edited` when it was
@@ -627,6 +644,17 @@ impl Comparison {
                 change.who = Who::Unknown;
             }
         }
+    }
+}
+
+/// The `edited` or `differs` row of the origin file `node`: its last modification, by whom.
+fn row(node: &Node, kind: Kind) -> Change {
+    Change {
+        kind,
+        when: node.item.modified,
+        who: node.item.editor(),
+        path: node.path.clone(),
+        id: node.item.id.clone(),
     }
 }
 

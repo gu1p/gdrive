@@ -141,7 +141,8 @@ enum Kind {
     /// Someone moved it to the trash.
     Trashed,
     /// Its content differs from the copy's, the copy is newer (or a time is missing), and no
-    /// revision of the copy is the origin as it is now, or they cannot be read.
+    /// revision of the copy is the origin as it is now, or they cannot be read; or it is one of
+    /// several origin files of one name left unmatched, which cannot be told apart.
     Differs,
     /// It was renamed or moved in the origin: its content is in the copy at `was`.
     Moved { was: String },

@@ -879,6 +879,158 @@ async fn files_of_one_name_are_matched_one_to_one() {
     assert!(copy.revision_requests().is_empty());
 }
 
+#[tokio::test]
+async fn of_several_files_of_one_name_left_none_is_dropped_whatever_their_ids() {
+    let alice = || FakeUser::new("Alice", "alice@example.com");
+    let bob = || FakeUser::new("Bob", "bob@example.com");
+    for (alice_id, bob_id) in [("a", "z"), ("z", "a")] {
+        // Migrated were Alice's `A` of Oct 20 and another file `B` of Oct 10, which Bob changed
+        // to `A` on Nov 2.
+        let files = vec![
+            folder("P", "Projects", "root"),
+            blob(alice_id, "notes.txt", "P", "A", "2026-10-20T00:00:00Z").modified_by(alice()),
+            blob(bob_id, "notes.txt", "P", "A", "2026-11-02T00:00:00Z").modified_by(bob()),
+        ];
+        let copy = |id: &str, content: &str, modified: &str| {
+            copy_of(
+                &blob("x", "notes.txt", "P", content, modified),
+                &format!("{id}2"),
+                "P2",
+            )
+        };
+        let revisions = |history: &[(&str, &str)]| {
+            history
+                .iter()
+                .map(|(content, time)| revision(content, time))
+                .collect::<Vec<_>>()
+        };
+        let cases = [
+            // Identical bytes uploaded to the copy of Alice's on Nov 3, which changed its time.
+            (
+                vec![
+                    copy(alice_id, "A", "2026-11-03T00:00:00Z"),
+                    copy(bob_id, "B", "2026-10-10T00:00:00Z"),
+                ],
+                Behavior::default(),
+            ),
+            // Both copies changed later, from `A` to `X` and from `B` to `Y`.
+            (
+                vec![
+                    copy(alice_id, "X", "2026-11-04T00:00:00Z"),
+                    copy(bob_id, "Y", "2026-11-04T00:00:00Z"),
+                ],
+                Behavior {
+                    revisions: [
+                        (
+                            format!("{alice_id}2"),
+                            revisions(&[
+                                ("A", "2026-10-20T00:00:00Z"),
+                                ("X", "2026-11-04T00:00:00Z"),
+                            ]),
+                        ),
+                        (
+                            format!("{bob_id}2"),
+                            revisions(&[
+                                ("B", "2026-10-10T00:00:00Z"),
+                                ("Y", "2026-11-04T00:00:00Z"),
+                            ]),
+                        ),
+                    ]
+                    .into(),
+                    ..Behavior::default()
+                },
+            ),
+        ];
+        for (mut copies, behavior) in cases {
+            copies.insert(0, copy_of(&files[0], "P2", "root"));
+            let origin = start(files.clone()).await;
+            let copy = FakeDrive::start(copies, behavior).await;
+            let bob_row = change(
+                "differs",
+                Some("2026-11-02T00:00:00Z"),
+                "bob@example.com",
+                "Projects/notes.txt",
+            );
+            let alice_row = change(
+                "differs",
+                Some("2026-10-20T00:00:00Z"),
+                "alice@example.com",
+                "Projects/notes.txt",
+            );
+
+            let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
+            ran.assert_ok();
+            assert_eq!(
+                ran.rows(),
+                [bob_row.clone(), alice_row],
+                "{alice_id} {bob_id}"
+            );
+
+            let ran = diverged(&origin, Some(&copy), since(settings(&["P"]), MIGRATION)).await;
+            ran.assert_ok();
+            assert_eq!(ran.rows(), [bob_row], "{alice_id} {bob_id}");
+            // Which copy is whose is not known: no revision is evidence.
+            assert!(copy.revision_requests().is_empty());
+            assert_read_only(&[&origin, &copy]);
+        }
+    }
+}
+
+#[tokio::test]
+async fn several_files_of_one_name_left_are_edited_only_when_later_than_every_copy_left() {
+    let files = vec![
+        folder("P", "Projects", "root"),
+        blob("n1", "notes.txt", "P", "C", "2026-11-05T00:00:00Z").modified_by(ana()),
+        blob("n2", "notes.txt", "P", "D", "2026-11-06T00:00:00Z").modified_by(bob()),
+        // Untouched: its exact partner is removed first.
+        blob("n3", "notes.txt", "P", "E", "2026-10-01T00:00:00Z"),
+        // Only in the copy, under another name: no copy of the ambiguous group moves to it.
+        blob("m", "moved.txt", "P", "A", BEFORE),
+    ];
+    let copies = vec![
+        copy_of(&files[0], "P2", "root"),
+        copy_of(&blob("x", "notes.txt", "P", "A", BEFORE), "c1", "P2"),
+        copy_of(
+            &blob("x", "notes.txt", "P", "B", "2026-11-05T12:00:00Z"),
+            "c2",
+            "P2",
+        ),
+        copy_of(&files[3], "c3", "P2"),
+    ];
+    let origin = start(files).await;
+    let copy = start(copies).await;
+
+    let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
+
+    ran.assert_ok();
+    assert_eq!(
+        ran.rows(),
+        [
+            change(
+                "edited",
+                Some("2026-11-06T00:00:00Z"),
+                "bob@example.com",
+                "Projects/notes.txt"
+            ),
+            // Not later than the copy of Nov 5, 12:00.
+            change(
+                "differs",
+                Some("2026-11-05T00:00:00Z"),
+                "ana@example.com",
+                "Projects/notes.txt"
+            ),
+            change(
+                "added",
+                Some(BEFORE),
+                "old@example.com",
+                "Projects/moved.txt"
+            ),
+        ]
+    );
+    assert!(copy.revision_requests().is_empty());
+    assert_read_only(&[&origin, &copy]);
+}
+
 /// `Projects` with a folder `Team` for each of `teams`, and below each the folders of the path
 /// `deeper` and the files `(name, content, modified)` in the last one. Ids start with `prefix`.
 fn teams(prefix: &str, teams: &[&[(&str, &str, &str)]], deeper: &[&str]) -> Vec<FakeFile> {
