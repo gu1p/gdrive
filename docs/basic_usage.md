@@ -32,9 +32,9 @@ KEY_JSON`) or Application Default Credentials (`gdrive account add --adc`); see
 
 ### Audit log access
 
-`gdrive files activity` reads the audit log of a Google Workspace organization, which records who viewed,
-downloaded or changed its files. That needs one more permission, which gdrive asks for only when you add
-`--audit-log` to the login:
+[`gdrive files activity`](activity.md) reads the audit log of a Google Workspace organization, which
+records who viewed, downloaded or changed its files. That needs one more permission, which gdrive asks
+for only when you add `--audit-log` to the login:
 
 ```sh
 gdrive account add --audit-log                     # a new account
