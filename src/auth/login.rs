@@ -12,6 +12,10 @@
 //!
 //! The authorization URL carries a random `state`, which the redirect must return, and a PKCE
 //! S256 `code_challenge`, whose `code_verifier` goes with the code to the token endpoint.
+//!
+//! The login asks for [`DRIVE_SCOPES`], and with [`AuditLog::Required`] or [`AuditLog::Optional`]
+//! also for [`AUDIT_LOG_SCOPE`]. The `scope` field of the token response says what the user
+//! granted: the consent screen lets them untick a scope.
 
 use std::{
     error,
@@ -37,7 +41,7 @@ use tokio::{
 use url::Url;
 use yup_oauth2::storage::TokenInfo;
 
-use super::DRIVE_SCOPES;
+use super::{store::TokenFile, AUDIT_LOG_SCOPE, DRIVE_AND_AUDIT_LOG_SCOPES, DRIVE_SCOPES};
 use crate::{app_config::Secret, hub};
 
 /// The default port of the loopback redirect URI, as in gdrive 3.x (SSH tunnels rely on it).
@@ -63,6 +67,30 @@ pub(crate) enum Mode {
     Manual,
 }
 
+/// Whether a login also asks for read access to the audit log ([`AUDIT_LOG_SCOPE`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum AuditLog {
+    /// The Drive scopes only.
+    #[default]
+    No,
+    /// `--audit-log`: the login fails with [`LoginError::AuditLogNotGranted`] when Google does not
+    /// grant it.
+    Required,
+    /// `account reauth` of an account that has the access, without `--audit-log`: asked for
+    /// again, and when Google does not grant it the login succeeds with the Drive scopes only.
+    Optional,
+}
+
+impl AuditLog {
+    /// The scopes the authorization URL asks for.
+    fn scopes(self) -> &'static [&'static str] {
+        match self {
+            AuditLog::No => &DRIVE_SCOPES,
+            AuditLog::Required | AuditLog::Optional => &DRIVE_AND_AUDIT_LOG_SCOPES,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Options {
     pub(crate) mode: Mode,
@@ -70,6 +98,7 @@ pub(crate) struct Options {
     pub(crate) port: u16,
     /// Preselects the Google account on the consent screen.
     pub(crate) login_hint: Option<String>,
+    audit_log: AuditLog,
     endpoints: Endpoints,
 }
 
@@ -95,8 +124,16 @@ impl Options {
             mode,
             port,
             login_hint,
+            audit_log: AuditLog::No,
             endpoints: Endpoints::default(),
         }
+    }
+
+    /// Whether the login also asks for read access to the audit log.
+    #[must_use]
+    pub(crate) fn with_audit_log(mut self, audit_log: AuditLog) -> Self {
+        self.audit_log = audit_log;
+        self
     }
 
     /// Rejects option combinations that cannot work, before the user is asked anything.
@@ -117,8 +154,66 @@ impl Options {
     }
 }
 
-/// Asks the user to authorize gdrive and returns the token Google issued.
-pub(crate) async fn login(secret: &Secret, options: &Options) -> Result<TokenInfo, LoginError> {
+/// What a login got from Google.
+#[derive(Debug)]
+pub(crate) struct Authorization {
+    pub(crate) token: TokenInfo,
+    /// Whether Google granted read access to the audit log. Only when the login asked for it;
+    /// a token response without a `scope` field grants what was asked for.
+    pub(crate) audit_log: bool,
+}
+
+impl Authorization {
+    /// The scopes to store the token for in `tokens.json`: [`DRIVE_SCOPES`], and
+    /// [`AUDIT_LOG_SCOPE`] too when Google granted it.
+    pub(crate) fn scopes(&self) -> &'static [&'static str] {
+        if self.audit_log {
+            &DRIVE_AND_AUDIT_LOG_SCOPES
+        } else {
+            &DRIVE_SCOPES
+        }
+    }
+}
+
+/// The tokens to save after a login.
+pub(crate) struct LoginTokens {
+    pub(crate) tokens: TokenFile,
+    /// Whether they record the audit-log grant.
+    pub(crate) audit_log: bool,
+}
+
+/// The tokens file after `authorization`, a login that asked for `asked`, which replaces
+/// `previous`: the tokens of the same account and OAuth client, if there are any.
+///
+/// The audit-log grant is recorded only with a refresh token of an authorization that was
+/// granted it: the one in this login's answer, or a kept one whose own entry records the grant.
+/// When Google returns no refresh token (#150), [`TokenFile::after_login`] keeps the stored
+/// one, which was granted what its own login asked for, whatever the new access token may do:
+/// a refresh with a Drive-only refresh token brings a Drive-only token. With `--audit-log`
+/// ([`AuditLog::Required`]) the login then fails with [`LoginError::AuditLogWithoutRefreshToken`]
+/// and nothing is saved; when `account reauth` asked again by itself ([`AuditLog::Optional`]),
+/// the Drive authorization is saved without the grant.
+pub(crate) fn tokens_after_login(
+    previous: Option<&TokenFile>,
+    mut authorization: Authorization,
+    asked: AuditLog,
+) -> Result<LoginTokens, LoginError> {
+    let refresh_token_has_grant = authorization.token.refresh_token.is_some()
+        || previous.is_some_and(TokenFile::refresh_token_has_audit_log);
+    if authorization.audit_log && !refresh_token_has_grant {
+        if asked == AuditLog::Required {
+            return Err(LoginError::AuditLogWithoutRefreshToken);
+        }
+        authorization.audit_log = false;
+    }
+    Ok(LoginTokens {
+        tokens: TokenFile::after_login(previous, authorization.scopes(), authorization.token),
+        audit_log: authorization.audit_log,
+    })
+}
+
+/// Asks the user to authorize gdrive and returns what Google granted.
+pub(crate) async fn login(secret: &Secret, options: &Options) -> Result<Authorization, LoginError> {
     options.check()?;
     let (code, request) = match options.mode {
         Mode::Browser => {
@@ -129,6 +224,7 @@ pub(crate) async fn login(secret: &Secret, options: &Options) -> Result<TokenInf
                 &secret.client_id,
                 &format!("http://localhost:{}", listener.port()),
                 options.login_hint.as_deref(),
+                options.audit_log,
             )?;
             print_browser_instructions(&request, listener.port());
             let code = listener.wait_for_code(&request, REDIRECT_TIMEOUT).await?;
@@ -140,6 +236,7 @@ pub(crate) async fn login(secret: &Secret, options: &Options) -> Result<TokenInf
                 &secret.client_id,
                 &format!("http://localhost:{}", options.port),
                 options.login_hint.as_deref(),
+                options.audit_log,
             )?;
             print_manual_instructions(&request, options.port);
             let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
@@ -165,6 +262,7 @@ fn print_browser_instructions(request: &AuthorizationRequest, port: u16) {
     println!();
     println!("{}", request.url());
     println!();
+    print_audit_log_note(request);
     println!(
         "gdrive is waiting for the browser to be redirected to http://localhost:{port}. That \
          works when the browser runs on this machine or reaches it through an SSH tunnel to port \
@@ -181,11 +279,23 @@ fn print_manual_instructions(request: &AuthorizationRequest, port: u16) {
     println!();
     println!("{}", request.url());
     println!();
+    print_audit_log_note(request);
     println!(
         "Google then redirects the browser to http://localhost:{port}/?code=... and the page \
          fails to load; that is expected. Copy the full address from the browser's address bar \
          and paste it here."
     );
+}
+
+/// Tells the user that the consent screen asks for the audit log too, when it does.
+fn print_audit_log_note(request: &AuthorizationRequest) {
+    if request.audit_log != AuditLog::No {
+        println!(
+            "gdrive also asks for read access to the audit log of your Google Workspace \
+             organization. Leave that box ticked on the consent screen."
+        );
+        println!();
+    }
 }
 
 /// One authorization attempt: the URL to open and the secrets the redirect is checked with.
@@ -194,6 +304,8 @@ pub(crate) struct AuthorizationRequest {
     redirect_uri: String,
     state: String,
     code_verifier: String,
+    /// Whether the URL asks for the audit log, and what the answer must grant.
+    audit_log: AuditLog,
 }
 
 impl AuthorizationRequest {
@@ -202,6 +314,7 @@ impl AuthorizationRequest {
         client_id: &str,
         redirect_uri: &str,
         login_hint: Option<&str>,
+        audit_log: AuditLog,
     ) -> Result<Self, LoginError> {
         let random = SystemRandom::new();
         let state = random_token(&random)?;
@@ -218,7 +331,7 @@ impl AuthorizationRequest {
                 .append_pair("client_id", client_id)
                 .append_pair("redirect_uri", redirect_uri)
                 .append_pair("response_type", "code")
-                .append_pair("scope", &DRIVE_SCOPES.join(" "))
+                .append_pair("scope", &audit_log.scopes().join(" "))
                 .append_pair("access_type", "offline")
                 // Google issues a refresh token only when the consent screen is shown (#150).
                 .append_pair("prompt", "consent")
@@ -235,6 +348,7 @@ impl AuthorizationRequest {
             redirect_uri: redirect_uri.to_owned(),
             state,
             code_verifier,
+            audit_log,
         })
     }
 
@@ -524,7 +638,7 @@ async fn exchange_code<C>(
     secret: &Secret,
     request: &AuthorizationRequest,
     code: &str,
-) -> Result<TokenInfo, LoginError>
+) -> Result<Authorization, LoginError>
 where
     C: Connect + Clone + Send + Sync + 'static,
 {
@@ -552,10 +666,15 @@ where
         .map_err(LoginError::TokenResponse)?
         .to_bytes();
 
-    token_from_response(status, &body)
+    token_from_response(status, &body, request.audit_log)
 }
 
-fn token_from_response(status: StatusCode, body: &[u8]) -> Result<TokenInfo, LoginError> {
+/// The authorization in the answer of the token endpoint, checked against what was asked for.
+fn token_from_response(
+    status: StatusCode,
+    body: &[u8],
+    audit_log: AuditLog,
+) -> Result<Authorization, LoginError> {
     #[derive(Deserialize)]
     struct TokenResponse {
         access_token: Option<String>,
@@ -578,20 +697,32 @@ fn token_from_response(status: StatusCode, body: &[u8]) -> Result<TokenInfo, Log
             description: response.error_description,
         });
     }
-    if let Some(scope) = &response.scope {
-        if !scope.split(' ').any(|scope| scope == DRIVE_SCOPES[0]) {
-            return Err(LoginError::DriveScopeNotGranted);
-        }
+    // Without a `scope` field, what was asked for is granted.
+    let granted = |wanted: &str| {
+        response
+            .scope
+            .as_deref()
+            .is_none_or(|scope| scope.split(' ').any(|scope| scope == wanted))
+    };
+    if !granted(DRIVE_SCOPES[0]) {
+        return Err(LoginError::DriveScopeNotGranted);
+    }
+    let audit_log_granted = audit_log != AuditLog::No && granted(AUDIT_LOG_SCOPE);
+    if audit_log == AuditLog::Required && !audit_log_granted {
+        return Err(LoginError::AuditLogNotGranted);
     }
     let access_token = response.access_token.ok_or(LoginError::NoAccessToken)?;
 
-    Ok(TokenInfo {
-        access_token: Some(access_token),
-        refresh_token: response.refresh_token,
-        expires_at: response
-            .expires_in
-            .map(|seconds| time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds)),
-        id_token: response.id_token,
+    Ok(Authorization {
+        token: TokenInfo {
+            access_token: Some(access_token),
+            refresh_token: response.refresh_token,
+            expires_at: response
+                .expires_in
+                .map(|seconds| time::OffsetDateTime::now_utc() + time::Duration::seconds(seconds)),
+            id_token: response.id_token,
+        },
+        audit_log: audit_log_granted,
     })
 }
 
@@ -629,6 +760,11 @@ pub(crate) enum LoginError {
     },
     NoAccessToken,
     DriveScopeNotGranted,
+    /// `--audit-log` was given and the user unticked the audit log on the consent screen.
+    AuditLogNotGranted,
+    /// `--audit-log` was given and Google granted it, but returned no refresh token, and the
+    /// stored one was not issued with the audit log ([`tokens_after_login`]).
+    AuditLogWithoutRefreshToken,
 }
 
 impl Display for LoginError {
@@ -710,6 +846,17 @@ impl Display for LoginError {
                 "the authorization does not include access to Google Drive; run the command \
                  again and allow gdrive to see, edit, create and delete your Google Drive files",
             ),
+            LoginError::AuditLogNotGranted => f.write_str(
+                "the authorization does not include read access to the audit log of the Google \
+                 Workspace organization, so nothing was saved; run the command again and leave \
+                 the box for the audit log ticked on the consent screen (the Google account must \
+                 be an administrator of the organization)",
+            ),
+            LoginError::AuditLogWithoutRefreshToken => f.write_str(
+                "Google returned no refresh token, and the stored one does not include read \
+                 access to the audit log, so nothing was saved; remove gdrive's access at \
+                 https://myaccount.google.com/permissions, then run the command again",
+            ),
         }
     }
 }
@@ -746,11 +893,16 @@ mod tests {
     }
 
     fn request(redirect_uri: &str) -> AuthorizationRequest {
+        request_for(redirect_uri, AuditLog::No)
+    }
+
+    fn request_for(redirect_uri: &str, audit_log: AuditLog) -> AuthorizationRequest {
         AuthorizationRequest::new(
             GOOGLE_AUTH_URI,
             &secret().client_id,
             redirect_uri,
             Some("me@example.com"),
+            audit_log,
         )
         .unwrap()
     }
@@ -797,6 +949,63 @@ mod tests {
         let other = self::request("http://localhost:8085");
         assert_ne!(other.state, request.state);
         assert_ne!(other.code_verifier, request.code_verifier);
+    }
+
+    fn code_challenge(request: &AuthorizationRequest) -> String {
+        URL_SAFE_NO_PAD.encode(ring::digest::digest(
+            &ring::digest::SHA256,
+            request.code_verifier.as_bytes(),
+        ))
+    }
+
+    #[test]
+    fn authorization_url_without_the_audit_log_is_that_of_gdrive_4_0() {
+        let request = request("http://localhost:8085");
+        let expected = format!(
+            "https://accounts.google.com/o/oauth2/v2/auth?\
+             client_id=client-id.apps.googleusercontent.com\
+             &redirect_uri=http%3A%2F%2Flocalhost%3A8085&response_type=code\
+             &scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive\
+             +https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fdrive.metadata.readonly\
+             &access_type=offline&prompt=consent&state={}&code_challenge={}\
+             &code_challenge_method=S256&login_hint=me%40example.com",
+            request.state,
+            code_challenge(&request)
+        );
+        assert_eq!(request.url(), expected);
+        assert!(!request.url().contains("admin.reports"));
+        assert_eq!(
+            Options::new(Mode::Browser, 8085, None).audit_log,
+            AuditLog::No
+        );
+    }
+
+    #[test]
+    fn authorization_url_asks_for_the_audit_log_too_with_the_flag() {
+        let request = request_for("http://localhost:8085", AuditLog::Required);
+        let mut params = query(request.url());
+        assert_eq!(
+            params["scope"],
+            "https://www.googleapis.com/auth/drive \
+             https://www.googleapis.com/auth/drive.metadata.readonly \
+             https://www.googleapis.com/auth/admin.reports.audit.readonly"
+        );
+        assert_eq!(params["code_challenge"], code_challenge(&request));
+        assert_eq!(params["state"], request.state);
+
+        // `account reauth` asks for it again in the same way.
+        let again = request_for("http://localhost:8085", AuditLog::Optional);
+        assert_eq!(query(again.url())["scope"], params["scope"]);
+
+        // Everything else is as without the flag.
+        let plain = self::request("http://localhost:8085");
+        let mut plain_params = query(plain.url());
+        for params in [&mut params, &mut plain_params] {
+            for name in ["scope", "state", "code_challenge"] {
+                params.remove(name);
+            }
+        }
+        assert_eq!(params, plain_params);
     }
 
     #[test]
@@ -909,6 +1118,7 @@ mod tests {
             &secret().client_id,
             "http://localhost:8085",
             None,
+            options.audit_log,
         )
         .unwrap();
 
@@ -918,7 +1128,7 @@ mod tests {
             request.state
         );
         let code = request.code_from_pasted(&pasted).unwrap();
-        let token = exchange_code(
+        let authorization = exchange_code(
             &http_client(),
             &options.endpoints.token_uri,
             &secret(),
@@ -927,6 +1137,9 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!authorization.audit_log);
+        assert_eq!(authorization.scopes(), DRIVE_SCOPES);
+        let token = authorization.token;
 
         let requests = server.requests();
         assert_eq!(requests.len(), 1);
@@ -968,6 +1181,9 @@ mod tests {
             .await
             .unwrap();
         let json = tokio::fs::read_to_string(&path).await.unwrap();
+        assert!(!TokenFile::from_json(json.as_bytes())
+            .unwrap()
+            .audit_log_granted());
         assert!(json.starts_with(
             r#"[{"scopes":["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/drive.metadata.readonly"],"token":{"access_token":"ya29.access","refresh_token":"1//refresh","expires_at":["#
         ));
@@ -1016,6 +1232,242 @@ mod tests {
             assert!(message.starts_with(expected), "{message}");
             assert!(!message.contains("secret-token"));
         }
+    }
+
+    /// The answer of the token endpoint to a login, with `scope` as its scope field.
+    fn token_response(scope: Option<&str>) -> String {
+        let mut response = serde_json::json!({
+            "access_token": "ya29.secret-access",
+            "expires_in": 3599,
+            "refresh_token": "1//secret-refresh",
+            "token_type": "Bearer",
+        });
+        if let Some(scope) = scope {
+            response["scope"] = scope.into();
+        }
+        response.to_string()
+    }
+
+    const DRIVE_GRANTED: &str = "https://www.googleapis.com/auth/drive \
+                                 https://www.googleapis.com/auth/drive.metadata.readonly";
+    const ALL_GRANTED: &str = "https://www.googleapis.com/auth/drive \
+                               https://www.googleapis.com/auth/drive.metadata.readonly \
+                               https://www.googleapis.com/auth/admin.reports.audit.readonly";
+
+    #[test]
+    fn the_token_response_says_whether_the_audit_log_was_granted() {
+        // (asked, scope field of the answer, audit log granted)
+        let granted = [
+            (AuditLog::Required, Some(ALL_GRANTED), true),
+            // Google lists the granted scopes in any order.
+            (
+                AuditLog::Required,
+                Some(
+                    "https://www.googleapis.com/auth/admin.reports.audit.readonly \
+                     https://www.googleapis.com/auth/drive",
+                ),
+                true,
+            ),
+            // Without a scope field, what was asked for is granted.
+            (AuditLog::Required, None, true),
+            // Asked for again by `account reauth`: granted or not, the login succeeds.
+            (AuditLog::Optional, Some(ALL_GRANTED), true),
+            (AuditLog::Optional, None, true),
+            (AuditLog::Optional, Some(DRIVE_GRANTED), false),
+            (AuditLog::No, None, false),
+            (AuditLog::No, Some(DRIVE_GRANTED), false),
+            // Not asked for, so not recorded.
+            (AuditLog::No, Some(ALL_GRANTED), false),
+        ];
+        for (asked, scope, expected) in granted {
+            let body = token_response(scope);
+            let authorization = token_from_response(StatusCode::OK, body.as_bytes(), asked)
+                .unwrap_or_else(|error| panic!("{asked:?} {scope:?}: {error}"));
+            assert_eq!(authorization.audit_log, expected, "{asked:?} {scope:?}");
+            let scopes = if expected {
+                &DRIVE_AND_AUDIT_LOG_SCOPES[..]
+            } else {
+                &DRIVE_SCOPES[..]
+            };
+            assert_eq!(authorization.scopes(), scopes);
+            assert_eq!(
+                authorization.token.refresh_token.as_deref(),
+                Some("1//secret-refresh")
+            );
+        }
+    }
+
+    #[test]
+    fn a_required_audit_log_that_was_not_granted_fails_the_login() {
+        let body = token_response(Some(DRIVE_GRANTED));
+        let error =
+            token_from_response(StatusCode::OK, body.as_bytes(), AuditLog::Required).unwrap_err();
+        assert!(matches!(error, LoginError::AuditLogNotGranted), "{error:?}");
+        let message = crate::error_message(&error);
+        assert_eq!(
+            message,
+            "Error: the authorization does not include read access to the audit log of the \
+             Google Workspace organization, so nothing was saved; run the command again and \
+             leave the box for the audit log ticked on the consent screen (the Google account \
+             must be an administrator of the organization)"
+        );
+        assert!(!message.contains("secret"), "{message}");
+
+        // The Drive scope is still checked first.
+        let body = token_response(Some(AUDIT_LOG_SCOPE));
+        let error =
+            token_from_response(StatusCode::OK, body.as_bytes(), AuditLog::Required).unwrap_err();
+        assert!(
+            matches!(error, LoginError::DriveScopeNotGranted),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_audit_log_login_checks_the_answer_of_the_token_endpoint() {
+        for (scope, granted) in [(ALL_GRANTED, true), (DRIVE_GRANTED, false)] {
+            let server = MockServer::start(vec![(200, token_response(Some(scope)))]).await;
+            let request = request_for("http://localhost:8085", AuditLog::Required);
+            let result = exchange_code(
+                &http_client(),
+                &server.url("/token"),
+                &secret(),
+                &request,
+                "code",
+            )
+            .await;
+            assert_eq!(server.requests().len(), 1);
+            match result {
+                Ok(authorization) => {
+                    assert!(granted, "{scope}");
+                    assert!(authorization.audit_log);
+                    // Stored like `account add` does, the entry records the grant.
+                    let tokens =
+                        TokenFile::after_login(None, authorization.scopes(), authorization.token);
+                    assert!(tokens.audit_log_granted());
+                    let json = tokens.to_json().unwrap();
+                    assert!(
+                        json.starts_with(
+                            r#"[{"scopes":["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/drive.metadata.readonly","https://www.googleapis.com/auth/admin.reports.audit.readonly"],"token":{"access_token":"ya29.secret-access","refresh_token":"1//secret-refresh","#
+                        ),
+                        "the stored entry"
+                    );
+                }
+                Err(error) => {
+                    assert!(!granted, "{scope}: {error}");
+                    assert!(matches!(error, LoginError::AuditLogNotGranted));
+                    assert!(!error.to_string().contains("secret"));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_audit_log_is_recorded_only_with_a_refresh_token_that_was_granted_it() {
+        // Google grants the audit log, but its answer carries no refresh token (#150).
+        let body = serde_json::json!({
+            "access_token": "ya29.secret-access",
+            "expires_in": 3599,
+            "scope": ALL_GRANTED,
+            "token_type": "Bearer",
+        })
+        .to_string();
+        let stored = |scopes: &[&str], refresh: Option<&str>| {
+            TokenFile::after_login(
+                None,
+                scopes,
+                TokenInfo {
+                    access_token: Some(String::from("old")),
+                    refresh_token: refresh.map(str::to_owned),
+                    expires_at: None,
+                    id_token: None,
+                },
+            )
+        };
+        // (stored tokens, whether a refresh token of the grant is kept)
+        let cases = [
+            (None, false),
+            (Some(stored(&DRIVE_SCOPES, Some("1//drive-only"))), false),
+            (Some(stored(&DRIVE_AND_AUDIT_LOG_SCOPES, None)), false),
+            (
+                Some(stored(&DRIVE_AND_AUDIT_LOG_SCOPES, Some("1//granted"))),
+                true,
+            ),
+        ];
+        for (previous, kept_has_grant) in &cases {
+            for asked in [AuditLog::Required, AuditLog::Optional] {
+                let server = MockServer::start(vec![(200, body.clone())]).await;
+                let request = request_for("http://localhost:8085", asked);
+                let authorization = exchange_code(
+                    &http_client(),
+                    &server.url("/token"),
+                    &secret(),
+                    &request,
+                    "code",
+                )
+                .await
+                .unwrap();
+                assert!(authorization.audit_log);
+                assert!(authorization.token.refresh_token.is_none());
+
+                let case = format!("{asked:?}, kept grant {kept_has_grant}");
+                let result = tokens_after_login(previous.as_ref(), authorization, asked);
+                match (asked, kept_has_grant) {
+                    (_, true) => {
+                        let LoginTokens { tokens, audit_log } = result.unwrap();
+                        assert!(audit_log, "{case}");
+                        assert!(tokens.audit_log_granted(), "{case}");
+                        assert_eq!(tokens.refresh_token(), Some("1//granted"), "{case}");
+                    }
+                    (AuditLog::Required, false) => {
+                        let Err(error) = result else {
+                            panic!("{case}: saved without a refresh token of the grant");
+                        };
+                        assert!(
+                            matches!(error, LoginError::AuditLogWithoutRefreshToken),
+                            "{case}: {error:?}"
+                        );
+                        let message = crate::error_message(&error);
+                        assert!(
+                            message.starts_with("Error: Google returned no refresh token"),
+                            "{message}"
+                        );
+                        assert!(message.contains("https://myaccount.google.com/permissions"));
+                        assert!(!message.contains("secret"), "{message}");
+                    }
+                    (_, false) => {
+                        // `account reauth` asked again by itself: the Drive authorization, with
+                        // the refresh token kept, and no grant.
+                        let LoginTokens { tokens, audit_log } = result.unwrap();
+                        assert!(!audit_log, "{case}");
+                        assert!(!tokens.audit_log_granted(), "{case}");
+                        assert_eq!(
+                            tokens.refresh_token(),
+                            previous.as_ref().and_then(TokenFile::refresh_token),
+                            "{case}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // With a refresh token in the answer, the grant is recorded whatever was stored.
+        let with_refresh_token = token_response(Some(ALL_GRANTED));
+        let server = MockServer::start(vec![(200, with_refresh_token)]).await;
+        let request = request_for("http://localhost:8085", AuditLog::Required);
+        let authorization = exchange_code(
+            &http_client(),
+            &server.url("/token"),
+            &secret(),
+            &request,
+            "code",
+        )
+        .await
+        .unwrap();
+        let LoginTokens { tokens, audit_log } =
+            tokens_after_login(cases[1].0.as_ref(), authorization, AuditLog::Required).unwrap();
+        assert!(audit_log);
+        assert_eq!(tokens.refresh_token(), Some("1//secret-refresh"));
     }
 
     /// Sends a GET to the listener like a browser and returns the response.

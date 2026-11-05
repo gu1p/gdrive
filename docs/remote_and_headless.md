@@ -198,6 +198,10 @@ not send a new refresh token, gdrive keeps the stored one instead of overwriting
 takes `--port` too. Sign in with the same Google account: if the address differs, or Google does not
 report one, nothing is changed. Run `gdrive account reauth --help` for the full list of options.
 
+An account that may read the audit log of its organization (`--audit-log`, see
+[Audit log access](basic_usage.md#audit-log-access)) keeps that access: `account reauth` asks for it again
+by itself. `--audit-log` works with `--manual` and `--port` as well.
+
 ### Keep the token valid
 
 A refresh token stops working when:

@@ -10,7 +10,10 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{auth::store::TokenFile, common::json_error::RedactedJsonError};
+use crate::{
+    auth::store::{self, TokenFile},
+    common::json_error::RedactedJsonError,
+};
 
 const SYSTEM_CONFIG_DIR_NAME: &str = ".config";
 const BASE_PATH_DIR_NAME: &str = "gdrive3";
@@ -34,13 +37,19 @@ pub(crate) async fn add_account(
     tokens: &TokenFile,
 ) -> Result<AppConfig, errors::AddAccount> {
     let config = AppConfig::init_account(account_name).map_err(errors::AddAccount::InitAccount)?;
-    config
-        .save_secret(secret)
-        .map_err(errors::AddAccount::SaveSecret)?;
-    tokens
-        .save(config.tokens_path())
-        .await
-        .map_err(errors::AddAccount::SaveTokens)?;
+    // Under the lock of the tokens file, which other gdrive processes write: a login that cannot
+    // get it changes neither the secret nor the tokens.
+    store::with_lock(config.tokens_path(), async |locked| {
+        config
+            .save_secret(secret)
+            .map_err(errors::AddAccount::SaveSecret)?;
+        tokens
+            .save_locked(locked)
+            .await
+            .map_err(errors::AddAccount::SaveTokens)
+    })
+    .await
+    .map_err(|error| errors::AddAccount::SaveTokens(error.into()))??;
     Ok(config)
 }
 

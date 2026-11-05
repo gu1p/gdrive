@@ -27,7 +27,9 @@ This guide was checked against Google's documentation on 2026-11-04. The sources
 7. [Choose Testing or In production](#7-choose-testing-or-in-production)
 8. [Add the account to gdrive](#8-add-the-account-to-gdrive)
 
-Then see [Verification](#verification-you-do-not-need-it) and [Troubleshooting](#troubleshooting).
+Then see [Verification](#verification-you-do-not-need-it) and [Troubleshooting](#troubleshooting). For
+`gdrive files activity`, which reads the audit log of a Google Workspace organization, also see
+[Audit log access](#audit-log-access-optional).
 
 ## 1. Create a project
 
@@ -86,6 +88,8 @@ gdrive asks for these two scopes when you sign in:
 
 - `https://www.googleapis.com/auth/drive` (see, edit, create and delete all your Drive files)
 - `https://www.googleapis.com/auth/drive.metadata.readonly` (see metadata of your Drive files)
+
+With `--audit-log`, gdrive asks for one more scope; see [Audit log access](#audit-log-access-optional).
 
 Declare them on your app so the configuration matches what gdrive requests:
 
@@ -193,6 +197,38 @@ gdrive files list
 
 More commands are in [Basic usage](basic_usage.md).
 
+## Audit log access (optional)
+
+Only for `gdrive files activity`, which reads the audit log of a Google Workspace organization. Skip this
+section otherwise. The Google account you sign in with must be an administrator of that organization, with
+the Reports privilege (super administrators have it).
+
+1. Enable the Admin SDK API. Open the [Admin SDK API](https://console.cloud.google.com/apis/library/admin.googleapis.com)
+   page (**Menu > APIs & Services > Library**, then search for `Admin SDK API`) and click **Enable**.
+2. Add the audit log scope. Open [Google Auth Platform > Data Access](https://console.cloud.google.com/auth/scopes),
+   click **Add or remove scopes**, and paste
+   `https://www.googleapis.com/auth/admin.reports.audit.readonly` into **Manually add scopes**. Click
+   **Add to table**, confirm the selection, then click **Save**. The scope gives read-only access to the
+   organization's audit log.
+3. Sign in with the access:
+
+   ```sh
+   gdrive account add --audit-log                     # a new account
+   gdrive account reauth <ACCOUNT_NAME> --audit-log   # an account you added already
+   ```
+
+What the sign-in shows depends on the audience of the app ([step 3](#3-set-up-google-auth-platform)):
+
+- **Internal**: nothing more to set up. There is no unverified-app warning and nothing to verify.
+- **External**, in Testing or In production: the same "Google hasn't verified this app" warning as for the
+  Drive scopes. After **Continue**, the list of what the app may access has one more item, the audit log,
+  with its own box. Leave it ticked: without it, gdrive saves nothing and tells you to run the command
+  again. The console may mark the scope as needing verification, as it does the Drive scopes; for your own
+  use you do not need to act on it. In Testing, the refresh token still expires after seven days
+  ([step 7](#7-choose-testing-or-in-production)).
+
+A later `gdrive account reauth` asks for the audit log again by itself, so the access is kept.
+
 ## Verification: you do not need it
 
 Google verifies apps that are offered to the public. gdrive is different: each user creates a private app
@@ -223,6 +259,7 @@ for their own account.
 | `deleted_client` or `invalid_client` | Wrong client ID or secret, or Google deleted the client. Google deletes OAuth clients that were not used for six months; you can restore them for 30 days. | Check the values in Clients. Restore the client or create a new one, then add the account again. |
 | `org_internal` | The app is Internal and the account is outside the organization. | Sign in with an account of the organization, or set the audience to External. |
 | `admin_policy_enforced` | A Google Workspace admin blocks the Drive scopes for your account. | Ask the admin to allow the app. |
+| `the authorization does not include read access to the audit log` | You signed in with `--audit-log` and unticked the box for the audit log on the consent screen. | Run the command again and leave the box ticked ([Audit log access](#audit-log-access-optional)). |
 | "127.0.0.1 refused to connect", `ERR_CONNECTION_REFUSED`, "This site can't be reached" after you approve | The browser is not on the machine where gdrive runs, or gdrive is no longer waiting. | See [Remote and headless setup](remote_and_headless.md). |
 
 ## Sources
@@ -243,6 +280,7 @@ Google documentation used for this guide, checked on 2026-11-04:
 - [OAuth 2.0 for Mobile & Desktop Apps](https://developers.google.com/identity/protocols/oauth2/native-app) (Desktop app, loopback redirect, error codes, OOB removal)
 - [Out-Of-Band (OOB) flow migration guide](https://developers.google.com/identity/protocols/oauth2/resources/oob-migration)
 - [OAuth 2.0 for Web Server Applications](https://developers.google.com/identity/protocols/oauth2/web-server) (registered redirect URIs must match exactly)
+- [Choose Reports API scopes](https://developers.google.com/workspace/admin/reports/auth) (the audit log scope; checked on 2026-11-05)
 - [Usability and safety updates to Google Auth Platform](https://developers.googleblog.com/en/usability-and-safety-updates-to-google-auth-platform/) (secret masking, deletion of unused clients, the move to Google Auth Platform)
 
 Other sources:
