@@ -1477,6 +1477,61 @@ async fn each_failure_of_the_audit_log_names_what_to_do() {
 }
 
 #[tokio::test]
+async fn a_page_that_fails_after_a_good_first_one_fails_the_report_and_prints_none_of_it() {
+    let log = (0..3)
+        .map(|second| {
+            record(
+                &format!("2026-11-01T15:00:0{second}Z"),
+                Some("ana@example.com"),
+                vec![event("view", "a")],
+            )
+        })
+        .collect();
+    let drive = FakeDrive::start(
+        tree(),
+        Behavior {
+            audit_page_size: Some(1),
+            audit_error_after_first_page: Some((
+                500,
+                google_error(500, "Backend Error", "backendError"),
+            )),
+            ..behavior(log)
+        },
+    )
+    .await;
+
+    for by in [By::User, By::File, By::Event] {
+        let ran = activity(
+            &drive,
+            Settings {
+                by,
+                ..settings(&["old"])
+            },
+        )
+        .await;
+        let error = ran.error();
+        assert!(
+            error.starts_with(
+                "Error: unable to read the audit log: Google answered 500 Internal Server Error: \
+                 Backend Error (gave up after 4 attempts"
+            ),
+            "{error}"
+        );
+        assert_eq!(ran.out.text(), "", "{by:?}: no partial report");
+        assert!(!ran.err.text().contains("Summary"), "{}", ran.err.text());
+        ran.assert_no_secrets();
+    }
+    // The first page of that window was read, with a matching event, and the next one failed.
+    let requests = drive.audit_requests();
+    let later = requests
+        .iter()
+        .filter(|request| request.param("pageToken").is_some())
+        .count();
+    assert_eq!(later, 3 * 4, "each run tried the second page 4 times");
+    assert_read_only(&drive);
+}
+
+#[tokio::test]
 async fn a_rate_limit_is_waited_for_and_retried() {
     let drive = FakeDrive::start(
         tree(),

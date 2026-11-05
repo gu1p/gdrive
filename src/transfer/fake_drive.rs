@@ -35,8 +35,9 @@
 //! [`Bounds::BothExcluded`]) and `endTime` (excluded), with `filters` of `name==value`
 //! terms over event parameters (a record matches when one of its events has all of them), paged
 //! with `maxResults` and `pageToken`. Both record their requests ([`FakeDrive::audit_requests`],
-//! [`FakeDrive::permission_requests`]); [`Behavior::audit_error`] and
-//! [`Behavior::audit_rate_limited`] make the audit log fail.
+//! [`FakeDrive::permission_requests`]); [`Behavior::audit_error`],
+//! [`Behavior::audit_error_after_first_page`] and [`Behavior::audit_rate_limited`] make the
+//! audit log fail.
 //!
 //! A test that checks how many requests were in flight at once does not rely on delays: the
 //! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
@@ -344,6 +345,9 @@ pub(crate) struct Behavior {
     pub(crate) audit_bounds: Bounds,
     /// Every audit log request is answered with this status and JSON body.
     pub(crate) audit_error: Option<(u16, Value)>,
+    /// Every audit log request for a page after the first (with a `pageToken`) is answered
+    /// with this status and JSON body.
+    pub(crate) audit_error_after_first_page: Option<(u16, Value)>,
     /// The first this many audit log requests are answered with 429, a rate limit.
     pub(crate) audit_rate_limited: usize,
     /// The first this many audit log requests are held until all of them have arrived.
@@ -1899,7 +1903,12 @@ async fn audit(
     tokio::time::sleep(state.behavior.delay).await;
 
     let behavior = &state.behavior;
-    if let Some((status, body)) = &behavior.audit_error {
+    let later_page = request.param("pageToken").is_some();
+    let failure = behavior.audit_error.as_ref().or(behavior
+        .audit_error_after_first_page
+        .as_ref()
+        .filter(|_| later_page));
+    if let Some((status, body)) = failure {
         let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         return json_response(status, body);
     }
