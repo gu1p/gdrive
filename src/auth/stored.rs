@@ -651,4 +651,227 @@ mod tests {
             .unwrap()
             .audit_log_granted());
     }
+
+    /// A refresh answer with the access token `access`. Valid for 30 seconds, a token counts as
+    /// expired at once (yup-oauth2 renews it a minute early), so the next request refreshes
+    /// again.
+    fn refresh_answer(access: &str, expires_in: u32) -> (u16, String) {
+        (
+            200,
+            format!(
+                r#"{{"access_token":"{access}","expires_in":{expires_in},"token_type":"Bearer"}}"#
+            ),
+        )
+    }
+
+    fn last_refresh_token(server: &MockServer) -> Option<String> {
+        server.requests().last()?.form("refresh_token")
+    }
+
+    /// Runs a command of the authorization in `tokens_path` (refresh token `refresh-1`, for
+    /// `loaded_scopes`) while the account is authorized again for `login_scopes` (refresh token
+    /// `refresh-2`). The older command refreshes after the new login was saved, and with
+    /// `refreshes_first` also before. Checks that nothing of it reaches the new file, and
+    /// returns that file's content.
+    async fn older_command_meets_a_new_login(
+        server: &MockServer,
+        dir: &Path,
+        loaded_scopes: &[&str],
+        login_scopes: &[&str],
+        refreshes_first: bool,
+    ) -> Vec<u8> {
+        let path = write_tokens_for(
+            dir,
+            loaded_scopes,
+            token("stale", Some("refresh-1"), TimeDuration::hours(-1)),
+        )
+        .await;
+        let older = load(server.addr(), &path).await.unwrap();
+        let asked = loaded_scopes;
+        if refreshes_first {
+            bounded(older.access_token(asked)).await.unwrap();
+            assert_eq!(last_refresh_token(server).as_deref(), Some("refresh-1"));
+        }
+
+        let previous = TokenFile::load(&path).await.unwrap();
+        TokenFile::after_login(
+            previous.as_ref(),
+            login_scopes,
+            token("login", Some("refresh-2"), TimeDuration::hours(-1)),
+        )
+        .save(&path)
+        .await
+        .unwrap();
+        let saved = tokio::fs::read(&path).await.unwrap();
+
+        // The older command refreshes with its own refresh token and keeps the token to itself.
+        let requests = server.requests().len();
+        let access = bounded(older.access_token(asked)).await.unwrap();
+        assert_eq!(access.token(), Some("older"));
+        assert_eq!(server.requests().len(), requests + 1);
+        assert_eq!(last_refresh_token(server).as_deref(), Some("refresh-1"));
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), saved);
+        // It goes on working from memory, without another request.
+        for scopes in [asked, &DRIVE_SCOPES[..1]] {
+            let access = bounded(older.access_token(scopes)).await.unwrap();
+            assert_eq!(access.token(), Some("older"), "{scopes:?}");
+        }
+        assert_eq!(server.requests().len(), requests + 1);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), saved);
+        saved
+    }
+
+    /// The answers of the token endpoint for [`older_command_meets_a_new_login`] and one more
+    /// refresh, `next`, of a command started after the login.
+    async fn token_endpoint(refreshes_first: bool, next: &str) -> MockServer {
+        let mut answers = Vec::new();
+        if refreshes_first {
+            answers.push(refresh_answer("older-early", 30));
+        }
+        answers.push(refresh_answer("older", 3599));
+        answers.push(refresh_answer(next, 3599));
+        MockServer::start(answers).await
+    }
+
+    #[tokio::test]
+    async fn an_older_drive_command_cannot_undo_an_audit_log_reauthorization() {
+        for refreshes_first in [false, true] {
+            let server = token_endpoint(refreshes_first, "audit").await;
+            let dir = tempfile::tempdir().unwrap();
+            // A Drive-only command, `gdrive account reauth --audit-log`, the command refreshes.
+            older_command_meets_a_new_login(
+                &server,
+                dir.path(),
+                &DRIVE_SCOPES,
+                &DRIVE_AND_AUDIT,
+                refreshes_first,
+            )
+            .await;
+
+            // Then a command that reads the audit log refreshes, with the new refresh token.
+            let path = dir.path().join("tokens.json");
+            let audit = load(server.addr(), &path).await.unwrap();
+            assert!(audit.audit_log_granted());
+            let access = bounded(audit.access_token(&[AUDIT_LOG_SCOPE]))
+                .await
+                .unwrap();
+            assert_eq!(access.token(), Some("audit"));
+            assert_eq!(last_refresh_token(&server).as_deref(), Some("refresh-2"));
+
+            let saved = TokenFile::load(&path).await.unwrap().unwrap();
+            assert!(saved.audit_log_granted());
+            assert_eq!(saved.refresh_token(), Some("refresh-2"));
+            let json = tokio::fs::read_to_string(&path).await.unwrap();
+            assert!(!json.contains("refresh-1"), "{refreshes_first}: {json}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_audit_log_command_cannot_undo_a_drive_only_reauthorization() {
+        for refreshes_first in [false, true] {
+            let server = token_endpoint(refreshes_first, "drive").await;
+            let dir = tempfile::tempdir().unwrap();
+            // An audit-log command (it asks for the scopes of the grant, as `get_audit_hub_for`
+            // does), a reauthorization without the audit log, the command refreshes.
+            older_command_meets_a_new_login(
+                &server,
+                dir.path(),
+                &DRIVE_AND_AUDIT,
+                &DRIVE_SCOPES,
+                refreshes_first,
+            )
+            .await;
+
+            let path = dir.path().join("tokens.json");
+            let drive = load(server.addr(), &path).await.unwrap();
+            assert!(!drive.audit_log_granted());
+            let access = bounded(drive.access_token(&DRIVE_SCOPES)).await.unwrap();
+            assert_eq!(access.token(), Some("drive"));
+            assert_eq!(last_refresh_token(&server).as_deref(), Some("refresh-2"));
+            let saved = TokenFile::load(&path).await.unwrap().unwrap();
+            assert!(!saved.audit_log_granted());
+            assert_eq!(saved.refresh_token(), Some("refresh-2"));
+        }
+    }
+
+    #[tokio::test]
+    async fn an_older_command_never_writes_its_refresh_token_over_a_newer_one() {
+        // Plain reauthorizations, for Drive only and with the audit log: the earlier refresh
+        // token may have been revoked, and must not come back.
+        for scopes in [&DRIVE_SCOPES[..], &DRIVE_AND_AUDIT] {
+            for refreshes_first in [false, true] {
+                let server = token_endpoint(refreshes_first, "new").await;
+                let dir = tempfile::tempdir().unwrap();
+                older_command_meets_a_new_login(
+                    &server,
+                    dir.path(),
+                    scopes,
+                    scopes,
+                    refreshes_first,
+                )
+                .await;
+
+                let path = dir.path().join("tokens.json");
+                let new = load(server.addr(), &path).await.unwrap();
+                let access = bounded(new.access_token(&DRIVE_SCOPES[..1])).await.unwrap();
+                assert_eq!(access.token(), Some("new"));
+                assert_eq!(last_refresh_token(&server).as_deref(), Some("refresh-2"));
+                let json = tokio::fs::read_to_string(&path).await.unwrap();
+                assert!(!json.contains("refresh-1"), "{scopes:?}: {json}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn an_account_that_is_not_authorized_again_keeps_its_layout_and_writes_only_to_refresh() {
+        let server = MockServer::start(vec![refresh_answer("fresh", 3599)]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tokens(
+            dir.path(),
+            token("stale", Some("refresh-1"), TimeDuration::hours(-1)),
+        )
+        .await;
+
+        let credentials = load(server.addr(), &path).await.unwrap();
+        bounded(credentials.access_token(&DRIVE_SCOPES))
+            .await
+            .unwrap();
+
+        // The layout of gdrive 3.x: one entry, the same keys.
+        let json: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+        let entries = json.as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        let keys = |value: &serde_json::Value| {
+            let mut keys: Vec<_> = value.as_object().unwrap().keys().cloned().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys(&entries[0]), ["scopes", "token"]);
+        assert_eq!(
+            keys(&entries[0]["token"]),
+            ["access_token", "expires_at", "id_token", "refresh_token"]
+        );
+        assert_eq!(entries[0]["scopes"], serde_json::json!(DRIVE_SCOPES));
+        assert_eq!(entries[0]["token"]["refresh_token"], "refresh-1");
+
+        // Served from the stored token, in this process and the next: no more writes.
+        let written = tokio::fs::read(&path).await.unwrap();
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+        let again = load(server.addr(), &path).await.unwrap();
+        for credentials in [&credentials, &again] {
+            for scopes in [&DRIVE_SCOPES[..], &DRIVE_SCOPES[..1], &DRIVE_SCOPES[1..]] {
+                let access = bounded(credentials.access_token(scopes)).await.unwrap();
+                assert_eq!(access.token(), Some("fresh"));
+            }
+        }
+        assert_eq!(server.requests().len(), 1);
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), written);
+        #[cfg(unix)]
+        assert_eq!(
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap()),
+            inode
+        );
+    }
 }

@@ -11,6 +11,12 @@
 //! The scopes of the entries also record what the account was granted: the login stores its
 //! token for the scopes Google granted, and [`TokenFile::audit_log_granted`] reads from them
 //! whether the account may read the audit log.
+//!
+//! The entries of an OAuth user account belong to one authorization, the one whose refresh
+//! token they carry ([`TokenFile::refresh_token`]). A login replaces the whole file. A process
+//! that loaded the tokens before that login refreshes with the refresh token of the earlier
+//! authorization, which may lack the audit log or be revoked; [`TokenStore`] keeps what it
+//! refreshes in memory then and leaves the file to the new authorization.
 
 use std::{
     error::Error,
@@ -73,39 +79,63 @@ impl TokenFile {
 
     /// The best token of `credential` for `scopes`: among its entries whose scopes include all
     /// of `scopes`, an unexpired one if there is any, and the one that expires last. Entries of
-    /// other credentials do not count.
+    /// other credentials do not count, nor, for an OAuth user account, entries of an earlier
+    /// authorization ([`TokenFile::user_entries`]).
     pub(crate) fn get_for(&self, credential: Option<&str>, scopes: &[&str]) -> Option<&TokenInfo> {
+        let refresh_token = self.refresh_token();
         self.entries
             .iter()
-            .filter(|entry| entry.credential.as_deref() == credential)
+            .filter(|entry| match credential {
+                None => entry.credential.is_none() && of_authorization(entry, refresh_token),
+                Some(_) => entry.credential.as_deref() == credential,
+            })
             .filter(|entry| covers(&entry.scopes, scopes))
             .max_by_key(|entry| (!entry.token.is_expired(), entry.token.expires_at))
             .map(|entry| &entry.token)
     }
 
-    /// The refresh token to use for this account: the one of the most recently issued entry
-    /// (latest expiry) that has a refresh token.
+    /// The refresh token of the account's authorization: the one of the most recently issued
+    /// entry (latest expiry) that has a refresh token, among the entries that record the
+    /// audit-log grant if there are any.
+    ///
+    /// A file this version writes holds one authorization: a login replaces the whole file, and
+    /// [`TokenStore`] never writes into the file of an authorization other than the one it
+    /// refreshes with. The preference keeps the choice right in a file where a process of an
+    /// earlier, Drive-only authorization wrote its tokens next to those of a login with the
+    /// audit log, as earlier builds let it: an entry that records the grant is written only
+    /// under an authorization that was granted it, and a later login without the grant removes
+    /// every such entry.
     pub(crate) fn refresh_token(&self) -> Option<&str> {
         self.entries
             .iter()
             .filter(|entry| entry.credential.is_none())
             .filter(|entry| entry.token.refresh_token.is_some())
-            .max_by_key(|entry| entry.token.expires_at)
+            .max_by_key(|entry| (records_audit_log(entry), entry.token.expires_at))
             .and_then(|entry| entry.token.refresh_token.as_deref())
     }
 
+    /// The entries of the OAuth user account's authorization: those with its refresh token
+    /// ([`TokenFile::refresh_token`]), and those without any (gdrive 3.x stored refreshed
+    /// tokens without one). An entry with another refresh token is of an earlier authorization
+    /// and is never used.
+    fn user_entries(&self) -> impl Iterator<Item = &TokenEntry> {
+        let refresh_token = self.refresh_token();
+        self.entries.iter().filter(move |entry| {
+            entry.credential.is_none() && of_authorization(entry, refresh_token)
+        })
+    }
+
     /// Whether the OAuth user account was granted read access to the audit log
-    /// ([`AUDIT_LOG_SCOPE`]): one of its entries is stored for a scope set that includes it.
+    /// ([`AUDIT_LOG_SCOPE`]): one of the entries of its authorization
+    /// ([`TokenFile::user_entries`]) is stored for a scope set that includes it. The refresh
+    /// token of that authorization ([`TokenFile::refresh_token`]) is then one of these entries'.
     ///
     /// Only a login that was granted the audit log writes such an entry
     /// ([`TokenFile::after_login`]), and only the next login removes it: a refresh for other
     /// scopes adds or replaces the entry of those scopes and leaves this one alone, and
     /// [`TokenStore`] stores a token asked for the audit log only while this holds.
     pub(crate) fn audit_log_granted(&self) -> bool {
-        self.entries
-            .iter()
-            .filter(|entry| entry.credential.is_none())
-            .any(|entry| entry.scopes.iter().any(|scope| scope == AUDIT_LOG_SCOPE))
+        self.user_entries().any(records_audit_log)
     }
 
     /// [`TokenFile::audit_log_granted`] of the tokens file at `path`; `false` when it is missing
@@ -127,10 +157,11 @@ impl TokenFile {
     /// Stores `token` of `credential` for exactly `scopes`, replacing the entry for the same
     /// credential and scope set.
     ///
-    /// For an OAuth user account (no credential), a token without a refresh token keeps the
-    /// refresh token that is already stored, first the one of the replaced entry, otherwise
-    /// [`TokenFile::refresh_token`]: token responses to a refresh request normally carry no
-    /// refresh token, and the stored one stays valid.
+    /// For an OAuth user account (no credential), `token` is one of the account's authorization
+    /// ([`TokenFile::refresh_token`]); [`TokenStore`] makes sure of that. Without a refresh token
+    /// it gets the authorization's: token responses to a refresh request normally carry none,
+    /// and the stored one stays valid. A refresh token it brings becomes the authorization's,
+    /// on every entry. Entries of an earlier authorization are dropped.
     ///
     /// Entries of other credentials are left alone while they are valid (a process that still
     /// has an earlier key of the account may use them) and dropped once they expired.
@@ -142,16 +173,28 @@ impl TokenFile {
     ) {
         self.entries
             .retain(|entry| entry.credential.as_deref() == credential || !entry.token.is_expired());
+
+        if credential.is_none() {
+            let current = self.refresh_token().map(str::to_owned);
+            self.entries.retain(|entry| {
+                entry.credential.is_some() || of_authorization(entry, current.as_deref())
+            });
+            match &token.refresh_token {
+                None => token.refresh_token = current,
+                Some(new) if current.as_deref() != Some(new.as_str()) => {
+                    for entry in &mut self.entries {
+                        if entry.credential.is_none() && entry.token.refresh_token.is_some() {
+                            entry.token.refresh_token = Some(new.clone());
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+
         let index = self.entries.iter().position(|entry| {
             entry.credential.as_deref() == credential && same_scopes(&entry.scopes, scopes)
         });
-
-        if token.refresh_token.is_none() && credential.is_none() {
-            token.refresh_token = index
-                .and_then(|index| self.entries[index].token.refresh_token.clone())
-                .or_else(|| self.refresh_token().map(str::to_owned));
-        }
-
         match index {
             Some(index) => self.entries[index].token = token,
             None => self.entries.push(TokenEntry {
@@ -258,6 +301,21 @@ async fn write_and_sync(file: &mut File, content: &[u8]) -> io::Result<()> {
     file.sync_all().await
 }
 
+/// Whether `entry` is stored for a scope set that includes [`AUDIT_LOG_SCOPE`].
+fn records_audit_log(entry: &TokenEntry) -> bool {
+    entry.scopes.iter().any(|scope| scope == AUDIT_LOG_SCOPE)
+}
+
+/// Whether `entry` of an OAuth user account belongs to the authorization whose refresh token is
+/// `refresh_token`: it has that refresh token, or none at all.
+fn of_authorization(entry: &TokenEntry, refresh_token: Option<&str>) -> bool {
+    entry
+        .token
+        .refresh_token
+        .as_deref()
+        .is_none_or(|own| Some(own) == refresh_token)
+}
+
 fn covers(stored: &[String], requested: &[&str]) -> bool {
     requested
         .iter()
@@ -323,11 +381,20 @@ async fn open_new_file(path: &Path) -> io::Result<File> {
 }
 
 /// `tokens.json` exposed to yup-oauth2 as its token storage.
+///
+/// A refreshed token is merged into the file on disk, so that the updates of other gdrive
+/// processes are kept, but only while that file is of the authorization this store refreshes
+/// with: its [`TokenFile::refresh_token`] is the refresh token of this store. Once the account
+/// was authorized again (`account add`, `account reauth`), the file belongs to the new
+/// authorization, and this store keeps its tokens in memory for the rest of the process. Its
+/// refresh token may lack scopes the new authorization has, such as the audit log, or be
+/// revoked, so neither it nor a token refreshed with it may end up in the new file.
 pub(crate) struct TokenStore {
     path: PathBuf,
     file: Mutex<TokenFile>,
     /// The refresh token the authenticator refreshes with; stored with refreshed tokens that
-    /// come without one.
+    /// come without one. For an OAuth user account, it names the authorization whose file this
+    /// store may write.
     refresh_token: Option<String>,
     /// The credential of a service account whose tokens these are; see [`TokenEntry`].
     credential: Option<String>,
@@ -372,15 +439,24 @@ impl TokenStorage for TokenStore {
 
         let mut file = self.file.lock().await;
         // Merge into what is on disk now, so that the update of another gdrive process that ran
-        // in the meantime is kept.
-        if let Ok(Some(on_disk)) = TokenFile::load(&self.path).await {
-            *file = on_disk;
-        }
+        // in the meantime is kept; but not into the file of a newer authorization.
+        let superseded = match TokenFile::load(&self.path).await {
+            Ok(Some(on_disk))
+                if self.credential.is_none()
+                    && on_disk.refresh_token() != self.refresh_token.as_deref() =>
+            {
+                true
+            }
+            Ok(Some(on_disk)) => {
+                *file = on_disk;
+                false
+            }
+            Ok(None) | Err(_) => false,
+        };
         // yup-oauth2 refreshes and stores a token for any scope set it is asked for. Stored
         // for the audit log, the token of an account that was not granted it would claim a
         // grant Google never gave (a refresh brings only the scopes of the grant), so it is not
-        // cached. The check is made against the file as it is now: another gdrive process may
-        // have authorized the account again without the audit log in the meantime.
+        // cached.
         if self.credential.is_none()
             && scopes.contains(&AUDIT_LOG_SCOPE)
             && !file.audit_log_granted()
@@ -388,6 +464,9 @@ impl TokenStorage for TokenStore {
             return Ok(());
         }
         file.set_for(self.credential.as_deref(), scopes, token);
+        if superseded {
+            return Ok(());
+        }
         file.save(&self.path).await.map_err(TokenStorageError::Io)
     }
 
@@ -820,7 +899,7 @@ mod tests {
         assert!(on_disk.audit_log_granted());
 
         // Another gdrive process authorized the account again without the audit log: the
-        // token this process refreshed for it is not stored.
+        // token this process refreshed for it is not stored (nor would any other be).
         let reauthorized = TokenFile::after_login(
             None,
             &DRIVE_SCOPES,
@@ -832,6 +911,160 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(TokenFile::load(&path).await.unwrap().unwrap(), reauthorized);
+    }
+
+    fn refresh_tokens(file: &TokenFile) -> Vec<Option<&str>> {
+        file.entries()
+            .iter()
+            .map(|entry| entry.token.refresh_token.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn the_refresh_token_is_that_of_the_authorization_that_records_the_grant() {
+        // A file as an older process could leave it: the login with the audit log (r2), and
+        // after it the Drive tokens that a process of the earlier, Drive-only authorization
+        // (r1) refreshed, which expire later.
+        let mut file = file(&[
+            (
+                &DRIVE_AND_AUDIT,
+                token("login", Some("r2"), Duration::hours(-1)),
+            ),
+            (
+                &DRIVE_SCOPES,
+                token("old-1", Some("r1"), Duration::hours(1)),
+            ),
+            (&[DRIVE], token("old-2", Some("r1"), Duration::hours(2))),
+        ]);
+        assert_eq!(file.refresh_token(), Some("r2"));
+        assert!(file.audit_log_granted());
+        // The tokens of the earlier authorization are never used, valid as they are.
+        for scopes in [&DRIVE_SCOPES[..], &[DRIVE], &[AUDIT]] {
+            assert_eq!(access(&file, scopes), Some("login"), "{scopes:?}");
+        }
+
+        // The next write drops them.
+        file.set(&DRIVE_SCOPES, token("fresh", None, Duration::hours(1)));
+        assert_eq!(file.entries().len(), 2);
+        assert_eq!(refresh_tokens(&file), [Some("r2"), Some("r2")]);
+        assert_eq!(access(&file, &DRIVE_SCOPES), Some("fresh"));
+        assert!(file.audit_log_granted());
+    }
+
+    #[test]
+    fn entries_of_an_earlier_authorization_are_never_used() {
+        let mut file = file(&[
+            (&DRIVE_SCOPES, token("new", Some("r2"), Duration::hours(1))),
+            (&[METADATA], token("old", Some("r1"), Duration::minutes(30))),
+            // gdrive 3.x stored refreshed tokens without a refresh token: those count.
+            (&[DRIVE], token("legacy", None, Duration::hours(2))),
+        ]);
+        assert_eq!(file.refresh_token(), Some("r2"));
+        assert_eq!(access(&file, &[METADATA]), Some("new"));
+        assert_eq!(access(&file, &[DRIVE]), Some("legacy"));
+
+        file.set(&[METADATA], token("meta", None, Duration::hours(1)));
+        let scopes: Vec<_> = file.entries().iter().map(|e| e.scopes.len()).collect();
+        assert_eq!(scopes, [2, 1, 1]);
+        assert_eq!(refresh_tokens(&file), [Some("r2"), None, Some("r2")]);
+        assert_eq!(access(&file, &[METADATA]), Some("meta"));
+    }
+
+    #[test]
+    fn a_refresh_token_in_a_refresh_answer_becomes_the_authorizations() {
+        let mut file = TokenFile::after_login(
+            None,
+            &DRIVE_AND_AUDIT,
+            token("login", Some("r1"), Duration::hours(1)),
+        );
+        file.set(&DRIVE_SCOPES, token("drive", None, Duration::hours(1)));
+        file.set(&[AUDIT], token("rotated", Some("r2"), Duration::hours(1)));
+
+        assert_eq!(file.refresh_token(), Some("r2"));
+        assert_eq!(refresh_tokens(&file), [Some("r2"); 3]);
+        assert!(file.audit_log_granted());
+        assert_eq!(access(&file, &DRIVE_SCOPES), Some("drive"));
+    }
+
+    #[tokio::test]
+    async fn store_never_writes_into_the_file_of_a_newer_authorization() {
+        // (scopes of the authorization the process loaded, of the login that replaced it,
+        // asked of the store)
+        let cases: [(&[&str], &[&str], &[&str]); 5] = [
+            (&DRIVE_SCOPES, &DRIVE_AND_AUDIT, &DRIVE_SCOPES),
+            (&DRIVE_SCOPES, &DRIVE_SCOPES, &[DRIVE]),
+            (&DRIVE_AND_AUDIT, &DRIVE_SCOPES, &DRIVE_SCOPES),
+            (&DRIVE_AND_AUDIT, &DRIVE_SCOPES, &[AUDIT]),
+            (&DRIVE_AND_AUDIT, &DRIVE_AND_AUDIT, &DRIVE_AND_AUDIT),
+        ];
+        for (loaded_scopes, login_scopes, asked) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("tokens.json");
+            let loaded = TokenFile::after_login(
+                None,
+                loaded_scopes,
+                token("old", Some("r1"), Duration::hours(-1)),
+            );
+            loaded.save(&path).await.unwrap();
+            let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+
+            // The account is authorized again: with a new refresh token, or with none at all.
+            for new_refresh_token in [Some("r2"), None] {
+                let login = TokenFile::after_login(
+                    None,
+                    login_scopes,
+                    token("login", new_refresh_token, Duration::hours(1)),
+                );
+                login.save(&path).await.unwrap();
+                #[cfg(unix)]
+                let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap());
+
+                store
+                    .set(asked, token("refreshed", None, Duration::hours(1)))
+                    .await
+                    .unwrap();
+
+                let case = format!("{loaded_scopes:?} -> {login_scopes:?}, {asked:?}");
+                assert_eq!(TokenFile::load(&path).await.unwrap(), Some(login), "{case}");
+                #[cfg(unix)]
+                assert_eq!(
+                    std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&path).unwrap()),
+                    inode,
+                    "{case}: the file was written"
+                );
+                // The process goes on with what it refreshed.
+                let kept = store.get(asked).await.unwrap();
+                assert_eq!(kept.access_token.as_deref(), Some("refreshed"), "{case}");
+                assert_eq!(kept.refresh_token.as_deref(), Some("r1"), "{case}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn store_writes_into_the_file_of_a_login_that_kept_its_refresh_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
+        loaded.save(&path).await.unwrap();
+        let store = TokenStore::new(path.clone(), loaded.clone(), Some(String::from("r1")));
+
+        // `account reauth --audit-log`, and Google left out the refresh token: the login kept
+        // r1, so this is still the authorization the process refreshes with.
+        let login = TokenFile::after_login(
+            Some(&loaded),
+            &DRIVE_AND_AUDIT,
+            token("login", None, Duration::hours(-1)),
+        );
+        login.save(&path).await.unwrap();
+        store
+            .set(&DRIVE_SCOPES, token("refreshed", None, Duration::hours(1)))
+            .await
+            .unwrap();
+
+        let on_disk = TokenFile::load(&path).await.unwrap().unwrap();
+        assert!(on_disk.audit_log_granted());
+        assert_eq!(access(&on_disk, &DRIVE_SCOPES), Some("refreshed"));
+        assert_eq!(refresh_tokens(&on_disk), [Some("r1"), Some("r1")]);
     }
 
     #[tokio::test]

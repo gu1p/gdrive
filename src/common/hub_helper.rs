@@ -292,7 +292,7 @@ mod tests {
     use crate::{
         app_config::AppConfig,
         auth::{
-            store::TokenFile,
+            store::{TokenEntry, TokenFile},
             test_support::{redirected_client, MockServer, RedirectConnector},
             ReauthReason, AUDIT_LOG_SCOPE, DRIVE_AND_AUDIT_LOG_SCOPES, DRIVE_SCOPES,
         },
@@ -384,6 +384,65 @@ mod tests {
         let drive = hub.auth.get_token(&DRIVE_SCOPES).await.unwrap();
         assert_eq!(drive.as_deref(), Some("fresh"));
         assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn audit_hub_refreshes_with_the_refresh_token_of_the_grant() {
+        let server = MockServer::start(vec![(
+            200,
+            String::from(r#"{"access_token":"fresh","expires_in":3599,"token_type":"Bearer"}"#),
+        )])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        // A tokens.json as an older process could leave it: the login with the audit log, and
+        // a Drive token of the earlier authorization that expires later.
+        let entry = |scopes: &[&str], access: &str, refresh: &str, expires_in| TokenEntry {
+            scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
+            token: TokenInfo {
+                refresh_token: Some(refresh.to_owned()),
+                ..token(access, expires_in)
+            },
+            credential: None,
+        };
+        let mixed = serde_json::to_string(&[
+            entry(
+                &DRIVE_AND_AUDIT_LOG_SCOPES,
+                "login",
+                "1//grant-refresh",
+                Duration::hours(-1),
+            ),
+            entry(
+                &DRIVE_SCOPES,
+                "older",
+                "1//older-refresh",
+                Duration::hours(2),
+            ),
+        ])
+        .unwrap();
+        let app_cfg =
+            user_account(dir.path(), &TokenFile::from_json(mixed.as_bytes()).unwrap()).await;
+
+        let hub = audit_hub(&app_cfg, &server).await.unwrap();
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].form("refresh_token").as_deref(),
+            Some("1//grant-refresh")
+        );
+        assert_eq!(audit_token(&hub).await.as_deref(), Some("fresh"));
+        // The command's Drive requests do not use the earlier authorization's token either.
+        let drive = hub.auth.get_token(&DRIVE_SCOPES).await.unwrap();
+        assert_eq!(drive.as_deref(), Some("fresh"));
+        assert_eq!(server.requests().len(), 1);
+
+        // The write dropped the earlier authorization's entry.
+        let saved = tokio::fs::read_to_string(app_cfg.tokens_path())
+            .await
+            .unwrap();
+        assert!(!saved.contains("older"), "{saved}");
+        assert!(TokenFile::from_json(saved.as_bytes())
+            .unwrap()
+            .audit_log_granted());
     }
 
     #[tokio::test]
