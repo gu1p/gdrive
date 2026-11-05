@@ -30,6 +30,7 @@ use yup_oauth2::{
 };
 
 use super::{
+    lock::AccountLock,
     store::{self, TokenFile, TokenStore},
     ReauthReason, ReauthRequired,
 };
@@ -102,7 +103,8 @@ where
             refresh_token: refresh_token.clone(),
             key_type: String::from("authorized_user"),
         };
-        let store = TokenStore::new(tokens_path.to_path_buf(), file, Some(refresh_token));
+        let lock = AccountLock::of_tokens_file(tokens_path).map_err(Error::Build)?;
+        let store = TokenStore::new(lock, file, Some(refresh_token));
         let auth = AuthorizedUserAuthenticator::with_client(
             user_secret,
             CustomHyperClientBuilder::from(client),
@@ -233,7 +235,7 @@ mod tests {
     use super::*;
     use crate::auth::{
         store::TokenEntry,
-        test_support::{redirected_client, MockServer, RedirectConnector},
+        test_support::{account_tokens_path, redirected_client, MockServer, RedirectConnector},
         AUDIT_LOG_SCOPE, DRIVE_SCOPES,
     };
 
@@ -262,7 +264,7 @@ mod tests {
 
     /// A tokens.json with one entry, `token` for `scopes`.
     async fn write_tokens_for(dir: &Path, scopes: &[&str], token: TokenInfo) -> PathBuf {
-        let path = dir.join("tokens.json");
+        let path = account_tokens_path(dir);
         let json = serde_json::to_string(&[TokenEntry {
             scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
             token,
@@ -452,7 +454,7 @@ mod tests {
         let server = MockServer::start(vec![(500, String::from("{}"))]).await;
         let dir = tempfile::tempdir().unwrap();
 
-        let missing = dir.path().join("tokens.json");
+        let missing = account_tokens_path(dir.path());
         let error = load(server.addr(), &missing).await.err().unwrap();
         assert!(
             matches!(&error, Error::Reauth(r) if r.reason == ReauthReason::NoStoredToken),
@@ -749,7 +751,7 @@ mod tests {
             .await;
 
             // Then a command that reads the audit log refreshes, with the new refresh token.
-            let path = dir.path().join("tokens.json");
+            let path = account_tokens_path(dir.path());
             let audit = load(server.addr(), &path).await.unwrap();
             assert!(audit.audit_log_granted());
             let access = bounded(audit.access_token(&[AUDIT_LOG_SCOPE]))
@@ -782,7 +784,7 @@ mod tests {
             )
             .await;
 
-            let path = dir.path().join("tokens.json");
+            let path = account_tokens_path(dir.path());
             let drive = load(server.addr(), &path).await.unwrap();
             assert!(!drive.audit_log_granted());
             let access = bounded(drive.access_token(&DRIVE_SCOPES)).await.unwrap();
@@ -811,7 +813,7 @@ mod tests {
                 )
                 .await;
 
-                let path = dir.path().join("tokens.json");
+                let path = account_tokens_path(dir.path());
                 let new = load(server.addr(), &path).await.unwrap();
                 let access = bounded(new.access_token(&DRIVE_SCOPES[..1])).await.unwrap();
                 assert_eq!(access.token(), Some("new"));

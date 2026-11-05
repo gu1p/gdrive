@@ -6,6 +6,7 @@ use std::{
 
 use crate::{
     app_config::{self, account_type, AppConfig},
+    auth::lock::{AccountLock, LockError, LOCK_TIMEOUT},
     common::account_archive,
 };
 
@@ -29,7 +30,25 @@ pub(crate) fn import(config: &Config) -> Result<(), Error> {
     }
 
     let config_base_path = AppConfig::default_base_path().map_err(Error::DefaultBasePath)?;
-    account_archive::unpack(&config.archive_path, &config_base_path).map_err(Error::Unpack)?;
+    // Under the lock of the account (see `auth::lock`), which a process of an account of this
+    // name that was removed may still hold, and where the check is made again: another process
+    // may have added the account in the meantime.
+    AccountLock::new(&config_base_path, &account_name)
+        .map_err(|source| {
+            Error::Lock(LockError::Io {
+                path: config_base_path.join(&account_name),
+                source,
+            })
+        })?
+        .hold(LOCK_TIMEOUT, |_| {
+            if AppConfig::named_account_in(config_base_path.clone(), &account_name)
+                .is_some_and(|account| account.exists())
+            {
+                return Err(Error::AccountExists(account_name.clone()));
+            }
+            account_archive::unpack(&config.archive_path, &config_base_path).map_err(Error::Unpack)
+        })
+        .map_err(Error::Lock)??;
 
     println!("Imported account '{account_name}'");
 
@@ -52,6 +71,7 @@ pub(crate) enum Error {
     Unpack(account_archive::errors::Unpack),
     LoadAccount(app_config::errors::LoadAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
+    Lock(LockError),
 }
 
 impl error::Error for Error {
@@ -64,6 +84,8 @@ impl error::Error for Error {
             Error::LoadAccount(error) => Some(error),
             Error::DefaultBasePath(error) => Some(error),
             Error::SwitchAccount(error) => Some(error),
+            // Shown as the lock error itself, which names the account and what to do.
+            Error::Lock(error) => error.source(),
         }
     }
 }
@@ -83,6 +105,7 @@ impl Display for Error {
             Error::Unpack(_) => f.write_str("unable to unpack account archive"),
             Error::LoadAccount(_) => f.write_str("unable to load account"),
             Error::SwitchAccount(_) => f.write_str("unable to switch account"),
+            Error::Lock(error) => error.fmt(f),
         }
     }
 }

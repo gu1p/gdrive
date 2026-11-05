@@ -26,6 +26,12 @@ gdrive account import <ARCHIVE_PATH>
 The account name is the email address of the Google account. `account remove` only deletes the files on
 your machine. To revoke gdrive's access, remove your app at <https://myaccount.google.com/permissions>.
 
+Several gdrive commands can use the same account at the same time. Their changes to the account's files
+take turns, through an empty lock file per account in `~/.config/gdrive3/.locks/`. A change waits at most
+5 seconds for another one; then a login, `account remove`, `import` or `export` stops with "another gdrive
+process is updating the files of account ...; nothing was changed, try again in a moment", and a running
+command keeps its renewed access token in memory and goes on.
+
 For CI and servers, gdrive 4.0.0 also takes a service account key (`gdrive account add --service-account
 KEY_JSON`) or Application Default Credentials (`gdrive account add --adc`); see
 [Service accounts](service_accounts.md).
