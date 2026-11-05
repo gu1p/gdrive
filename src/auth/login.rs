@@ -14,8 +14,8 @@
 //! S256 `code_challenge`, whose `code_verifier` goes with the code to the token endpoint.
 //!
 //! The login asks for [`DRIVE_SCOPES`], and with [`AuditLog::Required`] or [`AuditLog::Optional`]
-//! also for [`AUDIT_LOG_SCOPE`]. The `scope` field of the token response says what the user granted: the
-//! consent screen lets them untick a scope.
+//! also for [`AUDIT_LOG_SCOPE`]. The `scope` field of the token response says what the user
+//! granted: the consent screen lets them untick a scope.
 
 use std::{
     error,
