@@ -222,8 +222,11 @@ mod tests {
     use crate::auth::{
         store::TokenEntry,
         test_support::{redirected_client, MockServer, RedirectConnector},
-        DRIVE_SCOPES,
+        AUDIT_LOG_SCOPE, DRIVE_SCOPES,
     };
+
+    /// The scopes a login with `--audit-log` stores its token for.
+    const DRIVE_AND_AUDIT: [&str; 3] = [DRIVE_SCOPES[0], DRIVE_SCOPES[1], AUDIT_LOG_SCOPE];
 
     fn secret() -> app_config::Secret {
         app_config::Secret {
@@ -242,9 +245,14 @@ mod tests {
     }
 
     async fn write_tokens(dir: &Path, token: TokenInfo) -> PathBuf {
+        write_tokens_for(dir, &DRIVE_SCOPES, token).await
+    }
+
+    /// A tokens.json with one entry, `token` for `scopes`.
+    async fn write_tokens_for(dir: &Path, scopes: &[&str], token: TokenInfo) -> PathBuf {
         let path = dir.join("tokens.json");
         let json = serde_json::to_string(&[TokenEntry {
-            scopes: DRIVE_SCOPES.map(str::to_owned).to_vec(),
+            scopes: scopes.iter().map(|&scope| scope.to_owned()).collect(),
             token,
             credential: None,
         }])
@@ -489,5 +497,146 @@ mod tests {
             "{error:?}"
         );
         assert!(server.requests().is_empty());
+    }
+
+    /// The answer of the token endpoint to a refresh: no refresh token, as Google sends it.
+    const REFRESHED: &str = r#"{"access_token":"fresh","expires_in":3599,"token_type":"Bearer"}"#;
+
+    #[tokio::test]
+    async fn an_account_with_the_audit_log_works_for_drive_before_and_after_a_refresh() {
+        let server = MockServer::start(vec![(200, String::from(REFRESHED))]).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = write_tokens_for(
+            dir.path(),
+            &DRIVE_AND_AUDIT,
+            token("valid", Some("refresh-1"), TimeDuration::hours(1)),
+        )
+        .await;
+        let credentials = load(server.addr(), &path).await.unwrap();
+        for scopes in [&DRIVE_SCOPES[..], &DRIVE_SCOPES[..1], &DRIVE_SCOPES[1..]] {
+            let access = bounded(credentials.access_token(scopes)).await.unwrap();
+            assert_eq!(access.token(), Some("valid"), "{scopes:?}");
+        }
+        assert!(server.requests().is_empty());
+
+        let path = write_tokens_for(
+            dir.path(),
+            &DRIVE_AND_AUDIT,
+            token("stale", Some("refresh-1"), TimeDuration::hours(-1)),
+        )
+        .await;
+        let credentials = load(server.addr(), &path).await.unwrap();
+        let access = bounded(credentials.access_token(&DRIVE_SCOPES))
+            .await
+            .unwrap();
+        assert_eq!(access.token(), Some("fresh"));
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].form("refresh_token").as_deref(),
+            Some("refresh-1")
+        );
+        // The Drive calls that follow ask for one scope each: served by the refreshed token.
+        let access = bounded(credentials.access_token(&DRIVE_SCOPES[..1]))
+            .await
+            .unwrap();
+        assert_eq!(access.token(), Some("fresh"));
+        assert_eq!(server.requests().len(), 1);
+
+        // The refresh kept the record of the grant and the refresh token.
+        let saved = TokenFile::load(&path).await.unwrap().unwrap();
+        assert!(saved.audit_log_granted());
+        assert_eq!(saved.refresh_token(), Some("refresh-1"));
+        let drive = saved.get(&DRIVE_SCOPES).unwrap();
+        assert_eq!(drive.access_token.as_deref(), Some("fresh"));
+        assert_eq!(drive.refresh_token.as_deref(), Some("refresh-1"));
+
+        // The next run uses the saved token.
+        let again = load(server.addr(), &path).await.unwrap();
+        let access = bounded(again.access_token(&DRIVE_SCOPES)).await.unwrap();
+        assert_eq!(access.token(), Some("fresh"));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_audit_log_token_is_cached_while_valid_and_refreshed_when_expired() {
+        let server = MockServer::start(vec![(200, String::from(REFRESHED))]).await;
+        let dir = tempfile::tempdir().unwrap();
+
+        let path = write_tokens_for(
+            dir.path(),
+            &DRIVE_AND_AUDIT,
+            token("valid", Some("refresh-1"), TimeDuration::hours(1)),
+        )
+        .await;
+        let credentials = load(server.addr(), &path).await.unwrap();
+        let access = bounded(credentials.access_token(&[AUDIT_LOG_SCOPE]))
+            .await
+            .unwrap();
+        assert_eq!(access.token(), Some("valid"));
+        assert!(server.requests().is_empty());
+
+        let path = write_tokens_for(
+            dir.path(),
+            &DRIVE_AND_AUDIT,
+            token("stale", Some("refresh-1"), TimeDuration::hours(-1)),
+        )
+        .await;
+        let credentials = load(server.addr(), &path).await.unwrap();
+        for _ in 0..2 {
+            let access = bounded(credentials.access_token(&[AUDIT_LOG_SCOPE]))
+                .await
+                .unwrap();
+            assert_eq!(access.token(), Some("fresh"));
+        }
+        let requests = server.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].form("grant_type").as_deref(),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            requests[0].form("refresh_token").as_deref(),
+            Some("refresh-1")
+        );
+
+        let saved = TokenFile::load(&path).await.unwrap().unwrap();
+        assert!(saved.audit_log_granted());
+        assert_eq!(saved.refresh_token(), Some("refresh-1"));
+        let again = load(server.addr(), &path).await.unwrap();
+        let access = bounded(again.access_token(&[AUDIT_LOG_SCOPE]))
+            .await
+            .unwrap();
+        assert_eq!(access.token(), Some("fresh"));
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_account_without_the_grant_never_gets_an_audit_log_entry() {
+        let server = MockServer::start(vec![(200, String::from(REFRESHED))]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tokens(
+            dir.path(),
+            token("valid", Some("refresh-1"), TimeDuration::hours(1)),
+        )
+        .await;
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        // Asked for the audit log anyway (`get_audit_hub_for` checks the grant first and never
+        // does this), yup-oauth2 finds no entry for it and refreshes ...
+        let credentials = load(server.addr(), &path).await.unwrap();
+        bounded(credentials.access_token(&[AUDIT_LOG_SCOPE]))
+            .await
+            .unwrap();
+        assert_eq!(server.requests().len(), 1);
+
+        // ... but nothing is stored that claims the grant.
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert!(!TokenFile::load(&path)
+            .await
+            .unwrap()
+            .unwrap()
+            .audit_log_granted());
     }
 }

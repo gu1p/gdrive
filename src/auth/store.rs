@@ -7,6 +7,10 @@
 //! (the refresh-only flow does not carry the old refresh token over) and rewrites the file in
 //! place. Here a missing refresh token never replaces a stored one, and the file is replaced
 //! atomically.
+//!
+//! The scopes of the entries also record what the account was granted: the login stores its
+//! token for the scopes Google granted, and [`TokenFile::audit_log_granted`] reads from them
+//! whether the account may read the audit log.
 
 use std::{
     error::Error,
@@ -20,6 +24,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt, sync::Mutex};
 use yup_oauth2::storage::{TokenInfo, TokenStorage, TokenStorageError};
 
+use super::AUDIT_LOG_SCOPE;
 use crate::common::json_error::RedactedJsonError;
 
 /// One `tokens.json` entry: a token and the scopes it was issued for.
@@ -87,6 +92,20 @@ impl TokenFile {
             .filter(|entry| entry.token.refresh_token.is_some())
             .max_by_key(|entry| entry.token.expires_at)
             .and_then(|entry| entry.token.refresh_token.as_deref())
+    }
+
+    /// Whether the OAuth user account was granted read access to the audit log
+    /// ([`AUDIT_LOG_SCOPE`]): one of its entries is stored for a scope set that includes it.
+    ///
+    /// Only a login that was granted the audit log writes such an entry
+    /// ([`TokenFile::after_login`]), and only the next login removes it: a refresh for other
+    /// scopes adds or replaces the entry of those scopes and leaves this one alone, and
+    /// [`TokenStore`] stores a token asked for the audit log only while this holds.
+    pub(crate) fn audit_log_granted(&self) -> bool {
+        self.entries
+            .iter()
+            .filter(|entry| entry.credential.is_none())
+            .any(|entry| entry.scopes.iter().any(|scope| scope == AUDIT_LOG_SCOPE))
     }
 
     /// [`TokenFile::set_for`] for an OAuth user account.
@@ -347,6 +366,17 @@ impl TokenStorage for TokenStore {
         if let Ok(Some(on_disk)) = TokenFile::load(&self.path).await {
             *file = on_disk;
         }
+        // yup-oauth2 refreshes and stores a token for any scope set it is asked for. Stored
+        // for the audit log, the token of an account that was not granted it would claim a
+        // grant Google never gave (a refresh brings only the scopes of the grant), so it is not
+        // cached. The check is made against the file as it is now: another gdrive process may
+        // have authorized the account again without the audit log in the meantime.
+        if self.credential.is_none()
+            && scopes.contains(&AUDIT_LOG_SCOPE)
+            && !file.audit_log_granted()
+        {
+            return Ok(());
+        }
         file.set_for(self.credential.as_deref(), scopes, token);
         file.save(&self.path).await.map_err(TokenStorageError::Io)
     }
@@ -405,6 +435,9 @@ mod tests {
 
     const DRIVE: &str = "https://www.googleapis.com/auth/drive";
     const METADATA: &str = "https://www.googleapis.com/auth/drive.metadata.readonly";
+    const AUDIT: &str = "https://www.googleapis.com/auth/admin.reports.audit.readonly";
+    /// The scopes of a login with `--audit-log`.
+    const DRIVE_AND_AUDIT: [&str; 3] = [DRIVE, METADATA, AUDIT];
 
     fn token(access: &str, refresh: Option<&str>, expires_in: Duration) -> TokenInfo {
         TokenInfo {
@@ -626,6 +659,160 @@ mod tests {
             TokenFile::after_login(None, &DRIVE_SCOPES, token("new", None, Duration::hours(1)));
         assert_eq!(merged.entries().len(), 1);
         assert_eq!(merged.refresh_token(), None);
+    }
+
+    fn access<'a>(file: &'a TokenFile, scopes: &[&str]) -> Option<&'a str> {
+        file.get(scopes)?.access_token.as_deref()
+    }
+
+    #[test]
+    fn the_audit_log_grant_is_recorded_by_the_login_and_kept_by_refreshes() {
+        assert_eq!(AUDIT, crate::auth::AUDIT_LOG_SCOPE);
+        let mut file = TokenFile::after_login(
+            None,
+            &DRIVE_AND_AUDIT,
+            token("login", Some("r"), Duration::hours(1)),
+        );
+        assert_eq!(file.entries()[0].scopes, DRIVE_AND_AUDIT);
+        assert!(file.audit_log_granted());
+        // What the existing commands ask for (the Drive scopes, or one of them) is served by the
+        // entry of the login, and so is the audit log.
+        for scopes in [&DRIVE_SCOPES[..], &[DRIVE], &[METADATA], &[AUDIT]] {
+            assert_eq!(access(&file, scopes), Some("login"), "{scopes:?}");
+        }
+
+        // The access token expires. The refresh for the Drive scopes, whose answer has no
+        // refresh token, gets an entry of its own with the account's refresh token ...
+        file.entries[0].token.expires_at = Some(OffsetDateTime::now_utc() - Duration::hours(1));
+        file.set(&DRIVE_SCOPES, token("drive", None, Duration::hours(1)));
+        assert_eq!(access(&file, &DRIVE_SCOPES), Some("drive"));
+        assert_eq!(
+            file.get(&DRIVE_SCOPES).unwrap().refresh_token.as_deref(),
+            Some("r")
+        );
+        // ... and the entry of the grant stays, with its refresh token: the audit log is still
+        // asked of it.
+        assert!(file.audit_log_granted());
+        let grant = file.get(&[AUDIT]).unwrap();
+        assert_eq!(grant.access_token.as_deref(), Some("login"));
+        assert!(grant.is_expired());
+        assert_eq!(grant.refresh_token.as_deref(), Some("r"));
+
+        // Refreshed for the audit log, then again for Drive: the grant is never lost.
+        file.set(&[AUDIT], token("audit", None, Duration::hours(1)));
+        file.set(&DRIVE_SCOPES, token("drive-2", None, Duration::hours(1)));
+        assert!(file.audit_log_granted());
+        assert_eq!(access(&file, &[AUDIT]), Some("audit"));
+        assert_eq!(access(&file, &DRIVE_SCOPES), Some("drive-2"));
+        assert_eq!(file.refresh_token(), Some("r"));
+        assert_eq!(file.entries().len(), 3);
+        assert!(file
+            .entries()
+            .iter()
+            .all(|entry| entry.token.refresh_token.as_deref() == Some("r")));
+    }
+
+    #[test]
+    fn only_a_login_that_was_granted_the_audit_log_records_it() {
+        let drive_only = TokenFile::after_login(
+            None,
+            &DRIVE_SCOPES,
+            token("a", Some("r"), Duration::hours(1)),
+        );
+        assert!(!drive_only.audit_log_granted());
+        assert!(drive_only.get(&[AUDIT]).is_none());
+
+        // The next login replaces the grant: one without the audit log drops it.
+        let previous = TokenFile::after_login(
+            None,
+            &DRIVE_AND_AUDIT,
+            token("old", Some("r"), Duration::hours(1)),
+        );
+        let again = TokenFile::after_login(
+            Some(&previous),
+            &DRIVE_SCOPES,
+            token("new", None, Duration::hours(1)),
+        );
+        assert!(!again.audit_log_granted());
+        assert_eq!(again.refresh_token(), Some("r"));
+
+        // The tokens of a service account never count.
+        let mut service = TokenFile::default();
+        service.set_for(
+            Some("robot"),
+            &DRIVE_AND_AUDIT,
+            token("s", None, Duration::hours(1)),
+        );
+        assert!(!service.audit_log_granted());
+    }
+
+    #[tokio::test]
+    async fn store_never_records_an_audit_log_grant_that_was_not_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let loaded = file(&[(&DRIVE_SCOPES, token("old", Some("r1"), Duration::hours(-1)))]);
+        loaded.save(&path).await.unwrap();
+        let before = tokio::fs::read(&path).await.unwrap();
+
+        // What yup-oauth2 stores after a refresh it ran for a scope set that no entry covers.
+        let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+        for scopes in [&[AUDIT][..], &DRIVE_AND_AUDIT] {
+            store
+                .set(scopes, token("refreshed", None, Duration::hours(1)))
+                .await
+                .unwrap();
+        }
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
+        assert!(store.get(&[AUDIT]).await.is_none());
+
+        // Drive tokens are stored as before.
+        store
+            .set(&DRIVE_SCOPES, token("fresh", None, Duration::hours(1)))
+            .await
+            .unwrap();
+        let on_disk = TokenFile::load(&path).await.unwrap().unwrap();
+        assert_eq!(access(&on_disk, &DRIVE_SCOPES), Some("fresh"));
+        assert!(!on_disk.audit_log_granted());
+        assert_eq!(on_disk.entries().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_caches_audit_log_tokens_while_the_account_has_the_grant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        let loaded = TokenFile::after_login(
+            None,
+            &DRIVE_AND_AUDIT,
+            token("login", Some("r1"), Duration::hours(-1)),
+        );
+        loaded.save(&path).await.unwrap();
+
+        let store = TokenStore::new(path.clone(), loaded, Some(String::from("r1")));
+        store
+            .set(&[AUDIT], token("audit", None, Duration::hours(1)))
+            .await
+            .unwrap();
+        let on_disk = TokenFile::load(&path).await.unwrap().unwrap();
+        assert_eq!(access(&on_disk, &[AUDIT]), Some("audit"));
+        assert_eq!(
+            on_disk.get(&[AUDIT]).unwrap().refresh_token.as_deref(),
+            Some("r1")
+        );
+        assert!(on_disk.audit_log_granted());
+
+        // Another gdrive process authorized the account again without the audit log: the
+        // token this process refreshed for it is not stored.
+        let reauthorized = TokenFile::after_login(
+            None,
+            &DRIVE_SCOPES,
+            token("reauth", Some("r2"), Duration::hours(1)),
+        );
+        reauthorized.save(&path).await.unwrap();
+        store
+            .set(&[AUDIT], token("audit-2", None, Duration::hours(1)))
+            .await
+            .unwrap();
+        assert_eq!(TokenFile::load(&path).await.unwrap().unwrap(), reauthorized);
     }
 
     #[tokio::test]

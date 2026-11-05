@@ -4,6 +4,10 @@
 //! authorization. Every other command goes through [`stored::StoredCredentials`], which can
 //! only use and refresh the token saved in `tokens.json` and fails with [`ReauthRequired`]
 //! when that is not possible.
+//!
+//! An account is authorized for [`DRIVE_SCOPES`], and with `--audit-log` of the login commands
+//! also for [`AUDIT_LOG_SCOPE`]. `tokens.json` records what Google granted (see
+//! [`store::TokenFile::audit_log_granted`]).
 
 pub(crate) mod adc;
 pub(crate) mod login;
@@ -25,6 +29,11 @@ pub(crate) const DRIVE_SCOPES: [&str; 2] = [
     "https://www.googleapis.com/auth/drive",
     "https://www.googleapis.com/auth/drive.metadata.readonly",
 ];
+
+/// Read access to the audit log of a Google Workspace organization (Admin SDK Reports API), which
+/// `gdrive files activity` needs. Asked for only with `--audit-log` of the login commands.
+pub(crate) const AUDIT_LOG_SCOPE: &str =
+    "https://www.googleapis.com/auth/admin.reports.audit.readonly";
 
 /// The stored authorization of an account cannot be used any more; only a new login helps.
 #[derive(Debug, Clone, PartialEq, Eq)]
