@@ -527,15 +527,6 @@ impl AuditLogError {
             other => other,
         }
     }
-
-    /// The hint of a failed reply, if any.
-    #[must_use]
-    pub(crate) fn hint(&self) -> Option<&Hint> {
-        match self {
-            AuditLogError::Status { hint, .. } => hint.as_ref(),
-            _ => None,
-        }
-    }
 }
 
 /// ` (gave up after ...)` for a stop after retries, ` (TLS)` for a connection that could not be
@@ -593,10 +584,11 @@ impl Error for AuditLogError {
         match self {
             AuditLogError::Url(source) => Some(source),
             AuditLogError::Request(source) => Some(source),
-            AuditLogError::Token(source) => Some(source.as_ref()),
+            AuditLogError::Token(source) | AuditLogError::Body { source, .. } => {
+                Some(source.as_ref())
+            }
             AuditLogError::Send(source) => Some(source.as_ref()),
             AuditLogError::Transport { source, .. } => Some(source),
-            AuditLogError::Body { source, .. } => Some(source.as_ref()),
             AuditLogError::InvalidToken
             | AuditLogError::Status { .. }
             | AuditLogError::Decode(_) => None,
