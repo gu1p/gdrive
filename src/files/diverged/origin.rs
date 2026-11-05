@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use futures::StreamExt;
 use google_drive3::api::{File, User};
 
@@ -62,6 +62,8 @@ pub(super) struct Item {
     pub(super) modified_by: Option<Who>,
     /// The first of `owners`.
     pub(super) owner: Option<Who>,
+    /// Whether Drive names owners: items of a My Drive have one, items of shared drives none.
+    pub(super) owned: bool,
 }
 
 impl Item {
@@ -76,6 +78,10 @@ impl Item {
             created: file.created_time,
             modified_by: Who::of(file.last_modifying_user.as_ref()),
             owner: first_owner(file),
+            owned: file
+                .owners
+                .as_ref()
+                .is_some_and(|owners| !owners.is_empty()),
         }
     }
 
@@ -103,21 +109,44 @@ impl Item {
         relay::check_supported(&file).err()
     }
 
-    /// Who changed it last: `lastModifyingUser`, else its owner.
+    /// Who modified it last: `lastModifyingUser`, which Drive leaves out when that was nobody
+    /// signed in (an edit through a link), so then nobody: never its owner.
     pub(super) fn editor(&self) -> Who {
-        self.modified_by
-            .clone()
-            .or_else(|| self.owner.clone())
-            .unwrap_or(Who::Unknown)
+        self.modified_by.clone().unwrap_or(Who::Unknown)
     }
 
-    /// Who put it there: its owner, who created or uploaded it, else `lastModifyingUser`.
+    /// Who created or uploaded it: in a My Drive its owner. Without owners (a shared drive),
+    /// `lastModifyingUser` when nobody modified it after its creation, else nobody.
     pub(super) fn creator(&self) -> Who {
-        self.owner
-            .clone()
-            .or_else(|| self.modified_by.clone())
-            .unwrap_or(Who::Unknown)
+        if self.owned {
+            return self.owner.clone().unwrap_or(Who::Unknown);
+        }
+        let unmodified = match (self.modified, self.created) {
+            (Some(modified), Some(created)) => ms(modified) <= ms(created),
+            _ => false,
+        };
+        if unmodified {
+            self.editor()
+        } else {
+            Who::Unknown
+        }
     }
+
+    /// Whether it was modified after it was created, or that cannot be told without a creation
+    /// time.
+    pub(super) fn modified_after_creation(&self) -> bool {
+        match (self.modified, self.created) {
+            (Some(modified), Some(created)) => ms(modified) > ms(created),
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+}
+
+/// `time` to the millisecond, the precision of the times Drive keeps and of those a migration
+/// gives a copy: every comparison of two items' times is made at it.
+pub(super) fn ms(time: DateTime<Utc>) -> DateTime<Utc> {
+    time.trunc_subsecs(3)
 }
 
 /// The first of the file's `owners` that Drive names.
@@ -367,13 +396,14 @@ pub(super) struct Trashed {
     pub(super) path: String,
     /// `trashedTime`: Drive tells it only in shared drives.
     pub(super) when: Option<DateTime<Utc>>,
-    /// `trashingUser`, which Drive tells only in shared drives; elsewhere the owner, the only one
-    /// who can move a file of My Drive to the trash.
+    /// `trashingUser`, which Drive tells only in shared drives; else the first owner, the only one
+    /// who can move a file of a My Drive to the trash; else nobody.
     pub(super) who: Who,
 }
 
-/// The children of every listed folder of `origin` that were moved to the trash themselves
-/// (`explicitlyTrashed`; not what is in a trashed folder), `listing_jobs` requests at once.
+/// The children of every listed folder of `origin` that are in the trash, `listing_jobs` requests
+/// at once. A folder that is not in the trash holds no child that went there with its folder
+/// (`explicitlyTrashed` false), but such a child is left out anyway.
 pub(super) async fn trash(
     hub: &Hub,
     origin: &Origin,
@@ -406,12 +436,14 @@ fn trashed(folders: &[&Node], listed: &Listed) -> Vec<Trashed> {
     let mut trashed = Vec::new();
     for folder in folders {
         for file in listed.get(&folder.item.id).into_iter().flatten() {
-            let (Some(id), Some(name)) = (&file.id, &file.name) else {
+            let Some(id) = &file.id else {
                 continue;
             };
-            if file.explicitly_trashed != Some(true) || !seen.insert(id.clone()) {
+            // Without the field, it is in the trash all the same: it is reported.
+            if file.explicitly_trashed == Some(false) || !seen.insert(id.clone()) {
                 continue;
             }
+            let name = file.name.as_deref().unwrap_or(id);
             let who = Who::of(file.trashing_user.as_ref())
                 .or_else(|| first_owner(file))
                 .unwrap_or(Who::Unknown);

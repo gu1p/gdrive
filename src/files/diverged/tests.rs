@@ -119,9 +119,10 @@ fn doc_revision(modified: &str) -> Value {
 /// Projects/same.txt      as copied
 /// Projects/Budget        a Google Docs file as copied
 /// Projects/notes.txt     changed in the copy later; its revisions are gone
-/// Projects/2026/         added by Bob, with new.pdf (uploaded by Bob, edited by Ana) and
+/// Projects/2026/         added by Bob, with new.pdf (uploaded by Bob, edited by Ana later) and
 ///                        b.jpg, which was Projects/a.jpg
-/// Projects/old.xlsx      moved to the trash by Ana
+/// Projects/old.xlsx      moved to the trash by its owner Ana; in a My Drive Drive tells
+///                        neither who nor when
 /// ```
 fn origin_tree() -> Vec<FakeFile> {
     vec![
@@ -148,7 +149,8 @@ fn origin_tree() -> Vec<FakeFile> {
             .modified_by(ana()),
         blob("b", "b.jpg", "y2026", "jpeg", "2026-01-03T00:00:00Z"),
         blob("oldx", "old.xlsx", "P", "x", "2026-01-04T00:00:00Z")
-            .trashed_by(Some(ana()), Some("2026-11-03T16:40:10Z")),
+            .owned_by(ana())
+            .trashed_by(None, None),
     ]
 }
 
@@ -325,7 +327,13 @@ async fn each_change_of_the_origin_after_the_migration_is_a_row_and_what_is_as_c
                 "ana@example.com",
                 "Projects/plan.docx"
             ),
-            // Bob uploaded it, Ana edited it: the owner put it there.
+            // Bob uploaded it, the owner, and Ana edited it later: two facts, two rows.
+            change(
+                "edited",
+                Some("2026-11-04T10:00:00Z"),
+                "ana@example.com",
+                "Projects/2026/new.pdf"
+            ),
             change(
                 "added",
                 Some("2026-11-04T09:00:02Z"),
@@ -339,12 +347,6 @@ async fn each_change_of_the_origin_after_the_migration_is_a_row_and_what_is_as_c
                 "Projects/2026"
             ),
             change(
-                "trashed",
-                Some("2026-11-03T16:40:10Z"),
-                "ana@example.com",
-                "Projects/old.xlsx"
-            ),
-            change(
                 "differs",
                 Some("2026-10-28T08:15:00Z"),
                 "carol@example.com",
@@ -356,6 +358,8 @@ async fn each_change_of_the_origin_after_the_migration_is_a_row_and_what_is_as_c
                 "-",
                 "Projects/2026/b.jpg (was Projects/a.jpg)"
             ),
+            // In a My Drive only the owner can move a file to the trash.
+            change("trashed", None, "ana@example.com", "Projects/old.xlsx"),
         ]
     );
     assert_eq!(
@@ -366,10 +370,9 @@ async fn each_change_of_the_origin_after_the_migration_is_a_row_and_what_is_as_c
             "Compared by name with the copy in the top of My Drive: files by size and MD5 \
              checksum, Google Docs, Sheets and Slides by modification time",
             "Read the revisions of 1 file of the copy, newer than the origin's file of the same \
-             name; they do not tell whether 1 file of the origin changed after the migration \
-             (differs)",
-            "Summary: 6 items diverged in the origin (2 added, 1 edited, 1 trashed, 1 differs, \
-             1 moved) by 3 people; 1 item without a known person",
+             name; differs: 1 file of the origin whose present content no revision there holds",
+            "Summary: 6 items diverged in the origin, in 7 changes (2 added, 2 edited, 1 trashed, \
+             1 differs, 1 moved) by 3 people; 1 change without a known person",
         ]
     );
     // Only the file that changed on both sides has its revisions read.
@@ -466,26 +469,27 @@ async fn an_origin_as_it_was_copied_is_an_empty_report_of_its_header() {
 }
 
 #[tokio::test]
-async fn google_files_are_compared_by_their_times() {
+async fn google_files_are_compared_by_their_times_to_the_millisecond() {
     let files = vec![
         folder("P", "Projects", "root"),
-        // As copied.
-        doc("budget", "Budget", "P", "2026-10-02T00:00:00Z"),
+        // As copied: Drive may keep microseconds, the migration sent milliseconds.
+        doc("budget", "Budget", "P", "2026-10-02T00:00:00.123456Z"),
         // Edited in the origin after the migration.
         doc("plan", "Plan", "P", "2026-11-03T00:00:00Z").modified_by(ana()),
-        // Edited in the copy only.
+        // Edited in the copy only: a revision of the copy has the origin's time.
         doc("notes", "Notes", "P", "2026-10-03T00:00:00Z"),
-        // Edited in both, the copy last.
+        // Migrated on Nov 1, edited in the origin on Nov 2, edited many times in the copy since;
+        // Drive lists the copy's revisions from Nov 3 only.
         doc("minutes", "Minutes", "P", "2026-11-02T00:00:00Z").modified_by(bob()),
         // Edited in the copy, whose revisions are gone.
         doc("agenda", "Agenda", "P", "2026-10-04T00:00:00Z"),
     ];
     let copies = vec![
         copy_of(&files[0], "P2", "root"),
-        copy_of(&files[1], "budget2", "P2"),
+        copy_of(&files[1], "budget2", "P2").modified("2026-10-02T00:00:00.123Z"),
         copy_of(&files[2], "plan2", "P2").modified("2026-10-05T00:00:00Z"),
         copy_of(&files[3], "notes2", "P2").modified("2026-11-04T00:00:00Z"),
-        copy_of(&files[4], "minutes2", "P2").modified("2026-11-04T00:00:00Z"),
+        copy_of(&files[4], "minutes2", "P2").modified("2026-11-09T00:00:00Z"),
         copy_of(&files[5], "agenda2", "P2").modified("2026-11-04T00:00:00Z"),
     ];
     let origin = start(files).await;
@@ -493,19 +497,18 @@ async fn google_files_are_compared_by_their_times() {
         copies,
         Behavior {
             revisions: [
-                // The first revision has the time the migration gave the copy.
                 (
                     String::from("notes2"),
                     vec![
-                        doc_revision("2026-10-03T00:00:00Z"),
                         doc_revision("2026-11-04T00:00:00Z"),
+                        doc_revision("2026-10-03T00:00:00.000Z"),
                     ],
                 ),
                 (
                     String::from("minutes2"),
                     vec![
-                        doc_revision(MIGRATION),
-                        doc_revision("2026-11-04T00:00:00Z"),
+                        doc_revision("2026-11-03T00:00:00Z"),
+                        doc_revision("2026-11-09T00:00:00Z"),
                     ],
                 ),
             ]
@@ -527,8 +530,9 @@ async fn google_files_are_compared_by_their_times() {
                 "ana@example.com",
                 "Projects/Plan"
             ),
+            // No revision of the copy is the origin as it is: what was copied is unknown.
             change(
-                "edited",
+                "differs",
                 Some("2026-11-02T00:00:00Z"),
                 "bob@example.com",
                 "Projects/Minutes"
@@ -551,33 +555,46 @@ async fn google_files_are_compared_by_their_times() {
     assert_read_only(&[&origin, &copy]);
 }
 
-/// The revisions of the copies of `revisions_settle_a_file_changed_on_both_sides_or_it_differs`:
-/// the migration's and a later one, listed newest first and one per page as Drive may list them,
-/// none, refused, gone, and only later ones.
+/// The revisions of the copies of `revisions_tell_only_what_the_copy_once_held`, listed newest
+/// first and one per page as Drive may list them.
 fn revisions_behavior() -> Behavior {
+    let revisions = |list: &[(&str, &str)]| {
+        list.iter()
+            .map(|(content, time)| revision(content, time))
+            .collect::<Vec<_>>()
+    };
     Behavior {
         page_size: Some(1),
         revisions: [
             (
                 String::from("kept2"),
-                vec![
-                    revision("v9", "2026-11-04T00:00:00Z"),
-                    revision("v1", MIGRATION),
-                ],
+                revisions(&[("v9", "2026-11-04T00:00:00Z"), ("v1", MIGRATION)]),
             ),
             (
                 String::from("both2"),
-                vec![
-                    revision("v9", "2026-11-04T00:00:00Z"),
-                    revision("v1", MIGRATION),
-                ],
+                revisions(&[("v9", "2026-11-04T00:00:00Z"), ("v1", MIGRATION)]),
             ),
             (
                 String::from("pruned2"),
-                vec![
-                    revision("v5", "2026-11-03T00:00:00Z"),
-                    revision("v9", "2026-11-04T00:00:00Z"),
-                ],
+                revisions(&[
+                    ("v9", "2026-11-04T00:00:00Z"),
+                    ("v5", "2026-11-03T00:00:00Z"),
+                ]),
+            ),
+            // A file of the copy's account that held `B`, with an older revision `A`, which the
+            // migration reused as already there; then only the copy changed, to `v9`.
+            (
+                String::from("reused2"),
+                revisions(&[
+                    ("A", "2025-01-01T00:00:00Z"),
+                    ("B", "2025-06-01T00:00:00Z"),
+                    ("v9", "2026-11-04T00:00:00Z"),
+                ]),
+            ),
+            // The origin's content is on the second page, which fails.
+            (
+                String::from("later2"),
+                revisions(&[("v9", "2026-11-04T00:00:00Z"), ("v2", MIGRATION)]),
             ),
         ]
         .into(),
@@ -586,24 +603,28 @@ fn revisions_behavior() -> Behavior {
             (String::from("gone2"), 404),
         ]
         .into(),
+        revisions_fail_after_first_page: [String::from("later2")].into(),
         ..Behavior::default()
     }
 }
 
 #[tokio::test]
-async fn revisions_settle_a_file_changed_on_both_sides_or_it_differs() {
-    // Each origin file was copied as `v1` at the migration; the copy changed to `v9` later.
+async fn revisions_tell_only_what_the_copy_once_held() {
+    // Each copy changed to `v9` after the migration.
     let origin_files = vec![
         folder("P", "Projects", "root"),
-        // Not touched since the migration.
+        // Not touched since the migration: the copy once held `v1`.
         blob("kept", "kept.txt", "P", "v1", "2026-10-20T00:00:00Z"),
-        // Changed after the migration, before the copy was.
+        // Changed after the migration, before the copy was: `v2` was never in the copy.
         blob("both", "both.txt", "P", "v2", "2026-11-02T00:00:00Z").modified_by(ana()),
-        // No revisions, refused, gone, and a first revision that is not the migration's.
+        // As the destination held it before the migration, which reused it.
+        blob("reused", "reused.txt", "P", "B", "2025-06-01T00:00:00Z"),
+        // No revisions, refused, gone, only later ones, and a page that fails.
         blob("none", "none.txt", "P", "v2", "2026-10-21T00:00:00Z"),
         blob("refused", "refused.txt", "P", "v2", "2026-10-22T00:00:00Z"),
         blob("gone", "gone.txt", "P", "v2", "2026-10-23T00:00:00Z"),
         blob("pruned", "pruned.txt", "P", "v2", "2026-10-24T00:00:00Z"),
+        blob("later", "later.txt", "P", "v2", "2026-10-26T00:00:00Z"),
     ];
     let mut copies = vec![copy_of(&origin_files[0], "P2", "root")];
     for file in &origin_files[1..] {
@@ -622,58 +643,38 @@ async fn revisions_settle_a_file_changed_on_both_sides_or_it_differs() {
     let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
 
     ran.assert_ok();
+    let differs = |when: &str, who: &str, name: &str| {
+        change("differs", Some(when), who, &format!("Projects/{name}"))
+    };
     assert_eq!(
         ran.rows(),
         [
-            change(
-                "edited",
-                Some("2026-11-02T00:00:00Z"),
-                "ana@example.com",
-                "Projects/both.txt"
-            ),
-            change(
-                "differs",
-                Some("2026-10-24T00:00:00Z"),
-                "old@example.com",
-                "Projects/pruned.txt"
-            ),
-            change(
-                "differs",
-                Some("2026-10-23T00:00:00Z"),
-                "old@example.com",
-                "Projects/gone.txt"
-            ),
-            change(
-                "differs",
-                Some("2026-10-22T00:00:00Z"),
-                "old@example.com",
-                "Projects/refused.txt"
-            ),
-            change(
-                "differs",
-                Some("2026-10-21T00:00:00Z"),
-                "old@example.com",
-                "Projects/none.txt"
-            ),
+            differs("2026-11-02T00:00:00Z", "ana@example.com", "both.txt"),
+            differs("2026-10-26T00:00:00Z", "old@example.com", "later.txt"),
+            differs("2026-10-24T00:00:00Z", "old@example.com", "pruned.txt"),
+            differs("2026-10-23T00:00:00Z", "old@example.com", "gone.txt"),
+            differs("2026-10-22T00:00:00Z", "old@example.com", "refused.txt"),
+            differs("2026-10-21T00:00:00Z", "old@example.com", "none.txt"),
         ]
     );
     assert!(ran.err.lines().contains(&String::from(
-        "Read the revisions of 6 files of the copy, newer than the origin's file of the same \
-             name; they do not tell whether 4 files of the origin changed after the migration \
-             (differs)"
+        "Read the revisions of 8 files of the copy, newer than the origin's file of the same \
+         name; differs: 6 files of the origin whose present content no revision there holds"
     )));
     let requests = copy.revision_requests();
     let files = requests
         .iter()
         .map(|request| request.file_id.as_str())
         .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(files.len(), 6, "{files:?}");
-    // Every page is read: the oldest revision is not listed first.
-    let pages = requests
-        .iter()
-        .filter(|request| request.file_id == "both2")
-        .count();
-    assert_eq!(pages, 2);
+    assert_eq!(files.len(), 8, "{files:?}");
+    // Every page is read: the revision that was copied may come last.
+    let pages = |id: &str| {
+        requests
+            .iter()
+            .filter(|request| request.file_id == id)
+            .count()
+    };
+    assert_eq!((pages("kept2"), pages("reused2")), (2, 3));
     assert_read_only(&[&origin, &copy]);
 }
 
@@ -690,6 +691,11 @@ async fn a_renamed_or_moved_blob_is_moved_once_and_a_google_file_never() {
         doc("report", "Report", "P", BEFORE),
         folder("sub", "sub", "P"),
         blob("y", "y.bin", "sub", "other", BEFORE),
+        // Uploaded again by Ana under another name: the content is that of a file only in the
+        // copy, but it is another file, with a creation time of its own.
+        blob("fresh", "fresh.bin", "P", "fresh", "2026-11-02T00:00:00Z")
+            .created("2026-11-02T00:00:00Z")
+            .owned_by(ana()),
     ];
     let copies = vec![
         copy_of(&origin_files[0], "P2", "root"),
@@ -699,6 +705,7 @@ async fn a_renamed_or_moved_blob_is_moved_once_and_a_google_file_never() {
         copy_of(&origin_files[5], "sub2", "P2"),
         // Moved from sub/ to the top in the copy's terms: the origin moved it into sub/.
         copy_of(&blob("x", "z.bin", "P", "other", BEFORE), "z2", "P2"),
+        copy_of(&blob("x", "gone.bin", "P", "fresh", BEFORE), "gone2", "P2"),
     ];
     let origin = start(origin_files).await;
     let copy = start(copies).await;
@@ -709,6 +716,12 @@ async fn a_renamed_or_moved_blob_is_moved_once_and_a_google_file_never() {
     assert_eq!(
         ran.rows(),
         [
+            change(
+                "added",
+                Some("2026-11-02T00:00:00Z"),
+                "ana@example.com",
+                "Projects/fresh.bin"
+            ),
             change("added", Some(BEFORE), "old@example.com", "Projects/Report"),
             change("added", Some(BEFORE), "old@example.com", "Projects/x2.bin"),
             change(
@@ -727,6 +740,218 @@ async fn a_renamed_or_moved_blob_is_moved_once_and_a_google_file_never() {
     );
     assert!(copy.revision_requests().is_empty());
     assert_read_only(&[&origin, &copy]);
+}
+
+#[tokio::test]
+async fn an_item_not_in_the_copy_is_added_and_edited_each_row_filtered_on_its_own() {
+    let files = vec![
+        folder("P", "Projects", "root"),
+        // Uploaded by Ana after the migration, edited by Bob later.
+        blob("r", "report.txt", "P", "r", "2026-11-05T00:00:00Z")
+            .created("2026-11-02T00:00:00Z")
+            .owned_by(ana())
+            .modified_by(bob()),
+        // A Google file renamed in the origin, then edited: no checksum, so never `moved`.
+        doc("plan", "Plan v2", "P", "2026-11-03T00:00:00Z").modified_by(ana()),
+        // Uploaded and edited by Carol: one row.
+        blob("s", "solo.txt", "P", "s", "2026-11-03T00:00:00Z")
+            .created("2026-11-02T00:00:00Z")
+            .owned_by(carol())
+            .modified_by(carol()),
+    ];
+    let copies = vec![
+        copy_of(&files[0], "P2", "root"),
+        copy_of(&doc("x", "Plan", "P", BEFORE), "plan2", "P2"),
+    ];
+    let origin = start(files).await;
+    let copy = start(copies).await;
+
+    let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
+    ran.assert_ok();
+    assert_eq!(
+        ran.rows(),
+        [
+            change(
+                "edited",
+                Some("2026-11-05T00:00:00Z"),
+                "bob@example.com",
+                "Projects/report.txt"
+            ),
+            change(
+                "edited",
+                Some("2026-11-03T00:00:00Z"),
+                "ana@example.com",
+                "Projects/Plan v2"
+            ),
+            change(
+                "added",
+                Some("2026-11-02T00:00:00Z"),
+                "ana@example.com",
+                "Projects/report.txt"
+            ),
+            change(
+                "added",
+                Some("2026-11-02T00:00:00Z"),
+                "carol@example.com",
+                "Projects/solo.txt"
+            ),
+            change("added", Some(BEFORE), "old@example.com", "Projects/Plan v2"),
+        ]
+    );
+
+    // The edit is inside the interval although the creation is not.
+    let ran = diverged(
+        &origin,
+        Some(&copy),
+        since(settings(&["P"]), "2026-11-04T00:00:00Z"),
+    )
+    .await;
+    ran.assert_ok();
+    assert_eq!(
+        ran.rows(),
+        [change(
+            "edited",
+            Some("2026-11-05T00:00:00Z"),
+            "bob@example.com",
+            "Projects/report.txt"
+        )]
+    );
+    assert_eq!(
+        ran.summary(),
+        format!(
+            "Summary: 1 item diverged in the origin since {} (1 edited) by 1 person",
+            local("2026-11-04T00:00:00Z")
+        )
+    );
+    assert_read_only(&[&origin, &copy]);
+}
+
+#[tokio::test]
+async fn files_of_one_name_are_matched_one_to_one() {
+    // Two notes.txt were migrated, with `A` and `B`; then Ana changed the origin's `A` to `B`.
+    let files = vec![
+        folder("P", "Projects", "root"),
+        blob("n1", "notes.txt", "P", "B", "2026-11-03T00:00:00Z").modified_by(ana()),
+        blob("n2", "notes.txt", "P", "B", "2026-10-01T00:00:00Z"),
+    ];
+    let copies = vec![
+        copy_of(&files[0], "P2", "root"),
+        copy_of(
+            &blob("x", "notes.txt", "P", "A", "2026-10-02T00:00:00Z"),
+            "c1",
+            "P2",
+        ),
+        copy_of(&files[2], "c2", "P2"),
+    ];
+    let origin = start(files).await;
+    let copy = start(copies).await;
+    let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
+    ran.assert_ok();
+    assert_eq!(
+        ran.rows(),
+        [change(
+            "edited",
+            Some("2026-11-03T00:00:00Z"),
+            "ana@example.com",
+            "Projects/notes.txt"
+        )]
+    );
+
+    // One origin file, two in the copy: it has its partner, the other is the copy's own.
+    let files = vec![
+        folder("P", "Projects", "root"),
+        blob("n", "notes.txt", "P", "A", "2026-10-02T00:00:00Z"),
+    ];
+    let copies = vec![
+        copy_of(&files[0], "P2", "root"),
+        copy_of(&files[1], "c1", "P2"),
+        copy_of(
+            &blob("x", "notes.txt", "P", "X", "2026-11-04T00:00:00Z"),
+            "c2",
+            "P2",
+        ),
+    ];
+    let origin = start(files).await;
+    let copy = start(copies).await;
+    let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
+    ran.assert_ok();
+    assert!(ran.rows().is_empty(), "{:?}", ran.rows());
+    assert!(copy.revision_requests().is_empty());
+}
+
+/// `Projects` with a folder `Team` for each of `teams`, and below each the folders of the path
+/// `deeper` and the files `(name, content, modified)` in the last one. Ids start with `prefix`.
+fn teams(prefix: &str, teams: &[&[(&str, &str, &str)]], deeper: &[&str]) -> Vec<FakeFile> {
+    let mut files = vec![FakeFile {
+        id: format!("{prefix}P"),
+        ..folder("x", "Projects", "root")
+    }];
+    for (n, contents) in teams.iter().enumerate() {
+        let mut parent = format!("{prefix}team{n}");
+        files.push(folder(&parent, "Team", &format!("{prefix}P")));
+        for name in deeper {
+            let id = format!("{parent}-{name}");
+            files.push(folder(&id, name, &parent));
+            parent = id;
+        }
+        for (name, content, modified) in *contents {
+            let id = format!("{parent}-{name}");
+            files.push(blob(&id, name, &parent, content, modified));
+        }
+    }
+    files
+}
+
+#[tokio::test]
+async fn folders_of_one_name_are_compared_as_one_group() {
+    const OLD: &str = "2026-10-01T00:00:00Z";
+    const NEW: &str = "2026-11-03T00:00:00Z";
+    let a = ("a.txt", "a", OLD);
+    let b = ("b.txt", "b", OLD);
+    let changed = ("b.txt", "b2", NEW);
+    for (origin_teams, copy_teams, deeper, expected) in [
+        // Two folders `Team` on each side, their files placed the other way round.
+        (&[&[a][..], &[b]][..], &[&[b][..], &[a]][..], &[][..], None),
+        // A real change in one of them is still found.
+        (
+            &[&[a], &[changed]],
+            &[&[b], &[a]],
+            &[],
+            Some("Projects/Team/b.txt"),
+        ),
+        // Two in the copy only.
+        (&[&[a, b]], &[&[a], &[b]], &[], None),
+        // Three levels deep.
+        (&[&[a], &[b]], &[&[b], &[a]], &["Sub", "Deep"], None),
+        (
+            &[&[a], &[changed]],
+            &[&[b], &[a]],
+            &["Sub", "Deep"],
+            Some("Projects/Team/Sub/Deep/b.txt"),
+        ),
+    ] {
+        let origin = start(teams("o", origin_teams, deeper)).await;
+        let mut copies = teams("c", copy_teams, deeper);
+        for file in &mut copies {
+            file.owners = vec![FakeUser::new("New", "new@example.com")];
+        }
+        let copy = start(copies).await;
+
+        let ran = diverged(&origin, Some(&copy), settings(&["oP"])).await;
+
+        ran.assert_ok();
+        let expected = expected
+            .map(|path| change("edited", Some(NEW), "old@example.com", path))
+            .into_iter()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ran.rows(),
+            expected,
+            "{origin_teams:?} {copy_teams:?} {deeper:?}"
+        );
+        assert!(!ran.err.text().contains("Left out"), "{}", ran.err.text());
+        assert_read_only(&[&origin, &copy]);
+    }
 }
 
 #[tokio::test]
@@ -894,20 +1119,24 @@ async fn since_alone_reports_what_was_created_or_modified_at_or_after_it() {
     const WHEN: &str = "2026-11-01T00:00:00Z";
     let files = vec![
         folder("P", "Projects", "root"),
+        // Created by Bob exactly at WHEN, modified later by the owner of the old account.
         blob("c", "created.txt", "P", "c", "2026-11-03T00:00:00Z")
             .created(WHEN)
             .owned_by(bob()),
+        // Created and modified later by Ana: one row.
+        blob("s", "solo.txt", "P", "s", "2026-11-03T00:00:00Z")
+            .created("2026-11-02T00:00:00Z")
+            .owned_by(ana())
+            .modified_by(ana()),
+        // Modified exactly at WHEN.
         blob("m", "modified.txt", "P", "m", WHEN).modified_by(ana()),
+        // A second before WHEN.
         blob("o", "older.txt", "P", "o", "2026-10-31T23:59:59Z").created("2026-10-31T23:59:59Z"),
         doc("d", "Budget", "P", "2026-11-02T00:00:00Z").modified_by(carol()),
         FakeFile::folder("n", "New", "P")
             .created("2026-11-02T00:00:00Z")
             .owned_by(bob()),
         blob("i", "in.txt", "n", "i", BEFORE),
-        blob("t", "gone.txt", "P", "t", BEFORE)
-            .trashed_by(Some(ana()), Some("2026-11-04T00:00:00Z")),
-        blob("u", "early.txt", "P", "u", BEFORE)
-            .trashed_by(Some(ana()), Some("2026-10-30T00:00:00Z")),
     ];
     let origin = start(files).await;
 
@@ -918,10 +1147,10 @@ async fn since_alone_reports_what_was_created_or_modified_at_or_after_it() {
         ran.rows(),
         [
             change(
-                "trashed",
-                Some("2026-11-04T00:00:00Z"),
-                "ana@example.com",
-                "Projects/gone.txt"
+                "edited",
+                Some("2026-11-03T00:00:00Z"),
+                "old@example.com",
+                "Projects/created.txt"
             ),
             change(
                 "edited",
@@ -934,6 +1163,12 @@ async fn since_alone_reports_what_was_created_or_modified_at_or_after_it() {
                 Some("2026-11-02T00:00:00Z"),
                 "bob@example.com",
                 "Projects/New"
+            ),
+            change(
+                "added",
+                Some("2026-11-02T00:00:00Z"),
+                "ana@example.com",
+                "Projects/solo.txt"
             ),
             change(
                 "added",
@@ -953,7 +1188,7 @@ async fn since_alone_reports_what_was_created_or_modified_at_or_after_it() {
         ran.err.lines(),
         [
             String::from(
-                "Found 5 files in 2 folders in the origin, and 2 items moved from them to the trash"
+                "Found 6 files in 2 folders in the origin, and 0 items moved from them to the trash"
             ),
             format!(
                 "Reporting what was created or modified in the origin since {}, and what was \
@@ -961,8 +1196,8 @@ async fn since_alone_reports_what_was_created_or_modified_at_or_after_it() {
                 local(WHEN)
             ),
             format!(
-                "Summary: 5 items changed in the origin since {} (2 added, 2 edited, 1 trashed) \
-                 by 3 people",
+                "Summary: 5 items changed in the origin since {}, in 6 changes (3 added, 3 \
+                 edited) by 4 people",
                 local(WHEN)
             ),
         ]
@@ -993,6 +1228,12 @@ async fn since_filters_the_rows_of_a_comparison() {
                 "Projects/plan.docx"
             ),
             change(
+                "edited",
+                Some("2026-11-04T10:00:00Z"),
+                "ana@example.com",
+                "Projects/2026/new.pdf"
+            ),
+            change(
                 "added",
                 Some("2026-11-04T09:00:02Z"),
                 "bob@example.com",
@@ -1004,99 +1245,90 @@ async fn since_filters_the_rows_of_a_comparison() {
                 "bob@example.com",
                 "Projects/2026"
             ),
+            // No time: nothing tells they are older, so they stay.
             change(
                 "moved",
                 None,
                 "-",
                 "Projects/2026/b.jpg (was Projects/a.jpg)"
             ),
+            change("trashed", None, "ana@example.com", "Projects/old.xlsx"),
         ]
     );
     assert_eq!(
         ran.summary(),
         format!(
-            "Summary: 4 items diverged in the origin since {} (2 added, 1 edited, 1 moved) by 2 \
-             people; 1 item without a known person",
+            "Summary: 5 items diverged in the origin since {}, in 6 changes (2 added, 2 edited, \
+             1 trashed, 1 moved) by 2 people; 1 change without a known person",
             local("2026-11-04T08:00:00Z")
         )
     );
     assert_read_only(&[&origin, &copy]);
 }
 
-/// `Projects` with items moved to the trash: a file without a time or person (outside shared
-/// drives), a folder with a file in it, and a file of a subfolder.
+/// `Projects` in a My Drive with items moved to the trash, where Drive tells neither who nor
+/// when: a file, a folder with a file in it, a file of a subfolder, and a file without
+/// `explicitlyTrashed`.
 fn trash_tree() -> Vec<FakeFile> {
     vec![
         folder("P", "Projects", "root"),
         blob("x", "old.xlsx", "P", "x", BEFORE)
             .owned_by(ana())
             .trashed_by(None, None),
-        folder("bin", "bin", "P").trashed_by(Some(bob()), Some("2026-11-02T00:00:00Z")),
+        folder("bin", "bin", "P")
+            .owned_by(bob())
+            .trashed_by(None, None),
         // Trashed with its folder, not by itself.
         blob("inner", "inner.txt", "bin", "i", BEFORE).in_trashed_folder(),
         folder("s", "sub", "P"),
         blob("g", "gone.txt", "s", "g", BEFORE)
-            .trashed_by(Some(carol()), Some("2026-11-04T00:00:00Z")),
+            .owned_by(carol())
+            .trashed_by(None, None),
+        // Drive leaves the field out: it is in the trash all the same.
+        blob("w", "weird.txt", "P", "w", BEFORE).trashed(),
     ]
 }
 
 #[tokio::test]
-async fn what_was_moved_to_the_trash_is_a_row_in_both_modes_a_folder_once() {
+async fn what_was_moved_to_the_trash_of_a_my_drive_is_a_row_by_its_owner_a_folder_once() {
     let files = trash_tree();
-    let copies = vec![
-        copy_of(&files[0], "P2", "root"),
-        copy_of(&files[1], "x2", "P2"),
-        copy_of(&files[2], "bin2", "P2"),
-        copy_of(&files[3], "inner2", "bin2"),
-        copy_of(&files[4], "s2", "P2"),
-        copy_of(&files[5], "g2", "s2"),
-    ];
+    let copies = files
+        .iter()
+        .map(|file| {
+            let parent = match file.parents[0].as_str() {
+                "root" => String::from("root"),
+                parent => format!("{parent}2"),
+            };
+            FakeFile {
+                trashed: false,
+                explicitly_trashed: None,
+                ..copy_of(file, &format!("{}2", file.id), &parent)
+            }
+        })
+        .collect::<Vec<_>>();
     let origin = start(files).await;
     let copy = start(copies).await;
+    // Only the owner can move a file of a My Drive to the trash.
+    let expected = [
+        change("trashed", None, "bob@example.com", "Projects/bin"),
+        change("trashed", None, "ana@example.com", "Projects/old.xlsx"),
+        change(
+            "trashed",
+            None,
+            "carol@example.com",
+            "Projects/sub/gone.txt",
+        ),
+        change("trashed", None, "old@example.com", "Projects/weird.txt"),
+    ];
 
     let ran = diverged(&origin, Some(&copy), settings(&["P"])).await;
-
     ran.assert_ok();
-    assert_eq!(
-        ran.rows(),
-        [
-            change(
-                "trashed",
-                Some("2026-11-04T00:00:00Z"),
-                "carol@example.com",
-                "Projects/sub/gone.txt"
-            ),
-            change(
-                "trashed",
-                Some("2026-11-02T00:00:00Z"),
-                "bob@example.com",
-                "Projects/bin"
-            ),
-            // Outside shared drives Drive tells neither; only the owner can trash it there.
-            change("trashed", None, "ana@example.com", "Projects/old.xlsx"),
-        ]
-    );
+    assert_eq!(ran.rows(), expected);
 
-    // By time: what was trashed before is left out, what has no time stays.
-    let ran = diverged(
-        &origin,
-        None,
-        since(settings(&["P"]), "2026-11-03T00:00:00Z"),
-    )
-    .await;
+    // By time: without a time nothing tells they are older, so they stay.
+    let ran = diverged(&origin, None, since(settings(&["P"]), NOW)).await;
     ran.assert_ok();
-    assert_eq!(
-        ran.rows(),
-        [
-            change(
-                "trashed",
-                Some("2026-11-04T00:00:00Z"),
-                "carol@example.com",
-                "Projects/sub/gone.txt"
-            ),
-            change("trashed", None, "ana@example.com", "Projects/old.xlsx"),
-        ]
-    );
+    assert_eq!(ran.rows(), expected);
 
     let ran = diverged(
         &origin,
@@ -1108,69 +1340,196 @@ async fn what_was_moved_to_the_trash_is_a_row_in_both_modes_a_folder_once() {
     )
     .await;
     ran.assert_ok();
+    let user = |who: &str| row(&[who, "-", "0", "0", "1", "0", "1"]);
     assert_eq!(
         ran.rows(),
         [
-            row(&[
-                "carol@example.com",
-                &local("2026-11-04T00:00:00Z"),
-                "0",
-                "0",
-                "1",
-                "0",
-                "1"
-            ]),
-            row(&[
-                "bob@example.com",
-                &local("2026-11-02T00:00:00Z"),
-                "0",
-                "0",
-                "1",
-                "0",
-                "1"
-            ]),
-            // A person without a time comes after those with one.
-            row(&["ana@example.com", "-", "0", "0", "1", "0", "1"]),
+            user("ana@example.com"),
+            user("bob@example.com"),
+            user("carol@example.com"),
+            user("old@example.com"),
         ]
     );
     assert_read_only(&[&origin, &copy]);
 }
 
+/// A user of a shared drive.
+fn member(name: &str) -> FakeUser {
+    FakeUser::new(name, &format!("{}@example.com", name.to_lowercase()))
+}
+
+/// `Project` in the shared drive `d1`, as Drive describes items there: no owners, and who moved
+/// an item to the trash and when.
+fn shared_drive_tree() -> Vec<FakeFile> {
+    let item = |file: FakeFile, created: &str, modified: &str, by: &str| {
+        file.created(created)
+            .modified(modified)
+            .modified_by(member(by))
+            .in_drive("d1")
+    };
+    vec![
+        FakeFile {
+            parents: Vec::new(),
+            ..FakeFile::folder("d1", "Team", "").in_drive("d1")
+        },
+        item(
+            FakeFile::folder("proj", "Project", "d1"),
+            BEFORE,
+            BEFORE,
+            "Alice",
+        ),
+        item(
+            FakeFile::blob("kept", "kept.txt", "proj", "k"),
+            BEFORE,
+            BEFORE,
+            "Alice",
+        ),
+        // Uploaded by Alice and not modified since: the last modifier is who uploaded it.
+        item(
+            FakeFile::blob("up", "up.txt", "proj", "u"),
+            "2026-11-02T00:00:00Z",
+            "2026-11-02T00:00:00Z",
+            "Alice",
+        ),
+        // Uploaded, then edited by Bob: who uploaded it is not known.
+        item(
+            FakeFile::blob("ed", "edit.txt", "proj", "e"),
+            "2026-11-02T00:00:00Z",
+            "2026-11-04T00:00:00Z",
+            "Bob",
+        ),
+        item(
+            FakeFile::blob("t", "gone.txt", "proj", "t"),
+            BEFORE,
+            BEFORE,
+            "Alice",
+        )
+        .trashed_by(Some(member("Carol")), Some("2026-11-03T00:00:00Z")),
+        item(
+            FakeFile::blob("o", "early.txt", "proj", "o"),
+            BEFORE,
+            BEFORE,
+            "Alice",
+        )
+        .trashed_by(Some(member("Carol")), Some("2026-10-20T00:00:00Z")),
+    ]
+}
+
 #[tokio::test]
-async fn who_is_the_address_else_the_name_else_the_owner_and_the_owner_for_what_was_added() {
+async fn an_origin_in_a_shared_drive_names_who_trashed_and_who_uploaded_only_unmodified_files() {
+    let files = shared_drive_tree();
+    let copies = vec![
+        folder("P2", "Project", "root"),
+        copy_of(&files[2], "kept2", "P2"),
+        copy_of(&files[5], "t2", "P2"),
+        copy_of(&files[6], "o2", "P2"),
+    ];
+    let origin = start(files).await;
+    let copy = start(copies).await;
+    let rows = || {
+        vec![
+            change(
+                "edited",
+                Some("2026-11-04T00:00:00Z"),
+                "bob@example.com",
+                "Project/edit.txt",
+            ),
+            change(
+                "trashed",
+                Some("2026-11-03T00:00:00Z"),
+                "carol@example.com",
+                "Project/gone.txt",
+            ),
+            change(
+                "added",
+                Some("2026-11-02T00:00:00Z"),
+                "-",
+                "Project/edit.txt",
+            ),
+            change(
+                "added",
+                Some("2026-11-02T00:00:00Z"),
+                "alice@example.com",
+                "Project/up.txt",
+            ),
+            change(
+                "trashed",
+                Some("2026-10-20T00:00:00Z"),
+                "carol@example.com",
+                "Project/early.txt",
+            ),
+        ]
+    };
+
+    let ran = diverged(&origin, Some(&copy), settings(&["proj"])).await;
+    ran.assert_ok();
+    assert_eq!(ran.rows(), rows());
+
+    // By time, the trash too.
+    let ran = diverged(&origin, None, since(settings(&["proj"]), MIGRATION)).await;
+    ran.assert_ok();
+    let mut expected = rows();
+    expected.pop();
+    assert_eq!(ran.rows(), expected);
+    for request in origin.requests() {
+        assert_eq!(request.param("corpora"), Some("drive"));
+        assert_eq!(request.param("driveId"), Some("d1"));
+    }
+    assert_read_only(&[&origin, &copy]);
+}
+
+#[tokio::test]
+async fn who_is_who_drive_names_for_each_fact_and_nobody_without_evidence() {
     const WHEN: &str = "2026-11-01T00:00:00Z";
     let edit = "2026-11-02T00:00:00Z";
+    let without = |file: FakeFile, lmu: bool, owners: bool| FakeFile {
+        last_modifying_user: file.last_modifying_user.filter(|_| lmu),
+        owners: if owners { file.owners } else { Vec::new() },
+        ..file
+    };
     let files = vec![
         folder("P", "Projects", "root"),
+        // The address in lower case, else the display name.
         blob("a", "a.txt", "P", "a", edit).modified_by(FakeUser::new("Ana", " ANA@example.COM ")),
         blob("b", "b.txt", "P", "b", edit).modified_by(FakeUser::named("Bob Builder")),
-        FakeFile {
-            last_modifying_user: None,
-            ..blob("c", "c.txt", "P", "c", edit).owned_by(carol())
-        },
+        // Edited through a link by someone not signed in: nobody, not the owner.
+        without(blob("c", "c.txt", "P", "c", edit), false, true),
+        // Created by its owner, modified by someone else: who created it.
         blob("d", "d.txt", "P", "d", edit)
-            .created("2026-11-02T00:00:00Z")
+            .created(edit)
             .modified_by(ana())
             .owned_by(FakeUser::new("Dave", "dave@example.com")),
-        FakeFile {
-            last_modifying_user: None,
-            owners: Vec::new(),
-            ..blob("e", "e.txt", "P", "e", edit)
-        },
-        blob("f", "f.txt", "P", "f", edit)
-            .modified_by(FakeUser::default())
-            .owned_by(FakeUser::named("Erin")),
-        // Added in a shared drive, which has no owners: who modified it last.
-        FakeFile {
-            owners: Vec::new(),
-            ..blob("g", "g.txt", "P", "g", edit)
-                .created("2026-11-02T00:00:00Z")
-                .modified_by(bob())
-        },
+        without(blob("e", "e.txt", "P", "e", edit), false, false),
+        // A user Drive names nothing of is nobody.
+        blob("f", "f.txt", "P", "f", edit).modified_by(FakeUser::default()),
+        // Without owners (a shared drive): who modified it last, if nobody did after its creation.
+        without(
+            blob("g", "g.txt", "P", "g", edit)
+                .created(edit)
+                .modified_by(bob()),
+            true,
+            false,
+        ),
+        without(
+            blob("h", "h.txt", "P", "h", "2026-11-03T00:00:00Z")
+                .created(edit)
+                .modified_by(bob()),
+            true,
+            false,
+        ),
     ];
     let origin = start(files).await;
 
-    let ran = diverged(&origin, None, since(settings(&["P"]), WHEN)).await;
+    let ran = diverged(
+        &origin,
+        None,
+        Settings {
+            // The owner of the old account is left out, an anonymous edit is not.
+            exclude: vec![String::from("old@example.com")],
+            ..since(settings(&["P"]), WHEN)
+        },
+    )
+    .await;
 
     ran.assert_ok();
     let who = ran
@@ -1179,19 +1538,21 @@ async fn who_is_the_address_else_the_name_else_the_owner_and_the_owner_for_what_
         .map(|row| (row[3].clone(), row[0].clone(), row[2].clone()))
         .collect::<Vec<_>>();
     let expected = [
+        ("h.txt", "edited", "bob@example.com"),
         ("a.txt", "edited", "ana@example.com"),
         ("b.txt", "edited", "Bob Builder"),
-        ("c.txt", "edited", "carol@example.com"),
+        ("c.txt", "edited", "-"),
         ("d.txt", "added", "dave@example.com"),
         ("e.txt", "edited", "-"),
-        ("f.txt", "edited", "Erin"),
+        ("f.txt", "edited", "-"),
         ("g.txt", "added", "bob@example.com"),
+        ("h.txt", "added", "-"),
     ]
     .map(|(path, kind, who)| (format!("Projects/{path}"), kind.to_owned(), who.to_owned()));
     assert_eq!(who, expected);
     assert!(
         ran.summary()
-            .ends_with("by 6 people; 1 item without a known person"),
+            .ends_with("by 4 people; 4 changes without a known person"),
         "{}",
         ran.summary()
     );
@@ -1235,9 +1596,9 @@ async fn exclude_leaves_out_what_a_person_did_in_any_case() {
     assert_eq!(
         err[err.len() - 2..],
         [
-            "Left out 2 changes of the people of --exclude",
+            "Left out 3 changes of the people of --exclude",
             "Summary: 4 items diverged in the origin (2 added, 1 differs, 1 moved) by 2 people; \
-             1 item without a known person",
+             1 change without a known person",
         ]
     );
     assert_read_only(&[&origin, &copy]);
@@ -1266,14 +1627,15 @@ async fn by_user_has_a_row_per_person_most_recent_first_and_nobody_last() {
     assert_eq!(
         ran.rows(),
         [
+            // plan.docx and new.pdf edited, old.xlsx trashed.
             row(&[
                 "ana@example.com",
                 &local("2026-11-05T10:12:44Z"),
                 "0",
-                "1",
+                "2",
                 "1",
                 "0",
-                "2"
+                "3"
             ]),
             row(&[
                 "bob@example.com",
@@ -1365,7 +1727,7 @@ async fn the_table_aligns_columns_and_takes_the_flags_of_files_list() {
     .await;
     ran.assert_ok();
     let lines = ran.out.lines();
-    assert_eq!(lines.len(), 7);
+    assert_eq!(lines.len(), 8);
     assert!(
         lines[0].starts_with("Change    When                  Who                 Path"),
         "{}",
@@ -1384,7 +1746,7 @@ async fn the_table_aligns_columns_and_takes_the_flags_of_files_list() {
     .await;
     ran.assert_ok();
     let lines = ran.out.lines();
-    assert_eq!(lines.len(), 6);
+    assert_eq!(lines.len(), 7);
     assert_eq!(
         lines[0],
         format!(
@@ -1451,7 +1813,7 @@ async fn into_names_the_folder_that_holds_the_copy() {
     .await;
 
     ran.assert_ok();
-    assert_eq!(ran.rows().len(), 6);
+    assert_eq!(ran.rows().len(), 7);
     assert!(ran.err.lines().contains(&String::from(
         "Compared by name with the copy in the folder 'From old' (--into): files by size and \
          MD5 checksum, Google Docs, Sheets and Slides by modification time"
@@ -1509,7 +1871,7 @@ async fn a_copy_in_a_shared_drive_is_listed_in_its_corpus() {
     .await;
 
     ran.assert_ok();
-    assert_eq!(ran.rows().len(), 6);
+    assert_eq!(ran.rows().len(), 7);
     let requests = copy.requests();
     assert_eq!(requests.len(), 2);
     for request in &requests {
@@ -1699,6 +2061,25 @@ fn listing_failures() -> Vec<(Behavior, Behavior, &'static [&'static str], &'sta
             &["P", "missing"],
             "Error: unable to get 'missing'",
         ),
+        // A later page fails after a good first one.
+        (
+            behavior(|b| {
+                b.page_size = Some(1);
+                b.fail_after_first_page = [String::from("P")].into();
+            }),
+            Behavior::default(),
+            &["P"],
+            "Error: unable to list the folder 'Projects' of the origin",
+        ),
+        (
+            Behavior::default(),
+            behavior(|b| {
+                b.page_size = Some(1);
+                b.fail_after_first_page = [String::from("P2")].into();
+            }),
+            &["P"],
+            "Error: unable to list the folder 'Projects' of the copy",
+        ),
     ]
 }
 
@@ -1800,7 +2181,7 @@ async fn an_item_given_twice_or_inside_a_given_folder_is_one_row() {
             "plan.docx"
         )]
     );
-    assert_eq!(ran.rows().len(), 6);
+    assert_eq!(ran.rows().len(), 7);
 }
 
 #[test]

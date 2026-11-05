@@ -169,7 +169,13 @@ async fn list_query(
             });
         }
         for file in list.files.unwrap_or_default() {
-            if (file.trashed == Some(true)) != (trash == Trash::Only) {
+            // The query selects by `trashed`: only a result that contradicts it is dropped, never
+            // one whose field is missing.
+            let contradicts = match trash {
+                Trash::Without => file.trashed == Some(true),
+                Trash::Only => file.trashed == Some(false),
+            };
+            if contradicts {
                 continue;
             }
             let targets = if several {

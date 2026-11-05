@@ -131,16 +131,17 @@ impl Display for Who {
 }
 
 /// How an item of the origin diverged.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Kind {
-    /// It has no copy, or was created at or after `--since`.
+    /// It has no copy (its creation), or was created at or after `--since`.
     Added,
-    /// It changed after the migration, or was modified at or after `--since`.
+    /// It is newer than its copy, or it has no copy and was modified after its creation, or was
+    /// modified at or after `--since`.
     Edited,
     /// Someone moved it to the trash.
     Trashed,
-    /// Its content differs from the copy's and the copy is newer; its revisions do not tell
-    /// whether the origin changed after the migration.
+    /// Its content differs from the copy's, the copy is newer (or a time is missing), and no
+    /// revision of the copy is the origin as it is now, or they cannot be read.
     Differs,
     /// It was renamed or moved in the origin: its content is in the copy at `was`.
     Moved { was: String },
@@ -288,13 +289,26 @@ async fn make_report(
         .filter(|id| seen.insert(*id))
         .cloned()
         .collect::<Vec<_>>();
-    let (mut changes, left_out) = match (copy_hub, since) {
+    let (changes, left_out) = match (copy_hub, since) {
         (None, None) => return Err(Error::NothingToCompare),
         (Some(copy), since) => {
             let (origin, trashed) = read_origin(origin_hub, &ids, jobs, printer).await?;
             let comparison = compare_with_copy(copy, &origin, settings, jobs, printer).await?;
-            let (changes, left_out) = compared(comparison, since);
-            (with_trash(changes, trashed, since), left_out)
+            let mut left_out = LeftOut {
+                shared: comparison.shared,
+                ..LeftOut::default()
+            };
+            let mut changes = comparison.changes;
+            for node in comparison.unsupported {
+                // Never in the copy: only their times can tell.
+                if since.is_some() {
+                    changes.extend(new_item(&node));
+                } else {
+                    left_out.unsupported.push(node);
+                }
+            }
+            changes.extend(trashed.into_iter().map(Change::from));
+            (changes, left_out)
         }
         (None, Some(since)) => {
             let (origin, trashed) = read_origin(origin_hub, &ids, jobs, printer).await?;
@@ -305,19 +319,21 @@ async fn make_report(
                     format_date_time(since)
                 ))
                 .await;
-            let changes = origin
+            let mut changes = origin
                 .roots
                 .iter()
                 .flat_map(Node::all)
-                .filter_map(|node| by_time(node, since))
-                .collect();
-            (
-                with_trash(changes, trashed, Some(since)),
-                LeftOut::default(),
-            )
+                .flat_map(new_item)
+                .collect::<Vec<_>>();
+            changes.extend(trashed.into_iter().map(Change::from));
+            (changes, LeftOut::default())
         }
     };
-    report::one_per_item(&mut changes);
+    let mut changes = report::one_path_per_item(changes);
+    // Each row on its own; a row without a time is kept, since nothing tells it is older.
+    if let Some(since) = since {
+        changes.retain(|change| change.when.is_none_or(|when| when >= since));
+    }
     let exclude = settings
         .exclude
         .iter()
@@ -326,6 +342,7 @@ async fn make_report(
     let before = changes.len();
     changes.retain(|change| !change.who.is_excluded(&exclude));
     let excluded = before - changes.len();
+    report::collapse(&mut changes);
 
     let text = match settings.by {
         By::Item => render(
@@ -378,44 +395,6 @@ async fn read_origin(
         ))
         .await;
     Ok((origin, trashed))
-}
-
-/// The changes of `comparison`: with `since`, those at or after it (and those without a time),
-/// and the items a migration does not copy by time; without it, these are left out.
-fn compared(comparison: Comparison, since: Option<DateTime<Utc>>) -> (Vec<Change>, LeftOut) {
-    let mut changes = comparison.changes;
-    let mut left_out = LeftOut {
-        shared: comparison.shared,
-        ..LeftOut::default()
-    };
-    for node in comparison.unsupported {
-        match since {
-            Some(since) => changes.extend(by_time(&node, since)),
-            None => left_out.unsupported.push(node),
-        }
-    }
-    if let Some(since) = since {
-        changes.retain(|change| change.when.is_none_or(|when| when >= since));
-    }
-    (changes, left_out)
-}
-
-/// `changes` and the items of `trashed`; with `since`, those trashed at or after it. Drive tells
-/// when only in shared drives: an item without a time is kept.
-fn with_trash(
-    mut changes: Vec<Change>,
-    trashed: Vec<Trashed>,
-    since: Option<DateTime<Utc>>,
-) -> Vec<Change> {
-    changes.extend(
-        trashed
-            .into_iter()
-            .filter(|trashed| {
-                since.is_none_or(|since| trashed.when.is_none_or(|when| when >= since))
-            })
-            .map(Change::from),
-    );
-    changes
 }
 
 fn count(n: usize) -> u64 {
@@ -489,9 +468,12 @@ async fn compare_with_copy(
         if comparison.unsettled > 0 {
             let _ = write!(
                 line,
-                "; they do not tell whether {} of the origin changed after the migration \
-                 (differs)",
-                plural(comparison.unsettled, "file", "files")
+                "; differs: {} whose present content no revision there holds",
+                plural(
+                    comparison.unsettled,
+                    "file of the origin",
+                    "files of the origin"
+                )
             );
         }
         printer.err(line).await;
@@ -534,24 +516,28 @@ async fn into_folder(copy: &Hub, id: &str) -> Result<Into, Error> {
     })
 }
 
-/// The change of `node` by time: `added` if it was created at or after `since`, else `edited`
-/// if it was modified then; `None` if neither.
-fn by_time(node: &Node, since: DateTime<Utc>) -> Option<Change> {
+/// The rows of `node` when it is new to the copy, or by time: `added` when it was created (by
+/// its owner, see [`origin::Item::creator`]), and `edited` too when it was modified after its
+/// creation (by `lastModifyingUser`). Each is filtered by `--since` on its own.
+fn new_item(node: &Node) -> Vec<Change> {
     let item = &node.item;
-    let (kind, when, who) = if item.created.is_some_and(|created| created >= since) {
-        (Kind::Added, item.created, item.creator())
-    } else if item.modified.is_some_and(|modified| modified >= since) {
-        (Kind::Edited, item.modified, item.editor())
-    } else {
-        return None;
-    };
-    Some(Change {
-        kind,
-        when,
-        who,
+    let mut rows = vec![Change {
+        kind: Kind::Added,
+        when: item.created,
+        who: item.creator(),
         path: node.path.clone(),
-        id: node.item.id.clone(),
-    })
+        id: item.id.clone(),
+    }];
+    if item.modified_after_creation() {
+        rows.push(Change {
+            kind: Kind::Edited,
+            when: item.modified,
+            who: item.editor(),
+            path: node.path.clone(),
+            id: item.id.clone(),
+        });
+    }
+    rows
 }
 
 /// What the comparison did not look at.
@@ -603,18 +589,23 @@ impl LeftOut {
 }
 
 /// The last line on stderr: `Summary: 6 items diverged in the origin (2 added, 3 edited,
-/// 1 trashed) by 2 people`; without a comparison, `... changed in the origin since ...`.
+/// 1 trashed) by 2 people`; with more rows than items, `6 items diverged in the origin, in 7
+/// changes (...)`; without a comparison, `... changed in the origin since ...`.
 fn summary(changes: &[Change], since: Option<DateTime<Utc>>, compared: bool) -> String {
     let what = if compared { "diverged" } else { "changed" };
+    let items = report::items(changes);
     let mut line = format!(
         "Summary: {} {what} in the origin",
-        plural(count(changes.len()), "item", "items")
+        plural(items, "item", "items")
     );
     if let Some(since) = since {
         let _ = write!(line, " since {}", format_date_time(since));
     }
     if changes.is_empty() {
         return line;
+    }
+    if count(changes.len()) != items {
+        let _ = write!(line, ", in {} changes", changes.len());
     }
     let counts = report::counts(changes)
         .into_iter()
@@ -631,7 +622,7 @@ fn summary(changes: &[Change], since: Option<DateTime<Utc>>, compared: bool) -> 
         let _ = write!(
             line,
             "; {} without a known person",
-            plural(unknown, "item", "items")
+            plural(unknown, "change", "changes")
         );
     }
     line

@@ -162,18 +162,48 @@ pub(super) fn unknown(changes: &[Change]) -> u64 {
     u64::try_from(unknown).unwrap_or(u64::MAX)
 }
 
-/// Keeps one change per item: the one with the shortest path, then the first by path. An item
+/// How many items the changes are about.
+pub(super) fn items(changes: &[Change]) -> u64 {
+    let items = changes
+        .iter()
+        .map(|change| change.id.as_str())
+        .collect::<HashSet<_>>();
+    u64::try_from(items.len()).unwrap_or(u64::MAX)
+}
+
+/// Keeps the changes of each item at one path, its shortest, then the first by path: an item
 /// given as a `FILE_ID` and found in a given folder too is compared twice.
-pub(super) fn one_per_item(changes: &mut Vec<Change>) {
-    changes.sort_by(|a, b| {
-        a.id.cmp(&b.id)
-            .then_with(|| {
-                a.path
-                    .matches('/')
-                    .count()
-                    .cmp(&b.path.matches('/').count())
-            })
-            .then_with(|| a.path.cmp(&b.path))
+pub(super) fn one_path_per_item(changes: Vec<Change>) -> Vec<Change> {
+    let mut paths: HashMap<&str, &str> = HashMap::new();
+    for change in &changes {
+        let path = paths.entry(&change.id).or_insert(&change.path);
+        let key = |path: &str| (path.matches('/').count(), path.to_owned());
+        if key(&change.path) < key(path) {
+            *path = &change.path;
+        }
+    }
+    let keep = changes
+        .iter()
+        .map(|change| paths.get(change.id.as_str()) == Some(&change.path.as_str()))
+        .collect::<Vec<_>>();
+    let mut seen = HashSet::new();
+    changes
+        .into_iter()
+        .zip(keep)
+        .filter(|(change, keep)| *keep && seen.insert((change.id.clone(), change.kind.clone())))
+        .map(|(change, _)| change)
+        .collect()
+}
+
+/// Drops the `edited` row of an item whose `added` row names the same person: one person who
+/// created it and modified it later is one row.
+pub(super) fn collapse(changes: &mut Vec<Change>) {
+    let creators = changes
+        .iter()
+        .filter(|change| change.kind == Kind::Added && change.who != Who::Unknown)
+        .map(|change| (change.id.clone(), change.who.clone()))
+        .collect::<HashSet<_>>();
+    changes.retain(|change| {
+        change.kind != Kind::Edited || !creators.contains(&(change.id.clone(), change.who.clone()))
     });
-    changes.dedup_by(|later, first| later.id == first.id);
 }
