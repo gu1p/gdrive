@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     auth::{
         lock::{AccountLock, Held, LOCK_TIMEOUT},
-        store::TokenFile,
+        store::{self, TokenFile},
     },
     common::json_error::RedactedJsonError,
 };
@@ -216,22 +216,17 @@ impl AppConfig {
             .map_err(error)
     }
 
+    /// Replaces `secret.json` atomically, with mode 0600 on Unix from the start.
     fn save_secret(&self, secret: &Secret) -> Result<(), errors::SaveSecret> {
         let content =
             serde_json::to_string_pretty(&secret).map_err(errors::SaveSecret::Serialize)?;
         let path = self.secret_path();
-        if let Err(source) = fs::write(path, content) {
-            return Err(errors::SaveSecret::Write {
+        store::write_private_file_blocking(path, content.as_bytes()).map_err(|source| {
+            errors::SaveSecret::Write {
                 path: path.to_path_buf(),
                 source,
-            });
-        }
-
-        if let Err(err) = set_file_permissions(path) {
-            eprintln!("Warning: Failed to set file permissions on secrets file: {err}");
-        }
-
-        Ok(())
+            }
+        })
     }
 
     pub(crate) fn load_secret(&self) -> Result<Secret, errors::LoadSecret> {
