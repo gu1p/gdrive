@@ -122,7 +122,7 @@ gdrive account      add, list, current, switch, remove, export, import
                     reauth, add --service-account, add --adc (4.0.0)
 gdrive files        list, info, download, upload, update, delete, mkdir, rename,
                     move, copy, import, export, sync up, sync down, migrate,
-                    activity (4.0.0)
+                    activity, diverged (4.0.0)
 gdrive drives       list
 gdrive permissions  share, list, revoke
 gdrive about        information about gdrive
@@ -138,6 +138,9 @@ Run `gdrive <command> --help` for the options, for example `gdrive files list --
   [Migrate files to another account](docs/migrate.md).
 - Who still uses a folder, per person, from the Drive audit log of a Google Workspace organization, for
   example after a migration: [Who still uses a folder](docs/activity.md).
+- What changed in the old location after a migration, and who last changed it, compared with the copy or
+  since a time, for any account (personal Gmail accounts too) from Drive alone:
+  [What changed in the old location](docs/diverged.md).
 
 - Service accounts and Application Default Credentials, for CI and servers:
   [Service accounts](docs/service_accounts.md).

@@ -556,6 +556,68 @@ enum FileCommand {
         tsv: bool,
     },
 
+    /// Report what changed in the origin of a migration after it, and who changed it
+    ///
+    /// Takes the arguments of 'files migrate': the given files and folders of the origin
+    /// account (--from, the current account by default), folders with everything in them, and
+    /// with --to the account they were migrated to (--into: the folder that holds the copy).
+    /// Prints what diverged from the copy, compared by name as the migration copied it: items
+    /// added, edited, moved or renamed in the origin, moved to the trash, or changed on both
+    /// sides; with who last changed each and when, as Drive tells it. With --since only, prints
+    /// what was created, modified or trashed in the origin since then. Works for any account,
+    /// personal Gmail accounts included, and needs no permission beyond Drive. Views and
+    /// downloads cannot be seen this way (see 'files activity'). Nothing is changed in either
+    /// account. See docs/diverged.md.
+    #[command(group(clap::ArgGroup::new("diverged_from").args(["to", "since"]).required(true).multiple(true)))]
+    Diverged {
+        /// Id of a file or folder of the origin account, as given to 'files migrate'. Several ids are one report
+        #[arg(required = true, value_name = "FILE_ID")]
+        file_id: Vec<String>,
+
+        /// The account the files were migrated to, which holds the copy to compare with, as `gdrive account list` prints it
+        #[arg(long, value_name = "ACCOUNT")]
+        to: Option<String>,
+
+        /// The origin account, as `gdrive account list` prints it [default: the current account]
+        #[arg(long, value_name = "ACCOUNT")]
+        from: Option<String>,
+
+        /// Id of the folder of the --to account that holds the copy, as given to 'files migrate' [default: the top of My Drive]
+        #[arg(long, value_name = "FOLDER_ID", requires = "to")]
+        into: Option<String>,
+
+        /// Only what changed at or after this time: a duration back from now (12h, 30d, 2w), a local date (2026-10-01) or time (2026-10-01 14:30), or an RFC 3339 time. Without --to, what was created or modified since then
+        #[arg(long, value_name = "WHEN", value_parser = files::activity::when::parse)]
+        since: Option<files::activity::when::When>,
+
+        /// The rows of the report
+        #[arg(long, value_enum, default_value_t = files::diverged::By::Item)]
+        by: files::diverged::By,
+
+        /// Leave out what this email address did (case-insensitive), for example the account that ran the migration. Repeat for several
+        #[arg(long, value_name = "EMAIL")]
+        exclude: Vec<String>,
+
+        /// Send up to N listing requests at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// Don't print header
+        #[arg(long)]
+        skip_header: bool,
+
+        /// Field separator. Columns stay aligned; for tab-separated values use --tsv
+        #[arg(long, default_value_t = String::from("\t"))]
+        field_separator: String,
+
+        /// Print tab-separated values for scripts
+        ///
+        /// Columns are not aligned, and a tab, newline, carriage return or backslash in a value is
+        /// written as `\t`, `\n`, `\r` or `\\`, another control character as `\u{1b}`.
+        #[arg(long, conflicts_with = "field_separator")]
+        tsv: bool,
+    },
+
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
     Update {
         /// File id of the file you want ot update
@@ -1320,6 +1382,42 @@ async fn handle_files_command(
                 exclude,
                 active_only,
                 scan,
+                jobs,
+                output,
+            }))
+            .await?;
+        }
+
+        FileCommand::Diverged {
+            file_id,
+            to,
+            from,
+            into,
+            since,
+            by,
+            exclude,
+            jobs,
+            skip_header,
+            field_separator,
+            tsv,
+        } => {
+            let output = if tsv {
+                files::activity::Output::Tsv { skip_header }
+            } else {
+                files::activity::Output::Table {
+                    skip_header,
+                    field_separator,
+                }
+            };
+            // Boxed: the future of run() holds the state of every command at once.
+            Box::pin(files::diverged(files::diverged::Config {
+                file_ids: file_id,
+                from,
+                to,
+                into,
+                since,
+                by,
+                exclude,
                 jobs,
                 output,
             }))
@@ -2553,6 +2651,151 @@ mod flag_tests {
             error.contains("'soon' is not a time; use a duration"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn diverged_takes_the_arguments_of_migrate_and_the_report_flags() {
+        use crate::files::{activity::when::When, diverged::By};
+
+        let FileCommand::Diverged {
+            file_id,
+            to,
+            from,
+            into,
+            since,
+            by,
+            exclude,
+            jobs,
+            skip_header,
+            field_separator: _,
+            tsv,
+        } = parse(&[
+            "files",
+            "diverged",
+            "a",
+            "b",
+            "--to",
+            "new@example.com",
+            "--from",
+            "old@example.com",
+            "--into",
+            "folder",
+            "--since",
+            "2026-11-01T00:00:00Z",
+            "--by",
+            "user",
+            "--exclude",
+            "old@example.com",
+            "--exclude",
+            "new@example.com",
+            "--jobs",
+            "8",
+            "--skip-header",
+            "--tsv",
+        ])
+        else {
+            panic!("expected diverged");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+        assert_eq!(to.as_deref(), Some("new@example.com"));
+        assert_eq!(from.as_deref(), Some("old@example.com"));
+        assert_eq!(into.as_deref(), Some("folder"));
+        let migration = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(since, Some(When::At(migration)));
+        assert_eq!(by, By::User);
+        assert_eq!(exclude, ["old@example.com", "new@example.com"]);
+        assert_eq!(jobs.get(), 8);
+        assert!(skip_header && tsv);
+    }
+
+    #[test]
+    fn diverged_needs_to_or_since_and_defaults_to_one_row_per_item() {
+        use crate::files::{activity::when::When, diverged::By};
+
+        let FileCommand::Diverged {
+            to,
+            from,
+            into,
+            since,
+            by,
+            exclude,
+            jobs,
+            skip_header,
+            field_separator,
+            tsv,
+            ..
+        } = parse(&["files", "diverged", "id", "--to", "new@example.com"])
+        else {
+            panic!("expected diverged");
+        };
+        assert_eq!(to.as_deref(), Some("new@example.com"));
+        assert_eq!((from, into, since), (None, None, None));
+        assert_eq!(by, By::Item);
+        assert!(exclude.is_empty() && !skip_header && !tsv);
+        assert_eq!(jobs.get(), 4);
+        assert_eq!(field_separator, "\t");
+
+        // --since alone compares with nothing: it reports by time.
+        let FileCommand::Diverged { to, since, .. } =
+            parse(&["files", "diverged", "id", "--since", "30d"])
+        else {
+            panic!("expected diverged");
+        };
+        assert_eq!(to, None);
+        assert_eq!(since, Some(When::Ago(chrono::TimeDelta::days(30))));
+        let FileCommand::Diverged { by, .. } =
+            parse(&["files", "diverged", "id", "--to", "x", "--by", "item"])
+        else {
+            panic!("expected diverged");
+        };
+        assert_eq!(by, By::Item);
+
+        for args in [
+            &["files", "diverged"][..],
+            &["files", "diverged", "--to", "x"],
+            &["files", "diverged", "id"],
+            &["files", "diverged", "id", "--from", "old@example.com"],
+            &[
+                "files", "diverged", "id", "--since", "30d", "--into", "folder",
+            ],
+            &["files", "diverged", "id", "--to", "x", "--jobs", "0"],
+            &["files", "diverged", "id", "--to", "x", "--jobs", "65"],
+            &["files", "diverged", "id", "--to", "x", "--by", "file"],
+            &["files", "diverged", "id", "--since", "soon"],
+            &[
+                "files",
+                "diverged",
+                "id",
+                "--to",
+                "x",
+                "--tsv",
+                "--field-separator",
+                ",",
+            ],
+            &["files", "diverged", "id", "--to", "x", "--dry-run"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
+                "{args:?} should be rejected"
+            );
+        }
+        let error = Cli::try_parse_from(["gdrive", "files", "diverged", "id"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("--to <ACCOUNT>") && error.contains("--since <WHEN>"),
+            "{error}"
+        );
+        let error = Cli::try_parse_from([
+            "gdrive", "files", "diverged", "id", "--since", "1d", "--into", "f",
+        ])
+        .err()
+        .unwrap()
+        .to_string();
+        assert!(error.contains("--to <ACCOUNT>"), "{error}");
     }
 
     #[test]

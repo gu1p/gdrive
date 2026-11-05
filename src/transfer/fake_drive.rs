@@ -28,6 +28,14 @@
 //! returns what the test started the fake with. Every request that is not a `GET` is also in
 //! [`FakeDrive::writes`], which is empty for an account that was only read.
 //!
+//! For `files diverged` it lists the children of folders that are in the trash
+//! (`trashed = true`), with `explicitlyTrashed`, `trashedTime` and `trashingUser`
+//! ([`FakeFile::trashed_by`]), returns `lastModifyingUser` and `owners` ([`FakeFile::modified_by`],
+//! [`FakeFile::owned_by`]), and answers `revisions.list` of a stored file from
+//! [`Behavior::revisions`], paged ([`FakeDrive::revision_requests`]);
+//! [`Behavior::revisions_refused`] and [`Behavior::revisions_fail_after_first_page`] make it fail,
+//! and [`Behavior::unreadable_trash`] fails the listings of the trash.
+//!
 //! For `files activity` it answers `permissions.list` of a stored file from
 //! [`Behavior::permissions`] (paged with `pageSize` and `pageToken`), and the audit log of the
 //! Admin SDK Reports API (`GET /admin/reports/v1/activity/users/all/applications/drive`) from
@@ -76,6 +84,44 @@ const UPLOAD_PATH: &str = "/upload/drive/v3/files";
 const SESSION_PATH: &str = "/upload-session/";
 const AUDIT_PATH: &str = "/admin/reports/v1/activity/users/all/applications/drive";
 const PERMISSIONS_SUFFIX: &str = "/permissions";
+const REVISIONS_SUFFIX: &str = "/revisions";
+
+/// A user as Drive names one in `lastModifyingUser`, `owners` and `trashingUser`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FakeUser {
+    pub(crate) display_name: Option<String>,
+    pub(crate) email: Option<String>,
+}
+
+impl FakeUser {
+    /// A user with a display name and an email address.
+    pub(crate) fn new(display_name: &str, email: &str) -> Self {
+        Self {
+            display_name: Some(display_name.to_owned()),
+            email: Some(email.to_owned()),
+        }
+    }
+
+    /// A user whose email address Drive does not show.
+    pub(crate) fn named(display_name: &str) -> Self {
+        Self {
+            display_name: Some(display_name.to_owned()),
+            email: None,
+        }
+    }
+
+    fn to_json(&self) -> Value {
+        let mut user = Map::new();
+        user.insert("kind".into(), json!("drive#user"));
+        if let Some(name) = &self.display_name {
+            user.insert("displayName".into(), json!(name));
+        }
+        if let Some(email) = &self.email {
+            user.insert("emailAddress".into(), json!(email));
+        }
+        Value::Object(user)
+    }
+}
 
 /// A file stored by the fake.
 #[derive(Debug, Clone, Default)]
@@ -100,6 +146,14 @@ pub(crate) struct FakeFile {
     pub(crate) modified_time: Option<String>,
     /// `createdTime`, RFC 3339.
     pub(crate) created_time: Option<String>,
+    /// `lastModifyingUser`, sent only when set.
+    pub(crate) last_modifying_user: Option<FakeUser>,
+    /// `owners`, sent only when there are some.
+    pub(crate) owners: Vec<FakeUser>,
+    /// `trashedTime`, RFC 3339, sent only when set.
+    pub(crate) trashed_time: Option<String>,
+    /// `trashingUser`, sent only when set.
+    pub(crate) trashing_user: Option<FakeUser>,
 }
 
 impl FakeFile {
@@ -160,6 +214,42 @@ impl FakeFile {
     pub(crate) fn modified(self, time: &str) -> Self {
         Self {
             modified_time: Some(time.to_owned()),
+            ..self
+        }
+    }
+
+    /// With `createdTime` (RFC 3339).
+    pub(crate) fn created(self, time: &str) -> Self {
+        Self {
+            created_time: Some(time.to_owned()),
+            ..self
+        }
+    }
+
+    /// Last modified by `user` (`lastModifyingUser`).
+    pub(crate) fn modified_by(self, user: FakeUser) -> Self {
+        Self {
+            last_modifying_user: Some(user),
+            ..self
+        }
+    }
+
+    /// Owned by `user` (`owners`).
+    pub(crate) fn owned_by(self, user: FakeUser) -> Self {
+        Self {
+            owners: vec![user],
+            ..self
+        }
+    }
+
+    /// Moved to the trash by `user` (`None`: Drive does not say, as outside shared drives) at
+    /// `time` (RFC 3339; `None`: Drive does not say): `trashed` and `explicitlyTrashed`.
+    pub(crate) fn trashed_by(self, user: Option<FakeUser>, time: Option<&str>) -> Self {
+        Self {
+            trashed: true,
+            explicitly_trashed: Some(true),
+            trashing_user: user,
+            trashed_time: time.map(str::to_owned),
             ..self
         }
     }
@@ -253,6 +343,19 @@ impl FakeFile {
         }
         if let Some(created_time) = &self.created_time {
             file.insert("createdTime".into(), json!(created_time));
+        }
+        if let Some(user) = &self.last_modifying_user {
+            file.insert("lastModifyingUser".into(), user.to_json());
+        }
+        if !self.owners.is_empty() {
+            let owners = self.owners.iter().map(FakeUser::to_json).collect();
+            file.insert("owners".into(), Value::Array(owners));
+        }
+        if let Some(trashed_time) = &self.trashed_time {
+            file.insert("trashedTime".into(), json!(trashed_time));
+        }
+        if let Some(user) = &self.trashing_user {
+            file.insert("trashingUser".into(), user.to_json());
         }
         if let Some(resource_key) = &self.resource_key {
             file.insert("resourceKey".into(), json!(resource_key));
@@ -356,6 +459,15 @@ pub(crate) struct Behavior {
     pub(crate) permissions: HashMap<String, Vec<Value>>,
     /// `permissions.list` of these file ids fails with 403.
     pub(crate) permissions_unreadable: HashSet<String>,
+    /// A query for the trash (`trashed = true`) naming one of these folders fails with 404.
+    pub(crate) unreadable_trash: HashSet<String>,
+    /// The revisions `revisions.list` returns of these file ids, oldest first; a stored file
+    /// that is not here has none.
+    pub(crate) revisions: HashMap<String, Vec<Value>>,
+    /// `revisions.list` of these file ids fails with this status (403, 404, ...).
+    pub(crate) revisions_refused: HashMap<String, u16>,
+    /// `revisions.list` of these file ids fails with 500 on every page after the first.
+    pub(crate) revisions_fail_after_first_page: HashSet<String>,
 }
 
 /// Which ends of its time range an audit log request includes.
@@ -459,11 +571,11 @@ impl ListRequest {
     }
 }
 
-/// An audit log or `permissions.list` request as the fake saw it, with percent-decoded
-/// parameters.
+/// An audit log, `permissions.list` or `revisions.list` request as the fake saw it, with
+/// percent-decoded parameters.
 #[derive(Debug, Clone)]
 pub(crate) struct ApiRequest {
-    /// For `permissions.list`, the file id; empty for the audit log.
+    /// For `permissions.list` and `revisions.list`, the file id; empty for the audit log.
     pub(crate) file_id: String,
     pub(crate) params: Vec<(String, String)>,
     /// The `Authorization` header.
@@ -539,6 +651,7 @@ struct State {
     audit_max_in_flight: AtomicUsize,
     audit_rendezvous: Rendezvous,
     permission_requests: Mutex<Vec<ApiRequest>>,
+    revision_requests: Mutex<Vec<ApiRequest>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -599,6 +712,7 @@ impl FakeDrive {
             audit_max_in_flight: AtomicUsize::new(0),
             audit_rendezvous,
             permission_requests: Mutex::new(Vec::new()),
+            revision_requests: Mutex::new(Vec::new()),
         });
 
         let server_state = Arc::clone(&state);
@@ -745,6 +859,15 @@ impl FakeDrive {
             .permission_requests
             .lock()
             .expect("permission requests lock")
+            .clone()
+    }
+
+    /// The `revisions.list` requests, in arrival order.
+    pub(crate) fn revision_requests(&self) -> Vec<ApiRequest> {
+        self.state
+            .revision_requests
+            .lock()
+            .expect("revision requests lock")
             .clone()
     }
 
@@ -1598,7 +1721,8 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     let behavior = &state.behavior;
     let names = |set: &HashSet<String>| request.parents.iter().any(|id| set.contains(id));
 
-    if names(&behavior.unreadable) {
+    let only_trashed = q.contains("trashed = true");
+    if names(&behavior.unreadable) || (only_trashed && names(&behavior.unreadable_trash)) {
         return error(StatusCode::NOT_FOUND, "File not found.");
     }
     let unavailable = {
@@ -1656,6 +1780,7 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
         .iter()
         .filter(|file| file.parents.iter().any(|id| request.parents.contains(id)))
         .filter(|file| !(exclude_trashed && file.trashed))
+        .filter(|file| !only_trashed || file.trashed)
         .filter(|file| drive.is_none_or(|drive| file.drive_id.as_deref() == Some(drive)))
         .collect::<Vec<_>>();
 
@@ -1756,7 +1881,8 @@ fn permissions(
     json_response(StatusCode::OK, &body)
 }
 
-/// The routes of `files activity`: the audit log and `permissions.list`.
+/// The routes of `files activity` and `files diverged`: the audit log, `permissions.list` and
+/// `revisions.list`.
 async fn activity_route(
     state: &State,
     request: &hyper::Request<Incoming>,
@@ -1769,11 +1895,77 @@ async fn activity_route(
     if path == AUDIT_PATH {
         return Some(audit(state, params.to_vec(), request.headers()).await);
     }
-    let id = path
-        .strip_prefix(LIST_PATH)?
-        .strip_prefix('/')?
-        .strip_suffix(PERMISSIONS_SUFFIX)?;
+    let id = path.strip_prefix(LIST_PATH)?.strip_prefix('/')?;
+    if let Some(id) = id.strip_suffix(REVISIONS_SUFFIX) {
+        return Some(revisions(state, id, params.to_vec(), request.headers()));
+    }
+    let id = id.strip_suffix(PERMISSIONS_SUFFIX)?;
     Some(permissions(state, id, params.to_vec(), request.headers()))
+}
+
+/// `revisions.list` of the stored file `id`: its [`Behavior::revisions`] in their order,
+/// `pageSize` (200 without one) at a time, or the status of [`Behavior::revisions_refused`].
+fn revisions(
+    state: &State,
+    id: &str,
+    params: Vec<(String, String)>,
+    headers: &hyper::HeaderMap,
+) -> FakeResponse {
+    let request = ApiRequest {
+        file_id: id.to_owned(),
+        params,
+        authorization: authorization(headers),
+    };
+    state
+        .revision_requests
+        .lock()
+        .expect("revision requests lock")
+        .push(request.clone());
+    if state.file(id).is_none() {
+        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
+    }
+    if let Some(&status) = state.behavior.revisions_refused.get(id) {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
+        return error(
+            status,
+            "The user does not have sufficient permissions for this file.",
+        );
+    }
+    let all = state
+        .behavior
+        .revisions
+        .get(id)
+        .cloned()
+        .unwrap_or_default();
+    let offset = match request.param("pageToken") {
+        None => 0,
+        Some(token) => match parse_token(token, id) {
+            Some(offset) => offset,
+            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
+        },
+    };
+    if offset > 0 && state.behavior.revisions_fail_after_first_page.contains(id) {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error");
+    }
+    let requested = request
+        .param("pageSize")
+        .and_then(|size| size.parse::<usize>().ok())
+        .unwrap_or(200);
+    let page_size = state
+        .behavior
+        .page_size
+        .unwrap_or(requested)
+        .min(requested)
+        .max(1);
+    let end = (offset + page_size).min(all.len());
+    let mut body = json!({
+        "kind": "drive#revisionList",
+        "revisions": all.get(offset..end).unwrap_or_default(),
+    });
+    if end < all.len() {
+        body["nextPageToken"] = json!(token(end, id));
+    }
+    json_response(StatusCode::OK, &body)
 }
 
 /// What an audit log request selects.
@@ -2064,7 +2256,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{parent_ids, Behavior, Bounds, FakeDrive, FakeFile};
+    use super::{parent_ids, Behavior, Bounds, FakeDrive, FakeFile, FakeUser};
     use crate::common::media_client::MediaClient;
 
     #[tokio::test]
@@ -2340,6 +2532,106 @@ mod tests {
         assert_eq!(requests[1].file_id, "f");
         assert_eq!(requests[1].param("pageToken"), Some(token.as_str()));
         assert!(drive.gets().is_empty(), "not a files.get");
+    }
+
+    #[tokio::test]
+    async fn the_trash_users_and_revisions_are_answered() {
+        let ana = FakeUser::new("Ana", "ana@example.com");
+        let bob = FakeUser::named("Bob");
+        let drive = FakeDrive::start(
+            vec![
+                FakeFile::folder("f", "f", "root"),
+                FakeFile::blob("a", "a.txt", "f", "a")
+                    .created("2026-11-01T00:00:00Z")
+                    .modified_by(ana.clone())
+                    .owned_by(bob),
+                FakeFile::blob("t", "t.txt", "f", "t")
+                    .trashed_by(Some(ana), Some("2026-11-02T00:00:00Z")),
+                FakeFile::blob("r", "r.txt", "f", "r"),
+                FakeFile::blob("x", "x.txt", "f", "x"),
+            ],
+            Behavior {
+                revisions: [(
+                    String::from("a"),
+                    vec![json!({"id": "1", "modifiedTime": "2026-11-01T00:00:00Z"})],
+                )]
+                .into(),
+                revisions_refused: [(String::from("r"), 403)].into(),
+                unreadable_trash: [String::from("g")].into(),
+                ..Behavior::default()
+            },
+        )
+        .await;
+        let hub = drive.hub();
+        let list = |q: &'static str| {
+            let hub = hub.clone();
+            async move {
+                let (_, list) = hub.files().list().q(q).doit().await.unwrap();
+                list.files.unwrap_or_default()
+            }
+        };
+        let ids = |files: &[google_drive3::api::File]| {
+            files
+                .iter()
+                .map(|file| file.id.clone().unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        let kept = list("'f' in parents and trashed = false").await;
+        assert_eq!(ids(&kept), ["a", "r", "x"]);
+        let a = &kept[0];
+        let user = a.last_modifying_user.as_ref().unwrap();
+        assert_eq!(user.email_address.as_deref(), Some("ana@example.com"));
+        assert_eq!(user.display_name.as_deref(), Some("Ana"));
+        let owner = &a.owners.as_ref().unwrap()[0];
+        assert_eq!(
+            (
+                owner.display_name.as_deref(),
+                owner.email_address.as_deref()
+            ),
+            (Some("Bob"), None)
+        );
+        assert!(a.created_time.is_some() && a.trashing_user.is_none());
+
+        let trashed = list("'f' in parents and trashed = true").await;
+        assert_eq!(ids(&trashed), ["t"]);
+        assert_eq!(trashed[0].explicitly_trashed, Some(true));
+        assert!(trashed[0].trashed_time.is_some());
+        assert_eq!(
+            trashed[0]
+                .trashing_user
+                .as_ref()
+                .unwrap()
+                .email_address
+                .as_deref(),
+            Some("ana@example.com")
+        );
+        assert!(hub
+            .files()
+            .list()
+            .q("'g' in parents and trashed = true")
+            .doit()
+            .await
+            .is_err());
+        assert!(hub
+            .files()
+            .list()
+            .q("'g' in parents and trashed = false")
+            .doit()
+            .await
+            .is_ok());
+
+        let (_, revisions) = hub.revisions().list("a").doit().await.unwrap();
+        assert_eq!(revisions.revisions.unwrap().len(), 1);
+        let (_, none) = hub.revisions().list("x").doit().await.unwrap();
+        assert!(none.revisions.unwrap_or_default().is_empty());
+        assert!(hub.revisions().list("r").doit().await.is_err());
+        assert!(hub.revisions().list("missing").doit().await.is_err());
+        let requests = drive.revision_requests();
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].file_id, "a");
+        assert!(drive.gets().is_empty(), "not a files.get");
+        assert_eq!(drive.writes(), Vec::<String>::new());
     }
 
     #[test]

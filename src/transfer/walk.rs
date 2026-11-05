@@ -120,6 +120,11 @@
 //! warning and a non-zero exit, and the walk lists with its own `listing_jobs` while the
 //! scheduler's bounded queue paces it.
 //!
+//! `files diverged` walks the origin of a migration with a wider mask
+//! ([`Walk::start_with_fields`]: who last modified and who owns each file), and lists single
+//! levels of folders (the copy, the trash of the origin's folders) with [`children_query`] and
+//! [`request_page`], batched the same way.
+//!
 //! Still to do:
 //!
 //! - A file with a `resourceKey` (shared by link only) must be downloaded with the
@@ -403,6 +408,18 @@ impl Walk {
     /// Starts walking the subtree of `root` on the current Tokio runtime.
     #[must_use]
     pub(crate) fn start(hub: Arc<Hub>, root: WalkRoot, options: WalkOptions) -> Walk {
+        Self::start_with_fields(hub, root, options, FIELDS)
+    }
+
+    /// [`Self::start`] with the `fields` mask `fields` instead of [`FIELDS`], for a consumer
+    /// that reads more of each file. It must name every field of [`FIELDS`].
+    #[must_use]
+    pub(crate) fn start_with_fields(
+        hub: Arc<Hub>,
+        root: WalkRoot,
+        options: WalkOptions,
+        fields: &'static str,
+    ) -> Walk {
         let options = options.normalized();
         let (sender, items) = mpsc::channel(options.buffer);
 
@@ -432,6 +449,7 @@ impl Walk {
         let producer = Producer {
             hub,
             options,
+            fields,
             sender,
             pending: VecDeque::from([root]),
             visited: HashSet::from([id]),
@@ -605,15 +623,26 @@ impl Batch {
 /// The `q` of a batch: `('a' in parents or 'b' in parents) and trashed = false`. One folder is
 /// listed with the query of `files list --parent`: `'a' in parents and trashed = false`.
 fn parents_query<'a>(ids: impl Iterator<Item = &'a str>) -> String {
+    children_query(ids, false)
+}
+
+/// The `q` that lists the children of the folders `ids` that are in the trash (`trashed`) or
+/// not: `('a' in parents or 'b' in parents) and trashed = <trashed>`, for one folder
+/// `'a' in parents and trashed = <trashed>` (without the trash, the query of
+/// `files list --parent`).
+pub(crate) fn children_query<'a>(ids: impl Iterator<Item = &'a str>, trashed: bool) -> String {
     let ids = ids.collect::<Vec<_>>();
     if let [id] = ids.as_slice() {
-        return ListQuery::files_in_folder((*id).to_owned()).q();
+        if !trashed {
+            return ListQuery::files_in_folder((*id).to_owned()).q();
+        }
+        return format!("{} in parents and trashed = true", quote(id));
     }
     let parents = ids
         .iter()
         .map(|id| format!("{} in parents", quote(id)))
         .collect::<Vec<_>>();
-    format!("({}) and trashed = false", parents.join(" or "))
+    format!("({}) and trashed = {trashed}", parents.join(" or "))
 }
 
 /// Quotes a value as a string literal of the Drive query language: `'` and `\` are escaped
@@ -645,6 +674,8 @@ struct Closed;
 struct Producer {
     hub: Arc<Hub>,
     options: WalkOptions,
+    /// The `fields` mask of every request.
+    fields: &'static str,
     sender: mpsc::Sender<WalkItem>,
     /// Folders waiting to be listed, in breadth-first order (split batches go to the front).
     pending: VecDeque<PendingFolder>,
@@ -702,8 +733,9 @@ impl Producer {
 
     fn request(&mut self, batch: Batch, page_token: Option<String>) {
         let hub = Arc::clone(&self.hub);
+        let fields = self.fields;
         self.in_flight.push(Box::pin(async move {
-            let result = list_page(&hub, &batch, page_token.as_deref()).await;
+            let result = list_page(&hub, &batch, fields, page_token.as_deref()).await;
             Page { batch, result }
         }));
     }
@@ -907,21 +939,53 @@ impl Producer {
     }
 }
 
-/// Requests one page of a batch's query, through either request path, retried per the hub's
-/// policy and sharing its throttle: a rate limit seen by one listing slot holds back the others
-/// and the transfers of the same hub.
+/// Requests one page of a batch's query with the `fields` mask `fields`, through either request
+/// path, retried per the hub's policy and sharing its throttle: a rate limit seen by one listing
+/// slot holds back the others and the transfers of the same hub.
 async fn list_page(
     hub: &Hub,
     batch: &Batch,
+    fields: &str,
     page_token: Option<&str>,
 ) -> Result<FileList, Box<google_drive3::Error>> {
     let resource_keys = batch.resource_keys();
-    let resource_keys = resource_keys.as_deref();
+    let drive_id = match batch.corpus() {
+        Corpus::User => None,
+        Corpus::Drive(drive_id) => Some(drive_id.as_str()),
+    };
+    let query = PageQuery {
+        q: &batch.q,
+        fields,
+        drive_id,
+        resource_keys: resource_keys.as_deref(),
+    };
+    request_page(hub, &query, page_token).await
+}
+
+/// One `files.list` request as the walk sends it: `pageSize` 1000, items of all drives, and the
+/// [`RESOURCE_KEYS_HEADER`] when folders shared by link only are named.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PageQuery<'a> {
+    pub(crate) q: &'a str,
+    pub(crate) fields: &'a str,
+    /// The shared drive searched (`corpora=drive`, `driveId`); `None`: the user's corpus.
+    pub(crate) drive_id: Option<&'a str>,
+    /// The value of the [`RESOURCE_KEYS_HEADER`], if any folder needs one.
+    pub(crate) resource_keys: Option<&'a str>,
+}
+
+/// Requests one page of `query`, retried per the hub's policy and sharing its throttle, through
+/// google-drive3 or, with resource keys, through a request of its own.
+pub(crate) async fn request_page(
+    hub: &Hub,
+    query: &PageQuery<'_>,
+    page_token: Option<&str>,
+) -> Result<FileList, Box<google_drive3::Error>> {
     retry_read(hub.retrier(), "files.list", |mut delegate| async move {
-        let page = match resource_keys {
-            None => list_page_call(hub, batch, page_token, &mut delegate).await,
+        let page = match query.resource_keys {
+            None => list_page_call(hub, query, page_token, &mut delegate).await,
             Some(resource_keys) => {
-                list_page_with_resource_keys(hub, batch, page_token, resource_keys, &delegate).await
+                list_page_with_resource_keys(hub, query, page_token, resource_keys, &delegate).await
             }
         };
         page.map_err(|error| *error)
@@ -933,23 +997,23 @@ async fn list_page(
 /// The page request through google-drive3's `files.list` call.
 async fn list_page_call(
     hub: &Hub,
-    batch: &Batch,
+    query: &PageQuery<'_>,
     page_token: Option<&str>,
     delegate: &mut ApiDelegate,
 ) -> Result<FileList, Box<google_drive3::Error>> {
     let mut call = hub
         .files()
         .list()
-        .q(&batch.q)
+        .q(query.q)
         .page_size(PAGE_SIZE)
         .supports_all_drives(true)
         .include_items_from_all_drives(true)
-        .param("fields", FIELDS)
+        .param("fields", query.fields)
         .add_scope(Scope::Full);
     if let Some(token) = page_token {
         call = call.page_token(token);
     }
-    if let Corpus::Drive(drive_id) = batch.corpus() {
+    if let Some(drive_id) = query.drive_id {
         call = call.corpora("drive").drive_id(drive_id);
     }
 
@@ -963,7 +1027,7 @@ async fn list_page_call(
 /// delegate, so that the retry policy sees its `Retry-After`.
 async fn list_page_with_resource_keys(
     hub: &Hub,
-    batch: &Batch,
+    query: &PageQuery<'_>,
     page_token: Option<&str>,
     resource_keys: &str,
     delegate: &ApiDelegate,
@@ -972,17 +1036,17 @@ async fn list_page_with_resource_keys(
 
     let page_size = PAGE_SIZE.to_string();
     let mut params = vec![
-        ("q", batch.q.as_str()),
+        ("q", query.q),
         ("pageSize", page_size.as_str()),
         ("supportsAllDrives", "true"),
         ("includeItemsFromAllDrives", "true"),
-        ("fields", FIELDS),
+        ("fields", query.fields),
         ("alt", "json"),
     ];
     if let Some(token) = page_token {
         params.push(("pageToken", token));
     }
-    if let Corpus::Drive(drive_id) = batch.corpus() {
+    if let Some(drive_id) = query.drive_id {
         params.push(("corpora", "drive"));
         params.push(("driveId", drive_id));
     }

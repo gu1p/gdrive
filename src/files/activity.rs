@@ -18,7 +18,7 @@
 //! of the items or of the time range would tell wrongly that people are gone. The report is made
 //! whole before its first line is printed, so a failure leaves stdout empty.
 
-mod report;
+pub(crate) mod report;
 mod scan;
 mod sharing;
 #[cfg(test)]
