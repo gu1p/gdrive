@@ -53,8 +53,16 @@ pub(crate) enum AccountType {
 /// Whether `path` is the directory of an account: gdrive 3.x accounts have `tokens.json`, the
 /// others have `account.json` (a service account has no `tokens.json` until it got a token, an
 /// ADC account never has one).
+///
+/// A directory that gdrive uses itself is never an account, whatever is in it: the lock of an
+/// account named `tokens.json` is the file `.locks/tokens.json`.
 pub(super) fn is_account_dir(path: &Path) -> bool {
-    path.join(TOKENS_CONFIG_NAME).exists() || path.join(ACCOUNT_CONFIG_NAME).is_file()
+    let reserved = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_reserved_name);
+    !reserved
+        && (path.join(TOKENS_CONFIG_NAME).exists() || path.join(ACCOUNT_CONFIG_NAME).is_file())
 }
 
 /// The names under the config root that gdrive uses itself: the file that names the current
@@ -74,9 +82,14 @@ pub(crate) fn is_valid_account_name(name: &str) -> bool {
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     ) && !name.contains(['/', '\\'])
-        && !RESERVED_NAMES
-            .iter()
-            .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        && !is_reserved_name(name)
+}
+
+/// Whether `name` is one of the [`RESERVED_NAMES`], in any case.
+fn is_reserved_name(name: &str) -> bool {
+    RESERVED_NAMES
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 impl AppConfig {
@@ -518,6 +531,32 @@ mod tests {
             assert!(!is_valid_account_name(name), "{name:?}");
             assert!(AppConfig::named_account_in(PathBuf::from("/base"), name).is_none());
         }
+    }
+
+    /// The lock of an account named `tokens.json` is `.locks/tokens.json`, and a staged account
+    /// has an `account.json`: neither makes gdrive's own directory an account.
+    #[test]
+    fn the_directories_gdrive_uses_itself_are_never_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        for (directory, file) in [
+            (LOCKS_DIR_NAME, TOKENS_CONFIG_NAME),
+            (LOCKS_DIR_NAME, ACCOUNT_CONFIG_NAME),
+            (STAGING_DIR_NAME, TOKENS_CONFIG_NAME),
+            (STAGING_DIR_NAME, ACCOUNT_CONFIG_NAME),
+            ("me@example.com", TOKENS_CONFIG_NAME),
+        ] {
+            std::fs::create_dir_all(base.join(directory)).unwrap();
+            std::fs::write(base.join(directory).join(file), "[]").unwrap();
+        }
+
+        assert!(!is_account_dir(&base.join(LOCKS_DIR_NAME)));
+        assert!(!is_account_dir(&base.join(STAGING_DIR_NAME)));
+        assert!(is_account_dir(&base.join("me@example.com")));
+        assert_eq!(
+            list_accounts_in(base.to_path_buf()).unwrap(),
+            ["me@example.com"]
+        );
     }
 
     #[tokio::test]
