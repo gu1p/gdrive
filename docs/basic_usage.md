@@ -30,6 +30,30 @@ For CI and servers, gdrive 4.0.0 also takes a service account key (`gdrive accou
 KEY_JSON`) or Application Default Credentials (`gdrive account add --adc`); see
 [Service accounts](service_accounts.md).
 
+### Audit log access
+
+`gdrive files activity` reads the audit log of a Google Workspace organization, which records who viewed,
+downloaded or changed its files. That needs one more permission, which gdrive asks for only when you add
+`--audit-log` to the login:
+
+```sh
+gdrive account add --audit-log                     # a new account
+gdrive account reauth <ACCOUNT_NAME> --audit-log   # an account you added already
+```
+
+- Sign in with a Google account that is an administrator of the organization, with the Reports privilege
+  (super administrators have it). A personal Gmail account has no audit log.
+- The access is read-only: gdrive can read the organization's audit log, and changes nothing.
+- The OAuth client needs some more setup first: the Admin SDK API and one more scope. See
+  [Audit log access](create_google_api_credentials.md#audit-log-access-optional) in the credentials guide.
+- The consent screen has a box for the audit log. Leave it ticked. If you untick it, gdrive saves nothing
+  and tells you to run the command again.
+- A later `gdrive account reauth <ACCOUNT_NAME>`, without `--audit-log`, asks for the access again by
+  itself, so a routine new sign-in keeps it. If you untick the box then, gdrive saves the Drive
+  authorization and prints a warning that the audit log access is gone.
+- Service accounts and Application Default Credentials cannot read the audit log yet: `--audit-log` does
+  not work with `--service-account` or `--adc`.
+
 ## Find file and folder ids
 
 Most commands take a file id or a folder id. An id is a string such as
