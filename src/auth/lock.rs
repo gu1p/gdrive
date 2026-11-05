@@ -27,7 +27,8 @@
 //! - `account add` and `account reauth`: read the previous tokens, check the audit-log grant, write
 //!   the secret (`add`) and the tokens;
 //! - `account remove`: delete the directory;
-//! - `account import`: check that the account does not exist, unpack it;
+//! - `account import`: check that the account does not exist, and move it, unpacked beside the
+//!   accounts before, into place;
 //! - adding a service account or Application Default Credentials (`AppConfig::install`): check the
 //!   account that is there, swap in the directory that was prepared beside it;
 //! - `account export`: read the directory into the archive.

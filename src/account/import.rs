@@ -30,25 +30,42 @@ pub(crate) fn import(config: &Config) -> Result<(), Error> {
     }
 
     let config_base_path = AppConfig::default_base_path().map_err(Error::DefaultBasePath)?;
+    let account_path = config_base_path.join(&account_name);
+    let lock = AccountLock::new(&config_base_path, &account_name).map_err(|source| {
+        Error::Lock(LockError::Io {
+            path: account_path.clone(),
+            source,
+        })
+    })?;
+
+    // Unpacked into a private directory under the staging directory first, and moved into
+    // place with one rename: a failure or a crash halfway never leaves half an account under its
+    // name. The staging directory is removed when it goes out of scope.
+    let staging_root = config_base_path.join(account_type::STAGING_DIR_NAME);
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(&staging_root).map_err(Error::Install)?;
+    let staging = tempfile::Builder::new()
+        .prefix("import-")
+        .tempdir_in(&staging_root)
+        .map_err(Error::Install)?;
+    account_archive::unpack(&config.archive_path, staging.path()).map_err(Error::Unpack)?;
+    let unpacked = staging.path().join(&account_name);
+
     // Under the lock of the account (see `auth::lock`), which a process of an account of this
     // name that was removed may still hold, and where the check is made again: another process
     // may have added the account in the meantime.
-    AccountLock::new(&config_base_path, &account_name)
-        .map_err(|source| {
-            Error::Lock(LockError::Io {
-                path: config_base_path.join(&account_name),
-                source,
-            })
-        })?
-        .hold(LOCK_TIMEOUT, |_| {
-            if AppConfig::named_account_in(config_base_path.clone(), &account_name)
-                .is_some_and(|account| account.exists())
-            {
-                return Err(Error::AccountExists(account_name.clone()));
-            }
-            account_archive::unpack(&config.archive_path, &config_base_path).map_err(Error::Unpack)
-        })
-        .map_err(Error::Lock)??;
+    lock.hold(LOCK_TIMEOUT, |_| {
+        if AppConfig::named_account_in(config_base_path.clone(), &account_name)
+            .is_some_and(|account| account.exists())
+        {
+            return Err(Error::AccountExists(account_name.clone()));
+        }
+        std::fs::rename(&unpacked, &account_path).map_err(Error::Install)
+    })
+    .map_err(Error::Lock)??;
 
     println!("Imported account '{account_name}'");
 
@@ -72,6 +89,8 @@ pub(crate) enum Error {
     LoadAccount(app_config::errors::LoadAccount),
     SwitchAccount(app_config::errors::SaveAccountConfig),
     Lock(LockError),
+    /// The account could not be staged or moved into place.
+    Install(std::io::Error),
 }
 
 impl error::Error for Error {
@@ -86,6 +105,7 @@ impl error::Error for Error {
             Error::SwitchAccount(error) => Some(error),
             // Shown as the lock error itself, which names the account and what to do.
             Error::Lock(error) => error.source(),
+            Error::Install(error) => Some(error),
         }
     }
 }
@@ -106,6 +126,7 @@ impl Display for Error {
             Error::LoadAccount(_) => f.write_str("unable to load account"),
             Error::SwitchAccount(_) => f.write_str("unable to switch account"),
             Error::Lock(error) => error.fmt(f),
+            Error::Install(_) => f.write_str("unable to put the imported account in place"),
         }
     }
 }
