@@ -28,25 +28,6 @@
 //! returns what the test started the fake with. Every request that is not a `GET` is also in
 //! [`FakeDrive::writes`], which is empty for an account that was only read.
 //!
-//! For `files diverged` it lists the children of folders that are in the trash
-//! (`trashed = true`), with `explicitlyTrashed`, `trashedTime` and `trashingUser`
-//! ([`FakeFile::trashed_by`]), returns `lastModifyingUser` and `owners` ([`FakeFile::modified_by`],
-//! [`FakeFile::owned_by`]), and answers `revisions.list` of a stored file from
-//! [`Behavior::revisions`], paged ([`FakeDrive::revision_requests`]);
-//! [`Behavior::revisions_refused`] and [`Behavior::revisions_fail_after_first_page`] make it fail,
-//! and [`Behavior::unreadable_trash`] fails the listings of the trash.
-//!
-//! For `files activity` it answers `permissions.list` of a stored file from
-//! [`Behavior::permissions`] (paged with `pageSize` and `pageToken`), and the audit log of the
-//! Admin SDK Reports API (`GET /admin/reports/v1/activity/users/all/applications/drive`) from
-//! the records of [`Behavior::audit_log`]: newest first, within `startTime` (included, unless
-//! [`Bounds::BothExcluded`]) and `endTime` (excluded), with `filters` of `name==value`
-//! terms over event parameters (a record matches when one of its events has all of them), paged
-//! with `maxResults` and `pageToken`. Both record their requests ([`FakeDrive::audit_requests`],
-//! [`FakeDrive::permission_requests`]); [`Behavior::audit_error`],
-//! [`Behavior::audit_error_after_first_page`] and [`Behavior::audit_rate_limited`] make the
-//! audit log fail.
-//!
 //! A test that checks how many requests were in flight at once does not rely on delays: the
 //! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
 //! listing until a download has started, so the overlap happens however slow the machine is.
@@ -82,46 +63,6 @@ const ABOUT_PATH: &str = "/drive/v3/about";
 const GENERATE_IDS_PATH: &str = "/drive/v3/files/generateIds";
 const UPLOAD_PATH: &str = "/upload/drive/v3/files";
 const SESSION_PATH: &str = "/upload-session/";
-const AUDIT_PATH: &str = "/admin/reports/v1/activity/users/all/applications/drive";
-const PERMISSIONS_SUFFIX: &str = "/permissions";
-const REVISIONS_SUFFIX: &str = "/revisions";
-
-/// A user as Drive names one in `lastModifyingUser`, `owners` and `trashingUser`.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct FakeUser {
-    pub(crate) display_name: Option<String>,
-    pub(crate) email: Option<String>,
-}
-
-impl FakeUser {
-    /// A user with a display name and an email address.
-    pub(crate) fn new(display_name: &str, email: &str) -> Self {
-        Self {
-            display_name: Some(display_name.to_owned()),
-            email: Some(email.to_owned()),
-        }
-    }
-
-    /// A user whose email address Drive does not show.
-    pub(crate) fn named(display_name: &str) -> Self {
-        Self {
-            display_name: Some(display_name.to_owned()),
-            email: None,
-        }
-    }
-
-    fn to_json(&self) -> Value {
-        let mut user = Map::new();
-        user.insert("kind".into(), json!("drive#user"));
-        if let Some(name) = &self.display_name {
-            user.insert("displayName".into(), json!(name));
-        }
-        if let Some(email) = &self.email {
-            user.insert("emailAddress".into(), json!(email));
-        }
-        Value::Object(user)
-    }
-}
 
 /// A file stored by the fake.
 #[derive(Debug, Clone, Default)]
@@ -133,8 +74,6 @@ pub(crate) struct FakeFile {
     pub(crate) size: Option<u64>,
     pub(crate) md5: Option<String>,
     pub(crate) trashed: bool,
-    /// `explicitlyTrashed`, sent only when set: `Some(false)` for an item in a trashed folder.
-    pub(crate) explicitly_trashed: Option<bool>,
     pub(crate) drive_id: Option<String>,
     /// Target id and target MIME type of a shortcut.
     pub(crate) shortcut_target: Option<(String, String)>,
@@ -146,14 +85,6 @@ pub(crate) struct FakeFile {
     pub(crate) modified_time: Option<String>,
     /// `createdTime`, RFC 3339.
     pub(crate) created_time: Option<String>,
-    /// `lastModifyingUser`, sent only when set.
-    pub(crate) last_modifying_user: Option<FakeUser>,
-    /// `owners`, sent only when there are some.
-    pub(crate) owners: Vec<FakeUser>,
-    /// `trashedTime`, RFC 3339, sent only when set.
-    pub(crate) trashed_time: Option<String>,
-    /// `trashingUser`, sent only when set.
-    pub(crate) trashing_user: Option<FakeUser>,
 }
 
 impl FakeFile {
@@ -218,42 +149,6 @@ impl FakeFile {
         }
     }
 
-    /// With `createdTime` (RFC 3339).
-    pub(crate) fn created(self, time: &str) -> Self {
-        Self {
-            created_time: Some(time.to_owned()),
-            ..self
-        }
-    }
-
-    /// Last modified by `user` (`lastModifyingUser`).
-    pub(crate) fn modified_by(self, user: FakeUser) -> Self {
-        Self {
-            last_modifying_user: Some(user),
-            ..self
-        }
-    }
-
-    /// Owned by `user` (`owners`).
-    pub(crate) fn owned_by(self, user: FakeUser) -> Self {
-        Self {
-            owners: vec![user],
-            ..self
-        }
-    }
-
-    /// Moved to the trash by `user` (`None`: Drive does not say, as outside shared drives) at
-    /// `time` (RFC 3339; `None`: Drive does not say): `trashed` and `explicitlyTrashed`.
-    pub(crate) fn trashed_by(self, user: Option<FakeUser>, time: Option<&str>) -> Self {
-        Self {
-            trashed: true,
-            explicitly_trashed: Some(true),
-            trashing_user: user,
-            trashed_time: time.map(str::to_owned),
-            ..self
-        }
-    }
-
     pub(crate) fn shortcut(
         id: &str,
         name: &str,
@@ -274,16 +169,6 @@ impl FakeFile {
     pub(crate) fn trashed(self) -> Self {
         Self {
             trashed: true,
-            ..self
-        }
-    }
-
-    /// In the trash because a folder above it is, as Drive reports such an item: `trashed`, not
-    /// `explicitlyTrashed`.
-    pub(crate) fn in_trashed_folder(self) -> Self {
-        Self {
-            trashed: true,
-            explicitly_trashed: Some(false),
             ..self
         }
     }
@@ -323,9 +208,6 @@ impl FakeFile {
         file.insert("name".into(), json!(self.name));
         file.insert("mimeType".into(), json!(self.mime_type));
         file.insert("trashed".into(), json!(self.trashed));
-        if let Some(explicitly) = self.explicitly_trashed {
-            file.insert("explicitlyTrashed".into(), json!(explicitly));
-        }
         if with_parents {
             file.insert("parents".into(), json!(self.parents));
         }
@@ -343,19 +225,6 @@ impl FakeFile {
         }
         if let Some(created_time) = &self.created_time {
             file.insert("createdTime".into(), json!(created_time));
-        }
-        if let Some(user) = &self.last_modifying_user {
-            file.insert("lastModifyingUser".into(), user.to_json());
-        }
-        if !self.owners.is_empty() {
-            let owners = self.owners.iter().map(FakeUser::to_json).collect();
-            file.insert("owners".into(), Value::Array(owners));
-        }
-        if let Some(trashed_time) = &self.trashed_time {
-            file.insert("trashedTime".into(), json!(trashed_time));
-        }
-        if let Some(user) = &self.trashing_user {
-            file.insert("trashingUser".into(), user.to_json());
         }
         if let Some(resource_key) = &self.resource_key {
             file.insert("resourceKey".into(), json!(resource_key));
@@ -440,44 +309,6 @@ pub(crate) struct Behavior {
     pub(crate) list_after_media: HashSet<String>,
     /// The email address `about.get` reports; `fake@example.com` without one.
     pub(crate) account_email: Option<String>,
-    /// The records of the audit log, as the Reports API returns them in `items`.
-    pub(crate) audit_log: Vec<Value>,
-    /// The most audit records per page; `None` honors `maxResults`.
-    pub(crate) audit_page_size: Option<usize>,
-    /// Whether `startTime` takes a record of that very time.
-    pub(crate) audit_bounds: Bounds,
-    /// Every audit log request is answered with this status and JSON body.
-    pub(crate) audit_error: Option<(u16, Value)>,
-    /// Every audit log request for a page after the first (with a `pageToken`) is answered
-    /// with this status and JSON body.
-    pub(crate) audit_error_after_first_page: Option<(u16, Value)>,
-    /// The first this many audit log requests are answered with 429, a rate limit.
-    pub(crate) audit_rate_limited: usize,
-    /// The first this many audit log requests are held until all of them have arrived.
-    pub(crate) audit_rendezvous: usize,
-    /// The sharing list of these file ids: the permissions `permissions.list` returns.
-    pub(crate) permissions: HashMap<String, Vec<Value>>,
-    /// `permissions.list` of these file ids fails with 403.
-    pub(crate) permissions_unreadable: HashSet<String>,
-    /// A query for the trash (`trashed = true`) naming one of these folders fails with 404.
-    pub(crate) unreadable_trash: HashSet<String>,
-    /// The revisions `revisions.list` returns of these file ids, oldest first; a stored file
-    /// that is not here has none.
-    pub(crate) revisions: HashMap<String, Vec<Value>>,
-    /// `revisions.list` of these file ids fails with this status (403, 404, ...).
-    pub(crate) revisions_refused: HashMap<String, u16>,
-    /// `revisions.list` of these file ids fails with 500 on every page after the first.
-    pub(crate) revisions_fail_after_first_page: HashSet<String>,
-}
-
-/// Which ends of its time range an audit log request includes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum Bounds {
-    /// `startTime` is included, `endTime` is not.
-    #[default]
-    StartIncluded,
-    /// Neither is.
-    BothExcluded,
 }
 
 /// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
@@ -571,26 +402,6 @@ impl ListRequest {
     }
 }
 
-/// An audit log, `permissions.list` or `revisions.list` request as the fake saw it, with
-/// percent-decoded parameters.
-#[derive(Debug, Clone)]
-pub(crate) struct ApiRequest {
-    /// For `permissions.list` and `revisions.list`, the file id; empty for the audit log.
-    pub(crate) file_id: String,
-    pub(crate) params: Vec<(String, String)>,
-    /// The `Authorization` header.
-    pub(crate) authorization: Option<String>,
-}
-
-impl ApiRequest {
-    pub(crate) fn param(&self, name: &str) -> Option<&str> {
-        self.params
-            .iter()
-            .find(|(key, _)| key == name)
-            .map(|(_, value)| value.as_str())
-    }
-}
-
 struct State {
     /// The stored files; creates, content updates and metadata updates change them.
     files: Mutex<Vec<FakeFile>>,
@@ -644,14 +455,6 @@ struct State {
     media_arrived: watch::Sender<bool>,
     /// The chunks held without a reply ([`Behavior::chunks_stalled_from`]).
     stalled_chunks: watch::Sender<usize>,
-    audit_requests: Mutex<Vec<ApiRequest>>,
-    /// The 429 replies still to send ([`Behavior::audit_rate_limited`]).
-    audit_rate_limited_left: Mutex<usize>,
-    audit_in_flight: AtomicUsize,
-    audit_max_in_flight: AtomicUsize,
-    audit_rendezvous: Rendezvous,
-    permission_requests: Mutex<Vec<ApiRequest>>,
-    revision_requests: Mutex<Vec<ApiRequest>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -670,8 +473,6 @@ impl FakeDrive {
         let upload_rendezvous = Rendezvous::new(behavior.upload_rendezvous);
         let media_rendezvous = Rendezvous::new(behavior.media_rendezvous);
         let list_rendezvous = Rendezvous::new(behavior.list_rendezvous.len());
-        let audit_rendezvous = Rendezvous::new(behavior.audit_rendezvous);
-        let audit_rate_limited_left = Mutex::new(behavior.audit_rate_limited);
         let state = Arc::new(State {
             files: Mutex::new(files),
             unavailable_left: Mutex::new(behavior.unavailable_first.clone()),
@@ -706,13 +507,6 @@ impl FakeDrive {
             list_rendezvous,
             media_arrived: watch::channel(false).0,
             stalled_chunks: watch::channel(0).0,
-            audit_requests: Mutex::new(Vec::new()),
-            audit_rate_limited_left,
-            audit_in_flight: AtomicUsize::new(0),
-            audit_max_in_flight: AtomicUsize::new(0),
-            audit_rendezvous,
-            permission_requests: Mutex::new(Vec::new()),
-            revision_requests: Mutex::new(Vec::new()),
         });
 
         let server_state = Arc::clone(&state);
@@ -839,38 +633,6 @@ impl FakeDrive {
         self.state.uploads_max_in_flight.load(Ordering::SeqCst)
     }
 
-    /// The requests to the audit log, in arrival order.
-    pub(crate) fn audit_requests(&self) -> Vec<ApiRequest> {
-        self.state
-            .audit_requests
-            .lock()
-            .expect("audit requests lock")
-            .clone()
-    }
-
-    /// The most audit log requests that were being answered at the same time.
-    pub(crate) fn audit_max_in_flight(&self) -> usize {
-        self.state.audit_max_in_flight.load(Ordering::SeqCst)
-    }
-
-    /// The `permissions.list` requests, in arrival order.
-    pub(crate) fn permission_requests(&self) -> Vec<ApiRequest> {
-        self.state
-            .permission_requests
-            .lock()
-            .expect("permission requests lock")
-            .clone()
-    }
-
-    /// The `revisions.list` requests, in arrival order.
-    pub(crate) fn revision_requests(&self) -> Vec<ApiRequest> {
-        self.state
-            .revision_requests
-            .lock()
-            .expect("revision requests lock")
-            .clone()
-    }
-
     /// When the first media download arrived and when the last list reply was sent.
     pub(crate) fn first_media_and_last_list(&self) -> (Option<Instant>, Option<Instant>) {
         (
@@ -947,9 +709,6 @@ async fn handle(
 
     let path = request.uri().path().to_owned();
     record_write(&state, request.method(), &path);
-    if let Some(response) = activity_route(&state, &request, &path, &params).await {
-        return Ok(response);
-    }
     if request.method() == Method::POST && path == UPLOAD_PATH {
         let resumable = params
             .iter()
@@ -1721,8 +1480,7 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     let behavior = &state.behavior;
     let names = |set: &HashSet<String>| request.parents.iter().any(|id| set.contains(id));
 
-    let only_trashed = q.contains("trashed = true");
-    if names(&behavior.unreadable) || (only_trashed && names(&behavior.unreadable_trash)) {
+    if names(&behavior.unreadable) {
         return error(StatusCode::NOT_FOUND, "File not found.");
     }
     let unavailable = {
@@ -1780,7 +1538,6 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
         .iter()
         .filter(|file| file.parents.iter().any(|id| request.parents.contains(id)))
         .filter(|file| !(exclude_trashed && file.trashed))
-        .filter(|file| !only_trashed || file.trashed)
         .filter(|file| drive.is_none_or(|drive| file.drive_id.as_deref() == Some(drive)))
         .collect::<Vec<_>>();
 
@@ -1808,355 +1565,6 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
     }
     if names(&behavior.incomplete) {
         body["incompleteSearch"] = json!(true);
-    }
-    json_response(StatusCode::OK, &body)
-}
-
-/// The `Authorization` header of a request.
-fn authorization(headers: &hyper::HeaderMap) -> Option<String> {
-    headers
-        .get(hyper::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .map(String::from)
-}
-
-/// `permissions.list` of the stored file `id`: its [`Behavior::permissions`], `pageSize` (100
-/// without one) at a time.
-fn permissions(
-    state: &State,
-    id: &str,
-    params: Vec<(String, String)>,
-    headers: &hyper::HeaderMap,
-) -> FakeResponse {
-    let request = ApiRequest {
-        file_id: id.to_owned(),
-        params,
-        authorization: authorization(headers),
-    };
-    state
-        .permission_requests
-        .lock()
-        .expect("permission requests lock")
-        .push(request.clone());
-    if state.file(id).is_none() {
-        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
-    }
-    if state.behavior.permissions_unreadable.contains(id) {
-        return error(
-            StatusCode::FORBIDDEN,
-            "The user does not have sufficient permissions for this file.",
-        );
-    }
-    let all = state
-        .behavior
-        .permissions
-        .get(id)
-        .cloned()
-        .unwrap_or_default();
-    let offset = match request.param("pageToken") {
-        None => 0,
-        Some(token) => match parse_token(token, id) {
-            Some(offset) => offset,
-            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
-        },
-    };
-    let requested = request
-        .param("pageSize")
-        .and_then(|size| size.parse::<usize>().ok())
-        .unwrap_or(100);
-    let page_size = state
-        .behavior
-        .page_size
-        .unwrap_or(requested)
-        .min(requested)
-        .max(1);
-    let end = (offset + page_size).min(all.len());
-    let mut body = json!({
-        "kind": "drive#permissionList",
-        "permissions": all.get(offset..end).unwrap_or_default(),
-    });
-    if end < all.len() {
-        body["nextPageToken"] = json!(token(end, id));
-    }
-    json_response(StatusCode::OK, &body)
-}
-
-/// The routes of `files activity` and `files diverged`: the audit log, `permissions.list` and
-/// `revisions.list`.
-async fn activity_route(
-    state: &State,
-    request: &hyper::Request<Incoming>,
-    path: &str,
-    params: &[(String, String)],
-) -> Option<FakeResponse> {
-    if request.method() != Method::GET {
-        return None;
-    }
-    if path == AUDIT_PATH {
-        return Some(audit(state, params.to_vec(), request.headers()).await);
-    }
-    let id = path.strip_prefix(LIST_PATH)?.strip_prefix('/')?;
-    if let Some(id) = id.strip_suffix(REVISIONS_SUFFIX) {
-        return Some(revisions(state, id, params.to_vec(), request.headers()));
-    }
-    let id = id.strip_suffix(PERMISSIONS_SUFFIX)?;
-    Some(permissions(state, id, params.to_vec(), request.headers()))
-}
-
-/// `revisions.list` of the stored file `id`: its [`Behavior::revisions`] in their order,
-/// `pageSize` (200 without one) at a time, or the status of [`Behavior::revisions_refused`].
-fn revisions(
-    state: &State,
-    id: &str,
-    params: Vec<(String, String)>,
-    headers: &hyper::HeaderMap,
-) -> FakeResponse {
-    let request = ApiRequest {
-        file_id: id.to_owned(),
-        params,
-        authorization: authorization(headers),
-    };
-    state
-        .revision_requests
-        .lock()
-        .expect("revision requests lock")
-        .push(request.clone());
-    if state.file(id).is_none() {
-        return error(StatusCode::NOT_FOUND, &format!("File not found: {id}."));
-    }
-    if let Some(&status) = state.behavior.revisions_refused.get(id) {
-        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::FORBIDDEN);
-        return error(
-            status,
-            "The user does not have sufficient permissions for this file.",
-        );
-    }
-    let all = state
-        .behavior
-        .revisions
-        .get(id)
-        .cloned()
-        .unwrap_or_default();
-    let offset = match request.param("pageToken") {
-        None => 0,
-        Some(token) => match parse_token(token, id) {
-            Some(offset) => offset,
-            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
-        },
-    };
-    if offset > 0 && state.behavior.revisions_fail_after_first_page.contains(id) {
-        return error(StatusCode::INTERNAL_SERVER_ERROR, "Internal Error");
-    }
-    let requested = request
-        .param("pageSize")
-        .and_then(|size| size.parse::<usize>().ok())
-        .unwrap_or(200);
-    let page_size = state
-        .behavior
-        .page_size
-        .unwrap_or(requested)
-        .min(requested)
-        .max(1);
-    let end = (offset + page_size).min(all.len());
-    let mut body = json!({
-        "kind": "drive#revisionList",
-        "revisions": all.get(offset..end).unwrap_or_default(),
-    });
-    if end < all.len() {
-        body["nextPageToken"] = json!(token(end, id));
-    }
-    json_response(StatusCode::OK, &body)
-}
-
-/// What an audit log request selects.
-struct AuditQuery {
-    start: Option<chrono::DateTime<chrono::Utc>>,
-    end: Option<chrono::DateTime<chrono::Utc>>,
-    max_results: usize,
-    /// The `name==value` terms of `filters`.
-    terms: Vec<(String, String)>,
-    /// What a page token is bound to.
-    digest: String,
-}
-
-impl AuditQuery {
-    /// The query of `request`, or the reply to a request Google would refuse.
-    fn of(request: &ApiRequest) -> Result<Self, Box<FakeResponse>> {
-        let invalid = |name: &str| {
-            Box::new(error(
-                StatusCode::BAD_REQUEST,
-                &format!("Invalid value '{name}'"),
-            ))
-        };
-        let time = |name: &str| {
-            request
-                .param(name)
-                .map(|value| {
-                    chrono::DateTime::parse_from_rfc3339(value)
-                        .map(|time| time.with_timezone(&chrono::Utc))
-                        .map_err(|_| invalid(name))
-                })
-                .transpose()
-        };
-        let (start, end) = (time("startTime")?, time("endTime")?);
-        if let (Some(start), Some(end)) = (start, end) {
-            if start > end {
-                return Err(Box::new(error(
-                    StatusCode::BAD_REQUEST,
-                    "Start time must be less than or equal to the end time.",
-                )));
-            }
-        }
-        let max_results = match request.param("maxResults").map(str::parse::<usize>) {
-            None => 1000,
-            Some(Ok(max)) if (1..=1000).contains(&max) => max,
-            Some(_) => return Err(invalid("maxResults")),
-        };
-        let filters = request.param("filters").unwrap_or_default();
-        let terms = filters
-            .split(',')
-            .filter(|term| !term.is_empty())
-            .map(|term| {
-                term.split_once("==")
-                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
-                    .ok_or_else(|| invalid("filters"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let digest = format!(
-            "{:?} {:?} {filters} {max_results}",
-            request.param("startTime"),
-            request.param("endTime")
-        );
-        Ok(AuditQuery {
-            start,
-            end,
-            max_results,
-            terms,
-            digest,
-        })
-    }
-
-    /// Whether the query selects `record`: its time is in the range (a record without a
-    /// readable time always is), and one of its events has every term.
-    fn selects(&self, record: &Value, bounds: Bounds) -> bool {
-        let in_range = record_time(record).is_none_or(|time| {
-            let after_start = self.start.is_none_or(|start| match bounds {
-                Bounds::StartIncluded => time >= start,
-                Bounds::BothExcluded => time > start,
-            });
-            after_start && self.end.is_none_or(|end| time < end)
-        });
-        let has = |event: &Value, (name, value): &(String, String)| {
-            event["parameters"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|parameter| {
-                    parameter["name"] == name.as_str() && parameter["value"] == value.as_str()
-                })
-        };
-        in_range
-            && (self.terms.is_empty()
-                || record["events"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .any(|event| self.terms.iter().all(|term| has(event, term))))
-    }
-}
-
-/// The `id.time` of an audit record.
-fn record_time(record: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
-    record["id"]["time"]
-        .as_str()
-        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-        .map(|time| time.with_timezone(&chrono::Utc))
-}
-
-/// The audit log of the Reports API: the records of [`Behavior::audit_log`] that the request's
-/// time range and `filters` select, newest first, `maxResults` (1 to 1000) at a time.
-async fn audit(
-    state: &State,
-    params: Vec<(String, String)>,
-    headers: &hyper::HeaderMap,
-) -> FakeResponse {
-    let _in_flight = InFlight::new(&state.audit_in_flight, &state.audit_max_in_flight);
-    let request = ApiRequest {
-        file_id: String::new(),
-        params,
-        authorization: authorization(headers),
-    };
-    state
-        .audit_requests
-        .lock()
-        .expect("audit requests lock")
-        .push(request.clone());
-    state.audit_rendezvous.join().await;
-    tokio::time::sleep(state.behavior.delay).await;
-
-    let behavior = &state.behavior;
-    let later_page = request.param("pageToken").is_some();
-    let failure = behavior.audit_error.as_ref().or(behavior
-        .audit_error_after_first_page
-        .as_ref()
-        .filter(|_| later_page));
-    if let Some((status, body)) = failure {
-        let status = StatusCode::from_u16(*status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return json_response(status, body);
-    }
-    let limited = {
-        let mut left = state
-            .audit_rate_limited_left
-            .lock()
-            .expect("rate limit lock");
-        let limited = *left > 0;
-        *left = left.saturating_sub(1);
-        limited
-    };
-    if limited {
-        let message = "Quota exceeded for quota metric 'Queries' of service \
-                       'admin.googleapis.com'.";
-        return json_response(
-            StatusCode::TOO_MANY_REQUESTS,
-            &json!({"error": {
-                "code": 429,
-                "message": message,
-                "errors": [{"domain": "global", "reason": "rateLimitExceeded", "message": message}],
-            }}),
-        );
-    }
-
-    let query = match AuditQuery::of(&request) {
-        Ok(query) => query,
-        Err(response) => return *response,
-    };
-    let mut records = behavior
-        .audit_log
-        .iter()
-        .filter(|record| query.selects(record, behavior.audit_bounds))
-        .collect::<Vec<_>>();
-    records.sort_by_key(|record| std::cmp::Reverse(record_time(record)));
-
-    let offset = match request.param("pageToken") {
-        None => 0,
-        Some(token) => match parse_token(token, &query.digest) {
-            Some(offset) => offset,
-            None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
-        },
-    };
-    let page_size = behavior
-        .audit_page_size
-        .unwrap_or(query.max_results)
-        .min(query.max_results);
-    let end = (offset + page_size).min(records.len());
-    let items = records.get(offset..end).unwrap_or_default();
-    let mut body = json!({"kind": "admin#reports#activities"});
-    // Google leaves `items` out of an empty page.
-    if !items.is_empty() {
-        body["items"] = json!(items);
-    }
-    if end < records.len() {
-        body["nextPageToken"] = json!(token(end, &query.digest));
     }
     json_response(StatusCode::OK, &body)
 }
@@ -2254,9 +1662,7 @@ mod tests {
     use http_body_util::BodyExt;
     use hyper::{Request, StatusCode};
 
-    use serde_json::json;
-
-    use super::{parent_ids, Behavior, Bounds, FakeDrive, FakeFile, FakeUser};
+    use super::{parent_ids, Behavior, FakeDrive, FakeFile};
     use crate::common::media_client::MediaClient;
 
     #[tokio::test]
@@ -2341,297 +1747,6 @@ mod tests {
             about.user.and_then(|user| user.email_address).as_deref(),
             Some("me@example.com")
         );
-    }
-
-    /// The `items` of the audit log pages for `query`, one page per request, and the requests'
-    /// statuses.
-    async fn audit_pages(drive: &FakeDrive, query: &[(&str, &str)]) -> (Vec<Vec<String>>, u16) {
-        let hub = drive.hub();
-        let client = MediaClient::new(&hub);
-        let mut pages = Vec::new();
-        let mut token = None::<String>;
-        loop {
-            let mut url = url::Url::parse(hub.reports_base_url())
-                .unwrap()
-                .join("activity/users/all/applications/drive")
-                .unwrap();
-            url.query_pairs_mut().extend_pairs(query);
-            if let Some(token) = &token {
-                url.query_pairs_mut().append_pair("pageToken", token);
-            }
-            let request = Request::get(url.as_str())
-                .body(google_apis_common::to_body::<String>(None))
-                .unwrap();
-            let response = client.send(request).await.unwrap();
-            let status = response.status().as_u16();
-            let body = response.into_body().collect().await.unwrap().to_bytes();
-            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            if status != 200 {
-                return (pages, status);
-            }
-            let times = body["items"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .map(|item| item["id"]["time"].as_str().unwrap().to_owned())
-                .collect();
-            pages.push(times);
-            token = body["nextPageToken"].as_str().map(String::from);
-            if token.is_none() {
-                return (pages, status);
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn the_audit_log_is_selected_by_time_and_parameters_and_paged() {
-        let record = |time: &str, doc: &str, drive: &str| {
-            json!({
-                "id": {"time": time, "uniqueQualifier": "1"},
-                "actor": {"email": "ana@example.com"},
-                "events": [{"name": "view", "parameters": [
-                    {"name": "doc_id", "value": doc},
-                    {"name": "shared_drive_id", "value": drive},
-                ]}],
-            })
-        };
-        let behavior = Behavior {
-            audit_log: vec![
-                record("2026-11-01T00:00:00Z", "a", "d1"),
-                record("2026-11-03T00:00:00Z", "a", "d2"),
-                record("2026-11-02T00:00:00Z", "b", "d1"),
-            ],
-            audit_page_size: Some(1),
-            ..Behavior::default()
-        };
-        let drive = FakeDrive::start(Vec::new(), behavior.clone()).await;
-        let range = [
-            ("startTime", "2026-11-01T00:00:00Z"),
-            ("endTime", "2026-11-03T00:00:00Z"),
-        ];
-
-        let (pages, status) = audit_pages(&drive, &range).await;
-        assert_eq!(status, 200);
-        assert_eq!(
-            pages,
-            [["2026-11-02T00:00:00Z"], ["2026-11-01T00:00:00Z"]],
-            "newest first, the end excluded"
-        );
-        let (pages, _) = audit_pages(&drive, &[("filters", "doc_id==a")]).await;
-        assert_eq!(pages, [["2026-11-03T00:00:00Z"], ["2026-11-01T00:00:00Z"]]);
-        let (pages, _) = audit_pages(&drive, &[("filters", "shared_drive_id==d2")]).await;
-        assert_eq!(pages, [["2026-11-03T00:00:00Z"]]);
-        let (pages, _) = audit_pages(&drive, &[("filters", "doc_id==none")]).await;
-        assert_eq!(pages, [Vec::<String>::new()]);
-        for bad in [
-            &[("filters", "doc_id<>a")][..],
-            &[("maxResults", "1001")],
-            &[
-                ("startTime", "2026-11-02T00:00:00Z"),
-                ("endTime", "2026-11-01T00:00:00Z"),
-            ],
-            &[("startTime", "yesterday")],
-        ] {
-            assert_eq!(audit_pages(&drive, bad).await.1, 400, "{bad:?}");
-        }
-        assert_eq!(drive.audit_requests().len(), 2 + 2 + 1 + 1 + 4);
-        assert_eq!(
-            drive.audit_requests()[0].authorization.as_deref(),
-            Some("Bearer mock-token")
-        );
-        assert_eq!(drive.writes(), Vec::<String>::new());
-
-        let exclusive = FakeDrive::start(
-            Vec::new(),
-            Behavior {
-                audit_bounds: Bounds::BothExcluded,
-                ..behavior
-            },
-        )
-        .await;
-        let (pages, _) = audit_pages(&exclusive, &range).await;
-        assert_eq!(pages, [["2026-11-02T00:00:00Z"]]);
-    }
-
-    #[tokio::test]
-    async fn the_audit_log_answers_the_errors_it_is_given() {
-        let drive = FakeDrive::start(
-            Vec::new(),
-            Behavior {
-                audit_rate_limited: 1,
-                ..Behavior::default()
-            },
-        )
-        .await;
-        assert_eq!(audit_pages(&drive, &[]).await.1, 429);
-        assert_eq!(audit_pages(&drive, &[]).await.1, 200);
-
-        let body = json!({"error": {"code": 403, "message": "No."}});
-        let drive = FakeDrive::start(
-            Vec::new(),
-            Behavior {
-                audit_error: Some((403, body)),
-                ..Behavior::default()
-            },
-        )
-        .await;
-        assert_eq!(audit_pages(&drive, &[]).await.1, 403);
-    }
-
-    #[tokio::test]
-    async fn sharing_lists_are_paged() {
-        let permission =
-            |email: &str| json!({"type": "user", "role": "reader", "emailAddress": email});
-        let drive = FakeDrive::start(
-            vec![
-                FakeFile::folder("f", "f", "root"),
-                FakeFile::folder("g", "g", "root"),
-            ],
-            Behavior {
-                permissions: [(
-                    String::from("f"),
-                    vec![permission("a@x"), permission("b@x"), permission("c@x")],
-                )]
-                .into(),
-                permissions_unreadable: [String::from("g")].into(),
-                ..Behavior::default()
-            },
-        )
-        .await;
-        let hub = drive.hub();
-        let (_, first) = hub
-            .permissions()
-            .list("f")
-            .page_size(2)
-            .doit()
-            .await
-            .unwrap();
-        let emails = |list: &google_drive3::api::PermissionList| {
-            list.permissions
-                .iter()
-                .flatten()
-                .map(|permission| permission.email_address.clone().unwrap())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(emails(&first), ["a@x", "b@x"]);
-        let token = first.next_page_token.unwrap();
-        let (_, second) = hub
-            .permissions()
-            .list("f")
-            .page_size(2)
-            .page_token(&token)
-            .doit()
-            .await
-            .unwrap();
-        assert_eq!(emails(&second), ["c@x"]);
-        assert!(second.next_page_token.is_none());
-        assert!(hub.permissions().list("g").doit().await.is_err());
-        assert!(hub.permissions().list("missing").doit().await.is_err());
-        let requests = drive.permission_requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[1].file_id, "f");
-        assert_eq!(requests[1].param("pageToken"), Some(token.as_str()));
-        assert!(drive.gets().is_empty(), "not a files.get");
-    }
-
-    #[tokio::test]
-    async fn the_trash_users_and_revisions_are_answered() {
-        let ana = FakeUser::new("Ana", "ana@example.com");
-        let bob = FakeUser::named("Bob");
-        let drive = FakeDrive::start(
-            vec![
-                FakeFile::folder("f", "f", "root"),
-                FakeFile::blob("a", "a.txt", "f", "a")
-                    .created("2026-11-01T00:00:00Z")
-                    .modified_by(ana.clone())
-                    .owned_by(bob),
-                FakeFile::blob("t", "t.txt", "f", "t")
-                    .trashed_by(Some(ana), Some("2026-11-02T00:00:00Z")),
-                FakeFile::blob("r", "r.txt", "f", "r"),
-                FakeFile::blob("x", "x.txt", "f", "x"),
-            ],
-            Behavior {
-                revisions: [(
-                    String::from("a"),
-                    vec![json!({"id": "1", "modifiedTime": "2026-11-01T00:00:00Z"})],
-                )]
-                .into(),
-                revisions_refused: [(String::from("r"), 403)].into(),
-                unreadable_trash: [String::from("g")].into(),
-                ..Behavior::default()
-            },
-        )
-        .await;
-        let hub = drive.hub();
-        let list = |q: &'static str| {
-            let hub = hub.clone();
-            async move {
-                let (_, list) = hub.files().list().q(q).doit().await.unwrap();
-                list.files.unwrap_or_default()
-            }
-        };
-        let ids = |files: &[google_drive3::api::File]| {
-            files
-                .iter()
-                .map(|file| file.id.clone().unwrap())
-                .collect::<Vec<_>>()
-        };
-
-        let kept = list("'f' in parents and trashed = false").await;
-        assert_eq!(ids(&kept), ["a", "r", "x"]);
-        let a = &kept[0];
-        let user = a.last_modifying_user.as_ref().unwrap();
-        assert_eq!(user.email_address.as_deref(), Some("ana@example.com"));
-        assert_eq!(user.display_name.as_deref(), Some("Ana"));
-        let owner = &a.owners.as_ref().unwrap()[0];
-        assert_eq!(
-            (
-                owner.display_name.as_deref(),
-                owner.email_address.as_deref()
-            ),
-            (Some("Bob"), None)
-        );
-        assert!(a.created_time.is_some() && a.trashing_user.is_none());
-
-        let trashed = list("'f' in parents and trashed = true").await;
-        assert_eq!(ids(&trashed), ["t"]);
-        assert_eq!(trashed[0].explicitly_trashed, Some(true));
-        assert!(trashed[0].trashed_time.is_some());
-        assert_eq!(
-            trashed[0]
-                .trashing_user
-                .as_ref()
-                .unwrap()
-                .email_address
-                .as_deref(),
-            Some("ana@example.com")
-        );
-        assert!(hub
-            .files()
-            .list()
-            .q("'g' in parents and trashed = true")
-            .doit()
-            .await
-            .is_err());
-        assert!(hub
-            .files()
-            .list()
-            .q("'g' in parents and trashed = false")
-            .doit()
-            .await
-            .is_ok());
-
-        let (_, revisions) = hub.revisions().list("a").doit().await.unwrap();
-        assert_eq!(revisions.revisions.unwrap().len(), 1);
-        let (_, none) = hub.revisions().list("x").doit().await.unwrap();
-        assert!(none.revisions.unwrap_or_default().is_empty());
-        assert!(hub.revisions().list("r").doit().await.is_err());
-        assert!(hub.revisions().list("missing").doit().await.is_err());
-        let requests = drive.revision_requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[0].file_id, "a");
-        assert!(drive.gets().is_empty(), "not a files.get");
-        assert_eq!(drive.writes(), Vec::<String>::new());
     }
 
     #[test]

@@ -10,7 +10,6 @@ use error_trace::ErrorTrace;
 
 use crate::{
     app_config::{self, set_file_permissions, AppConfig},
-    auth::lock::{AccountLock, LockError, LOCK_TIMEOUT},
     common::account_archive,
 };
 
@@ -31,20 +30,7 @@ pub(crate) fn export(config: &Config) -> Result<(), Error> {
 
     let archive_name = format!("gdrive_export-{}.tar", normalize_name(account_name));
     let archive_path = Path::new(&archive_name);
-    // Under the lock of the account (see `auth::lock`): the archive holds the account's files as
-    // a whole change of another gdrive process left them.
-    AccountLock::new(&app_cfg.base_path, account_name)
-        .map_err(|source| {
-            Error::Lock(LockError::Io {
-                path: account_path.to_path_buf(),
-                source,
-            })
-        })?
-        .hold(LOCK_TIMEOUT, |_| {
-            account_archive::create(account_path, archive_path)
-        })
-        .map_err(Error::Lock)?
-        .map_err(Error::CreateArchive)?;
+    account_archive::create(account_path, archive_path).map_err(Error::CreateArchive)?;
 
     if let Err(err) = set_file_permissions(archive_path) {
         eprintln!(
@@ -64,7 +50,6 @@ pub(crate) enum Error {
     InitAccount(app_config::errors::InitAccount),
     AccountNotFound(String),
     CreateArchive(account_archive::errors::Create),
-    Lock(LockError),
 }
 
 impl error::Error for Error {
@@ -74,8 +59,6 @@ impl error::Error for Error {
             Error::InitAccount(error) => Some(error),
             Error::AccountNotFound(_) => None,
             Error::CreateArchive(error) => Some(error),
-            // Shown as the lock error itself, which names the account and what to do.
-            Error::Lock(error) => error.source(),
         }
     }
 }
@@ -87,7 +70,6 @@ impl Display for Error {
             Error::InitAccount(_) => f.write_str("unable to initialize account in config"),
             Error::AccountNotFound(name) => write!(f, "account '{name}' not found"),
             Error::CreateArchive(_) => f.write_str("unable to create account archive"),
-            Error::Lock(error) => error.fmt(f),
         }
     }
 }

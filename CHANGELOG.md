@@ -99,58 +99,11 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the chunk and
   progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
   docs/migrate.md.
-- **Who still uses a folder.** `files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>]
-  [--until <WHEN>]` reads the Drive audit log of the Google Workspace organization (Admin SDK Reports API)
-  and prints per person the last activity, the days with activity, views, downloads, edits and other
-  events, and how many items they touched, for the given files and folders with everything in them; then
-  the people on the sharing lists of the given items without activity, with their role. `--by file` gives
-  a row per item and person, `--by event` a row per event. `--exclude EMAIL` leaves out a person, such as
-  the account that ran a migration, from the activity and the sharing rows; `--active-only` leaves out
-  those without activity. `--since` and `--until` take `30d`, `12h`, `2w`, a local date or time, or an RFC
-  3339 time (180 days at most, the audit log's limit). The whole Drive log of the organization is read by
-  default, which is complete; `--scan file` (each item) is faster for a few items, `--scan drive` (the
-  items' shared drives) faster but blind to what happened before an item was moved into its shared drive.
-  The items are always filtered on this machine. A missing id, an id in the trash, an incomplete listing
-  or a page of the log that cannot be read fails the command rather than print a partial report. Nothing
-  in Drive is changed. Needs a Workspace administrator with the Reports privilege, the Admin SDK API
-  enabled in the Cloud project, and an account authorized with `--audit-log`. Takes `--jobs`,
-  `--skip-header`, `--field-separator` and `--tsv`. See docs/activity.md.
-- **What changed in the old location after a migration.** `files diverged <FILE_ID>... [--from <ACCOUNT>]
-  [--to <ACCOUNT>] [--into <FOLDER_ID>] [--since <WHEN>]` takes the arguments of `files migrate` and reports
-  what diverged in the origin from its copy, with who changed each item and when, as Drive tells it:
-  `added` (no item of its name in the copy, and everything in an added folder; with an `edited` row too
-  when it was modified after its creation), `edited` (other content and the origin newer than the copy),
-  `differs` (the copy is newer and none of its revisions is the origin as it is now, or they cannot be
-  read, or several files of one name are left that cannot be told apart), `moved` (a file renamed or moved in the origin, found by size, MD5 checksum and creation time,
-  without a person or time) and `trashed` (who and when in shared drives, the owner in My Drive). Files are
-  compared by size and MD5 checksum, Google Docs files by modification time to the millisecond; files of
-  one name are paired one to one only by the same content and time, and folders of one name compared as a
-  group. A person is
-  named only when Drive names them for that fact, else `-`, which `--exclude` never hides. Without `--to`,
-  `--since` reports what was created or modified in the origin since then; with it, `--since` filters the
-  rows, each on its own. Shortcuts, Drawings, Forms and items both accounts see are left out and listed. `--by item` (default) or `--by user`; `--exclude EMAIL`, `--jobs`, `--skip-header`,
-  `--field-separator` and `--tsv`. Works for any account, personal Gmail accounts included, with the Drive
-  access gdrive has; cannot see views or downloads. A missing copy of a given item, a missing or trashed id
-  and a listing that fails or is incomplete fail the command with nothing on stdout. Nothing is changed in
-  either account. See docs/diverged.md.
 
 Accounts and login:
 
 - `gdrive account reauth [NAME]` signs in again with the account's stored client and replaces its
   tokens, after checking that it is the same Google account.
-- `account add --audit-log` and `account reauth [NAME] --audit-log` also ask for read-only access to the
-  audit log of the Google Workspace organization (the Admin SDK Reports API scope), which `files activity`
-  needs; the Google account must be an administrator. If that access is unticked on the consent screen, or
-  Google returns no refresh token for it, nothing is saved and the command says what to do. `tokens.json`
-  records whether the account was granted it, and a later `account reauth` without `--audit-log` asks for
-  it again, so the access is kept. `--audit-log` cannot be combined with `--service-account` or `--adc`.
-  See [Audit log access](docs/basic_usage.md#audit-log-access).
-- Several gdrive processes can use one account safely: every change of an account's files takes turns
-  through a lock file per account in `~/.config/gdrive3/.locks/`, so a command that refreshes its token
-  while the account is authorized again can no longer undo the new login or bring back its earlier
-  refresh token. The change is finished even when the command is cancelled, and the lock survives
-  removing and adding the account again. `account import` puts an account in place in one step, and
-  `secret.json` is replaced atomically.
 - `account add --manual` (alias `--no-browser`) for machines without a browser: open the printed URL
   anywhere and paste the address the browser lands on. `--port N` sets the redirect port (`0` picks a free
   one, in browser mode only; `--manual` needs a fixed port). The login sends PKCE and checks `state`; a

@@ -22,10 +22,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use super::{Account, AppConfig, ACCOUNT_CONFIG_NAME, TOKENS_CONFIG_NAME};
-use crate::auth::{
-    lock::{AccountLock, LOCKS_DIR_NAME, LOCK_TIMEOUT},
-    store::{self, TokenFile},
-};
+use crate::auth::store::{self, TokenFile};
 
 const SERVICE_ACCOUNT_KEY_NAME: &str = "service_account.json";
 
@@ -53,26 +50,18 @@ pub(crate) enum AccountType {
 /// Whether `path` is the directory of an account: gdrive 3.x accounts have `tokens.json`, the
 /// others have `account.json` (a service account has no `tokens.json` until it got a token, an
 /// ADC account never has one).
-///
-/// A directory that gdrive uses itself is never an account, whatever is in it: the lock of an
-/// account named `tokens.json` is the file `.locks/tokens.json`.
 pub(super) fn is_account_dir(path: &Path) -> bool {
-    let reserved = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(is_reserved_name);
-    !reserved
-        && (path.join(TOKENS_CONFIG_NAME).exists() || path.join(ACCOUNT_CONFIG_NAME).is_file())
+    path.join(TOKENS_CONFIG_NAME).exists() || path.join(ACCOUNT_CONFIG_NAME).is_file()
 }
 
 /// The names under the config root that gdrive uses itself: the file that names the current
-/// account, the staging directory and the directory of the account locks. No account may have
-/// one of them, in any case (Windows and macOS file systems ignore it).
-const RESERVED_NAMES: [&str; 3] = [ACCOUNT_CONFIG_NAME, STAGING_DIR_NAME, LOCKS_DIR_NAME];
+/// account and the staging directory. No account may have one of them, in any case (Windows and
+/// macOS file systems ignore it).
+const RESERVED_NAMES: [&str; 2] = [ACCOUNT_CONFIG_NAME, STAGING_DIR_NAME];
 
 /// What [`is_valid_account_name`] requires, for messages.
 pub(crate) const ACCOUNT_NAME_RULES: &str = "an account name must not be empty, '.' or '..', \
-     contain '/' or '\\', or be 'account.json', '.staging' or '.locks', which gdrive uses itself";
+     contain '/' or '\\', or be 'account.json' or '.staging', which gdrive uses itself";
 
 /// Whether `name` can be the name of an account: it becomes a directory under the config root,
 /// so it must be one plain path component, and none of the [`RESERVED_NAMES`].
@@ -82,14 +71,9 @@ pub(crate) fn is_valid_account_name(name: &str) -> bool {
         (components.next(), components.next()),
         (Some(Component::Normal(_)), None)
     ) && !name.contains(['/', '\\'])
-        && !is_reserved_name(name)
-}
-
-/// Whether `name` is one of the [`RESERVED_NAMES`], in any case.
-fn is_reserved_name(name: &str) -> bool {
-    RESERVED_NAMES
-        .iter()
-        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        && !RESERVED_NAMES
+            .iter()
+            .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 impl AppConfig {
@@ -227,7 +211,7 @@ impl AppConfig {
                 .await?;
             }
             let aside = staging_root.join(format!("{name}.old"));
-            self.move_into_place(staging.clone(), aside, fail_at).await
+            self.move_into_place(&staging, &aside, fail_at).await
         }
         .await;
 
@@ -238,54 +222,13 @@ impl AppConfig {
     }
 
     /// Replaces the account directory with `staging`, moving an existing one to `aside` first
-    /// and removing it after. The check that the account may be replaced and the two renames are
-    /// one change under the lock of the account (see `auth::lock`): a refresh of the replaced
-    /// account that is under way finishes first, and nothing is moved when the lock cannot be
-    /// had. The replaced account, now in the staging directory, is removed after.
+    /// and removing it after.
     async fn move_into_place(
-        &self,
-        staging: PathBuf,
-        aside: PathBuf,
-        fail_at: Option<InstallStep>,
-    ) -> Result<(), InstallAccount> {
-        let dir = self.account_base_path().to_path_buf();
-        let move_error = {
-            let dir = dir.clone();
-            move |source| InstallAccount::Move {
-                path: dir.clone(),
-                source,
-            }
-        };
-        let lock = AccountLock::new(&self.base_path, &self.account.name).map_err(&move_error)?;
-        let (account, moved_aside) = (self.clone(), aside.clone());
-        let had_account = lock
-            .hold_blocking(LOCK_TIMEOUT, move |_| {
-                account.check_replaceable()?;
-                account.swap_in(&staging, &moved_aside, fail_at)
-            })
-            .await
-            .map_err(|error| move_error(error.into()))??;
-
-        if had_account {
-            if let Err(error) = tokio::fs::remove_dir_all(&aside).await {
-                eprintln!(
-                    "Warning: unable to remove the replaced account in '{}': {error}",
-                    aside.display()
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Moves an existing account directory to `aside` and `staging` in its place; on failure,
-    /// the earlier account is put back. Returns whether there was one. Blocks the thread: under
-    /// the account lock.
-    fn swap_in(
         &self,
         staging: &Path,
         aside: &Path,
         fail_at: Option<InstallStep>,
-    ) -> Result<bool, InstallAccount> {
+    ) -> Result<(), InstallAccount> {
         let dir = self.account_base_path();
         let move_error = |source| InstallAccount::Move {
             path: dir.to_path_buf(),
@@ -296,24 +239,33 @@ impl AppConfig {
         {
             Ok(false) => false,
             Ok(true) => {
-                fs::rename(dir, aside).map_err(move_error)?;
+                tokio::fs::rename(dir, aside).await.map_err(move_error)?;
                 true
             }
             Err(source) => return Err(move_error(source)),
         };
 
         let moved_in = match inject(fail_at, InstallStep::MoveNewIn) {
-            Ok(()) => fs::rename(staging, dir),
+            Ok(()) => tokio::fs::rename(staging, dir).await,
             Err(error) => Err(error),
         };
         if let Err(source) = moved_in {
             if had_account {
                 // Put the earlier account back.
-                let _ = fs::rename(aside, dir);
+                let _ = tokio::fs::rename(aside, dir).await;
             }
             return Err(move_error(source));
         }
-        Ok(had_account)
+
+        if had_account {
+            if let Err(error) = tokio::fs::remove_dir_all(aside).await {
+                eprintln!(
+                    "Warning: unable to remove the replaced account in '{}': {error}",
+                    aside.display()
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -525,38 +477,10 @@ mod tests {
             "account.json",
             "Account.JSON",
             ".staging",
-            ".locks",
-            ".Locks",
         ] {
             assert!(!is_valid_account_name(name), "{name:?}");
             assert!(AppConfig::named_account_in(PathBuf::from("/base"), name).is_none());
         }
-    }
-
-    /// The lock of an account named `tokens.json` is `.locks/tokens.json`, and a staged account
-    /// has an `account.json`: neither makes gdrive's own directory an account.
-    #[test]
-    fn the_directories_gdrive_uses_itself_are_never_accounts() {
-        let dir = tempfile::tempdir().unwrap();
-        let base = dir.path();
-        for (directory, file) in [
-            (LOCKS_DIR_NAME, TOKENS_CONFIG_NAME),
-            (LOCKS_DIR_NAME, ACCOUNT_CONFIG_NAME),
-            (STAGING_DIR_NAME, TOKENS_CONFIG_NAME),
-            (STAGING_DIR_NAME, ACCOUNT_CONFIG_NAME),
-            ("me@example.com", TOKENS_CONFIG_NAME),
-        ] {
-            std::fs::create_dir_all(base.join(directory)).unwrap();
-            std::fs::write(base.join(directory).join(file), "[]").unwrap();
-        }
-
-        assert!(!is_account_dir(&base.join(LOCKS_DIR_NAME)));
-        assert!(!is_account_dir(&base.join(STAGING_DIR_NAME)));
-        assert!(is_account_dir(&base.join("me@example.com")));
-        assert_eq!(
-            list_accounts_in(base.to_path_buf()).unwrap(),
-            ["me@example.com"]
-        );
     }
 
     #[tokio::test]
@@ -616,51 +540,6 @@ mod tests {
             list_accounts_in(dir.path().to_path_buf()).unwrap(),
             ["robot"]
         );
-    }
-
-    #[tokio::test]
-    async fn install_swaps_the_directory_in_under_the_account_lock() {
-        use crate::auth::lock::{
-            test_hooks::{when_waiting, within, Elsewhere},
-            AccountLock,
-        };
-
-        let dir = tempfile::tempdir().unwrap();
-        let config = account(dir.path(), "robot");
-        config
-            .install(&AccountType::ApplicationDefaultCredentials, None, None)
-            .await
-            .unwrap();
-
-        // Another process, a refresh of the service account for example, holds the lock: the
-        // new account waits for it before it replaces the directory.
-        let lock = AccountLock::new(dir.path(), "robot").unwrap();
-        let elsewhere = Elsewhere::hold(lock, |_| ()).await;
-        let waiting = when_waiting(config.tokens_path());
-        let install = tokio::spawn({
-            let config = config.clone();
-            async move {
-                config
-                    .install(
-                        &AccountType::ServiceAccount { subject: None },
-                        Some(b"new-key"),
-                        Some(&new_tokens()),
-                    )
-                    .await
-            }
-        });
-        within("the wait of the install", waiting.notified()).await;
-        assert_eq!(
-            config.account_type().unwrap(),
-            AccountType::ApplicationDefaultCredentials
-        );
-        elsewhere.finish().await;
-        within("the install", install).await.unwrap().unwrap();
-        assert_eq!(
-            config.account_type().unwrap(),
-            AccountType::ServiceAccount { subject: None }
-        );
-        assert!(config.tokens_path().is_file());
     }
 
     #[tokio::test]

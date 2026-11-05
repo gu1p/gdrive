@@ -989,7 +989,7 @@ mod tests {
         let value = format!("http://user:hunter2@{}", proxy.addr());
         let client = hub::token_http_client_with(connector(&[("HTTPS_PROXY", &value)])).unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let tokens = crate::auth::test_support::account_tokens_path(dir.path());
+        let tokens = dir.path().join("tokens.json");
         std::fs::write(
             &tokens,
             r#"[{"scopes":["https://www.googleapis.com/auth/drive","https://www.googleapis.com/auth/drive.metadata.readonly"],"token":{"access_token":"old","refresh_token":"1//r","expires_at":[2020,1,0,0,0,0,0,0,0],"id_token":null}}]"#,

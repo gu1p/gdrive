@@ -105,10 +105,6 @@ enum AccountCommand {
     /// `account add`, with the client credentials stored for the account, and replaces the
     /// account's tokens. Other commands never start a login: when the stored token cannot be
     /// refreshed, they fail at once and point to this command.
-    ///
-    /// An account that may read the audit log of its organization (--audit-log) is asked for
-    /// that access again; if Google does not grant it, the Drive authorization is saved and a
-    /// warning says how to get the access back.
     Reauth {
         /// Account name [default: current account]
         account_name: Option<String>,
@@ -157,11 +153,7 @@ struct ServiceAccountArgs {
     /// directory. Service accounts have no Drive storage of their own: they work in shared drives
     /// they are a member of and on files shared with them, or, with --subject, as a Google
     /// Workspace user.
-    #[arg(
-        long,
-        value_name = "KEY_JSON",
-        conflicts_with_all = ["manual", "port", "audit_log"]
-    )]
+    #[arg(long, value_name = "KEY_JSON", conflicts_with_all = ["manual", "port"])]
     service_account: Option<PathBuf>,
 
     /// Act for this Google Workspace user (domain-wide delegation, set up by an administrator)
@@ -178,7 +170,7 @@ struct ServiceAccountArgs {
     /// The service account key named by `GOOGLE_APPLICATION_CREDENTIALS`, the user credentials of
     /// `gcloud auth application-default login`, or the metadata server of Google Cloud. gdrive
     /// stores none of them and looks them up again on every run.
-    #[arg(long, conflicts_with_all = ["manual", "port", "audit_log"])]
+    #[arg(long, conflicts_with_all = ["manual", "port"])]
     adc: bool,
 
     /// Name of the new account [default: the `client_email` of the key, or "adc"]
@@ -204,16 +196,6 @@ struct LoginArgs {
     /// 0 picks a free port. Desktop app clients accept any port.
     #[arg(long, value_name = "PORT", default_value_t = auth::login::DEFAULT_PORT)]
     port: u16,
-
-    /// Also ask for read access to the audit log of the Google Workspace organization, which
-    /// `gdrive files activity` needs
-    ///
-    /// The Google account must be an administrator of the organization. The access is read-only.
-    /// `account reauth` asks for it again without this flag when the account has it. Service
-    /// accounts and Application Default Credentials (--service-account, --adc) are not supported
-    /// for the audit log yet.
-    #[arg(long)]
-    audit_log: bool,
 }
 
 impl LoginArgs {
@@ -491,131 +473,6 @@ enum FileCommand {
 
         #[command(flatten)]
         progress: ProgressArgs,
-    },
-
-    /// Report who used files and folders, from the audit log of a Google Workspace organization
-    ///
-    /// Reads the Drive audit log (Admin SDK Reports API) of the organization that owns the
-    /// given files and folders, folders with everything in them, and prints per person what they
-    /// did there: the last time, on how many days, how many views, downloads, edits and other
-    /// events, on how many items. People on the sharing lists of the given items without any
-    /// activity follow. Use it after a migration to see who still uses the old location. The
-    /// account must be an administrator of the organization with the Reports privilege, and
-    /// authorized with 'gdrive account reauth <ACCOUNT> --audit-log'. Nothing in Drive is
-    /// changed. See docs/activity.md.
-    Activity {
-        /// Id of a file or folder: also `root`, or the id of a shared drive. Several ids are one report
-        #[arg(required = true, value_name = "FILE_ID")]
-        file_id: Vec<String>,
-
-        /// The account to read with, as `gdrive account list` prints it [default: the current account]
-        #[arg(long, value_name = "ACCOUNT")]
-        account: Option<String>,
-
-        /// Start of the time range: a duration back from now (12h, 30d, 2w), a local date (2026-10-01) or time (2026-10-01 14:30), or an RFC 3339 time. The audit log keeps 180 days
-        #[arg(long, value_name = "WHEN", default_value = "30d", value_parser = files::activity::when::parse)]
-        since: files::activity::when::When,
-
-        /// End of the time range, in the forms of --since [default: now]
-        #[arg(long, value_name = "WHEN", value_parser = files::activity::when::parse)]
-        until: Option<files::activity::when::When>,
-
-        /// The rows of the report
-        #[arg(long, value_enum, default_value_t = files::activity::By::User)]
-        by: files::activity::By,
-
-        /// Leave out this email address (case-insensitive): its activity and its row on the sharing lists, for example the account that ran a migration. Repeat for several
-        #[arg(long, value_name = "EMAIL")]
-        exclude: Vec<String>,
-
-        /// Only people with activity: leave out those on the sharing lists without any. The sharing lists are not read, and the Access column is `-`
-        #[arg(long)]
-        active_only: bool,
-
-        /// How much of the audit log Google sends; the items are filtered on this machine in every case. The default reads everything and is always complete
-        #[arg(long, value_enum, default_value_t = files::activity::Scan::Domain)]
-        scan: files::activity::Scan,
-
-        /// Send up to N requests at once (1 to 64)
-        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
-        jobs: NonZeroUsize,
-
-        /// Don't print header
-        #[arg(long)]
-        skip_header: bool,
-
-        /// Field separator. Columns stay aligned; for tab-separated values use --tsv
-        #[arg(long, default_value_t = String::from("\t"))]
-        field_separator: String,
-
-        /// Print tab-separated values for scripts
-        ///
-        /// Columns are not aligned, and a tab, newline, carriage return or backslash in a value is
-        /// written as `\t`, `\n`, `\r` or `\\`, another control character as `\u{1b}`.
-        #[arg(long, conflicts_with = "field_separator")]
-        tsv: bool,
-    },
-
-    /// Report what changed in the origin of a migration after it, and who changed it
-    ///
-    /// Takes the arguments of 'files migrate': the given files and folders of the origin
-    /// account (--from, the current account by default), folders with everything in them, and
-    /// with --to the account they were migrated to (--into: the folder that holds the copy).
-    /// Prints what diverged from the copy, compared by name as the migration copied it: items
-    /// added, edited, moved or renamed in the origin, moved to the trash, or changed on both
-    /// sides; with who last changed each and when, as Drive tells it. With --since only, prints
-    /// what was created, modified or trashed in the origin since then. Works for any account,
-    /// personal Gmail accounts included, and needs no permission beyond Drive. Views and
-    /// downloads cannot be seen this way (see 'files activity'). Nothing is changed in either
-    /// account. See docs/diverged.md.
-    #[command(group(clap::ArgGroup::new("diverged_from").args(["to", "since"]).required(true).multiple(true)))]
-    Diverged {
-        /// Id of a file or folder of the origin account, as given to 'files migrate'. Several ids are one report
-        #[arg(required = true, value_name = "FILE_ID")]
-        file_id: Vec<String>,
-
-        /// The account the files were migrated to, which holds the copy to compare with, as `gdrive account list` prints it
-        #[arg(long, value_name = "ACCOUNT")]
-        to: Option<String>,
-
-        /// The origin account, as `gdrive account list` prints it [default: the current account]
-        #[arg(long, value_name = "ACCOUNT")]
-        from: Option<String>,
-
-        /// Id of the folder of the --to account that holds the copy, as given to 'files migrate' [default: the top of My Drive]
-        #[arg(long, value_name = "FOLDER_ID", requires = "to")]
-        into: Option<String>,
-
-        /// Only what changed at or after this time: a duration back from now (12h, 30d, 2w), a local date (2026-10-01) or time (2026-10-01 14:30), or an RFC 3339 time. Without --to, what was created or modified since then
-        #[arg(long, value_name = "WHEN", value_parser = files::activity::when::parse)]
-        since: Option<files::activity::when::When>,
-
-        /// The rows of the report
-        #[arg(long, value_enum, default_value_t = files::diverged::By::Item)]
-        by: files::diverged::By,
-
-        /// Leave out what this email address did (case-insensitive), for example the account that ran the migration. Repeat for several
-        #[arg(long, value_name = "EMAIL")]
-        exclude: Vec<String>,
-
-        /// Send up to N listing requests at once (1 to 64)
-        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
-        jobs: NonZeroUsize,
-
-        /// Don't print header
-        #[arg(long)]
-        skip_header: bool,
-
-        /// Field separator. Columns stay aligned; for tab-separated values use --tsv
-        #[arg(long, default_value_t = String::from("\t"))]
-        field_separator: String,
-
-        /// Print tab-separated values for scripts
-        ///
-        /// Columns are not aligned, and a tab, newline, carriage return or backslash in a value is
-        /// written as `\t`, `\n`, `\r` or `\\`, another control character as `\u{1b}`.
-        #[arg(long, conflicts_with = "field_separator")]
-        tsv: bool,
     },
 
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
@@ -1350,80 +1207,6 @@ async fn handle_files_command(
             .await?;
         }
 
-        FileCommand::Activity {
-            file_id,
-            account,
-            since,
-            until,
-            by,
-            exclude,
-            active_only,
-            scan,
-            jobs,
-            skip_header,
-            field_separator,
-            tsv,
-        } => {
-            let output = if tsv {
-                files::activity::Output::Tsv { skip_header }
-            } else {
-                files::activity::Output::Table {
-                    skip_header,
-                    field_separator,
-                }
-            };
-            // Boxed: the future of run() holds the state of every command at once.
-            Box::pin(files::activity(files::activity::Config {
-                file_ids: file_id,
-                account,
-                since,
-                until,
-                by,
-                exclude,
-                active_only,
-                scan,
-                jobs,
-                output,
-            }))
-            .await?;
-        }
-
-        FileCommand::Diverged {
-            file_id,
-            to,
-            from,
-            into,
-            since,
-            by,
-            exclude,
-            jobs,
-            skip_header,
-            field_separator,
-            tsv,
-        } => {
-            let output = if tsv {
-                files::activity::Output::Tsv { skip_header }
-            } else {
-                files::activity::Output::Table {
-                    skip_header,
-                    field_separator,
-                }
-            };
-            // Boxed: the future of run() holds the state of every command at once.
-            Box::pin(files::diverged(files::diverged::Config {
-                file_ids: file_id,
-                from,
-                to,
-                into,
-                since,
-                by,
-                exclude,
-                jobs,
-                output,
-            }))
-            .await?;
-        }
-
         FileCommand::Update {
             file_id,
             file_path,
@@ -1573,7 +1356,6 @@ async fn handle_account_command(
                 account::add(&account::add::Config {
                     mode: login.mode(),
                     port: login.port,
-                    audit_log: login.audit_log,
                 })
                 .await?;
             }
@@ -1599,7 +1381,6 @@ async fn handle_account_command(
                 account_name,
                 mode: login.mode(),
                 port: login.port,
-                audit_log: login.audit_log,
             })
             .await?;
         }
@@ -1984,72 +1765,6 @@ mod tests {
             &["account", "add", "--adc", "--manual"],
         ] {
             assert!(parse(args).is_err(), "{args:?} should not parse");
-        }
-    }
-
-    #[test]
-    fn the_login_commands_take_audit_log() {
-        let cli = parse(&["account", "add", "--audit-log", "--manual"]).expect("account add");
-        let Command::Account {
-            command: AccountCommand::Add { login, service },
-        } = cli.command
-        else {
-            panic!("expected account add");
-        };
-        assert!(login.audit_log);
-        assert!(login.manual);
-        assert!(service.service_account.is_none() && !service.adc);
-
-        let cli =
-            parse(&["account", "reauth", "me@example.com", "--audit-log"]).expect("account reauth");
-        let Command::Account {
-            command:
-                AccountCommand::Reauth {
-                    account_name,
-                    login,
-                },
-        } = cli.command
-        else {
-            panic!("expected account reauth");
-        };
-        assert_eq!(account_name.as_deref(), Some("me@example.com"));
-        assert!(login.audit_log);
-
-        // Off by default.
-        for args in [&["account", "add"][..], &["account", "reauth"]] {
-            let cli = parse(args).expect("no flags");
-            let Command::Account {
-                command: AccountCommand::Add { login, .. } | AccountCommand::Reauth { login, .. },
-            } = cli.command
-            else {
-                panic!("expected a login command");
-            };
-            assert!(!login.audit_log, "{args:?}");
-        }
-    }
-
-    #[test]
-    fn audit_log_does_not_mix_with_service_accounts_or_adc() {
-        for args in [
-            &[
-                "account",
-                "add",
-                "--service-account",
-                "key.json",
-                "--audit-log",
-            ][..],
-            &["account", "add", "--audit-log", "--adc"],
-            &["account", "add", "--adc", "--name", "ci", "--audit-log"],
-        ] {
-            let Err(error) = parse(args) else {
-                panic!("{args:?} should not parse");
-            };
-            assert_eq!(
-                error.kind(),
-                clap::error::ErrorKind::ArgumentConflict,
-                "{args:?}"
-            );
-            assert!(error.to_string().contains("--audit-log"), "{error}");
         }
     }
 
@@ -2520,282 +2235,6 @@ mod flag_tests {
                 "{args:?} should be rejected"
             );
         }
-    }
-
-    #[test]
-    fn activity_takes_ids_the_time_range_and_the_report_flags() {
-        use crate::files::activity::{when::When, By, Scan};
-
-        let FileCommand::Activity {
-            file_id,
-            account,
-            since,
-            until,
-            by,
-            exclude,
-            active_only,
-            scan,
-            jobs,
-            skip_header,
-            field_separator: _,
-            tsv,
-        } = parse(&[
-            "files",
-            "activity",
-            "a",
-            "b",
-            "--account",
-            "admin@example.com",
-            "--since",
-            "2026-10-01T08:00:00Z",
-            "--until",
-            "12h",
-            "--by",
-            "event",
-            "--exclude",
-            "migrator@example.com",
-            "--exclude",
-            "other@example.com",
-            "--active-only",
-            "--scan",
-            "file",
-            "--jobs",
-            "8",
-            "--skip-header",
-            "--tsv",
-        ])
-        else {
-            panic!("expected activity");
-        };
-        assert_eq!(file_id, ["a", "b"]);
-        assert_eq!(account.as_deref(), Some("admin@example.com"));
-        let october = chrono::DateTime::parse_from_rfc3339("2026-10-01T08:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(since, When::At(october));
-        assert_eq!(until, Some(When::Ago(chrono::TimeDelta::hours(12))));
-        assert_eq!(by, By::Event);
-        assert_eq!(exclude, ["migrator@example.com", "other@example.com"]);
-        assert!(active_only && skip_header && tsv);
-        assert_eq!(scan, Scan::File);
-        assert_eq!(jobs.get(), 8);
-
-        for (value, expected) in [("user", By::User), ("file", By::File)] {
-            let FileCommand::Activity { by, .. } =
-                parse(&["files", "activity", "a", "--by", value])
-            else {
-                panic!("expected activity");
-            };
-            assert_eq!(by, expected);
-        }
-        for (value, expected) in [("domain", Scan::Domain), ("drive", Scan::Drive)] {
-            let FileCommand::Activity { scan, .. } =
-                parse(&["files", "activity", "a", "--scan", value])
-            else {
-                panic!("expected activity");
-            };
-            assert_eq!(scan, expected);
-        }
-    }
-
-    #[test]
-    fn activity_defaults_to_30_days_per_person_of_the_current_account() {
-        use crate::files::activity::{when::When, By, Scan};
-
-        let FileCommand::Activity {
-            account,
-            since,
-            until,
-            by,
-            exclude,
-            active_only,
-            scan,
-            jobs,
-            skip_header,
-            field_separator,
-            tsv,
-            ..
-        } = parse(&["files", "activity", "id"])
-        else {
-            panic!("expected activity");
-        };
-        assert_eq!(account, None);
-        assert_eq!(since, When::Ago(chrono::TimeDelta::days(30)));
-        assert_eq!(until, None);
-        assert_eq!((by, scan), (By::User, Scan::Domain));
-        assert!(exclude.is_empty() && !active_only && !skip_header && !tsv);
-        assert_eq!(jobs.get(), 4);
-        assert_eq!(field_separator, "\t");
-
-        for args in [
-            &["files", "activity"][..],
-            &["files", "activity", "id", "--since", "yesterday"],
-            &["files", "activity", "id", "--until", "30m"],
-            &["files", "activity", "id", "--jobs", "0"],
-            &["files", "activity", "id", "--jobs", "65"],
-            &["files", "activity", "id", "--by", "person"],
-            &["files", "activity", "id", "--scan", "everything"],
-            &["files", "activity", "id", "--scan", "auto"],
-            &["files", "activity", "id", "--tsv", "--field-separator", ","],
-        ] {
-            assert!(
-                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
-                "{args:?} should be rejected"
-            );
-        }
-        let error = Cli::try_parse_from(["gdrive", "files", "activity", "id", "--since", "soon"])
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            error.contains("'soon' is not a time; use a duration"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn diverged_takes_the_arguments_of_migrate_and_the_report_flags() {
-        use crate::files::{activity::when::When, diverged::By};
-
-        let FileCommand::Diverged {
-            file_id,
-            to,
-            from,
-            into,
-            since,
-            by,
-            exclude,
-            jobs,
-            skip_header,
-            field_separator: _,
-            tsv,
-        } = parse(&[
-            "files",
-            "diverged",
-            "a",
-            "b",
-            "--to",
-            "new@example.com",
-            "--from",
-            "old@example.com",
-            "--into",
-            "folder",
-            "--since",
-            "2026-11-01T00:00:00Z",
-            "--by",
-            "user",
-            "--exclude",
-            "old@example.com",
-            "--exclude",
-            "new@example.com",
-            "--jobs",
-            "8",
-            "--skip-header",
-            "--tsv",
-        ])
-        else {
-            panic!("expected diverged");
-        };
-        assert_eq!(file_id, ["a", "b"]);
-        assert_eq!(to.as_deref(), Some("new@example.com"));
-        assert_eq!(from.as_deref(), Some("old@example.com"));
-        assert_eq!(into.as_deref(), Some("folder"));
-        let migration = chrono::DateTime::parse_from_rfc3339("2026-11-01T00:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(since, Some(When::At(migration)));
-        assert_eq!(by, By::User);
-        assert_eq!(exclude, ["old@example.com", "new@example.com"]);
-        assert_eq!(jobs.get(), 8);
-        assert!(skip_header && tsv);
-    }
-
-    #[test]
-    fn diverged_needs_to_or_since_and_defaults_to_one_row_per_item() {
-        use crate::files::{activity::when::When, diverged::By};
-
-        let FileCommand::Diverged {
-            to,
-            from,
-            into,
-            since,
-            by,
-            exclude,
-            jobs,
-            skip_header,
-            field_separator,
-            tsv,
-            ..
-        } = parse(&["files", "diverged", "id", "--to", "new@example.com"])
-        else {
-            panic!("expected diverged");
-        };
-        assert_eq!(to.as_deref(), Some("new@example.com"));
-        assert_eq!((from, into, since), (None, None, None));
-        assert_eq!(by, By::Item);
-        assert!(exclude.is_empty() && !skip_header && !tsv);
-        assert_eq!(jobs.get(), 4);
-        assert_eq!(field_separator, "\t");
-
-        // --since alone compares with nothing: it reports by time.
-        let FileCommand::Diverged { to, since, .. } =
-            parse(&["files", "diverged", "id", "--since", "30d"])
-        else {
-            panic!("expected diverged");
-        };
-        assert_eq!(to, None);
-        assert_eq!(since, Some(When::Ago(chrono::TimeDelta::days(30))));
-        let FileCommand::Diverged { by, .. } =
-            parse(&["files", "diverged", "id", "--to", "x", "--by", "item"])
-        else {
-            panic!("expected diverged");
-        };
-        assert_eq!(by, By::Item);
-
-        for args in [
-            &["files", "diverged"][..],
-            &["files", "diverged", "--to", "x"],
-            &["files", "diverged", "id"],
-            &["files", "diverged", "id", "--from", "old@example.com"],
-            &[
-                "files", "diverged", "id", "--since", "30d", "--into", "folder",
-            ],
-            &["files", "diverged", "id", "--to", "x", "--jobs", "0"],
-            &["files", "diverged", "id", "--to", "x", "--jobs", "65"],
-            &["files", "diverged", "id", "--to", "x", "--by", "file"],
-            &["files", "diverged", "id", "--since", "soon"],
-            &[
-                "files",
-                "diverged",
-                "id",
-                "--to",
-                "x",
-                "--tsv",
-                "--field-separator",
-                ",",
-            ],
-            &["files", "diverged", "id", "--to", "x", "--dry-run"],
-        ] {
-            assert!(
-                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
-                "{args:?} should be rejected"
-            );
-        }
-        let error = Cli::try_parse_from(["gdrive", "files", "diverged", "id"])
-            .err()
-            .unwrap()
-            .to_string();
-        assert!(
-            error.contains("--to <ACCOUNT>") && error.contains("--since <WHEN>"),
-            "{error}"
-        );
-        let error = Cli::try_parse_from([
-            "gdrive", "files", "diverged", "id", "--since", "1d", "--into", "f",
-        ])
-        .err()
-        .unwrap()
-        .to_string();
-        assert!(error.contains("--to <ACCOUNT>"), "{error}");
     }
 
     #[test]

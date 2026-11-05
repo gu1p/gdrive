@@ -1,8 +1,6 @@
-pub(crate) mod activity;
 pub(crate) mod batch;
 pub(crate) mod copy;
 pub(crate) mod delete;
-pub(crate) mod diverged;
 pub(crate) mod download;
 pub(crate) mod export;
 pub(crate) mod generate_ids;
@@ -18,10 +16,8 @@ pub(crate) mod trash;
 pub(crate) mod update;
 pub(crate) mod upload;
 
-pub(crate) use activity::activity;
 pub(crate) use copy::copy;
 pub(crate) use delete::delete;
-pub(crate) use diverged::diverged;
 pub(crate) use download::download;
 pub(crate) use export::export;
 pub(crate) use generate_ids::generate_ids;

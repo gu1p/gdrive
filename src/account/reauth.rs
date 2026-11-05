@@ -4,15 +4,12 @@ use std::{
     io,
 };
 
+use yup_oauth2::storage::TokenInfo;
+
 use crate::{
     account::add::{authorized_email, token_hub},
     app_config::{self, account_type::AccountType, AppConfig},
-    auth::{
-        self,
-        lock::{AccountLock, LOCK_TIMEOUT},
-        login,
-        store::TokenFile,
-    },
+    auth::{self, login, store::TokenFile},
     hub::Hub,
 };
 
@@ -22,18 +19,11 @@ pub(crate) struct Config {
     pub(crate) account_name: Option<String>,
     pub(crate) mode: login::Mode,
     pub(crate) port: u16,
-    /// `--audit-log`: also ask for read access to the audit log of the organization.
-    pub(crate) audit_log: bool,
 }
 
 /// Runs the authorization again for an existing account, with its stored client credentials,
 /// and replaces its tokens. Nothing is changed unless the new authorization is for the same
 /// Google account.
-///
-/// An account whose tokens record read access to the audit log is asked for it again, also
-/// without `--audit-log`, so that a routine reauthorization keeps it. Only with `--audit-log`
-/// does a missing grant fail the login; otherwise the Drive authorization is saved and a warning
-/// says how to get the access back.
 pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
     login::Options::new(config.mode, config.port, None)
         .check()
@@ -64,48 +54,20 @@ pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
 
     println!("Authorizing account '{account_name}' again with its stored client credentials.");
 
-    let had_audit_log = TokenFile::audit_log_granted_at(app_cfg.tokens_path()).await;
-    let asked = audit_log_request(config.audit_log, had_audit_log);
-    if asked == login::AuditLog::Optional {
-        println!(
-            "The account may read the audit log of its organization, so gdrive asks for that \
-             access again."
-        );
-    }
-
     // Account names are the email addresses of the Google accounts.
     let login_hint = account_name.contains('@').then(|| account_name.clone());
-    let options = login::Options::new(config.mode, config.port, login_hint).with_audit_log(asked);
-    let authorization = login::login(&secret, &options)
+    let options = login::Options::new(config.mode, config.port, login_hint);
+    let token = login::login(&secret, &options)
         .await
         .map_err(Error::Login)?;
-    let granted_by_google = authorization.audit_log;
 
-    let hub = token_hub(&authorization.token).map_err(Error::HubCreation)?;
-    let recorded = save_reauthorized(&app_cfg, &secret, &hub, authorization, asked).await?;
+    let hub = token_hub(&token).map_err(Error::HubCreation)?;
+    save_reauthorized(&app_cfg, &secret, &hub, token).await?;
 
     println!();
     println!("Authorized account '{account_name}' again");
-    if let Some(loss) = auth::audit_log_loss(asked, granted_by_google, recorded) {
-        if had_audit_log {
-            eprintln!("{}", auth::audit_log_lost_warning(&account_name, loss));
-        }
-    }
 
     Ok(())
-}
-
-/// What the login of `account reauth` asks for: the audit log with `--audit-log`, and also
-/// without it when the account had the access, so that a routine reauthorization does not drop
-/// it.
-fn audit_log_request(audit_log_flag: bool, had_audit_log: bool) -> login::AuditLog {
-    if audit_log_flag {
-        login::AuditLog::Required
-    } else if had_audit_log {
-        login::AuditLog::Optional
-    } else {
-        login::AuditLog::No
-    }
 }
 
 /// The type of the account `account_name`, if it exists and does not log in with an OAuth client.
@@ -117,17 +79,15 @@ fn non_user_account_type(account_name: &str) -> Option<AccountType> {
     (account_type != AccountType::User).then_some(account_type)
 }
 
-/// Replaces the tokens of `app_cfg` with those of `authorization`, a login that asked for
-/// `asked`, after checking with `hub` (authorized by its token) that the new authorization is
-/// for the same Google account. Nothing is written when a check fails. Returns whether the new
-/// tokens record the audit-log grant (see [`login::tokens_after_login`]).
+/// Replaces the tokens of `app_cfg` with `token`, after checking with `hub` (authorized by
+/// `token`) that the new authorization is for the same Google account. Nothing is written when
+/// the check fails.
 async fn save_reauthorized(
     app_cfg: &AppConfig,
     secret: &app_config::Secret,
     hub: &Hub,
-    authorization: login::Authorization,
-    asked: login::AuditLog,
-) -> Result<bool, Box<Error>> {
+    token: TokenInfo,
+) -> Result<(), Box<Error>> {
     let account_name = &app_cfg.account.name;
     match authorized_email(hub).await.map_err(Error::About)? {
         Some(email) if email == *account_name => {}
@@ -148,29 +108,14 @@ async fn save_reauthorized(
     }
 
     // Google leaves out the refresh token when the grant still exists; keep the stored one then.
-    // The stored tokens are read and replaced in one change under the lock of the account (see
-    // `auth::lock`): a refresh that is under way finishes first, and one that starts now sees
-    // the new tokens.
-    let lock = AccountLock::new(&app_cfg.base_path, account_name).map_err(Error::SaveTokens)?;
-    let (account, client_id) = (app_cfg.clone(), secret.client_id.clone());
-    let saved = lock
-        .hold_blocking(LOCK_TIMEOUT, move |held| {
-            let previous = account.tokens_of_client(&client_id);
-            let login_tokens = login::tokens_after_login(previous.as_ref(), authorization, asked)
-                .map_err(Error::Login)?;
-            login_tokens
-                .tokens
-                .write_locked(held)
-                .map_err(Error::SaveTokens)?;
-            Ok(login_tokens)
-        })
-        .await;
-    let login::LoginTokens { tokens, audit_log } = match saved {
-        Ok(saved) => saved.map_err(Box::new)?,
-        Err(error) => return Err(Error::SaveTokens(error.into()).into()),
-    };
+    let previous = app_cfg.tokens_of_client(&secret.client_id).await;
+    let tokens = TokenFile::after_login(previous.as_ref(), &auth::DRIVE_SCOPES, token);
     auth::warn_if_no_refresh_token(&tokens, account_name);
-    Ok(audit_log)
+    tokens
+        .save(app_cfg.tokens_path())
+        .await
+        .map_err(Error::SaveTokens)?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -265,7 +210,6 @@ impl Display for Error {
 mod tests {
     use serde_json::json;
     use time::{Duration, OffsetDateTime};
-    use yup_oauth2::storage::TokenInfo;
 
     use super::*;
     use crate::common::mock_server::{MockServer, Response};
@@ -277,18 +221,6 @@ mod tests {
             expires_at: Some(OffsetDateTime::now_utc() + Duration::hours(1)),
             id_token: None,
         }
-    }
-
-    /// The result of a login, granted the audit log or not.
-    fn authorization(audit_log: bool) -> login::Authorization {
-        login::Authorization {
-            token: new_token(),
-            audit_log,
-        }
-    }
-
-    fn about_me() -> Response {
-        Response::json(200, &json!({"user": {"emailAddress": "me@example.com"}}))
     }
 
     /// An account directory with secret.json and, if given, tokens.json.
@@ -310,18 +242,15 @@ mod tests {
     async fn reauth_writes_the_tokens_of_an_account_whose_tokens_json_is_missing() {
         let dir = tempfile::tempdir().unwrap();
         let (app_cfg, secret) = account(dir.path(), None);
-        let server = MockServer::start(vec![about_me()]).await;
+        let server = MockServer::start(vec![Response::json(
+            200,
+            &json!({"user": {"emailAddress": "me@example.com"}}),
+        )])
+        .await;
 
-        let recorded = save_reauthorized(
-            &app_cfg,
-            &secret,
-            &server.hub(),
-            authorization(false),
-            login::AuditLog::No,
-        )
-        .await
-        .unwrap();
-        assert!(!recorded);
+        save_reauthorized(&app_cfg, &secret, &server.hub(), new_token())
+            .await
+            .unwrap();
 
         let saved = TokenFile::load(app_cfg.tokens_path())
             .await
@@ -348,277 +277,15 @@ mod tests {
         let (app_cfg, secret) = account(dir.path(), Some(OLD_TOKENS));
         let server = MockServer::start(vec![Response::json(200, &about)]).await;
 
-        let error = save_reauthorized(
-            &app_cfg,
-            &secret,
-            &server.hub(),
-            authorization(true),
-            login::AuditLog::Required,
-        )
-        .await
-        .unwrap_err();
+        let error = save_reauthorized(&app_cfg, &secret, &server.hub(), new_token())
+            .await
+            .unwrap_err();
 
         let tokens = tokio::fs::read_to_string(app_cfg.tokens_path())
             .await
             .unwrap();
         assert_eq!(tokens, OLD_TOKENS, "the stored tokens were changed");
         error
-    }
-
-    /// A login that Google granted the audit log, without a refresh token.
-    fn audit_log_without_refresh_token() -> login::Authorization {
-        login::Authorization {
-            token: TokenInfo {
-                refresh_token: None,
-                ..new_token()
-            },
-            audit_log: true,
-        }
-    }
-
-    /// The tokens of an account that was granted the audit log, with refresh token `refresh`.
-    fn granted_tokens(refresh: Option<&str>) -> String {
-        TokenFile::after_login(
-            None,
-            &auth::DRIVE_AND_AUDIT_LOG_SCOPES,
-            TokenInfo {
-                access_token: Some(String::from("old")),
-                refresh_token: refresh.map(str::to_owned),
-                ..new_token()
-            },
-        )
-        .to_json()
-        .unwrap()
-    }
-
-    #[tokio::test]
-    async fn reauth_granted_the_audit_log_records_it_with_a_refresh_token_of_the_grant() {
-        // With the refresh token of the answer.
-        let dir = tempfile::tempdir().unwrap();
-        let (app_cfg, secret) = account(dir.path(), Some(OLD_TOKENS));
-        let server = MockServer::start(vec![about_me()]).await;
-        let asked = login::AuditLog::Required;
-        let recorded =
-            save_reauthorized(&app_cfg, &secret, &server.hub(), authorization(true), asked)
-                .await
-                .unwrap();
-        assert!(recorded);
-        let saved = TokenFile::load(app_cfg.tokens_path())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(saved.audit_log_granted());
-        assert_eq!(saved.entries()[0].scopes, auth::DRIVE_AND_AUDIT_LOG_SCOPES);
-        assert_eq!(saved.refresh_token(), Some("new-refresh"));
-
-        // Google left out the refresh token, and the stored one was issued with the audit log:
-        // it is kept, with the grant.
-        for asked in [login::AuditLog::Required, login::AuditLog::Optional] {
-            let dir = tempfile::tempdir().unwrap();
-            let (app_cfg, secret) = account(dir.path(), Some(&granted_tokens(Some("old-refresh"))));
-            let server = MockServer::start(vec![about_me()]).await;
-            let recorded = save_reauthorized(
-                &app_cfg,
-                &secret,
-                &server.hub(),
-                audit_log_without_refresh_token(),
-                asked,
-            )
-            .await
-            .unwrap();
-            assert!(recorded, "{asked:?}");
-            let saved = TokenFile::load(app_cfg.tokens_path())
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(saved.audit_log_granted());
-            assert_eq!(saved.refresh_token(), Some("old-refresh"));
-            assert!(saved.refresh_token_has_audit_log());
-        }
-    }
-
-    #[tokio::test]
-    async fn audit_log_reauth_without_a_refresh_token_never_records_it_with_a_drive_only_one() {
-        // `--audit-log`, and the stored refresh token is of a Drive-only authorization: nothing
-        // is saved, and the error says how to get a refresh token.
-        let dir = tempfile::tempdir().unwrap();
-        let (app_cfg, secret) = account(dir.path(), Some(OLD_TOKENS));
-        let server = MockServer::start(vec![about_me()]).await;
-        let error = save_reauthorized(
-            &app_cfg,
-            &secret,
-            &server.hub(),
-            audit_log_without_refresh_token(),
-            login::AuditLog::Required,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            matches!(
-                &*error,
-                Error::Login(login::LoginError::AuditLogWithoutRefreshToken)
-            ),
-            "{error:?}"
-        );
-        let message = crate::error_message(&*error);
-        assert!(
-            message.starts_with("Error: Google returned no refresh token"),
-            "{message}"
-        );
-        assert!(message.contains("https://myaccount.google.com/permissions"));
-        assert!(!message.contains("refresh\""), "{message}");
-        assert_eq!(
-            tokio::fs::read_to_string(app_cfg.tokens_path())
-                .await
-                .unwrap(),
-            OLD_TOKENS
-        );
-
-        // Asked again by itself (the account had the grant, but no refresh token of it): the
-        // Drive authorization is saved, without the grant.
-        let dir = tempfile::tempdir().unwrap();
-        let (app_cfg, secret) = account(dir.path(), Some(&granted_tokens(None)));
-        let server = MockServer::start(vec![about_me()]).await;
-        let recorded = save_reauthorized(
-            &app_cfg,
-            &secret,
-            &server.hub(),
-            audit_log_without_refresh_token(),
-            login::AuditLog::Optional,
-        )
-        .await
-        .unwrap();
-        assert!(!recorded);
-        let saved = TokenFile::load(app_cfg.tokens_path())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!saved.audit_log_granted());
-        assert_eq!(saved.entries()[0].scopes, auth::DRIVE_SCOPES);
-        assert_eq!(
-            auth::audit_log_loss(login::AuditLog::Optional, true, recorded),
-            Some(auth::AuditLogLoss::NoRefreshToken)
-        );
-    }
-
-    #[test]
-    fn reauth_asks_for_the_audit_log_again_when_the_account_had_it() {
-        use login::AuditLog;
-
-        assert_eq!(audit_log_request(true, false), AuditLog::Required);
-        assert_eq!(audit_log_request(true, true), AuditLog::Required);
-        assert_eq!(audit_log_request(false, true), AuditLog::Optional);
-        assert_eq!(audit_log_request(false, false), AuditLog::No);
-
-        // What "the account had it" is read from.
-        let granted = TokenFile::after_login(None, &auth::DRIVE_AND_AUDIT_LOG_SCOPES, new_token());
-        assert!(granted.audit_log_granted());
-        let drive_only = TokenFile::from_json(OLD_TOKENS.as_bytes()).unwrap();
-        assert!(!drive_only.audit_log_granted());
-    }
-
-    #[tokio::test]
-    async fn reauth_not_granted_the_audit_log_again_saves_the_drive_authorization() {
-        let dir = tempfile::tempdir().unwrap();
-        let granted = TokenFile::after_login(
-            None,
-            &auth::DRIVE_AND_AUDIT_LOG_SCOPES,
-            TokenInfo {
-                access_token: Some(String::from("old")),
-                ..new_token()
-            },
-        );
-        let (app_cfg, secret) = account(dir.path(), Some(&granted.to_json().unwrap()));
-        let server = MockServer::start(vec![about_me()]).await;
-
-        // The login asked for it again (AuditLog::Optional) and Google did not grant it.
-        let recorded = save_reauthorized(
-            &app_cfg,
-            &secret,
-            &server.hub(),
-            authorization(false),
-            login::AuditLog::Optional,
-        )
-        .await
-        .unwrap();
-        assert!(!recorded);
-
-        let saved = TokenFile::load(app_cfg.tokens_path())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(!saved.audit_log_granted());
-        assert_eq!(
-            saved
-                .get(&auth::DRIVE_SCOPES)
-                .unwrap()
-                .access_token
-                .as_deref(),
-            Some("new-access")
-        );
-        assert_eq!(saved.refresh_token(), Some("new-refresh"));
-    }
-
-    #[tokio::test]
-    async fn reauth_builds_the_new_tokens_from_the_file_it_finds_under_the_lock() {
-        use crate::auth::lock::test_hooks::{when_waiting, within, Elsewhere};
-
-        let dir = tempfile::tempdir().unwrap();
-        let (app_cfg, secret) = account(dir.path(), Some(OLD_TOKENS));
-        let server = MockServer::start(vec![about_me()]).await;
-
-        // Another process holds the lock, and saves a new authorization (r2).
-        let lock = AccountLock::new(dir.path(), "me@example.com").unwrap();
-        let elsewhere = Elsewhere::hold(lock, |held| {
-            TokenFile::after_login(
-                None,
-                &auth::DRIVE_SCOPES,
-                TokenInfo {
-                    refresh_token: Some(String::from("r2")),
-                    ..new_token()
-                },
-            )
-            .write_locked(held)
-            .unwrap();
-        })
-        .await;
-
-        // The reauthorization, which Google answered without a refresh token, waits for the lock
-        // and builds the new tokens from the file it finds then: it keeps r2.
-        let waiting = when_waiting(app_cfg.tokens_path());
-        let reauth = tokio::spawn({
-            let (app_cfg, hub) = (app_cfg.clone(), server.hub());
-            async move {
-                let authorization = login::Authorization {
-                    token: TokenInfo {
-                        refresh_token: None,
-                        ..new_token()
-                    },
-                    audit_log: false,
-                };
-                save_reauthorized(&app_cfg, &secret, &hub, authorization, login::AuditLog::No).await
-            }
-        });
-        within("the wait of the reauthorization", waiting.notified()).await;
-        elsewhere.finish().await;
-        within("the reauthorization", reauth)
-            .await
-            .unwrap()
-            .unwrap();
-
-        let saved = TokenFile::load(app_cfg.tokens_path())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(saved.refresh_token(), Some("r2"));
-        assert_eq!(
-            saved
-                .get(&auth::DRIVE_SCOPES)
-                .unwrap()
-                .access_token
-                .as_deref(),
-            Some("new-access")
-        );
     }
 
     #[tokio::test]

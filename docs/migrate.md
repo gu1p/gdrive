@@ -272,18 +272,3 @@ What a dry run cannot tell, because it reads no content and writes nothing:
   was migrated is not copied again.
 - Shared drives' own settings, and the "Shared with me" view, are not migrated: migrate the folders and
   files themselves by id.
-
-## After the migration: who still uses the old location
-
-Some people may keep working in the old location after the migration. Two commands tell who, to contact them:
-
-- [`gdrive files diverged`](diverged.md), with the same arguments as the migration, reports what changed in
-  the source after it (added, edited, moved, renamed or trashed items) and who last changed each. It works for
-  any account, personal Gmail accounts included, and needs nothing beyond Drive; it cannot see views or
-  downloads.
-- [`gdrive files activity`](activity.md) reads the audit log of a Google Workspace organization: views,
-  downloads and edits, per person. It needs an administrator of the organization.
-
-```sh
-gdrive files diverged <FOLDER_ID> --from old@example.com --to new@example.com --into 1XyZ... --by user
-```
