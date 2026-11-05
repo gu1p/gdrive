@@ -64,9 +64,9 @@ gdrive files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>] [--unt
   Dates and times without a time zone are in the local time zone, the one the report prints times in. The
   audit log keeps 180 days: an older `--since` starts 180 days ago, with a warning.
 - `--by user|file|event`: the rows of the report (see [The reports](#the-reports)); `user` by default.
-- `--exclude EMAIL`: leave out what this person did, for example the account that ran the migration, whose
-  reads are in the log as downloads. Not case-sensitive; repeat it for several people. It applies to all
-  three reports.
+- `--exclude EMAIL`: leave out this person, for example the account that ran the migration, whose reads are
+  in the log as downloads: what they did, and their row on the sharing lists (a group of that address too).
+  Not case-sensitive; repeat it for several people. It applies to all three reports and to the summary.
 - `--active-only`: only the people with activity. The sharing lists are then not read at all, and the
   `Access` column is `-` for everyone.
 - `--scan`: how much of the audit log Google sends (see [Scans](#scans---scan)): `domain` by default,

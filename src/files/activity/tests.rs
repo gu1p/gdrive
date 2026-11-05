@@ -586,6 +586,57 @@ async fn exclude_leaves_a_person_out_of_every_report() {
 }
 
 #[tokio::test]
+async fn an_excluded_person_is_left_out_of_the_sharing_rows_and_the_summary_too() {
+    let sharing = vec![
+        // Another case than the --exclude below.
+        permission("user", "owner", "MIGRATOR@example.com"),
+        permission("group", "writer", "Migrator@Example.com"),
+        permission("user", "reader", "carol@example.com"),
+    ];
+    let drive = FakeDrive::start(
+        tree(),
+        Behavior {
+            permissions: [(String::from("old"), sharing)].into(),
+            ..behavior(migrated_log())
+        },
+    )
+    .await;
+
+    let ran = activity(
+        &drive,
+        Settings {
+            exclude: vec![String::from("migrator@EXAMPLE.com")],
+            ..settings(&["old"])
+        },
+    )
+    .await;
+
+    ran.assert_ok();
+    let users = ran
+        .rows()
+        .into_iter()
+        .map(|row| row[0].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        users,
+        [
+            "ana@example.com",
+            "bob@example.com",
+            "(anonymous)",
+            "carol@example.com"
+        ]
+    );
+    assert!(!ran.out.text().to_lowercase().contains("migrator"));
+    assert_eq!(
+        ran.summary(),
+        format!(
+            "Summary: 2 people active since {}, and anonymous users; 1 with access and no activity",
+            local("2026-10-06T12:00:00Z")
+        )
+    );
+}
+
+#[tokio::test]
 async fn by_file_has_a_row_per_item_and_person_by_path_then_newest_first() {
     let drive = FakeDrive::start(tree(), behavior(migrated_log())).await;
 

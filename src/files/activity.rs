@@ -130,6 +130,16 @@ pub(crate) enum Who {
     Anyone,
 }
 
+impl Who {
+    /// Whether the address of this person or group is one of `exclude` (lower-case addresses).
+    fn is_excluded(&self, exclude: &HashSet<String>) -> bool {
+        match self {
+            Who::Person(email) | Who::Group(email) => exclude.contains(email),
+            Who::Anonymous | Who::Domain(_) | Who::Anyone => false,
+        }
+    }
+}
+
 impl Display for Who {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -214,9 +224,17 @@ async fn report(
         ))
         .await;
 
+    let exclude = settings
+        .exclude
+        .iter()
+        .map(|email| email.trim().to_lowercase())
+        .collect::<HashSet<_>>();
     // Before the audit log, which takes long: a sharing list that cannot be read fails early.
+    // An excluded address is left out of it as well.
     let access = if settings.by == By::User && !settings.active_only {
-        Some(sharing::read(hub, &items.roots).await?)
+        let mut access = sharing::read(hub, &items.roots).await?;
+        access.retain(|who, _| !who.is_excluded(&exclude));
+        Some(access)
     } else {
         None
     };
@@ -233,11 +251,6 @@ async fn report(
     let series = scan::series(&plan, &range);
     printer.err(reading_line(&plan, &range, series.len())).await;
 
-    let exclude = settings
-        .exclude
-        .iter()
-        .map(|email| email.trim().to_lowercase())
-        .collect::<HashSet<_>>();
     let selection = report::Selection {
         items: &items.paths,
         exclude: &exclude,

@@ -154,7 +154,7 @@ impl Tally {
         if read(time) {
             self.read += u64::try_from(record.events.len()).unwrap_or(u64::MAX);
         }
-        if matches!(&who, Who::Person(email) if selection.exclude.contains(email)) {
+        if who.is_excluded(selection.exclude) {
             return;
         }
         for (position, event) in record.events.iter().enumerate() {

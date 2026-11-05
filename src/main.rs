@@ -506,7 +506,7 @@ enum FileCommand {
         #[arg(long, value_enum, default_value_t = files::activity::By::User)]
         by: files::activity::By,
 
-        /// Leave out the activity of this email address (case-insensitive), for example the account that ran a migration. Repeat for several
+        /// Leave out this email address (case-insensitive): its activity and its row on the sharing lists, for example the account that ran a migration. Repeat for several
         #[arg(long, value_name = "EMAIL")]
         exclude: Vec<String>,
 
