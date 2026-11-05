@@ -1,3 +1,4 @@
+pub(crate) mod activity;
 pub(crate) mod batch;
 pub(crate) mod copy;
 pub(crate) mod delete;
@@ -16,6 +17,7 @@ pub(crate) mod trash;
 pub(crate) mod update;
 pub(crate) mod upload;
 
+pub(crate) use activity::activity;
 pub(crate) use copy::copy;
 pub(crate) use delete::delete;
 pub(crate) use download::download;
