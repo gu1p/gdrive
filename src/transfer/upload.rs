@@ -42,6 +42,7 @@ pub(crate) mod session;
 mod tests;
 
 use std::{
+    collections::BTreeMap,
     error::Error,
     fmt::{self, Display, Formatter, Write},
     io::{self, Read, Seek},
@@ -129,6 +130,9 @@ pub(crate) struct UploadTarget {
     /// The id the new file gets, from `files.generateIds`. `None`: the upload generates one.
     /// Not used by an update, nor by a conversion (Drive takes no id for those).
     pub(crate) new_file_id: Option<String>,
+    /// The `appProperties` a new file is created with, in the request that creates it. Not
+    /// used by an update.
+    pub(crate) app_properties: BTreeMap<String, String>,
 }
 
 /// The times a new file gets instead of the time of its upload; a relay gives the copy the
@@ -766,6 +770,7 @@ impl<'a> Upload<'a> {
             marker: self.marker.clone(),
             modified_time: self.times.modified.as_ref().map(rfc3339),
             created_time: self.times.created.as_ref().map(rfc3339),
+            app_properties: self.target.app_properties.clone(),
         }
     }
 
@@ -970,7 +975,8 @@ impl<'a> Upload<'a> {
     }
 
     /// The metadata JSON: the name, if any, for an update (the file keeps its type and
-    /// folders), the id, name, type and folders for a new file; the times of [`FileTimes`].
+    /// folders), the id, name, type, folders and `appProperties` for a new file; the times of
+    /// [`FileTimes`].
     fn metadata(&self) -> String {
         let mut metadata = serde_json::Map::new();
         if let Some(id) = self.created_id() {
@@ -991,11 +997,17 @@ impl<'a> Upload<'a> {
             if !self.target.parents.is_empty() {
                 metadata.insert("parents".into(), self.target.parents.clone().into());
             }
+            let mut properties = self
+                .target
+                .app_properties
+                .iter()
+                .map(|(key, value)| (key.clone(), value.as_str().into()))
+                .collect::<serde_json::Map<_, _>>();
             if let Some(marker) = &self.marker {
-                metadata.insert(
-                    "appProperties".into(),
-                    serde_json::json!({ UPLOAD_MARKER: marker }),
-                );
+                properties.insert(UPLOAD_MARKER.into(), marker.as_str().into());
+            }
+            if !properties.is_empty() {
+                metadata.insert("appProperties".into(), properties.into());
             }
         }
         serde_json::Value::Object(metadata).to_string()

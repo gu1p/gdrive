@@ -15,6 +15,7 @@
 //!   Drive's `modifiedTime`, which the next run compares.
 
 use std::{
+    collections::BTreeMap,
     io,
     path::{Path, PathBuf},
     sync::{
@@ -232,6 +233,7 @@ impl Transfers {
                     },
                     existing_file_id: existing,
                     convert_to: None,
+                    app_properties: BTreeMap::new(),
                 };
                 self.upload_job(label, line, path, target, size)
             }

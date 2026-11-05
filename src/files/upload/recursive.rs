@@ -20,6 +20,7 @@
 mod tests;
 
 use std::{
+    collections::BTreeMap,
     future::Future,
     path::{Path, PathBuf},
     sync::Arc,
@@ -260,6 +261,7 @@ impl Uploads {
             existing_file_id: None,
             convert_to: None,
             new_file_id: Some(file.drive_id.clone()),
+            app_properties: BTreeMap::new(),
         };
         send_file(&self.hub, &file.path, &target, &self.options, progress).await
     }
