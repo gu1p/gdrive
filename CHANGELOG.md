@@ -121,10 +121,11 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   `added` (no item of its name in the copy, and everything in an added folder; with an `edited` row too
   when it was modified after its creation), `edited` (other content and the origin newer than the copy),
   `differs` (the copy is newer and none of its revisions is the origin as it is now, or they cannot be
-  read), `moved` (a file renamed or moved in the origin, found by size, MD5 checksum and creation time,
+  read, or several files of one name are left that cannot be told apart), `moved` (a file renamed or moved in the origin, found by size, MD5 checksum and creation time,
   without a person or time) and `trashed` (who and when in shared drives, the owner in My Drive). Files are
-  compared by size and MD5 checksum, Google Docs files by modification time to the millisecond; files and
-  folders of one name are matched one to one, and folders of one name compared as a group. A person is
+  compared by size and MD5 checksum, Google Docs files by modification time to the millisecond; files of
+  one name are paired one to one only by the same content and time, and folders of one name compared as a
+  group. A person is
   named only when Drive names them for that fact, else `-`, which `--exclude` never hides. Without `--to`,
   `--since` reports what was created or modified in the origin since then; with it, `--since` filters the
   rows, each on its own. Shortcuts, Drawings, Forms and items both accounts see are left out and listed. `--by item` (default) or `--by user`; `--exclude EMAIL`, `--jobs`, `--skip-header`,

@@ -92,20 +92,31 @@ out of these listings on both sides.
 **Several folders of one name.** Which of two folders `Team` in the copy belongs to which `Team` of the
 origin cannot be known, so all folders of one name in a folder are compared as one group, with the copy's
 folders of that name: their contents are pooled and matched by name, at every level. One folder on each
-side is the same thing with groups of one.
+side is the same thing with groups of one. What this cannot see: a second, empty folder of an existing name
+created in the origin, and a file moved between two folders of the same name, give no row, and `--to
+--since` does not find them either.
 
-**Files of one name** are matched one to one: each file of the origin is paired with a file of its name in
-the copy that has the same content (first one that has the same modification time too), each file of the
-copy used once. Then each file of the origin without a partner:
+**Files of one name.** A file of the origin and a file of its name in the copy with the same content and the
+same modification time (which the migration gave the copy) are a file nobody touched: such pairs are
+matched one to one and set aside. Then, when **one** file of the origin of that name is left:
 
 | Case | Row |
 |---|---|
 | the copy has no file of its name left (for a folder: no folder of its name). Everything in an added folder is added too, one row each | `added`, and `edited` if it was modified after its creation (see below) |
-| the files of its name left in the copy are all older than the origin's last modification | `edited` |
-| one of them is newer, or a time is missing: a revision of one of them holds the origin's present content | nothing: the copy was made from the origin as it is |
+| a file of its name left in the copy has its content (under another time) | nothing |
+| the files of its name left in the copy all have other content and are all older than the origin's last modification | `edited` |
+| one of them is newer, or a time is missing: a revision of one of them holds the origin's present content | nothing: the copy once held that content |
 | as above, but no revision holds it, or the revisions cannot be read | `differs` |
 | an added file whose size, MD5 checksum and creation time are those of a file of the copy that no origin file was matched or compared with | `moved`, with where it is in the copy: `PATH (was OLD_PATH)` |
 | someone moved it to the trash, from a folder of the origin | `trashed` (see [In the trash](#in-the-trash)) |
+
+When **several** files of the origin of one name are left and the copy has files of that name left too,
+which copy belongs to which file cannot be known, and every guess could hide the one that changed. So no
+content and no revision counts as evidence there: each of those origin files gets a row of its own,
+`edited` when its content is that of none of the copies left and it was modified later than all of them,
+otherwise `differs`, with its own last modification and who made it. A `differs` row is preferred over a
+guess. Those copies are not used for `moved` either. When the copy has no file of that name left, each is
+new (`added`, and `edited`).
 
 **The same content** is the migration's own rule for a file with content (a photo, a PDF, an office file):
 the same size and MD5 checksum. A Google Docs, Sheets or Slides file has no checksum, and its copy was
@@ -114,10 +125,12 @@ origin's modification time, so the two are the same when their modification time
 to the millisecond, the precision the migration sends.
 
 **Changed on both sides.** People who moved to the new place edit the copy, which is expected, and makes the
-copy the newer side. Whether the origin also changed after the migration is then settled by the copy's
-revisions, all of them (Drive lists them in no set order): if one of them is exactly the origin as it is now
-(the same size and checksum; for a Google file the same modification time), the copy was made from it and
-nothing is reported. Otherwise the row is `differs`: the revision the migration wrote may have been
+copy the newer side. For a single file of the origin of that name, whether it also changed after the
+migration is then looked up in the copy's revisions, all of them (Drive lists them in no set order): if one
+of them is exactly the origin as it is now (the same size and checksum; for a Google file the same
+modification time), the copy once held the origin's present content, and nothing is reported. That is all
+it shows: a file of the origin that was changed after the migration and then put back to content the copy
+once held is not reported. Otherwise the row is `differs`: the revision the migration wrote may have been
 deleted by Drive, may never have existed (a file the copy's account already had, which the migration
 reused), or the origin changed after the migration. A `differs` row carries the origin's last modification
 and who made it, which is what to judge by: a time before the migration, or the migration's own account,
@@ -190,14 +203,17 @@ Said plainly, the limits of this way of looking:
 - **Renames and moves have no person and no time** (`moved`).
 - **What is only in the copy is not reported.**
 - **A file edited in both places** is settled only when a revision of the copy is the origin as it is now;
-  otherwise it `differs`. Drive deletes old revisions of files with content after about 30 days, or earlier
+  otherwise it `differs`. A file changed after the migration and then put back to content the copy once
+  held is not reported. Several files of one name that are left unmatched are never settled: each `differs`
+  unless it is plainly `edited`. Drive deletes old revisions of files with content after about 30 days, or earlier
   once a file has 100 of them, unless they are kept forever, and may not list every revision of a Google file
   with a long history.
 - **A Google file's copy is a conversion**: only the times are compared, not the content.
 - **The owner of a My Drive file is taken for who created it**, which is wrong when its ownership was
   transferred later.
 - **Matched by name**, as the migration matches: a renamed folder in the origin is `added` with everything in
-  it, since the copy's folder of the old name is not looked into. A file the migration could not copy,
+  it, since the copy's folder of the old name is not looked into. Folders of one name are one group: a new
+  empty folder of an existing name, and a file moved between two folders of one name, give no row. A file the migration could not copy,
   because the copy's account already had another file of its name, is compared with that file: it shows as
   `edited` or `differs` with the origin's own time, which may be before the migration.
 - **Read only.** Nothing is ever changed, in either account.
