@@ -493,6 +493,69 @@ enum FileCommand {
         progress: ProgressArgs,
     },
 
+    /// Report who used files and folders, from the audit log of a Google Workspace organization
+    ///
+    /// Reads the Drive audit log (Admin SDK Reports API) of the organization that owns the
+    /// given files and folders, folders with everything in them, and prints per person what they
+    /// did there: the last time, on how many days, how many views, downloads, edits and other
+    /// events, on how many items. People on the sharing lists of the given items without any
+    /// activity follow. Use it after a migration to see who still uses the old location. The
+    /// account must be an administrator of the organization with the Reports privilege, and
+    /// authorized with 'gdrive account reauth <ACCOUNT> --audit-log'. Nothing in Drive is
+    /// changed. See docs/activity.md.
+    Activity {
+        /// Id of a file or folder: also `root`, or the id of a shared drive. Several ids are one report
+        #[arg(required = true, value_name = "FILE_ID")]
+        file_id: Vec<String>,
+
+        /// The account to read with, as `gdrive account list` prints it [default: the current account]
+        #[arg(long, value_name = "ACCOUNT")]
+        account: Option<String>,
+
+        /// Start of the time range: a duration back from now (12h, 30d, 2w), a local date (2026-10-01) or time (2026-10-01 14:30), or an RFC 3339 time. The audit log keeps 180 days
+        #[arg(long, value_name = "WHEN", default_value = "30d", value_parser = files::activity::when::parse)]
+        since: files::activity::when::When,
+
+        /// End of the time range, in the forms of --since [default: now]
+        #[arg(long, value_name = "WHEN", value_parser = files::activity::when::parse)]
+        until: Option<files::activity::when::When>,
+
+        /// The rows of the report
+        #[arg(long, value_enum, default_value_t = files::activity::By::User)]
+        by: files::activity::By,
+
+        /// Leave out this email address (case-insensitive): its activity and its row on the sharing lists, for example the account that ran a migration. Repeat for several
+        #[arg(long, value_name = "EMAIL")]
+        exclude: Vec<String>,
+
+        /// Only people with activity: leave out those on the sharing lists without any. The sharing lists are not read, and the Access column is `-`
+        #[arg(long)]
+        active_only: bool,
+
+        /// How much of the audit log Google sends; the items are filtered on this machine in every case. The default reads everything and is always complete
+        #[arg(long, value_enum, default_value_t = files::activity::Scan::Domain)]
+        scan: files::activity::Scan,
+
+        /// Send up to N requests at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// Don't print header
+        #[arg(long)]
+        skip_header: bool,
+
+        /// Field separator. Columns stay aligned; for tab-separated values use --tsv
+        #[arg(long, default_value_t = String::from("\t"))]
+        field_separator: String,
+
+        /// Print tab-separated values for scripts
+        ///
+        /// Columns are not aligned, and a tab, newline, carriage return or backslash in a value is
+        /// written as `\t`, `\n`, `\r` or `\\`, another control character as `\u{1b}`.
+        #[arg(long, conflicts_with = "field_separator")]
+        tsv: bool,
+    },
+
     /// Update file. This will create a new version of the file. The older versions will typically be kept for 30 days.
     Update {
         /// File id of the file you want ot update
@@ -1222,6 +1285,44 @@ async fn handle_files_command(
                 transfer: Options::new(jobs, continue_on_error),
                 progress: progress.mode(),
             })
+            .await?;
+        }
+
+        FileCommand::Activity {
+            file_id,
+            account,
+            since,
+            until,
+            by,
+            exclude,
+            active_only,
+            scan,
+            jobs,
+            skip_header,
+            field_separator,
+            tsv,
+        } => {
+            let output = if tsv {
+                files::activity::Output::Tsv { skip_header }
+            } else {
+                files::activity::Output::Table {
+                    skip_header,
+                    field_separator,
+                }
+            };
+            // Boxed: the future of run() holds the state of every command at once.
+            Box::pin(files::activity(files::activity::Config {
+                file_ids: file_id,
+                account,
+                since,
+                until,
+                by,
+                exclude,
+                active_only,
+                scan,
+                jobs,
+                output,
+            }))
             .await?;
         }
 
@@ -2321,6 +2422,137 @@ mod flag_tests {
                 "{args:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn activity_takes_ids_the_time_range_and_the_report_flags() {
+        use crate::files::activity::{when::When, By, Scan};
+
+        let FileCommand::Activity {
+            file_id,
+            account,
+            since,
+            until,
+            by,
+            exclude,
+            active_only,
+            scan,
+            jobs,
+            skip_header,
+            field_separator: _,
+            tsv,
+        } = parse(&[
+            "files",
+            "activity",
+            "a",
+            "b",
+            "--account",
+            "admin@example.com",
+            "--since",
+            "2026-10-01T08:00:00Z",
+            "--until",
+            "12h",
+            "--by",
+            "event",
+            "--exclude",
+            "migrator@example.com",
+            "--exclude",
+            "other@example.com",
+            "--active-only",
+            "--scan",
+            "file",
+            "--jobs",
+            "8",
+            "--skip-header",
+            "--tsv",
+        ])
+        else {
+            panic!("expected activity");
+        };
+        assert_eq!(file_id, ["a", "b"]);
+        assert_eq!(account.as_deref(), Some("admin@example.com"));
+        let october = chrono::DateTime::parse_from_rfc3339("2026-10-01T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(since, When::At(october));
+        assert_eq!(until, Some(When::Ago(chrono::TimeDelta::hours(12))));
+        assert_eq!(by, By::Event);
+        assert_eq!(exclude, ["migrator@example.com", "other@example.com"]);
+        assert!(active_only && skip_header && tsv);
+        assert_eq!(scan, Scan::File);
+        assert_eq!(jobs.get(), 8);
+
+        for (value, expected) in [("user", By::User), ("file", By::File)] {
+            let FileCommand::Activity { by, .. } =
+                parse(&["files", "activity", "a", "--by", value])
+            else {
+                panic!("expected activity");
+            };
+            assert_eq!(by, expected);
+        }
+        for (value, expected) in [("domain", Scan::Domain), ("drive", Scan::Drive)] {
+            let FileCommand::Activity { scan, .. } =
+                parse(&["files", "activity", "a", "--scan", value])
+            else {
+                panic!("expected activity");
+            };
+            assert_eq!(scan, expected);
+        }
+    }
+
+    #[test]
+    fn activity_defaults_to_30_days_per_person_of_the_current_account() {
+        use crate::files::activity::{when::When, By, Scan};
+
+        let FileCommand::Activity {
+            account,
+            since,
+            until,
+            by,
+            exclude,
+            active_only,
+            scan,
+            jobs,
+            skip_header,
+            field_separator,
+            tsv,
+            ..
+        } = parse(&["files", "activity", "id"])
+        else {
+            panic!("expected activity");
+        };
+        assert_eq!(account, None);
+        assert_eq!(since, When::Ago(chrono::TimeDelta::days(30)));
+        assert_eq!(until, None);
+        assert_eq!((by, scan), (By::User, Scan::Domain));
+        assert!(exclude.is_empty() && !active_only && !skip_header && !tsv);
+        assert_eq!(jobs.get(), 4);
+        assert_eq!(field_separator, "\t");
+
+        for args in [
+            &["files", "activity"][..],
+            &["files", "activity", "id", "--since", "yesterday"],
+            &["files", "activity", "id", "--until", "30m"],
+            &["files", "activity", "id", "--jobs", "0"],
+            &["files", "activity", "id", "--jobs", "65"],
+            &["files", "activity", "id", "--by", "person"],
+            &["files", "activity", "id", "--scan", "everything"],
+            &["files", "activity", "id", "--scan", "auto"],
+            &["files", "activity", "id", "--tsv", "--field-separator", ","],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("gdrive").chain(args.iter().copied())).is_err(),
+                "{args:?} should be rejected"
+            );
+        }
+        let error = Cli::try_parse_from(["gdrive", "files", "activity", "id", "--since", "soon"])
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            error.contains("'soon' is not a time; use a duration"),
+            "{error}"
+        );
     }
 
     #[test]

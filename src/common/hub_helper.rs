@@ -75,13 +75,6 @@ pub(crate) async fn get_hub_for(app_cfg: &AppConfig) -> Result<Hub, GetHubError>
 /// whose message names `gdrive account reauth <ACCOUNT> --audit-log`) or is not a user account
 /// (`GetHubError::AuditLogUnsupported`: service accounts and Application Default Credentials are
 /// not supported yet). Never starts an interactive authorization.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "used by `gdrive files activity`, which branch activity-cmd adds"
-    )
-)]
 pub(crate) async fn get_audit_hub_for(app_cfg: &AppConfig) -> Result<Hub, GetHubError> {
     audit_hub_with(app_cfg, hub::token_http_client).await
 }

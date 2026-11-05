@@ -99,6 +99,22 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the chunk and
   progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
   docs/migrate.md.
+- **Who still uses a folder.** `files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>]
+  [--until <WHEN>]` reads the Drive audit log of the Google Workspace organization (Admin SDK Reports API)
+  and prints per person the last activity, the days with activity, views, downloads, edits and other
+  events, and how many items they touched, for the given files and folders with everything in them; then
+  the people on the sharing lists of the given items without activity, with their role. `--by file` gives
+  a row per item and person, `--by event` a row per event. `--exclude EMAIL` leaves out a person, such as
+  the account that ran a migration, from the activity and the sharing rows; `--active-only` leaves out those without activity. `--since` and
+  `--until` take `30d`, `12h`, `2w`, a local date or time, or an RFC 3339 time (180 days at most, the
+  audit log's limit). The whole Drive log of the organization is read by default, which is complete;
+  `--scan file` (each item) is faster for a few items, `--scan drive` (the items' shared drives) faster
+  but blind to what happened before an item was moved into its shared drive. The items are always
+  filtered on this machine. A missing id, an id in the trash, an incomplete listing or a page of the log
+  that cannot be read fails the command rather than print a partial report. Nothing in Drive is changed. Needs
+  a Workspace administrator with the Reports privilege, the Admin SDK API enabled in the Cloud project,
+  and an account authorized with `--audit-log`. Takes `--jobs`, `--skip-header`, `--field-separator` and
+  `--tsv`. See docs/activity.md.
 
 Accounts and login:
 
