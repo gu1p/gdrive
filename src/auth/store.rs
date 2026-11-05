@@ -590,8 +590,10 @@ pub(crate) struct TokenStore {
 struct StoreState {
     /// The tokens this process works with: the file as it read it last, with its own updates.
     file: TokenFile,
-    /// The refresh token of the authorization whose file this store may write, the one the
-    /// authenticator refreshes with; stored with refreshed tokens that come without one.
+    /// The refresh token of the authorization whose file this store may write; stored with
+    /// refreshed tokens that come without one. It starts as the one the authenticator
+    /// refreshes with, and follows a refresh token that a refresh answer brought once that is
+    /// in the file.
     refresh_token: Option<String>,
 }
 
@@ -660,6 +662,13 @@ impl TokenStorage for TokenStore {
         }
         let mut state = self.state.lock().await;
         let state = &mut *state;
+        // A refresh token in the answer replaces the authorization's (Google does not do that
+        // for this flow today). This store then writes the file of the new one, once it is in
+        // the file. yup-oauth2's authenticator keeps refreshing with the refresh token it was
+        // built with for the rest of the process; should Google stop accepting that one, the
+        // process fails with invalid_grant at its next refresh, and the next one loads the new
+        // refresh token from the file.
+        let brought = token.refresh_token.clone();
         if token.refresh_token.is_none() {
             token.refresh_token.clone_from(&state.refresh_token);
         }
@@ -698,7 +707,13 @@ impl TokenStorage for TokenStore {
         .await;
 
         match written {
-            Ok(Ok(_)) => Ok(()),
+            Ok(Ok(true)) => {
+                if brought.is_some() {
+                    state.refresh_token = brought;
+                }
+                Ok(())
+            }
+            Ok(Ok(false)) => Ok(()),
             Ok(Err(error)) => Err(TokenStorageError::Io(error)),
             // Another process is updating the file: keep the token for this process only.
             Err(LockError::Timeout { .. }) => {

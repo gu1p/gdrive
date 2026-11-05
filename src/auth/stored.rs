@@ -874,4 +874,63 @@ mod tests {
             inode
         );
     }
+
+    #[tokio::test]
+    async fn a_refresh_token_in_a_refresh_answer_is_saved_and_followed_by_later_refreshes() {
+        // Each answer counts as expired at once, so every request refreshes again.
+        let answer = |access: &str, refresh: Option<&str>| {
+            let mut answer = serde_json::json!({
+                "access_token": access,
+                "expires_in": 30,
+                "token_type": "Bearer",
+            });
+            if let Some(refresh) = refresh {
+                answer["refresh_token"] = refresh.into();
+            }
+            (200, answer.to_string())
+        };
+        let server = MockServer::start(vec![
+            answer("a", Some("refresh-2")),
+            answer("b", Some("refresh-3")),
+            answer("c", None),
+            answer("d", None),
+        ])
+        .await;
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_tokens_for(
+            dir.path(),
+            &DRIVE_AND_AUDIT,
+            token("stale", Some("refresh-1"), TimeDuration::hours(-1)),
+        )
+        .await;
+
+        let credentials = load(server.addr(), &path).await.unwrap();
+        for (access, refresh_token) in [("a", "refresh-2"), ("b", "refresh-3"), ("c", "refresh-3")]
+        {
+            let token = bounded(credentials.access_token(&DRIVE_SCOPES))
+                .await
+                .unwrap();
+            assert_eq!(token.token(), Some(access));
+            let saved = TokenFile::load(&path).await.unwrap().unwrap();
+            assert_eq!(saved.refresh_token(), Some(refresh_token), "after {access}");
+            assert_eq!(
+                saved.get(&DRIVE_SCOPES).unwrap().access_token.as_deref(),
+                Some(access)
+            );
+            assert!(saved.audit_log_granted(), "after {access}");
+        }
+        // yup-oauth2 keeps refreshing with the refresh token this process started with.
+        let sent: Vec<_> = server
+            .requests()
+            .iter()
+            .filter_map(|request| request.form("refresh_token"))
+            .collect();
+        assert_eq!(sent, ["refresh-1"; 3]);
+
+        // The next process refreshes with the latest one.
+        let next = load(server.addr(), &path).await.unwrap();
+        let token = bounded(next.access_token(&DRIVE_SCOPES)).await.unwrap();
+        assert_eq!(token.token(), Some("d"));
+        assert_eq!(last_refresh_token(&server).as_deref(), Some("refresh-3"));
+    }
 }
