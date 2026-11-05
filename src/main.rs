@@ -416,11 +416,12 @@ enum FileCommand {
     ///
     /// Copies the given files and folders of the source account (--from, the current account by
     /// default) into the account --to, folders with everything in them. The content streams through this
-    /// machine without being written to disk. Running the command again skips what is already
-    /// there, so an interrupted migration is finished by running it again. Google Docs, Sheets
-    /// and Slides are exported and converted back (up to 10 MB each); shortcuts, Drawings, Forms
-    /// and the other Google types are skipped; sharing and comments are not migrated. Use
-    /// --dry-run first. See docs/migrate.md.
+    /// machine without being written to disk. The source account is only read: nothing in it is
+    /// changed, trashed or deleted unless --trash-source is given. Running the command again
+    /// skips what is already there, so an interrupted migration is finished by running it again.
+    /// Google Docs, Sheets and Slides are exported and converted back (up to 10 MB each);
+    /// shortcuts, Drawings, Forms and the other Google types are skipped; sharing and comments
+    /// are not migrated. Use --dry-run first. See docs/migrate.md.
     Migrate {
         /// Id of a file or folder of the source account. Several ids are migrated in one run
         #[arg(required = true, value_name = "FILE_ID")]

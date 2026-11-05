@@ -988,7 +988,15 @@ impl Migration {
     }
 
     /// Moves the source file or folder `id` to the trash (not in a dry run) and prints `line`.
+    ///
+    /// This is the only request of a migration that changes the source account, and nothing is
+    /// ever deleted there for good. It is sent only with `--trash-source`: both callers ask
+    /// that first, and without it this does nothing whoever calls it.
     async fn trash(&self, id: &str, line: String, context: &JobContext) -> Result<(), Error> {
+        debug_assert!(self.trash_source, "the trash was not asked for");
+        if !self.trash_source {
+            return Ok(());
+        }
         if !self.dry_run {
             let patch = PatchFile::new(id.to_owned()).with_trashed(true);
             update_metadata(&self.source, patch)

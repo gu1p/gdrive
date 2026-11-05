@@ -6,6 +6,10 @@ are logged in to gdrive on the same machine. The content streams from the source
 machine into the destination account: nothing is written to the local disk, and memory use stays small
 however large the files are.
 
+The source account is only read. Nothing in it is changed, moved to the trash or deleted, unless you ask
+for it with [`--trash-source`](#moving-instead-of-copying---trash-source), and even then nothing is deleted
+for good.
+
 ```sh
 gdrive files migrate <FOLDER_ID> --to new@example.com --dry-run    # what would be done
 gdrive files migrate <FOLDER_ID> --to new@example.com              # do it

@@ -253,6 +253,7 @@ async fn a_folder_tree_is_migrated_with_its_structure_and_content() {
          0 cancelled; 4 folders created, 0 reused"
     );
     // The source is only read.
+    assert_eq!(source.writes(), Vec::<String>::new());
     assert_eq!(source.patches(), []);
     assert!(source.created().is_empty());
     let mut media = source.media();
@@ -574,9 +575,11 @@ async fn a_dry_run_reads_the_destination_and_writes_nothing() {
         .collect::<Vec<_>>();
     listed.sort();
     assert_eq!(listed, ["old-photos", "root"]);
-    // The source is only listed.
+    // The source is only listed, also with --trash-source.
     assert!(source.media().is_empty() && source.exports().is_empty());
     assert_eq!(source.patches(), []);
+    assert_eq!(source.writes(), Vec::<String>::new());
+    assert_eq!(dest.writes(), Vec::<String>::new());
 
     let skip = format!("skip photos/link: {}", Unsupported::Shortcut);
     let mut expected = vec![
@@ -779,6 +782,69 @@ async fn an_export_over_the_limit_is_a_failed_item() {
     assert!(!dest.created().iter().any(|file| file.name == "Big"));
 }
 
+/// Without `--trash-source` the source account is only read, whatever a run meets: files that
+/// are copied, converted, skipped, already there or in conflict, and a second run over all of
+/// it. Not one request that could change, trash or delete anything goes to the source.
+#[tokio::test]
+async fn without_trash_source_the_source_is_only_read() {
+    let mut files = source_tree();
+    files.push(FakeFile::native(
+        "budget",
+        "Budget",
+        "photos",
+        "application/vnd.google-apps.spreadsheet",
+        "a,b",
+    ));
+    files.push(FakeFile::shortcut(
+        "link",
+        "link",
+        "photos",
+        "a",
+        "text/plain",
+    ));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    // `a.txt` is in conflict, `b.txt` is already there.
+    let mut before = conflicting_destination();
+    before.push(FakeFile::blob("old-b", "b.txt", "old-photos", "bb"));
+    let dest = FakeDrive::start(before, Behavior::default()).await;
+
+    for run in ["first", "second"] {
+        let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+        assert_eq!(
+            migrated.error(),
+            "Error: the migration is incomplete: 1 file failed",
+            "{run} run"
+        );
+        assert_eq!(source.writes(), Vec::<String>::new(), "{run} run");
+        assert_eq!(source.patches(), [], "{run} run");
+        assert_eq!(source.deletes(), Vec::<String>::new(), "{run} run");
+        assert!(source.created().is_empty(), "{run} run");
+        assert!(source.updates().is_empty(), "{run} run");
+        assert_eq!(source.chunks(), [], "{run} run");
+        assert_eq!(source.generated_ids(), 0, "{run} run");
+        assert!(
+            !migrated.out.text().contains("trash "),
+            "{run} run: {}",
+            migrated.out.text()
+        );
+        assert!(
+            !migrated.summary().contains("trash"),
+            "{run} run: {}",
+            migrated.summary()
+        );
+    }
+    // The run did its work: the copies read the source's content.
+    let mut media = source.media();
+    media.sort();
+    media.dedup();
+    assert_eq!(media, ["d", "f"]);
+    assert_eq!(source.exports().len(), 1, "{:?}", source.exports());
+    // And the destination never loses anything either.
+    assert_eq!(dest.deletes(), Vec::<String>::new());
+    assert_eq!(dest.patches(), []);
+}
+
 #[tokio::test]
 async fn trash_source_trashes_each_file_and_then_its_folders() {
     let source = FakeDrive::start(source_tree(), Behavior::default()).await;
@@ -823,8 +889,14 @@ async fn trash_source_trashes_each_file_and_then_its_folders() {
         "{}",
         migrated.summary()
     );
-    // Never deleted for good.
+    // Never deleted for good: the trash is the only thing the source is asked for.
     assert_eq!(source.deletes(), Vec::<String>::new());
+    let writes = source.writes();
+    assert_eq!(writes.len(), patches.len(), "{writes:?}");
+    assert!(
+        writes.iter().all(|write| write.starts_with("PATCH ")),
+        "{writes:?}"
+    );
 }
 
 #[tokio::test]

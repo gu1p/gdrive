@@ -25,7 +25,8 @@
 //! upload path, [`FakeDrive::updates`]), metadata `files.update` (a `PATCH` of JSON, such as
 //! `{"trashed": true}`, [`FakeDrive::patches`]) and records `files.delete`
 //! ([`FakeDrive::deletes`]). The stored files do not change: a listing after an update still
-//! returns what the test started the fake with.
+//! returns what the test started the fake with. Every request that is not a `GET` is also in
+//! [`FakeDrive::writes`], which is empty for an account that was only read.
 //!
 //! A test that checks how many requests were in flight at once does not rely on delays: the
 //! fake holds the first requests of a kind until all of them have arrived ([`Rendezvous`]), or a
@@ -432,6 +433,8 @@ struct State {
     patches: Mutex<Vec<(String, Value)>>,
     /// The ids of `files.delete` requests.
     deletes: Mutex<Vec<String>>,
+    /// `METHOD PATH` of every request that is not a `GET`, whatever the answer.
+    writes: Mutex<Vec<String>>,
     /// Orders the arrivals and replies of creates.
     create_events: AtomicUsize,
     uploads_in_flight: AtomicUsize,
@@ -489,6 +492,7 @@ impl FakeDrive {
             updates: Mutex::new(Vec::new()),
             patches: Mutex::new(Vec::new()),
             deletes: Mutex::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
             create_events: AtomicUsize::new(0),
             uploads_in_flight: AtomicUsize::new(0),
             uploads_max_in_flight: AtomicUsize::new(0),
@@ -589,6 +593,12 @@ impl FakeDrive {
         self.state.deletes.lock().expect("deletes lock").clone()
     }
 
+    /// `METHOD PATH` of every request that was not a `GET`, also the ones the fake does not
+    /// know: empty when the account was only read.
+    pub(crate) fn writes(&self) -> Vec<String> {
+        self.state.writes.lock().expect("writes lock").clone()
+    }
+
     /// How many ids `files.generateIds` handed out.
     pub(crate) fn generated_ids(&self) -> usize {
         self.state.generated.load(Ordering::SeqCst)
@@ -670,6 +680,17 @@ impl Drop for InFlight<'_> {
 
 type FakeResponse = hyper::Response<BoxBody<Bytes, Infallible>>;
 
+/// Notes a request that is not a `GET` for [`FakeDrive::writes`].
+fn record_write(state: &State, method: &Method, path: &str) {
+    if method != Method::GET {
+        state
+            .writes
+            .lock()
+            .expect("writes lock")
+            .push(format!("{method} {path}"));
+    }
+}
+
 async fn handle(
     state: Arc<State>,
     request: hyper::Request<Incoming>,
@@ -687,6 +708,7 @@ async fn handle(
         .unwrap_or_default();
 
     let path = request.uri().path().to_owned();
+    record_write(&state, request.method(), &path);
     if request.method() == Method::POST && path == UPLOAD_PATH {
         let resumable = params
             .iter()
