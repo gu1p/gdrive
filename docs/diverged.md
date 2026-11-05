@@ -3,34 +3,38 @@
 After a [migration](migrate.md), some people keep working in the old location: they open the old folder,
 edit the old files, add new ones. `gdrive files diverged` finds out who, so that you can tell them
 personally where the files are now. It looks at what **diverged** in the old location (the origin) from the
-copy that the migration made, and at who Drive says last changed each of those items, and when.
+copy that the migration made, and at who Drive says changed each of those items, and when.
 
 It works for **any account**, personal Gmail accounts included, which have no audit log, and needs no
 permission beyond the access to Drive that every gdrive account has. For a Google Workspace organization,
 [`files activity`](activity.md) reads the audit log instead, which also has views and downloads.
 
 ```sh
-gdrive files diverged <OLD_FOLDER_ID> --from old@gmail.com --to new@example.com --exclude old@gmail.com
+gdrive files diverged <OLD_FOLDER_ID> --from old@gmail.com --to new@example.com
 ```
 
 ```text
 Change    When                  Who                 Path
 edited    2026-11-05 10:12:44   ana@example.com     Projects/plan.docx
+edited    2026-11-04 10:00:00   ana@example.com     Projects/2026/new.pdf
 added     2026-11-04 09:00:02   bob@example.com     Projects/2026/new.pdf
 added     2026-11-04 08:00:00   bob@example.com     Projects/2026
-trashed   2026-11-03 16:40:10   ana@example.com     Projects/old.xlsx
 differs   2026-10-28 08:15:00   carol@example.com   Projects/notes.txt
 moved     -                     -                   Projects/2026/b.jpg (was Projects/a.jpg)
+trashed   -                     ana@example.com     Projects/old.xlsx
 ```
 
 Nothing is ever changed by this command, in either account: every request it sends is a read.
+
+The rule behind every row: a definite answer needs evidence. `edited`, a named person and "nothing to
+report" are given only when Drive's data shows them. When it does not, the row says so (`differs`, or `-`
+for the person or the time); an item is never left out because something is missing.
 
 ## Two ways to look, which combine
 
 **Compared with the copy: `--to`.** Give the same arguments as to the migration: the `FILE_ID`s, `--from`,
 `--to` and `--into`. gdrive lists the origin and the copy side by side, folder by folder, matched by name as
-the migration matched them, and reports what is different in the origin. This needs no date and tells
-apart what changed after the migration from what was there before it.
+the migration matched them, and reports what is different in the origin. This needs no date.
 
 ```sh
 # The migration was:
@@ -47,8 +51,8 @@ reorganized since, but it cannot tell an edit from a file that was only moved th
 gdrive files diverged 1AbC... --from old@gmail.com --since 2026-11-01
 ```
 
-**Both.** With `--to` and `--since`, the comparison is made and only its changes at or after `--since` are
-reported: a second migration, a week of changes.
+**Both.** With `--to` and `--since`, the comparison is made and only its rows at or after `--since` are
+reported.
 
 ## The command
 
@@ -64,15 +68,16 @@ gdrive files diverged <FILE_ID>... [--from <ACCOUNT>] [--to <ACCOUNT>] [--into <
 - `--from ACCOUNT`: the origin account, as `gdrive account list` prints it; the current account by default.
 - `--to ACCOUNT`: the account the files were migrated to, which holds the copy. It must be another account.
 - `--into FOLDER_ID`: the folder of the `--to` account that holds the copy, as given to `files migrate`;
-  without it, the copy is at the top of its My Drive. Needs `--to`.
+  without it, the copy is at the top of its My Drive. Needs `--to`. A folder of a shared drive is listed in
+  that drive.
 - `--since WHEN`: a duration back from now (`12h`, `30d`, `2w`), a date (`2026-10-01`, from midnight), a
   date and time (`2026-10-01 14:30`, the form the report prints), or an RFC 3339 time
   (`2026-10-01T14:30:00Z`), as for `files activity`. Dates and times without a time zone are in the local
   time zone. There is no limit to how long ago.
 - At least one of `--to` and `--since` is required.
 - `--by item|user`: the rows of the report (see [The reports](#the-reports)); `item` by default.
-- `--exclude EMAIL`: leave out what this person did, for example the account that ran the migration. Not
-  case-sensitive; repeat it for several people.
+- `--exclude EMAIL`: leave out the rows of this person, for example yourself. Not case-sensitive; repeat it
+  for several people. A row whose person is `-` is never left out.
 - `--jobs N`: send up to N listing requests at once, 1 to 64 (default 4).
 - `--skip-header`, `--field-separator SEP`, `--tsv`: as for `gdrive files list`.
 
@@ -80,76 +85,100 @@ gdrive files diverged <FILE_ID>... [--from <ACCOUNT>] [--to <ACCOUNT>] [--into <
 
 ### Compared with the copy
 
-The copy of a given folder is the folder of its name in `--into` (or at the top of My Drive); then each
-folder of the origin is compared with the folder of its name in the copy of its parent, and each item with
-the items of its name there. Items in the trash are left out of the listings on both sides.
+The copy of a given folder is the folder of its name in `--into` (or at the top of My Drive). Below it,
+items are compared by name with the items of the copy's folder of the same name. Items in the trash are left
+out of these listings on both sides.
 
-| Change | When it is reported | When | Who |
-|---|---|---|---|
-| `added` | the copy's folder has no file of its name (for a folder: no folder of its name). Everything in an added folder is added too, one row each | when it was created | its owner, who created or uploaded it |
-| `edited` | the copy has files of its name, none has the same content, and the origin was modified later than all of them | when it was last modified | who modified it last |
-| `edited` | as above but the copy is newer, and the copy's revisions show the origin changed after the migration (see below) | when it was last modified | who modified it last |
-| `differs` | the content differs, the copy is newer, and the copy's revisions cannot tell whether the origin changed after the migration | when it was last modified | who modified it last |
-| `moved` | an added file whose size and MD5 checksum are those of a file of the copy that has no file of its name in the origin: it was renamed or moved in the origin. The row shows where it is in the copy: `PATH (was OLD_PATH)` | `-` | `-` |
-| `trashed` | someone moved it to the trash, from a folder of the origin (see [In the trash](#in-the-trash)) | when it was moved there | who moved it there |
+**Several folders of one name.** Which of two folders `Team` in the copy belongs to which `Team` of the
+origin cannot be known, so all folders of one name in a folder are compared as one group, with the copy's
+folders of that name: their contents are pooled and matched by name, at every level. One folder on each
+side is the same thing with groups of one.
 
-**The same content** is the migration's own rule: a file with content (a photo, a PDF, an office file) is the
-same when the size and the MD5 checksum are. A Google Docs, Sheets or Slides file has no checksum; its copy
-was exported and converted back, so the two cannot be compared byte by byte. The migration gave the copy the
-origin's modification time: the two are the same when their modification times are.
+**Files of one name** are matched one to one: each file of the origin is paired with a file of its name in
+the copy that has the same content (first one that has the same modification time too), each file of the
+copy used once. Then each file of the origin without a partner:
+
+| Case | Row |
+|---|---|
+| the copy has no file of its name left (for a folder: no folder of its name). Everything in an added folder is added too, one row each | `added`, and `edited` if it was modified after its creation (see below) |
+| the files of its name left in the copy are all older than the origin's last modification | `edited` |
+| one of them is newer, or a time is missing: a revision of one of them holds the origin's present content | nothing: the copy was made from the origin as it is |
+| as above, but no revision holds it, or the revisions cannot be read | `differs` |
+| an added file whose size, MD5 checksum and creation time are those of a file of the copy that no origin file was matched or compared with | `moved`, with where it is in the copy: `PATH (was OLD_PATH)` |
+| someone moved it to the trash, from a folder of the origin | `trashed` (see [In the trash](#in-the-trash)) |
+
+**The same content** is the migration's own rule for a file with content (a photo, a PDF, an office file):
+the same size and MD5 checksum. A Google Docs, Sheets or Slides file has no checksum, and its copy was
+exported and converted back, so the two cannot be compared byte by byte; the migration gave the copy the
+origin's modification time, so the two are the same when their modification times are. Times are compared
+to the millisecond, the precision the migration sends.
 
 **Changed on both sides.** People who moved to the new place edit the copy, which is expected, and makes the
-copy the newer side. The origin may still have been edited after the migration, before the copy was. gdrive
-reads the revisions of the copy (only for these files, every page, since Drive does not list the oldest
-first): the oldest one is what the migration wrote. The origin changed after the migration if it was modified
-later than that revision, and for a file with content only if its checksum differs from that revision's too.
-Then it is `edited`; if the origin is what the migration copied, nothing is reported. When the revisions
-cannot tell (Drive returns none, refuses them, or the oldest one cannot be what the migration wrote because
-Drive deleted the older ones), the file is reported as `differs`, so that nothing is hidden. With several
-files of its name in the copy, the one with the oldest revision is taken for the migration's copy.
+copy the newer side. Whether the origin also changed after the migration is then settled by the copy's
+revisions, all of them (Drive lists them in no set order): if one of them is exactly the origin as it is now
+(the same size and checksum; for a Google file the same modification time), the copy was made from it and
+nothing is reported. Otherwise the row is `differs`: the revision the migration wrote may have been
+deleted by Drive, may never have existed (a file the copy's account already had, which the migration
+reused), or the origin changed after the migration. A `differs` row carries the origin's last modification
+and who made it, which is what to judge by: a time before the migration, or the migration's own account,
+tells it was not someone who kept working there.
 
 **Moved and renamed files.** Drive does not tell who renamed or moved a file, and neither changes its
-modification time: a `moved` row has no time and no person. Each file of the copy is used for one `moved` row
-at most. Only files with a checksum can be matched: a Google file that was renamed is `added`.
+modification time: a `moved` row has no time and no person. The migration gave the copy the origin's
+creation time, which a rename or a move keeps: a file uploaded again under another name has a new one and
+stays `added`. Only files with a checksum can be matched: a renamed Google file is `added` (and `edited` if
+it was modified after its creation).
 
 A given item without a copy fails the command: there is no folder (or file) of its name in `--into` or at
 the top of My Drive. Give the folder that holds the copy with `--into`, or run without `--to` and with
 `--since`. Reporting a whole tree as added would not help.
 
+### An item that is new: `added` and `edited`
+
+An item that has no copy carries two facts: when it was created, and, if later, when it was last
+modified. Each is a row: `added` (its creation time, its creator) and `edited` (its last modification, who
+made it). Each row is then kept or left out on its own by `--since` and `--exclude`; when both remain and
+name the same person, only the `added` row is printed.
+
 ### By time: `--since`
 
-An item of the origin counts when it was created or last modified at or after `--since`. Without `--to`, it
-is `added` when it was created then (the time is its creation, the person its owner), otherwise `edited`
-(the time is its last modification, the person who made it). With `--to`, `--since` keeps the rows of the
-comparison whose time is at or after it, and the `moved` rows, which have no time.
+Without `--to`, every item of the origin gives the rows of a new item above, and `--since` keeps those at or
+after it: an item created before `--since` and modified since gives only its `edited` row. With `--to`,
+`--since` keeps the rows of the comparison at or after it. A row without a time (`moved`, `trashed` in a My
+Drive) is kept, since nothing tells it is older.
 
 ### In the trash
 
 For every folder of the origin, gdrive lists what was moved from it to the trash, in both modes. A folder in
 the trash is one row; what is in it is not listed. Drive tells who moved an item to the trash and when **only
 for items in shared drives**. In a My Drive only the owner of a file can move it to the trash, so the owner is
-named and the time is `-`; `--since` keeps such rows, since the time is unknown. Drive empties the trash after
-30 days: what was moved there earlier is gone, and so is what was deleted for good.
+named and the time is `-`. Drive empties the trash after 30 days: what was moved there earlier is gone, and so
+is what was deleted for good.
 
 ### What is left out
 
 - **Items a migration does not copy**: shortcuts, Google Drawings, Forms and the other Google types without
   an export. They are never in the copy, so a comparison would call them added. They are listed on stderr,
   and reported only with `--since`, by time.
-- **Items that both accounts see.** When the copy's folder holds the origin item itself (the same Drive id),
-  or the item of its name there is another item of the origin, it is not compared with itself; the item is
-  listed on stderr. A given item whose copy is such an item, and an `--into` folder that is one of the
-  origin's folders, fail the command.
+- **Items that both accounts see.** When the copy's folders hold the origin item itself (the same Drive id),
+  or the items of its name there include another item of the origin, it is not compared with itself; the
+  item is listed on stderr. A given item whose copy is such an item, and an `--into` folder that is one of
+  the origin's folders, fail the command.
 - **What is only in the copy**, made in the new place or removed from the origin for good: that is expected,
   and nobody can be named for it.
 
-## Who and When, and what cannot be known
+## Who and When
 
-**Who** is Drive's `lastModifyingUser` of the item: the email address, in lower case, or the name when Drive
-shows no address; else the item's owner; else `-`. For an `added` item it is the owner, who created or
-uploaded it, rather than whoever modified it last; in a shared drive, which has no owners, who modified it
-last. **When** is a time Drive keeps: the creation for `added`, the last modification for `edited` and
-`differs`, the move to the trash for `trashed`.
+Who is always one person Drive names for that fact, never a guess: the email address, in lower case, or the
+name when Drive shows no address. When is a time Drive keeps.
+
+| Change | When | Who | `-` when |
+|---|---|---|---|
+| `added` | the item's creation | in a My Drive its owner, who created or uploaded it; in a shared drive (no owners) who modified it last, if nobody modified it after its creation | Drive names no owner, or in a shared drive the item was modified after its creation |
+| `edited` | its last modification | who modified it last (`lastModifyingUser`) | the last modification was by someone not signed in (a file editable by link), or Drive names nobody. The owner is never named in their place |
+| `differs` | the origin's last modification | who modified the origin last | as for `edited` |
+| `moved` | `-` | `-` | always: Drive keeps neither for a rename or a move |
+| `trashed` | when it was moved to the trash, in shared drives | in a shared drive who moved it there; in a My Drive the owner, the only one who can | the time always outside shared drives |
 
 Said plainly, the limits of this way of looking:
 
@@ -160,31 +189,36 @@ Said plainly, the limits of this way of looking:
   edited last.
 - **Renames and moves have no person and no time** (`moved`).
 - **What is only in the copy is not reported.**
-- **A file edited in both places** is settled by the copy's revisions while Drive still has them. Drive
-  deletes old revisions of files with content after about 30 days, or earlier once a file has 100 of them,
-  unless they are kept forever; then the file `differs`. For a Google file with a long history Drive may not
-  list its oldest revisions: an edit of the origin made before the oldest revision listed is then taken for
-  what the migration copied.
+- **A file edited in both places** is settled only when a revision of the copy is the origin as it is now;
+  otherwise it `differs`. Drive deletes old revisions of files with content after about 30 days, or earlier
+  once a file has 100 of them, unless they are kept forever, and may not list every revision of a Google file
+  with a long history.
 - **A Google file's copy is a conversion**: only the times are compared, not the content.
+- **The owner of a My Drive file is taken for who created it**, which is wrong when its ownership was
+  transferred later.
 - **Matched by name**, as the migration matches: a renamed folder in the origin is `added` with everything in
-  it, since the copy's folder of the old name is not looked into.
+  it, since the copy's folder of the old name is not looked into. A file the migration could not copy,
+  because the copy's account already had another file of its name, is compared with that file: it shows as
+  `edited` or `differs` with the origin's own time, which may be before the migration.
 - **Read only.** Nothing is ever changed, in either account.
 
 ## The reports
 
 ### Per item: `--by item`
 
-One row per item that diverged: the newest first, the rows without a time last, then by path. Paths start with
-the name of the given item, as the migration's output does. An empty report prints only its header.
+One row per change: the newest first, the rows without a time last, then by path. An item can have two rows
+(`added` and `edited`). Paths start with the name of the given item, as the migration's output does. An
+empty report prints only its header.
 
 ### Per person: `--by user`
 
 One row per person: the most recent change first, the people without a time next, and the row of the
-changes nobody is named for (`-`) last. `Other` counts `differs` and `moved`; `Items` how many items.
+changes nobody is named for (`-`) last. `Added`, `Edited`, `Trashed` and `Other` (`differs` and `moved`)
+count rows; `Items` counts items.
 
 ```text
 User                Last change           Added   Edited   Trashed   Other   Items
-ana@example.com     2026-11-05 10:12:44   0       1        1         0       2
+ana@example.com     2026-11-05 10:12:44   0       2        1         0       3
 bob@example.com     2026-11-04 09:00:02   2       0        0         0       2
 carol@example.com   2026-10-28 08:15:00   0       0        0         1       1
 -                   -                     0       0        0         1       1
@@ -207,20 +241,21 @@ how the comparison was made, what was left out and why, and a summary:
 Found 6 files in 2 folders in the origin, and 1 item moved from them to the trash
 Found 6 files in 1 folder in the copy
 Compared by name with the copy in the top of My Drive: files by size and MD5 checksum, Google Docs, Sheets and Slides by modification time
-Read the revisions of 1 file of the copy, newer than the origin's file of the same name; they do not tell whether 1 file of the origin changed after the migration (differs)
+Read the revisions of 1 file of the copy, newer than the origin's file of the same name; differs: 1 file of the origin whose present content no revision there holds
 Left out 1 item that a migration does not copy and the copy never has (--since reports those created or modified since a time):
   Projects/link: shortcuts have no content
-Summary: 6 items diverged in the origin (2 added, 1 edited, 1 trashed, 1 differs, 1 moved) by 3 people; 1 item without a known person
+Summary: 6 items diverged in the origin, in 7 changes (2 added, 2 edited, 1 trashed, 1 differs, 1 moved) by 3 people; 1 change without a known person
 ```
 
-Without `--to`, the summary is `Summary: 6 items changed in the origin since 2026-11-01 00:00:00 (...)`. The
-summary is for people; scripts should read the report.
+`in 7 changes` appears when there are more rows than items. Without `--to`, the summary is
+`Summary: 6 items changed in the origin since 2026-11-01 00:00:00 (...)`. The summary is for people; scripts
+should read the report.
 
 **Exit status:** 0 when the report was made, also when it is empty. 1 when it could not be made: a given id
 that does not exist or is in the trash, a given item without a copy, a folder of the origin or of the copy
-that cannot be listed completely (also when Drive answers with `incompleteSearch`). Then nothing is printed
-on stdout: a comparison over part of a tree would call things added or unchanged wrongly. Revisions that
-cannot be read are no failure: the file `differs`.
+that cannot be listed completely (a page that fails, also after good ones, or Drive answering with
+`incompleteSearch`). Then nothing is printed on stdout: a comparison over part of a tree would call things
+added or unchanged wrongly. Revisions that cannot be read are no failure: the file `differs`.
 
 ## Contacting people
 
@@ -232,4 +267,4 @@ gdrive files diverged 1AbC... --from old@gmail.com --to new@example.com \
 ```
 
 A person named by display name only did not make their address visible to the origin account; their row
-still tells who to ask about.
+still tells who to ask about. The rows of `-` cannot name anyone: look at their paths and times.
