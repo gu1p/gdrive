@@ -127,9 +127,12 @@ Accounts and login:
   records whether the account was granted it, and a later `account reauth` without `--audit-log` asks for
   it again, so the access is kept. `--audit-log` cannot be combined with `--service-account` or `--adc`.
   See [Audit log access](docs/basic_usage.md#audit-log-access).
-- gdrive processes that use the same account update `tokens.json` one at a time (a lock file
-  `tokens.json.lock` next to it), so a command that refreshes its token while the account is authorized
-  again can no longer undo the new login or bring back its earlier refresh token.
+- Several gdrive processes can use one account safely: every change of an account's files takes turns
+  through a lock file per account in `~/.config/gdrive3/.locks/`, so a command that refreshes its token
+  while the account is authorized again can no longer undo the new login or bring back its earlier
+  refresh token. The change is finished even when the command is cancelled, and the lock survives
+  removing and adding the account again. `account import` puts an account in place in one step, and
+  `secret.json` is replaced atomically.
 - `account add --manual` (alias `--no-browser`) for machines without a browser: open the printed URL
   anywhere and paste the address the browser lands on. `--port N` sets the redirect port (`0` picks a free
   one, in browser mode only; `--manual` needs a fixed port). The login sends PKCE and checks `state`; a
