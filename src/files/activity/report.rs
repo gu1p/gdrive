@@ -113,7 +113,7 @@ type EventKey = (String, String, usize, String, String);
 
 /// The counted events, kept as the report needs them: per person, per item and person, and
 /// every event for `--by event` only. Events about other items are counted as read and dropped.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(super) struct Tally {
     /// Events the audit log returned.
     pub(super) read: u64,
@@ -125,14 +125,27 @@ pub(super) struct Tally {
     pub(super) users: HashMap<Who, UserActivity>,
     items: HashMap<(String, Who), ItemActivity>,
     events: Option<Vec<Counted>>,
+    /// The calendar day of an event, for `Days`: [`local_day`]; tests take another time zone.
+    day_of: fn(DateTime<Utc>) -> NaiveDate,
+}
+
+/// The day of `time` in the local time zone, the one times are printed in.
+fn local_day(time: DateTime<Utc>) -> NaiveDate {
+    time.with_timezone(&Local).date_naive()
 }
 
 impl Tally {
     /// A tally that keeps every counted event if `keep_events`.
     pub(super) fn new(keep_events: bool) -> Self {
         Tally {
+            read: 0,
+            counted: 0,
+            without_time: 0,
+            seen: HashSet::new(),
+            users: HashMap::new(),
+            items: HashMap::new(),
             events: keep_events.then(Vec::new),
-            ..Tally::default()
+            day_of: local_day,
         }
     }
 
@@ -196,7 +209,7 @@ impl Tally {
                 items: HashSet::new(),
             });
         user.last = user.last.max(time);
-        user.days.insert(time.with_timezone(&Local).date_naive());
+        user.days.insert((self.day_of)(time));
         user.counts.add(category);
         user.items.insert(item.to_owned());
         let per_item = self
@@ -395,7 +408,60 @@ pub(super) fn render<const N: usize>(
 
 #[cfg(test)]
 mod tests {
-    use super::Category;
+    use std::collections::{HashMap, HashSet};
+
+    use chrono::{DateTime, NaiveDate, Utc};
+    use serde_json::json;
+
+    use super::{by_user, Category, Selection, Tally};
+    use crate::{common::audit_log::Activity, files::activity::test_zone::Berlin};
+
+    fn berlin_day(time: DateTime<Utc>) -> NaiveDate {
+        time.with_timezone(&Berlin).date_naive()
+    }
+
+    #[test]
+    fn days_are_calendar_days_of_the_time_zone_not_of_utc() {
+        let mut tally = Tally::new(false);
+        tally.day_of = berlin_day;
+        let items = HashMap::from([(String::from("a"), String::from("a.txt"))]);
+        let exclude = HashSet::new();
+        let selection = Selection {
+            items: &items,
+            exclude: &exclude,
+        };
+        let view = |qualifier: &str, time: &str, actor: &str| -> Activity {
+            serde_json::from_value(json!({
+                "id": {"time": time, "uniqueQualifier": qualifier},
+                "actor": {"email": actor},
+                "events": [{"name": "view", "parameters": [{"name": "doc_id", "value": "a"}]}],
+            }))
+            .unwrap()
+        };
+        for record in [
+            // One UTC day, two days in Berlin: a second before and after its midnight (CET).
+            view("1", "2026-11-01T22:59:59Z", "ana@example.com"),
+            view("2", "2026-11-01T23:00:01Z", "ana@example.com"),
+            // Two UTC days, one day in Berlin: 00:30 and 23:30 on 2026-11-03.
+            view("3", "2026-11-02T23:30:00Z", "bob@example.com"),
+            view("4", "2026-11-03T22:30:00Z", "bob@example.com"),
+        ] {
+            tally.add(&record, &selection, |_| true);
+        }
+
+        let days = by_user(&tally, None)
+            .into_iter()
+            .map(|row| (row[0].clone(), row[3].clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            days,
+            [
+                (String::from("bob@example.com"), String::from("1")),
+                (String::from("ana@example.com"), String::from("2")),
+            ]
+        );
+        assert_eq!(tally.counted, 4);
+    }
 
     #[test]
     fn event_names_map_to_their_columns() {

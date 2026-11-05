@@ -22,6 +22,8 @@ mod report;
 mod scan;
 mod sharing;
 #[cfg(test)]
+mod test_zone;
+#[cfg(test)]
 mod tests;
 mod tree;
 pub(crate) mod when;

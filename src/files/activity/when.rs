@@ -218,6 +218,49 @@ mod tests {
     }
 
     #[test]
+    fn a_time_that_a_clock_change_skips_is_an_error_and_a_repeated_one_is_the_first() {
+        use crate::files::activity::test_zone::Berlin;
+
+        let parse = |value: &str| parse_in(value, &Berlin);
+        // 2026-03-29: Berlin goes from 02:00 CET to 03:00 CEST; 02:30 does not exist.
+        assert_eq!(
+            parse("2026-03-29 02:30"),
+            Err(String::from(
+                "'2026-03-29 02:30' does not exist in the local time zone"
+            ))
+        );
+        assert!(parse("2026-03-29 02:00:00").is_err());
+        assert_eq!(
+            parse("2026-03-29 01:59:59"),
+            Ok(When::At(utc("2026-03-29T00:59:59Z")))
+        );
+        assert_eq!(
+            parse("2026-03-29 03:00"),
+            Ok(When::At(utc("2026-03-29T01:00:00Z")))
+        );
+        // The midnight of that day exists.
+        assert_eq!(
+            parse("2026-03-29"),
+            Ok(When::At(utc("2026-03-28T23:00:00Z")))
+        );
+        // 2026-10-25: Berlin goes from 03:00 CEST back to 02:00 CET; 02:30 comes twice, and the
+        // first one (CEST) is taken.
+        assert_eq!(
+            parse("2026-10-25 02:30"),
+            Ok(When::At(utc("2026-10-25T00:30:00Z")))
+        );
+        assert_eq!(
+            parse("2026-10-25 03:30"),
+            Ok(When::At(utc("2026-10-25T02:30:00Z")))
+        );
+        // A time with an offset is not in the local time zone, whatever the clock does.
+        assert_eq!(
+            parse("2026-10-25T02:30:00+01:00"),
+            Ok(When::At(utc("2026-10-25T01:30:00Z")))
+        );
+    }
+
+    #[test]
     fn the_range_is_clamped_to_the_audit_log_and_must_not_be_empty() {
         let now = utc("2026-11-05T12:00:00Z");
         let range = Range::resolve(When::Ago(TimeDelta::days(30)), None, now).unwrap();
