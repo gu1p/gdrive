@@ -508,16 +508,17 @@ impl Migration {
         Ok((exports, fresh))
     }
 
-    /// The entries of `plan` with its `exports`, and how many of them are exports; an export
-    /// over Drive's limit is left out.
+    /// The entries of `plan` with its `exports`, how many of them are exports, and how many
+    /// exports over Drive's limit were left out (printed, not counted yet).
     async fn entries(
         &self,
         plan: &Plan,
         exports: &BTreeMap<String, CachedExport>,
         context: &JobContext,
-    ) -> (Vec<Entry>, u64) {
+    ) -> (Vec<Entry>, u64, u64) {
         let mut entries = Vec::new();
         let mut exported = 0;
+        let mut left_out = 0;
         for planned in &plan.entries {
             let export = match &planned.kind {
                 Kind::Export(export) => {
@@ -528,7 +529,8 @@ impl Migration {
                         let too_large = RelayError::ExportTooLarge {
                             limit: EXPORT_LIMIT,
                         };
-                        self.left_out(&planned.label, &too_large, context).await;
+                        self.note_skipped(&planned.label, &too_large, context).await;
+                        left_out += 1;
                         continue;
                     }
                 }
@@ -536,7 +538,7 @@ impl Migration {
             };
             entries.push(planned.entry(export));
         }
-        (entries, exported)
+        (entries, exported, left_out)
     }
 
     /// Exports, lays out and uploads the archive of `plan`; its size, or `None` when nothing is
@@ -554,10 +556,13 @@ impl Migration {
             .filter(|_| plan.exports() > 0)
             .map(|dir| ExportsCache::new(dir, &plan.manifest));
         let (exports, fresh) = self.exports(plan, cache.as_ref()).await?;
-        let (entries, exported) = self.entries(plan, &exports, context).await;
+        let (entries, exported, left_out) = self.entries(plan, &exports, context).await;
         if entries.is_empty() {
+            // A FILE_ID that is a Workspace file whose export is too large: the job's outcome
+            // counts it.
             return Ok(None);
         }
+        self.tally.skipped.fetch_add(left_out, Ordering::SeqCst);
 
         let layout = Layout::new(entries);
         let size = layout.size();

@@ -785,3 +785,33 @@ async fn a_wrong_file_that_an_interruption_fell_in_fails_the_next_run() {
         "read again from its first byte"
     );
 }
+
+#[tokio::test]
+async fn a_doc_whose_export_is_too_large_is_one_skipped_item() {
+    let source = FakeDrive::start(
+        vec![FakeFile::native("doc", "Notes", "root", DOCUMENT, "docx")],
+        Behavior {
+            export_too_large: HashSet::from([String::from("doc")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, settings(&["doc"])).await;
+
+    migrated.assert_ok();
+    assert!(dest.created().is_empty());
+    let too_large = RelayError::ExportTooLarge {
+        limit: EXPORT_LIMIT,
+    };
+    assert_eq!(
+        migrated.out.lines()[1..],
+        [format!("skip Notes: {too_large}")]
+    );
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 0 archives migrated (0 B), 0 already there, 1 skipped (unsupported), 0 failed, \
+         0 cancelled"
+    );
+}
