@@ -510,7 +510,7 @@ enum FileCommand {
         #[arg(long, value_name = "EMAIL")]
         exclude: Vec<String>,
 
-        /// Only people with activity: leave out those on the sharing lists without any, and do not read the sharing lists
+        /// Only people with activity: leave out those on the sharing lists without any. The sharing lists are not read, and the Access column is `-`
         #[arg(long)]
         active_only: bool,
 

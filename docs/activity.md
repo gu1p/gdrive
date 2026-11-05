@@ -67,7 +67,8 @@ gdrive files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>] [--unt
 - `--exclude EMAIL`: leave out what this person did, for example the account that ran the migration, whose
   reads are in the log as downloads. Not case-sensitive; repeat it for several people. It applies to all
   three reports.
-- `--active-only`: only the people with activity. The sharing lists are then not read at all.
+- `--active-only`: only the people with activity. The sharing lists are then not read at all, and the
+  `Access` column is `-` for everyone.
 - `--scan`: how much of the audit log Google sends (see [Scans](#scans---scan)); `auto` by default.
 - `--jobs N`: send up to N requests at once, 1 to 64 (default 4).
 - `--skip-header`, `--field-separator SEP`, `--tsv`: as for `gdrive files list`.
