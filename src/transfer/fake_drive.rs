@@ -32,7 +32,7 @@
 //! [`Behavior::permissions`] (paged with `pageSize` and `pageToken`), and the audit log of the
 //! Admin SDK Reports API (`GET /admin/reports/v1/activity/users/all/applications/drive`) from
 //! the records of [`Behavior::audit_log`]: newest first, within `startTime` (included, unless
-//! [`Behavior::audit_exclusive_start`]) and `endTime` (excluded), with `filters` of `name==value`
+//! [`Bounds::BothExcluded`]) and `endTime` (excluded), with `filters` of `name==value`
 //! terms over event parameters (a record matches when one of its events has all of them), paged
 //! with `maxResults` and `pageToken`. Both record their requests ([`FakeDrive::audit_requests`],
 //! [`FakeDrive::permission_requests`]); [`Behavior::audit_error`] and
@@ -325,8 +325,8 @@ pub(crate) struct Behavior {
     pub(crate) audit_log: Vec<Value>,
     /// The most audit records per page; `None` honors `maxResults`.
     pub(crate) audit_page_size: Option<usize>,
-    /// `startTime` leaves out a record of that very time, as `endTime` always does.
-    pub(crate) audit_exclusive_start: bool,
+    /// Whether `startTime` takes a record of that very time.
+    pub(crate) audit_bounds: Bounds,
     /// Every audit log request is answered with this status and JSON body.
     pub(crate) audit_error: Option<(u16, Value)>,
     /// The first this many audit log requests are answered with 429, a rate limit.
@@ -337,6 +337,16 @@ pub(crate) struct Behavior {
     pub(crate) permissions: HashMap<String, Vec<Value>>,
     /// `permissions.list` of these file ids fails with 403.
     pub(crate) permissions_unreadable: HashSet<String>,
+}
+
+/// Which ends of its time range an audit log request includes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Bounds {
+    /// `startTime` is included, `endTime` is not.
+    #[default]
+    StartIncluded,
+    /// Neither is.
+    BothExcluded,
 }
 
 /// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
@@ -795,6 +805,9 @@ async fn handle(
 
     let path = request.uri().path().to_owned();
     record_write(&state, request.method(), &path);
+    if let Some(response) = activity_route(&state, &request, &path, &params).await {
+        return Ok(response);
+    }
     if request.method() == Method::POST && path == UPLOAD_PATH {
         let resumable = params
             .iter()
@@ -822,17 +835,11 @@ async fn handle(
     if path == GENERATE_IDS_PATH {
         return Ok(generate_ids(&state, &params));
     }
-    if path == AUDIT_PATH {
-        return Ok(audit(&state, params, request.headers()).await);
-    }
     if let Some(id) = path
         .as_str()
         .strip_prefix(LIST_PATH)
         .and_then(|id| id.strip_prefix('/'))
     {
-        if let Some(id) = id.strip_suffix(PERMISSIONS_SUFFIX) {
-            return Ok(permissions(&state, id, params, request.headers()));
-        }
         if let Some(id) = id.strip_suffix("/export") {
             return Ok(export(&state, id, &params).await);
         }
@@ -1730,6 +1737,131 @@ fn permissions(
     json_response(StatusCode::OK, &body)
 }
 
+/// The routes of `files activity`: the audit log and `permissions.list`.
+async fn activity_route(
+    state: &State,
+    request: &hyper::Request<Incoming>,
+    path: &str,
+    params: &[(String, String)],
+) -> Option<FakeResponse> {
+    if request.method() != Method::GET {
+        return None;
+    }
+    if path == AUDIT_PATH {
+        return Some(audit(state, params.to_vec(), request.headers()).await);
+    }
+    let id = path
+        .strip_prefix(LIST_PATH)?
+        .strip_prefix('/')?
+        .strip_suffix(PERMISSIONS_SUFFIX)?;
+    Some(permissions(state, id, params.to_vec(), request.headers()))
+}
+
+/// What an audit log request selects.
+struct AuditQuery {
+    start: Option<chrono::DateTime<chrono::Utc>>,
+    end: Option<chrono::DateTime<chrono::Utc>>,
+    max_results: usize,
+    /// The `name==value` terms of `filters`.
+    terms: Vec<(String, String)>,
+    /// What a page token is bound to.
+    digest: String,
+}
+
+impl AuditQuery {
+    /// The query of `request`, or the reply to a request Google would refuse.
+    fn of(request: &ApiRequest) -> Result<Self, Box<FakeResponse>> {
+        let invalid = |name: &str| {
+            Box::new(error(
+                StatusCode::BAD_REQUEST,
+                &format!("Invalid value '{name}'"),
+            ))
+        };
+        let time = |name: &str| {
+            request
+                .param(name)
+                .map(|value| {
+                    chrono::DateTime::parse_from_rfc3339(value)
+                        .map(|time| time.with_timezone(&chrono::Utc))
+                        .map_err(|_| invalid(name))
+                })
+                .transpose()
+        };
+        let (start, end) = (time("startTime")?, time("endTime")?);
+        if let (Some(start), Some(end)) = (start, end) {
+            if start > end {
+                return Err(Box::new(error(
+                    StatusCode::BAD_REQUEST,
+                    "Start time must be less than or equal to the end time.",
+                )));
+            }
+        }
+        let max_results = match request.param("maxResults").map(str::parse::<usize>) {
+            None => 1000,
+            Some(Ok(max)) if (1..=1000).contains(&max) => max,
+            Some(_) => return Err(invalid("maxResults")),
+        };
+        let filters = request.param("filters").unwrap_or_default();
+        let terms = filters
+            .split(',')
+            .filter(|term| !term.is_empty())
+            .map(|term| {
+                term.split_once("==")
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .ok_or_else(|| invalid("filters"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let digest = format!(
+            "{:?} {:?} {filters} {max_results}",
+            request.param("startTime"),
+            request.param("endTime")
+        );
+        Ok(AuditQuery {
+            start,
+            end,
+            max_results,
+            terms,
+            digest,
+        })
+    }
+
+    /// Whether the query selects `record`: its time is in the range (a record without a
+    /// readable time always is), and one of its events has every term.
+    fn selects(&self, record: &Value, bounds: Bounds) -> bool {
+        let in_range = record_time(record).is_none_or(|time| {
+            let after_start = self.start.is_none_or(|start| match bounds {
+                Bounds::StartIncluded => time >= start,
+                Bounds::BothExcluded => time > start,
+            });
+            after_start && self.end.is_none_or(|end| time < end)
+        });
+        let has = |event: &Value, (name, value): &(String, String)| {
+            event["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|parameter| {
+                    parameter["name"] == name.as_str() && parameter["value"] == value.as_str()
+                })
+        };
+        in_range
+            && (self.terms.is_empty()
+                || record["events"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|event| self.terms.iter().all(|term| has(event, term))))
+    }
+}
+
+/// The `id.time` of an audit record.
+fn record_time(record: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    record["id"]["time"]
+        .as_str()
+        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
+        .map(|time| time.with_timezone(&chrono::Utc))
+}
+
 /// The audit log of the Reports API: the records of [`Behavior::audit_log`] that the request's
 /// time range and `filters` select, newest first, `maxResults` (1 to 1000) at a time.
 async fn audit(
@@ -1778,99 +1910,28 @@ async fn audit(
         );
     }
 
-    let time = |name: &str| match request.param(name) {
-        None => Ok(None),
-        Some(value) => chrono::DateTime::parse_from_rfc3339(value)
-            .map(|time| Some(time.with_timezone(&chrono::Utc)))
-            .map_err(|_| error(StatusCode::BAD_REQUEST, &format!("Invalid value '{name}'"))),
-    };
-    let (start, end) = match (time("startTime"), time("endTime")) {
-        (Ok(start), Ok(end)) => (start, end),
-        (Err(response), _) | (_, Err(response)) => return response,
-    };
-    if let (Some(start), Some(end)) = (start, end) {
-        if start > end {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "Start time must be less than or equal to the end time.",
-            );
-        }
-    }
-    let max_results = match request.param("maxResults").map(str::parse::<usize>) {
-        None => 1000,
-        Some(Ok(max)) if (1..=1000).contains(&max) => max,
-        Some(_) => return error(StatusCode::BAD_REQUEST, "Invalid value 'maxResults'"),
-    };
-    let filters = request.param("filters").unwrap_or_default();
-    let mut terms = Vec::new();
-    for term in filters.split(',').filter(|term| !term.is_empty()) {
-        let Some((name, value)) = term.split_once("==") else {
-            return error(StatusCode::BAD_REQUEST, "Invalid value 'filters'");
-        };
-        terms.push((name.to_owned(), value.to_owned()));
-    }
-
-    let record_time = |record: &Value| {
-        record["id"]["time"]
-            .as_str()
-            .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-            .map(|time| time.with_timezone(&chrono::Utc))
-    };
-    let in_range = |record: &Value| {
-        let Some(time) = record_time(record) else {
-            return true;
-        };
-        let after_start = start.is_none_or(|start| {
-            if behavior.audit_exclusive_start {
-                time > start
-            } else {
-                time >= start
-            }
-        });
-        after_start && end.is_none_or(|end| time < end)
-    };
-    let has_terms = |record: &Value| {
-        terms.is_empty()
-            || record["events"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .any(|event| {
-                    terms.iter().all(|(name, value)| {
-                        event["parameters"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .any(|parameter| {
-                                parameter["name"] == name.as_str()
-                                    && parameter["value"] == value.as_str()
-                            })
-                    })
-                })
+    let query = match AuditQuery::of(&request) {
+        Ok(query) => query,
+        Err(response) => return *response,
     };
     let mut records = behavior
         .audit_log
         .iter()
-        .filter(|record| in_range(record) && has_terms(record))
+        .filter(|record| query.selects(record, behavior.audit_bounds))
         .collect::<Vec<_>>();
     records.sort_by_key(|record| std::cmp::Reverse(record_time(record)));
 
-    let query = format!(
-        "{:?} {:?} {filters} {max_results}",
-        request.param("startTime"),
-        request.param("endTime")
-    );
     let offset = match request.param("pageToken") {
         None => 0,
-        Some(token) => match parse_token(token, &query) {
+        Some(token) => match parse_token(token, &query.digest) {
             Some(offset) => offset,
             None => return error(StatusCode::BAD_REQUEST, "Invalid page token."),
         },
     };
     let page_size = behavior
         .audit_page_size
-        .unwrap_or(max_results)
-        .min(max_results);
+        .unwrap_or(query.max_results)
+        .min(query.max_results);
     let end = (offset + page_size).min(records.len());
     let items = records.get(offset..end).unwrap_or_default();
     let mut body = json!({"kind": "admin#reports#activities"});
@@ -1879,7 +1940,7 @@ async fn audit(
         body["items"] = json!(items);
     }
     if end < records.len() {
-        body["nextPageToken"] = json!(token(end, &query));
+        body["nextPageToken"] = json!(token(end, &query.digest));
     }
     json_response(StatusCode::OK, &body)
 }
@@ -1979,7 +2040,7 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{parent_ids, Behavior, FakeDrive, FakeFile};
+    use super::{parent_ids, Behavior, Bounds, FakeDrive, FakeFile};
     use crate::common::media_client::MediaClient;
 
     #[tokio::test]
@@ -2167,7 +2228,7 @@ mod tests {
         let exclusive = FakeDrive::start(
             Vec::new(),
             Behavior {
-                audit_exclusive_start: true,
+                audit_bounds: Bounds::BothExcluded,
                 ..behavior
             },
         )
