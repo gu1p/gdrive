@@ -69,6 +69,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         into: None,
         dry_run: false,
         trash_source: false,
+        archive: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
 }

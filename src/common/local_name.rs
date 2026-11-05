@@ -165,6 +165,13 @@ impl Rules {
         windows_chars: cfg!(windows),
         case_insensitive: cfg!(any(windows, target_os = "macos")),
     };
+
+    /// The strictest rules, whatever the host: names that are safe on Windows, macOS and Linux
+    /// at once, and the same wherever gdrive runs.
+    const PORTABLE: Self = Self {
+        windows_chars: true,
+        case_insensitive: true,
+    };
 }
 
 /// Maps the Drive name of the file `file_id` to a safe single local path component.
@@ -207,6 +214,21 @@ pub(crate) fn local_name(drive_name: &str, file_id: &str) -> Result<String, Inva
 // sync work (milestone 2), so that a file keeps its local name across runs.
 pub(crate) fn unique_local_names(entries: &[NameEntry<'_>]) -> Result<UniqueNames, UnusableName> {
     unique_local_names_with(entries, Rules::HOST)
+}
+
+/// [`local_name`] with the rules of every platform at once ([`Rules::PORTABLE`]): `< > : " | ? *`
+/// become `_` too, on any host. For names that are written where any platform reads them (the
+/// paths in an archive), and must not depend on where gdrive runs.
+pub(crate) fn portable_name(drive_name: &str, file_id: &str) -> Result<String, InvalidName> {
+    sanitize(drive_name, file_id, Rules::PORTABLE)
+}
+
+/// [`unique_local_names`] with the rules of every platform at once, like [`portable_name`]:
+/// names that differ only in letter case collide on any host.
+pub(crate) fn unique_portable_names(
+    entries: &[NameEntry<'_>],
+) -> Result<UniqueNames, UnusableName> {
+    unique_local_names_with(entries, Rules::PORTABLE)
 }
 
 /// The local name [`unique_local_names`] gives the file `file_id` named `drive_name` when another
@@ -529,9 +551,10 @@ mod tests {
     use unicode_normalization::is_nfc;
 
     use super::{
-        id_tag, is_renamed, is_reserved_temp_name, local_name, safe_join, safe_join_with, sanitize,
-        temp_file_name, tree_path, unique_local_names_with, InvalidName, NameChange, NameEntry,
-        Rules, UniqueNames, UnusableName, MAX_COMPONENT_BYTES,
+        id_tag, is_renamed, is_reserved_temp_name, local_name, portable_name, safe_join,
+        safe_join_with, sanitize, temp_file_name, tree_path, unique_local_names_with,
+        unique_portable_names, InvalidName, NameChange, NameEntry, Rules, UniqueNames,
+        UnusableName, MAX_COMPONENT_BYTES,
     };
 
     const UNIX: Rules = Rules {
@@ -1123,5 +1146,30 @@ mod tests {
 
         assert!(!is_renamed(&nfd, &result.names[0]));
         assert!(is_renamed("a/b", "a_b"));
+    }
+
+    #[test]
+    fn portable_names_follow_the_strictest_rules_on_every_host() {
+        assert_eq!(portable_name("a:b?c*.txt", "id").unwrap(), "a_b_c_.txt");
+        assert_eq!(
+            portable_name("x", "id").unwrap(),
+            sanitize("x", "id", WINDOWS).unwrap()
+        );
+        assert_eq!(portable_name("..", "id"), Err(InvalidName::ParentDir));
+
+        let names = unique_portable_names(&[
+            NameEntry {
+                id: "b",
+                name: "Report.pdf",
+            },
+            NameEntry {
+                id: "a",
+                name: "report.pdf",
+            },
+        ])
+        .unwrap()
+        .names;
+        assert_eq!(names[1], "report.pdf");
+        assert_eq!(names[0], format!("Report{}.pdf", id_tag("b")));
     }
 }

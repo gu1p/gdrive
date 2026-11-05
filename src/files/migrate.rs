@@ -32,7 +32,10 @@
 //! unsupported item, an incomplete listing) stays, and so do its ancestors. Right before an item
 //! goes, it is read again: a file whose size, md5 or modification time changed since the listing
 //! stays, and so does a folder that holds anything not in the trash (added during the run).
+//!
+//! `--archive` makes each `FILE_ID` one tar file in the destination instead (`archive.rs`).
 
+mod archive;
 mod source;
 #[cfg(test)]
 mod tests;
@@ -117,6 +120,8 @@ pub(crate) struct Config {
     pub(crate) into: Option<String>,
     pub(crate) dry_run: bool,
     pub(crate) trash_source: bool,
+    /// Each `FILE_ID` as one tar file (`--archive`).
+    pub(crate) archive: bool,
     pub(crate) chunk_size: ChunkSize,
     pub(crate) multipart_threshold: MultipartThreshold,
     pub(crate) print_chunk_errors: bool,
@@ -133,6 +138,7 @@ struct Settings {
     into: Option<String>,
     dry_run: bool,
     trash_source: bool,
+    archive: bool,
     transfer: scheduler::Options,
 }
 
@@ -182,6 +188,7 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         into: config.into,
         dry_run: config.dry_run,
         trash_source: config.trash_source,
+        archive: config.archive,
         transfer: config.transfer,
     };
     let printer = Printer::stdio();
@@ -237,7 +244,12 @@ async fn run(
         Some(id) => destination_folder(dest, id).await?,
         None => MY_DRIVE.to_owned(),
     };
-    let existing = list_existing(dest, &into).await?;
+    let fields = if settings.archive {
+        archive::DEST_FIELDS
+    } else {
+        DEST_FIELDS
+    };
+    let existing = list_existing(dest, &into, fields).await?;
 
     let listing_jobs = settings.transfer.metadata_jobs.get();
     let mut roots = Vec::new();
@@ -289,18 +301,37 @@ async fn run(
         existing: Arc::new(existing),
         trash: None,
     };
-    let jobs = roots
-        .into_iter()
-        .map(|(id, root)| match root {
-            Ok(SourceNode::Folder(folder)) => migration.folder_job(folder, place.clone()),
-            Ok(SourceNode::File(item)) => migration.file_job(item, place.clone()),
-            Err(error) => Job::done(JobKind::Media, id.clone(), failed(id, error)),
-        })
-        .collect::<Vec<_>>();
+    let mut planned = (totals.files, totals.bytes);
+    let jobs = if settings.archive {
+        // One transfer per archive.
+        let mut bytes = 0;
+        let jobs = roots
+            .into_iter()
+            .map(|(id, root)| match root {
+                Ok(node) => {
+                    let (job, size) = migration.archive_job(node, place.clone());
+                    bytes += size;
+                    job
+                }
+                Err(error) => Job::done(JobKind::Media, id.clone(), failed(id, error)),
+            })
+            .collect::<Vec<_>>();
+        planned = (u64::try_from(jobs.len()).unwrap_or(u64::MAX), bytes);
+        jobs
+    } else {
+        roots
+            .into_iter()
+            .map(|(id, root)| match root {
+                Ok(SourceNode::Folder(folder)) => migration.folder_job(folder, place.clone()),
+                Ok(SourceNode::File(item)) => migration.file_job(item, place.clone()),
+                Err(error) => Job::done(JobKind::Media, id.clone(), failed(id, error)),
+            })
+            .collect::<Vec<_>>()
+    };
 
     progress.sink().event(&ProgressEvent::Planned {
-        files: totals.files,
-        bytes: totals.bytes,
+        files: planned.0,
+        bytes: planned.1,
     });
     let report = Scheduler::new(settings.transfer, printer.clone())
         .with_progress(progress.sink())
@@ -376,6 +407,9 @@ async fn finish(
 /// The last line on stderr, for example `Summary: 12 migrated (3.4 MB), 2 already there,
 /// 1 skipped (unsupported), 0 failed, 0 cancelled; 3 folders created, 1 reused`.
 fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
+    if settings.archive {
+        return archive::summary(report, tally, settings.dry_run);
+    }
     let (migrated, converted, created, trashed) = if settings.dry_run {
         (
             "to migrate",
@@ -457,6 +491,8 @@ struct DestFile {
     mime_type: String,
     size: Option<i64>,
     md5: Option<String>,
+    /// The manifest digest of an archive (`appProperties`), listed in archive runs only.
+    archive: Option<String>,
 }
 
 /// How a source file compares with the destination's files of its name.
@@ -487,6 +523,9 @@ impl Existing {
                 mime_type: file.mime_type.unwrap_or_default(),
                 size: file.size,
                 md5: file.md5_checksum,
+                archive: file
+                    .app_properties
+                    .and_then(|mut properties| properties.remove(archive::PROPERTY)),
             });
         }
         Existing { by_name, ids }
@@ -542,16 +581,17 @@ impl Existing {
     }
 }
 
-/// Lists the destination folder `folder_id`: the files that are not in the trash.
+/// Lists the destination folder `folder_id`: the files that are not in the trash, with the
+/// `fields` mask `fields`.
 ///
 /// Fails when Drive answers a page with `incompleteSearch`: a file missing from the listing would
 /// be taken for absent and created a second time.
-async fn list_existing(dest: &Hub, folder_id: &str) -> Result<Existing, Error> {
+async fn list_existing(dest: &Hub, folder_id: &str, fields: &str) -> Result<Existing, Error> {
     let q = ListQuery::files_in_folder(folder_id.to_owned()).q();
     let mut files = Vec::new();
     let mut page_token = None;
     loop {
-        let list = list_page(dest, &q, LIST_PAGE_SIZE, DEST_FIELDS, page_token.as_deref())
+        let list = list_page(dest, &q, LIST_PAGE_SIZE, fields, page_token.as_deref())
             .await
             .map_err(Error::ListDestination)?;
         if list.incomplete_search == Some(true) {
@@ -649,6 +689,9 @@ struct Tally {
     trashed: AtomicU64,
     /// Source files and folders that stay although they were to go to the trash.
     kept: AtomicU64,
+    /// Items left out of the archives (`--archive`): shortcuts, Workspace types without an
+    /// export, exports over Drive's limit.
+    skipped: AtomicU64,
 }
 
 /// Where the items of a source folder go.
@@ -708,6 +751,7 @@ impl Migration {
             label,
             mut children,
             incomplete,
+            modified_time: _,
             error: _,
         } = folder;
 
@@ -721,7 +765,7 @@ impl Migration {
                 return failed(&label, Error::InsideSource { folder: true }).into();
             }
             context.printer.out(format!("reuse {label}/")).await;
-            match list_existing(&self.dest, dest_id).await {
+            match list_existing(&self.dest, dest_id, DEST_FIELDS).await {
                 Ok(existing) => {
                     self.tally.folders_reused.fetch_add(1, Ordering::SeqCst);
                     (Some(dest_id.to_owned()), existing)
@@ -941,11 +985,7 @@ impl Migration {
         reason: &Unsupported,
         context: &JobContext,
     ) -> JobOutput {
-        context.printer.out(format!("skip {label}: {reason}")).await;
-        self.unsupported
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(format!("{label}: {reason}"));
+        self.note_skipped(label, reason, context).await;
         let reason = match reason {
             Unsupported::Shortcut => SkipReason::Shortcut,
             Unsupported::NativeType(_) => SkipReason::NotExportable,
@@ -1130,6 +1170,24 @@ pub(crate) enum Error {
     /// No id for a new file or folder of the destination.
     GenerateId(NextError),
     Relay(Box<RelayError>),
+    /// A folder of an archive could not be listed or is its own ancestor (`source`): an archive
+    /// without it is not made.
+    ArchiveUnlisted {
+        folder: String,
+        source: Box<Error>,
+    },
+    /// Drive reported `incompleteSearch` while listing this folder of an archive.
+    ArchiveIncomplete(String),
+    /// A name in an archive cannot be used as a file name.
+    ArchiveName(crate::common::local_name::UnusableName),
+    /// The listing has no size for this file of an archive.
+    NoSize(String),
+    /// The Workspace file of an archive could not be exported.
+    Export {
+        label: String,
+        source: Box<RelayError>,
+    },
+    Archive(Box<crate::transfer::archive::ArchiveError>),
     /// The item is in the destination, but could not be moved to the trash in the source.
     Trash(Box<google_drive3::Error>),
     /// An item of the migration failed; `label` is its path, starting with the name of its
@@ -1218,6 +1276,21 @@ impl Display for Error {
             }
             Error::GenerateId(_) => f.write_str("unable to get an id for the destination"),
             Error::Relay(error) => error.fmt(f),
+            Error::ArchiveUnlisted { folder, .. } => {
+                write!(f, "the archive would miss what is in '{folder}/'")
+            }
+            Error::ArchiveIncomplete(folder) => write!(
+                f,
+                "Drive did not list '{folder}/' completely, the archive would miss files; run the \
+                 command again later"
+            ),
+            Error::ArchiveName(_) => f.write_str("a name cannot be used in the archive"),
+            Error::NoSize(label) => write!(
+                f,
+                "Drive lists no size for '{label}'; run the command again later"
+            ),
+            Error::Export { label, .. } => write!(f, "unable to export '{label}'"),
+            Error::Archive(error) => error.fmt(f),
             Error::Trash(_) => f.write_str(
                 "it is in the destination, but it could not be moved to the trash in the source",
             ),
@@ -1246,7 +1319,12 @@ impl error::Error for Error {
             | Error::Recheck(source) => Some(source.as_ref()),
             Error::ListSource(error) => Some(error.error.as_ref()),
             Error::Relay(error) => error::Error::source(error.as_ref()),
-            Error::Item { source, .. } => Some(source.as_ref()),
+            Error::Archive(error) => error::Error::source(error.as_ref()),
+            Error::ArchiveUnlisted { source, .. } | Error::Item { source, .. } => {
+                Some(source.as_ref())
+            }
+            Error::Export { source, .. } => Some(source.as_ref()),
+            Error::ArchiveName(source) => Some(source),
             Error::Incomplete(source) => Some(source),
             Error::GenerateId(source) => Some(source),
             Error::WriteOutput(source) => Some(source),
@@ -1259,7 +1337,9 @@ impl error::Error for Error {
             | Error::Cycle
             | Error::Conflict
             | Error::FolderMissingId
-            | Error::IncompleteListing => None,
+            | Error::IncompleteListing
+            | Error::ArchiveIncomplete(_)
+            | Error::NoSize(_) => None,
         }
     }
 }

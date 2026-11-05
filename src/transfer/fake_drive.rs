@@ -19,7 +19,8 @@
 //! of small files and the creation of folders, [`Created`]) and resumable sessions (a `POST` with
 //! `uploadType=resumable`, then `PUT`s of chunks at the next offset, 308 with `Range` until the
 //! last). Like Drive, a create fails with 404 when a parent does not exist yet. The
-//! `modifiedTime` and `createdTime` of a create's metadata are the new file's.
+//! `modifiedTime`, `createdTime` and `appProperties` of a create's metadata are the new file's,
+//! and listings return the `appProperties` of the files that have them.
 //!
 //! For syncs it answers multipart `files.update` of a stored file's content (a `PATCH` to the
 //! upload path, [`FakeDrive::updates`]), metadata `files.update` (a `PATCH` of JSON, such as
@@ -33,11 +34,11 @@
 //! listing until a download has started, so the overlap happens however slow the machine is.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::Infallible,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -85,6 +86,8 @@ pub(crate) struct FakeFile {
     pub(crate) modified_time: Option<String>,
     /// `createdTime`, RFC 3339.
     pub(crate) created_time: Option<String>,
+    /// `appProperties`.
+    pub(crate) app_properties: BTreeMap<String, String>,
 }
 
 impl FakeFile {
@@ -229,6 +232,9 @@ impl FakeFile {
         if let Some(resource_key) = &self.resource_key {
             file.insert("resourceKey".into(), json!(resource_key));
         }
+        if !self.app_properties.is_empty() {
+            file.insert("appProperties".into(), json!(self.app_properties));
+        }
         if let Some((target_id, target_mime_type)) = &self.shortcut_target {
             let mut details = json!({"targetId": target_id, "targetMimeType": target_mime_type});
             if let Some(resource_key) = &self.target_resource_key {
@@ -241,6 +247,10 @@ impl FakeFile {
 }
 
 /// How the fake deviates from a well-behaved, instant Drive.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "independent deviations, each switched on by the tests that need it"
+)]
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Behavior {
     /// The most files per page; `None` honors `pageSize`. Drive may return fewer than asked.
@@ -278,6 +288,9 @@ pub(crate) struct Behavior {
     pub(crate) media_stalled: HashSet<String>,
     /// Exports of these file ids fail with Drive's 403 for exports over 10 MB.
     pub(crate) export_too_large: HashSet<String>,
+    /// Every export returns other bytes, as Drive's do: the content and ` #<n>` for the n-th
+    /// export (from 0) the fake answered.
+    pub(crate) exports_vary: bool,
     /// How long the create of a file (not a folder) takes before its reply.
     pub(crate) upload_delay: Duration,
     /// Creates of files with these names fail with 400.
@@ -292,7 +305,8 @@ pub(crate) struct Behavior {
     /// committing nothing.
     pub(crate) chunk_unavailable: HashMap<String, u64>,
     /// Chunks that start at or after this offset get no reply, like a transfer that hangs.
-    /// [`FakeDrive::wait_for_stalled_chunks`] waits until that many have arrived.
+    /// [`FakeDrive::wait_for_stalled_chunks`] waits until that many have arrived, and after
+    /// [`FakeDrive::stop_stalling`] the next chunks are answered.
     pub(crate) chunks_stalled_from: Option<u64>,
     /// The first this many file uploads (multipart creates of files, first chunks of resumable
     /// sessions) are held until all of them have arrived, so they are in flight together.
@@ -377,6 +391,8 @@ pub(crate) struct Created {
     /// The `modifiedTime` and `createdTime` of the metadata.
     pub(crate) modified_time: Option<String>,
     pub(crate) creation_time: Option<String>,
+    /// The `appProperties` of the metadata.
+    pub(crate) app_properties: BTreeMap<String, String>,
     /// The position of the request's arrival among all arrivals and replies of creates.
     pub(crate) arrived: usize,
     /// The position of its reply.
@@ -455,6 +471,8 @@ struct State {
     media_arrived: watch::Sender<bool>,
     /// The chunks held without a reply ([`Behavior::chunks_stalled_from`]).
     stalled_chunks: watch::Sender<usize>,
+    /// [`FakeDrive::stop_stalling`] was called.
+    stalling_stopped: AtomicBool,
 }
 
 pub(crate) struct FakeDrive {
@@ -507,6 +525,7 @@ impl FakeDrive {
             list_rendezvous,
             media_arrived: watch::channel(false).0,
             stalled_chunks: watch::channel(0).0,
+            stalling_stopped: AtomicBool::new(false),
         });
 
         let server_state = Arc::clone(&state);
@@ -621,6 +640,12 @@ impl FakeDrive {
         let mut stalled = self.state.stalled_chunks.subscribe();
         // The sender lives as long as `self`.
         let _ = stalled.wait_for(|stalled| *stalled >= count).await;
+    }
+
+    /// Chunks of [`Behavior::chunks_stalled_from`] that arrive from now on are answered, like
+    /// a network that is back; the ones held already stay held.
+    pub(crate) fn stop_stalling(&self) {
+        self.state.stalling_stopped.store(true, Ordering::SeqCst);
     }
 
     /// The most resumable sessions that were started and not completed at the same time.
@@ -876,6 +901,15 @@ fn finish_create(
     }
 
     let time = |key: &str| metadata[key].as_str().map(String::from);
+    let app_properties = metadata["appProperties"]
+        .as_object()
+        .map(|properties| {
+            properties
+                .iter()
+                .filter_map(|(key, value)| Some((key.clone(), value.as_str()?.to_owned())))
+                .collect()
+        })
+        .unwrap_or_default();
     let created = Created {
         id: text("id"),
         name,
@@ -884,6 +918,7 @@ fn finish_create(
         content,
         modified_time: time("modifiedTime"),
         creation_time: time("createdTime"),
+        app_properties,
         arrived,
         answered: state.create_events.fetch_add(1, Ordering::SeqCst),
     };
@@ -899,6 +934,7 @@ fn finish_create(
         content: Some(String::from_utf8_lossy(&created.content).into_owned()),
         modified_time: created.modified_time.clone(),
         created_time: created.creation_time.clone(),
+        app_properties: created.app_properties.clone(),
         ..FakeFile::default()
     });
     state.created.lock().expect("created lock").push(created);
@@ -1266,6 +1302,7 @@ async fn hold_chunk(state: &State, first: Option<u64>) {
             .behavior
             .chunks_stalled_from
             .is_some_and(|from| first >= from)
+            && !state.stalling_stopped.load(Ordering::SeqCst)
         {
             state.stalled_chunks.send_modify(|stalled| *stalled += 1);
             std::future::pending::<()>().await;
@@ -1442,11 +1479,11 @@ async fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeRes
         .find(|(key, _)| key == "mimeType")
         .map(|(_, mime_type)| mime_type.clone())
         .unwrap_or_default();
-    state
-        .exports
-        .lock()
-        .expect("exports lock")
-        .push((id.to_owned(), mime_type));
+    let number = {
+        let mut exports = state.exports.lock().expect("exports lock");
+        exports.push((id.to_owned(), mime_type));
+        exports.len() - 1
+    };
     pass_gate(state).await;
 
     if state.behavior.export_too_large.contains(id) {
@@ -1463,9 +1500,12 @@ async fn export(state: &State, id: &str, params: &[(String, String)]) -> FakeRes
         .iter()
         .find(|file| file.id == id && file.mime_type.starts_with("application/vnd.google-apps."))
         .and_then(|file| file.content.clone());
-    let Some(content) = content else {
+    let Some(mut content) = content else {
         return error(StatusCode::NOT_FOUND, "File not found.");
     };
+    if state.behavior.exports_vary {
+        content = format!("{content} #{number}");
+    }
     let frames = stream::iter([Ok::<_, Infallible>(hyper::body::Frame::data(Bytes::from(
         content,
     )))]);

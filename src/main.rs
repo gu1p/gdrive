@@ -455,6 +455,10 @@ enum FileCommand {
         #[arg(long)]
         trash_source: bool,
 
+        /// Migrate each given file or folder as one tar file, NAME.tar, made on the fly while it is uploaded, without compression: a folder with everything in it, Google Docs, Sheets, Slides and Drawings exported as docx, xlsx, pptx and png. Running the command again continues an interrupted archive, or finds it already there. See docs/migrate.md
+        #[arg(long, conflicts_with = "trash_source")]
+        archive: bool,
+
         /// Set chunk size in MB, must be a power of two.
         #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
         chunk_size: ChunkSize,
@@ -1184,6 +1188,7 @@ async fn handle_files_command(
             continue_on_error,
             dry_run,
             trash_source,
+            archive,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -1197,6 +1202,7 @@ async fn handle_files_command(
                 into,
                 dry_run,
                 trash_source,
+                archive,
                 chunk_size,
                 multipart_threshold,
                 print_chunk_errors,
@@ -2145,6 +2151,7 @@ mod flag_tests {
             continue_on_error,
             dry_run,
             trash_source,
+            archive,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -2183,11 +2190,52 @@ mod flag_tests {
         assert_eq!(from.as_deref(), Some("old@example.com"));
         assert_eq!(into.as_deref(), Some("folder"));
         assert_eq!(jobs.get(), 8);
-        assert!(continue_on_error && dry_run && trash_source);
+        assert!(continue_on_error && dry_run && trash_source && !archive);
         assert_eq!(chunk_size.in_bytes(), 1 << 20);
         assert_eq!(multipart_threshold.in_bytes(), 0);
         assert!(print_chunk_errors && print_chunk_info);
         assert_eq!((progress.progress, progress.no_progress), (false, true));
+    }
+
+    #[test]
+    fn migrate_takes_archive_but_never_with_trash_source() {
+        let FileCommand::Migrate {
+            archive,
+            trash_source,
+            ..
+        } = parse(&[
+            "files",
+            "migrate",
+            "id",
+            "--to",
+            "new@example.com",
+            "--archive",
+        ])
+        else {
+            panic!("expected migrate");
+        };
+        assert!(archive && !trash_source);
+        let FileCommand::Migrate { archive, .. } =
+            parse(&["files", "migrate", "id", "--to", "new@example.com"])
+        else {
+            panic!("expected migrate");
+        };
+        assert!(!archive);
+
+        let error = Cli::try_parse_from([
+            "gdrive",
+            "files",
+            "migrate",
+            "id",
+            "--to",
+            "new@example.com",
+            "--archive",
+            "--trash-source",
+        ]);
+        let Err(error) = error else {
+            panic!("--archive --trash-source should be refused");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]
