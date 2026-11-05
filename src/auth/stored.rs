@@ -46,6 +46,8 @@ where
 {
     source: Source<C>,
     account: Arc<str>,
+    /// [`TokenFile::audit_log_granted`] of the tokens loaded.
+    audit_log_granted: bool,
 }
 
 #[derive(Clone)]
@@ -85,10 +87,12 @@ where
             .map_err(Error::LoadTokens)?
             .filter(|file| !file.is_empty())
             .ok_or_else(|| reauth(ReauthReason::NoStoredToken))?;
+        let audit_log_granted = file.audit_log_granted();
         let Some(refresh_token) = file.refresh_token().map(str::to_owned) else {
             return Ok(StoredCredentials {
                 source: Source::CachedOnly(Arc::new(file)),
                 account: account.into(),
+                audit_log_granted,
             });
         };
 
@@ -111,7 +115,15 @@ where
         Ok(StoredCredentials {
             source: Source::Refreshing(auth),
             account: account.into(),
+            audit_log_granted,
         })
+    }
+
+    /// Whether the stored tokens record that the account was granted read access to the audit
+    /// log ([`TokenFile::audit_log_granted`]). Ask for a token for [`super::AUDIT_LOG_SCOPE`]
+    /// only when they do.
+    pub(crate) fn audit_log_granted(&self) -> bool {
+        self.audit_log_granted
     }
 
     /// An access token for `scopes`: the stored one while it is valid, otherwise a refreshed
