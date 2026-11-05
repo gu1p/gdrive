@@ -39,6 +39,10 @@ The audit log belongs to a Google Workspace organization, and only its administr
   already with `gdrive account reauth <ACCOUNT> --audit-log`. Google then asks you to allow read access to
   the audit reports of your organization besides the access to Drive.
 
+Without an audit log, for example for a personal Gmail account, [`files diverged`](diverged.md) tells what
+changed in the old location after a migration and who last changed it, from Drive alone (views and downloads
+excepted).
+
 Service accounts and accounts with Application Default Credentials cannot read the audit log yet.
 
 The account that reads the audit log also lists the folders and reads the sharing lists, so it must be able

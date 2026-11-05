@@ -115,6 +115,21 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   in Drive is changed. Needs a Workspace administrator with the Reports privilege, the Admin SDK API
   enabled in the Cloud project, and an account authorized with `--audit-log`. Takes `--jobs`,
   `--skip-header`, `--field-separator` and `--tsv`. See docs/activity.md.
+- **What changed in the old location after a migration.** `files diverged <FILE_ID>... [--from <ACCOUNT>]
+  [--to <ACCOUNT>] [--into <FOLDER_ID>] [--since <WHEN>]` takes the arguments of `files migrate` and reports
+  what diverged in the origin from its copy, with who last changed each item and when, as Drive tells it:
+  `added` (no item of its name in the copy, and everything in an added folder), `edited` (other content and
+  the origin newer; when the copy is newer, the copy's first revision tells whether the origin changed after
+  the migration), `differs` (the revisions cannot tell), `moved` (a file renamed or moved in the origin,
+  found by size and MD5 checksum, without a person or time) and `trashed` (who and when in shared drives,
+  the owner in My Drive). Files are compared by size and MD5 checksum, Google Docs files by modification
+  time. Without `--to`, `--since` reports what was created or modified in the origin since then; with it,
+  `--since` filters the rows. Shortcuts, Drawings, Forms and items both accounts see are left out and
+  listed. `--by item` (default) or `--by user`; `--exclude EMAIL`, `--jobs`, `--skip-header`,
+  `--field-separator` and `--tsv`. Works for any account, personal Gmail accounts included, with the Drive
+  access gdrive has; cannot see views or downloads. A missing copy of a given item, a missing or trashed id
+  and a listing that fails or is incomplete fail the command with nothing on stdout. Nothing is changed in
+  either account. See docs/diverged.md.
 
 Accounts and login:
 
