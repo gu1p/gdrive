@@ -4,12 +4,19 @@
 //!
 //! ```text
 //!   domain  every Drive event of the organization         windows of 24 hours, no filters
-//!   drive   the events of the shared drives of the items   windows of 24 hours,
-//!                                                          filters=shared_drive_id==<ID>
+//!   (default)                                              complete
 //!   file    the events of each item                        the whole range,
 //!                                                          filters=doc_id==<ID>
-//!   auto    drive when every FILE_ID is in a shared drive, else domain (never file)
+//!                                                          complete: an id survives moves
+//!   drive   the events of the shared drives of the items   windows of 24 hours,
+//!                                                          filters=shared_drive_id==<ID>
+//!                                                          misses what happened before an
+//!                                                          item was moved into its drive
 //! ```
+//!
+//! `shared_drive_id` is the drive an item was in when the event happened: the events of a file
+//! from before it was moved into a shared drive carry another drive or none, and a `drive` scan
+//! does not see them. That is why it is never the default.
 //!
 //! Each window (or item) is a series of requests that follows `nextPageToken`; up to `--jobs`
 //! series run at once, and each page is counted ([`Tally`]) as it arrives, so that only the
@@ -48,14 +55,12 @@ const OVERLAP: TimeDelta = TimeDelta::seconds(1);
 /// `--scan`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub(crate) enum Scan {
-    /// The drive scan when every given item is in a shared drive, otherwise the domain scan
-    Auto,
-    /// Every Drive event of the organization: always complete, slow for a large organization
+    /// Every Drive event of the organization: complete, slow for a large organization
     Domain,
-    /// The events of the shared drives of the given items, which must all be in shared drives
-    Drive,
-    /// The events of each item, one series of requests per item: fast for a few files
+    /// The events of each item, one series of requests per item: complete (an item keeps its id when it moves), fast for a few items
     File,
+    /// The events of the shared drives of the given items, which must all be in shared drives: faster, but misses what happened before an item was moved into its shared drive
+    Drive,
 }
 
 /// The requests a scan sends.
@@ -71,24 +76,23 @@ pub(super) enum Plan {
 impl Plan {
     /// The plan of `scan` for `items`. `drive` fails for an item outside shared drives.
     pub(super) fn choose(scan: Scan, items: &Items) -> Result<Plan, Error> {
-        let mut drives = Vec::new();
-        let mut outside = None;
-        for root in &items.roots {
-            match &root.drive_id {
-                Some(drive) if !drives.contains(drive) => drives.push(drive.clone()),
-                Some(_) => {}
-                None => outside = outside.or(Some(root)),
+        Ok(match scan {
+            Scan::Domain => Plan::Domain,
+            Scan::Drive => {
+                let mut drives = Vec::new();
+                for root in &items.roots {
+                    let Some(drive) = &root.drive_id else {
+                        return Err(Error::NotInSharedDrive {
+                            path: root.name.clone(),
+                        });
+                    };
+                    if !drives.contains(drive) {
+                        drives.push(drive.clone());
+                    }
+                }
+                Plan::Drives(drives)
             }
-        }
-        Ok(match (scan, outside) {
-            (Scan::Domain, _) | (Scan::Auto, Some(_)) => Plan::Domain,
-            (Scan::Drive, Some(root)) => {
-                return Err(Error::NotInSharedDrive {
-                    path: root.name.clone(),
-                })
-            }
-            (Scan::Drive | Scan::Auto, None) => Plan::Drives(drives),
-            (Scan::File, _) => {
+            Scan::File => {
                 let mut ids = items.paths.keys().cloned().collect::<Vec<_>>();
                 ids.sort();
                 Plan::Items(ids)

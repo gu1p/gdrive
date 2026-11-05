@@ -49,7 +49,7 @@ to open the given files and folders too: as their owner, or as someone they are 
 ```sh
 gdrive files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>] [--until <WHEN>]
     [--by user|file|event] [--exclude <EMAIL>]... [--active-only]
-    [--scan auto|domain|drive|file] [--jobs <N>]
+    [--scan domain|file|drive] [--jobs <N>]
     [--skip-header] [--field-separator <SEP>] [--tsv]
 ```
 
@@ -69,7 +69,8 @@ gdrive files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>] [--unt
   three reports.
 - `--active-only`: only the people with activity. The sharing lists are then not read at all, and the
   `Access` column is `-` for everyone.
-- `--scan`: how much of the audit log Google sends (see [Scans](#scans---scan)); `auto` by default.
+- `--scan`: how much of the audit log Google sends (see [Scans](#scans---scan)): `domain` by default,
+  which is complete; `file` and `drive` are faster on request.
 - `--jobs N`: send up to N requests at once, 1 to 64 (default 4).
 - `--skip-header`, `--field-separator SEP`, `--tsv`: as for `gdrive files list`.
 
@@ -157,7 +158,7 @@ The report is the only thing on stdout. stderr gets what was found and read, war
 
 ```text
 Found 312 files in 41 folders
-Reading the audit log from 2026-10-06 14:00:00 to 2026-11-05 14:00:00: every Drive event of the organization, in 30 windows of 24 hours (--scan domain)
+Reading the audit log from 2026-10-06 14:00:00 to 2026-11-05 14:00:00: every Drive event of the organization, in 30 windows of 24 hours (--scan domain; --scan file is faster for a few items, --scan drive for items in shared drives)
 Read 1843209 events of the audit log, 3512 of them about these items
 Summary: 3 people active since 2026-10-06 14:00:00, and anonymous users; 2 with access and no activity
 ```
@@ -174,18 +175,24 @@ of the time: such a report would tell wrongly that people are gone.
 
 Google cannot select "everything under this folder": an event names one item. So gdrive lists the items
 first, and keeps the events about them from what Google sends, whatever the scan. The scan only chooses how
-much Google sends:
+much Google sends. **The default is complete; the faster scans are a choice you make.**
 
-| Scan | What Google sends | When to pick it |
-|---|---|---|
-| `domain` | every Drive event of the organization in the time range | always complete; slow for a large organization |
-| `drive` | the events of the shared drives the given items are in (`shared_drive_id`) | the items are in shared drives: much less than the whole organization. An error for an item in a My Drive |
-| `file` | the events of each item, one series of requests per item over the whole time range (`doc_id`) | a few files in a large organization. With thousands of items it sends thousands of request series |
-| `auto` (default) | `drive` when every given item is in a shared drive, otherwise `domain` | |
+| Scan | What Google sends | Complete? | When to pick it |
+|---|---|---|---|
+| `domain` (default) | every Drive event of the organization in the time range | yes | always right; slow for a large organization, since all its Drive events are read to find those of the items |
+| `file` | the events of each item (`doc_id`), one series of requests per item over the whole time range | yes: an item keeps its id when it is moved or renamed | a few files or a small folder in a large organization. With thousands of items it sends thousands of request series |
+| `drive` | the events of the shared drives the given items are in (`shared_drive_id`) | **no**: see below | items that have always been in their shared drive. An error for an item in a My Drive |
+
+**What `--scan drive` misses.** Google records in each event the shared drive the item was in *when the event
+happened*. The views of a file from before it was moved into a shared drive name another shared drive, or none
+when it was in a My Drive, and `--scan drive` does not get them: people who used the file only before the
+move look gone. A [migration](migrate.md) into a shared drive is such a move, so after a migration read with
+the default scan, or with `--scan file`.
 
 `domain` and `drive` read the time range in windows of 24 hours, `--jobs` windows at once, and page through
 each window. The windows overlap by a second, so that an event at their border is read twice rather than
-missed; it counts once. If Google refuses the filter of a `drive` or `file` scan, use `--scan domain`.
+missed; it counts once. `file` reads the whole time range for each item, `--jobs` items at once. If Google
+refuses the filter of a `file` or `drive` scan, use the default.
 
 The events are counted as they arrive: memory holds the events about the items, not the whole audit log. A
 rate limit from Google holds back every request for a while and is retried, as for the other commands.

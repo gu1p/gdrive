@@ -297,7 +297,8 @@ async fn report(
 }
 
 /// How the log is read: `Reading the audit log from A to B: every Drive event of the
-/// organization, in 30 windows of 24 hours (--scan domain)`.
+/// organization, in 30 windows of 24 hours (--scan domain; ...)`. The complete default names the
+/// faster scans, once.
 fn reading_line(plan: &Plan, range: &Range, series: usize) -> String {
     let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
     let windows = |n: usize| {
@@ -318,8 +319,14 @@ fn reading_line(plan: &Plan, range: &Range, series: usize) -> String {
             plural(count(ids.len()), "item", "items")
         ),
     };
+    let faster = match plan {
+        Plan::Domain => {
+            "; --scan file is faster for a few items, --scan drive for items in shared drives"
+        }
+        Plan::Drives(_) | Plan::Items(_) => "",
+    };
     format!(
-        "Reading the audit log from {} to {}: {what} (--scan {})",
+        "Reading the audit log from {} to {}: {what} (--scan {}{faster})",
         format_date_time(range.since),
         format_date_time(range.until),
         plan.scan_name(),

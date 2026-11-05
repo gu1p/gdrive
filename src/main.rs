@@ -514,8 +514,8 @@ enum FileCommand {
         #[arg(long)]
         active_only: bool,
 
-        /// How much of the audit log Google sends; the items are filtered on this machine in every case
-        #[arg(long, value_enum, default_value_t = files::activity::Scan::Auto)]
+        /// How much of the audit log Google sends; the items are filtered on this machine in every case. The default reads everything and is always complete
+        #[arg(long, value_enum, default_value_t = files::activity::Scan::Domain)]
         scan: files::activity::Scan,
 
         /// Send up to N requests at once (1 to 64)
@@ -2438,7 +2438,7 @@ mod flag_tests {
         assert_eq!(account, None);
         assert_eq!(since, When::Ago(chrono::TimeDelta::days(30)));
         assert_eq!(until, None);
-        assert_eq!((by, scan), (By::User, Scan::Auto));
+        assert_eq!((by, scan), (By::User, Scan::Domain));
         assert!(exclude.is_empty() && !active_only && !skip_header && !tsv);
         assert_eq!(jobs.get(), 4);
         assert_eq!(field_separator, "\t");
@@ -2451,6 +2451,7 @@ mod flag_tests {
             &["files", "activity", "id", "--jobs", "65"],
             &["files", "activity", "id", "--by", "person"],
             &["files", "activity", "id", "--scan", "everything"],
+            &["files", "activity", "id", "--scan", "auto"],
             &["files", "activity", "id", "--tsv", "--field-separator", ","],
         ] {
             assert!(

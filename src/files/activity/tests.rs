@@ -137,7 +137,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         by: By::User,
         exclude: Vec::new(),
         active_only: false,
-        scan: Scan::Auto,
+        scan: Scan::Domain,
         jobs: NonZeroUsize::new(4).unwrap(),
         output: Output::Tsv { skip_header: false },
         progress_every: None,
@@ -359,7 +359,8 @@ async fn the_report_has_each_person_newest_first_then_who_has_access_and_did_not
             String::from("Found 3 files in 2 folders"),
             format!(
                 "Reading the audit log from {since} to {}: every Drive event of the \
-                 organization, in 30 windows of 24 hours (--scan domain)",
+                 organization, in 30 windows of 24 hours (--scan domain; --scan file is faster \
+                 for a few items, --scan drive for items in shared drives)",
                 local(NOW)
             ),
             String::from("Read 10 events of the audit log, 8 of them about these items"),
@@ -913,7 +914,7 @@ async fn the_domain_scan_reads_windows_of_a_day_without_filters() {
 }
 
 #[tokio::test]
-async fn auto_reads_the_shared_drive_when_every_item_is_in_one() {
+async fn the_drive_scan_reads_the_shared_drive_of_the_items_on_request_only() {
     let log = vec![
         record(
             "2026-11-01T12:00:00Z",
@@ -933,6 +934,7 @@ async fn auto_reads_the_shared_drive_when_every_item_is_in_one() {
         let ran = activity(
             &drive,
             Settings {
+                scan: Scan::Drive,
                 active_only: true,
                 ..settings(&[id])
             },
@@ -960,22 +962,87 @@ async fn auto_reads_the_shared_drive_when_every_item_is_in_one() {
 }
 
 #[tokio::test]
-async fn auto_reads_the_domain_when_an_item_is_in_my_drive() {
-    let mut files = tree();
-    files.extend(shared_drive());
-    let drive = FakeDrive::start(files, Behavior::default()).await;
+async fn the_default_scan_reads_the_whole_organization_also_for_shared_drives() {
+    let drive = FakeDrive::start(shared_drive(), Behavior::default()).await;
 
-    let ran = activity(&drive, settings(&["proj", "old"])).await;
+    let ran = activity(&drive, settings(&["proj"])).await;
 
     ran.assert_ok();
     assert!(
-        ran.err.text().contains("(--scan domain)"),
+        ran.err.text().contains(
+            "(--scan domain; --scan file is faster for a few items, --scan drive for items in \
+             shared drives)"
+        ),
         "{}",
         ran.err.text()
     );
-    assert!(windows(&drive)
-        .iter()
-        .all(|(_, _, filters)| filters.is_none()));
+    assert_eq!(
+        windows(&drive),
+        expected_windows(now() - TimeDelta::days(30), now(), None)
+    );
+}
+
+/// A file that was in My Drive, then in the shared drive `d0`, and is in `d1` since yesterday:
+/// each of its events names the drive it was in then.
+fn moved_file_log() -> Vec<Value> {
+    vec![
+        record(
+            "2026-10-10T12:00:00Z",
+            Some("ana@example.com"),
+            vec![event("view", "plan")],
+        ),
+        record(
+            "2026-10-20T12:00:00Z",
+            Some("bob@example.com"),
+            vec![in_drive(event("view", "plan"), "d0")],
+        ),
+        record(
+            "2026-11-04T12:00:00Z",
+            Some("carol@example.com"),
+            vec![in_drive(event("view", "plan"), "d1")],
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_drive_scan_misses_what_happened_before_a_file_was_moved_into_its_shared_drive() {
+    let drive = FakeDrive::start(shared_drive(), behavior(moved_file_log())).await;
+    let users = |ran: &Ran| {
+        ran.assert_ok();
+        ran.rows()
+            .into_iter()
+            .map(|row| row[0].clone())
+            .collect::<Vec<_>>()
+    };
+
+    // Complete: domain reads everything, file selects by id, which a move keeps.
+    for scan in [Scan::Domain, Scan::File] {
+        let ran = activity(
+            &drive,
+            Settings {
+                scan,
+                active_only: true,
+                ..settings(&["proj"])
+            },
+        )
+        .await;
+        assert_eq!(
+            users(&ran),
+            ["carol@example.com", "bob@example.com", "ana@example.com"],
+            "{scan:?}"
+        );
+    }
+    // The documented miss: only the events from the time the file was in d1.
+    let ran = activity(
+        &drive,
+        Settings {
+            scan: Scan::Drive,
+            active_only: true,
+            ..settings(&["proj"])
+        },
+    )
+    .await;
+    assert_eq!(users(&ran), ["carol@example.com"]);
 }
 
 #[tokio::test]
