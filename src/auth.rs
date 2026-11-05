@@ -105,6 +105,27 @@ pub(crate) fn warn_if_no_refresh_token(tokens: &store::TokenFile, account: &str)
     }
 }
 
+/// The warning for a login that took away the account's read access to the audit log: the
+/// account had it, and the new authorization, which replaces the old one, does not include it.
+/// `asked` says whether the login asked for it again (and Google did not grant it).
+pub(crate) fn audit_log_lost_warning(account: &str, asked: bool) -> String {
+    if asked {
+        format!(
+            "Warning: Google did not grant read access to the audit log this time, so 'gdrive \
+             files activity' no longer works with account '{account}'; its Drive authorization \
+             was saved. To get the access back, run 'gdrive account reauth {account} \
+             --audit-log' and leave the box for the audit log ticked (the Google account must be \
+             an administrator of the organization)"
+        )
+    } else {
+        format!(
+            "Warning: account '{account}' could read the audit log of its organization, and this \
+             login did not ask for that access, so 'gdrive files activity' no longer works with \
+             it. To get the access back, run 'gdrive account reauth {account} --audit-log'"
+        )
+    }
+}
+
 /// Finds a [`ReauthRequired`] in an error chain.
 ///
 /// The Drive API client wraps token errors in `MissingToken`, whose `source()` returns `None`,
@@ -161,6 +182,21 @@ mod tests {
              account add'"
         ));
         assert!(message.contains("7 days"));
+    }
+
+    #[test]
+    fn the_audit_log_warnings_name_the_command_that_brings_the_access_back() {
+        for asked in [true, false] {
+            let warning = audit_log_lost_warning("me@example.com", asked);
+            assert!(warning.starts_with("Warning: "), "{warning}");
+            assert!(
+                warning.contains("'gdrive account reauth me@example.com --audit-log'"),
+                "{warning}"
+            );
+            assert!(warning.contains("'gdrive files activity'"), "{warning}");
+        }
+        assert!(audit_log_lost_warning("me@example.com", true)
+            .contains("its Drive authorization was saved"));
     }
 
     #[derive(Debug)]

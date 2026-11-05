@@ -105,6 +105,10 @@ enum AccountCommand {
     /// `account add`, with the client credentials stored for the account, and replaces the
     /// account's tokens. Other commands never start a login: when the stored token cannot be
     /// refreshed, they fail at once and point to this command.
+    ///
+    /// An account that may read the audit log of its organization (--audit-log) is asked for
+    /// that access again; if Google does not grant it, the Drive authorization is saved and a
+    /// warning says how to get the access back.
     Reauth {
         /// Account name [default: current account]
         account_name: Option<String>,
@@ -205,8 +209,9 @@ struct LoginArgs {
     /// `gdrive files activity` needs
     ///
     /// The Google account must be an administrator of the organization. The access is read-only.
-    /// Service accounts and Application Default Credentials (--service-account, --adc) are not
-    /// supported for the audit log yet.
+    /// `account reauth` asks for it again without this flag when the account has it. Service
+    /// accounts and Application Default Credentials (--service-account, --adc) are not supported
+    /// for the audit log yet.
     #[arg(long)]
     audit_log: bool,
 }

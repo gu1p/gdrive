@@ -13,8 +13,8 @@
 //! The authorization URL carries a random `state`, which the redirect must return, and a PKCE
 //! S256 `code_challenge`, whose `code_verifier` goes with the code to the token endpoint.
 //!
-//! The login asks for [`DRIVE_SCOPES`], and with [`AuditLog::Required`] also for
-//! [`AUDIT_LOG_SCOPE`]. The `scope` field of the token response says what the user granted: the
+//! The login asks for [`DRIVE_SCOPES`], and with [`AuditLog::Required`] or [`AuditLog::Optional`]
+//! also for [`AUDIT_LOG_SCOPE`]. The `scope` field of the token response says what the user granted: the
 //! consent screen lets them untick a scope.
 
 use std::{
@@ -76,6 +76,9 @@ pub(crate) enum AuditLog {
     /// `--audit-log`: the login fails with [`LoginError::AuditLogNotGranted`] when Google does not
     /// grant it.
     Required,
+    /// `account reauth` of an account that has the access, without `--audit-log`: asked for
+    /// again, and when Google does not grant it the login succeeds with the Drive scopes only.
+    Optional,
 }
 
 impl AuditLog {
@@ -83,7 +86,7 @@ impl AuditLog {
     fn scopes(self) -> &'static [&'static str] {
         match self {
             AuditLog::No => &DRIVE_SCOPES,
-            AuditLog::Required => &DRIVE_AND_AUDIT_LOG_SCOPES,
+            AuditLog::Required | AuditLog::Optional => &DRIVE_AND_AUDIT_LOG_SCOPES,
         }
     }
 }
@@ -945,6 +948,10 @@ mod tests {
         assert_eq!(params["code_challenge"], code_challenge(&request));
         assert_eq!(params["state"], request.state);
 
+        // `account reauth` asks for it again in the same way.
+        let again = request_for("http://localhost:8085", AuditLog::Optional);
+        assert_eq!(query(again.url())["scope"], params["scope"]);
+
         // Everything else is as without the flag.
         let plain = self::request("http://localhost:8085");
         let mut plain_params = query(plain.url());
@@ -1218,6 +1225,10 @@ mod tests {
             ),
             // Without a scope field, what was asked for is granted.
             (AuditLog::Required, None, true),
+            // Asked for again by `account reauth`: granted or not, the login succeeds.
+            (AuditLog::Optional, Some(ALL_GRANTED), true),
+            (AuditLog::Optional, None, true),
+            (AuditLog::Optional, Some(DRIVE_GRANTED), false),
             (AuditLog::No, None, false),
             (AuditLog::No, Some(DRIVE_GRANTED), false),
             // Not asked for, so not recorded.

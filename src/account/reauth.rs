@@ -24,6 +24,11 @@ pub(crate) struct Config {
 /// Runs the authorization again for an existing account, with its stored client credentials,
 /// and replaces its tokens. Nothing is changed unless the new authorization is for the same
 /// Google account.
+///
+/// An account whose tokens record read access to the audit log is asked for it again, also
+/// without `--audit-log`, so that a routine reauthorization keeps it. Only with `--audit-log`
+/// does a missing grant fail the login; otherwise the Drive authorization is saved and a warning
+/// says how to get the access back.
 pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
     login::Options::new(config.mode, config.port, None)
         .check()
@@ -54,26 +59,50 @@ pub(crate) async fn reauth(config: &Config) -> Result<(), Box<Error>> {
 
     println!("Authorizing account '{account_name}' again with its stored client credentials.");
 
+    let had_audit_log = TokenFile::audit_log_granted_at(app_cfg.tokens_path()).await;
+    let audit_log = audit_log_request(config.audit_log, had_audit_log);
+    if audit_log == login::AuditLog::Optional {
+        println!(
+            "The account may read the audit log of its organization, so gdrive asks for that \
+             access again."
+        );
+    }
+
     // Account names are the email addresses of the Google accounts.
     let login_hint = account_name.contains('@').then(|| account_name.clone());
-    let audit_log = if config.audit_log {
-        login::AuditLog::Required
-    } else {
-        login::AuditLog::No
-    };
     let options =
         login::Options::new(config.mode, config.port, login_hint).with_audit_log(audit_log);
     let authorization = login::login(&secret, &options)
         .await
         .map_err(Error::Login)?;
+    let granted_audit_log = authorization.audit_log;
 
     let hub = token_hub(&authorization.token).map_err(Error::HubCreation)?;
     save_reauthorized(&app_cfg, &secret, &hub, authorization).await?;
 
     println!();
     println!("Authorized account '{account_name}' again");
+    if had_audit_log && !granted_audit_log {
+        eprintln!(
+            "{}",
+            auth::audit_log_lost_warning(&account_name, audit_log != login::AuditLog::No)
+        );
+    }
 
     Ok(())
+}
+
+/// What the login of `account reauth` asks for: the audit log with `--audit-log`, and also
+/// without it when the account had the access, so that a routine reauthorization does not drop
+/// it.
+fn audit_log_request(audit_log_flag: bool, had_audit_log: bool) -> login::AuditLog {
+    if audit_log_flag {
+        login::AuditLog::Required
+    } else if had_audit_log {
+        login::AuditLog::Optional
+    } else {
+        login::AuditLog::No
+    }
 }
 
 /// The type of the account `account_name`, if it exists and does not log in with an OAuth client.
@@ -333,6 +362,57 @@ mod tests {
         assert_eq!(saved.entries()[0].scopes, auth::DRIVE_AND_AUDIT_LOG_SCOPES);
         // Google left out the refresh token: the stored one is kept.
         assert_eq!(saved.refresh_token(), Some("old-refresh"));
+    }
+
+    #[test]
+    fn reauth_asks_for_the_audit_log_again_when_the_account_had_it() {
+        use login::AuditLog;
+
+        assert_eq!(audit_log_request(true, false), AuditLog::Required);
+        assert_eq!(audit_log_request(true, true), AuditLog::Required);
+        assert_eq!(audit_log_request(false, true), AuditLog::Optional);
+        assert_eq!(audit_log_request(false, false), AuditLog::No);
+
+        // What "the account had it" is read from.
+        let granted = TokenFile::after_login(None, &auth::DRIVE_AND_AUDIT_LOG_SCOPES, new_token());
+        assert!(granted.audit_log_granted());
+        let drive_only = TokenFile::from_json(OLD_TOKENS.as_bytes()).unwrap();
+        assert!(!drive_only.audit_log_granted());
+    }
+
+    #[tokio::test]
+    async fn reauth_not_granted_the_audit_log_again_saves_the_drive_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let granted = TokenFile::after_login(
+            None,
+            &auth::DRIVE_AND_AUDIT_LOG_SCOPES,
+            TokenInfo {
+                access_token: Some(String::from("old")),
+                ..new_token()
+            },
+        );
+        let (app_cfg, secret) = account(dir.path(), Some(&granted.to_json().unwrap()));
+        let server = MockServer::start(vec![about_me()]).await;
+
+        // The login asked for it again (AuditLog::Optional) and Google did not grant it.
+        save_reauthorized(&app_cfg, &secret, &server.hub(), authorization(false))
+            .await
+            .unwrap();
+
+        let saved = TokenFile::load(app_cfg.tokens_path())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!saved.audit_log_granted());
+        assert_eq!(
+            saved
+                .get(&auth::DRIVE_SCOPES)
+                .unwrap()
+                .access_token
+                .as_deref(),
+            Some("new-access")
+        );
+        assert_eq!(saved.refresh_token(), Some("new-refresh"));
     }
 
     #[tokio::test]

@@ -108,6 +108,16 @@ impl TokenFile {
             .any(|entry| entry.scopes.iter().any(|scope| scope == AUDIT_LOG_SCOPE))
     }
 
+    /// [`TokenFile::audit_log_granted`] of the tokens file at `path`; `false` when it is missing
+    /// or cannot be read.
+    pub(crate) async fn audit_log_granted_at(path: &Path) -> bool {
+        TokenFile::load(path)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|tokens| tokens.audit_log_granted())
+    }
+
     /// [`TokenFile::set_for`] for an OAuth user account.
     #[cfg(test)]
     pub(crate) fn set(&mut self, scopes: &[&str], token: TokenInfo) {
@@ -712,8 +722,8 @@ mod tests {
             .all(|entry| entry.token.refresh_token.as_deref() == Some("r")));
     }
 
-    #[test]
-    fn only_a_login_that_was_granted_the_audit_log_records_it() {
+    #[tokio::test]
+    async fn only_a_login_that_was_granted_the_audit_log_records_it() {
         let drive_only = TokenFile::after_login(
             None,
             &DRIVE_SCOPES,
@@ -735,6 +745,15 @@ mod tests {
         );
         assert!(!again.audit_log_granted());
         assert_eq!(again.refresh_token(), Some("r"));
+
+        // Nor does a missing or invalid file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.json");
+        assert!(!TokenFile::audit_log_granted_at(&path).await);
+        tokio::fs::write(&path, "not json").await.unwrap();
+        assert!(!TokenFile::audit_log_granted_at(&path).await);
+        previous.save(&path).await.unwrap();
+        assert!(TokenFile::audit_log_granted_at(&path).await);
 
         // The tokens of a service account never count.
         let mut service = TokenFile::default();

@@ -61,6 +61,10 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
         return Err(Error::NotAUserAccount(email.into_owned()).into());
     }
 
+    // Adding an account again replaces its authorization, with whichever client.
+    let had_audit_log = TokenFile::audit_log_granted_at(existing.tokens_path()).await;
+    let granted_audit_log = authorization.audit_log;
+
     // When the account is added again with the same client, Google may leave out the refresh
     // token; keep the stored one then.
     let previous = existing.tokens_of_client(&secret.client_id).await;
@@ -88,6 +92,13 @@ pub(crate) async fn add(config: &Config) -> Result<(), Box<Error>> {
     app_config::switch_account(&app_cfg).map_err(Error::SwitchAccount)?;
     println!();
     println!("Logged in as {}", app_cfg.account.name);
+    if had_audit_log && !granted_audit_log {
+        // A login that asked for the audit log and was not granted it failed before this.
+        eprintln!(
+            "{}",
+            auth::audit_log_lost_warning(&app_cfg.account.name, config.audit_log)
+        );
+    }
 
     Ok(())
 }
