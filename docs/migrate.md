@@ -289,6 +289,8 @@ machine.
 (its `default` profile): Docs as docx, Sheets as xlsx, Slides as pptx, Drawings as png. The entry gets the
 extension unless its name already ends with it (`Budget` becomes `Budget.xlsx`). The exports are made
 before the upload starts, since their sizes are part of the archive, and are held in memory until it ends.
+A Google file goes in as it is when it is exported, not as it was when the folder was listed: one edited in
+between goes in with its newer content, and the next run then finds the archive different from the source.
 
 **Left out**, each printed as `skip PATH: REASON` and counted as skipped: shortcuts, Google types without an
 export (Forms, Sites, My Maps, Apps Script, ...), and a Google file whose export is larger than the 10 MB
@@ -296,28 +298,33 @@ Drive exports. A folder that could not be listed, or that Drive listed incomplet
 before anything is uploaded: an archive that silently misses files is worse than none.
 
 **Running it again.** The archive file carries a property with a digest of what it was made from (every
-path, and the id, size and MD5 checksum of every file, the id, modification time and format of every
-export). A second run with nothing changed in the source prints `already-there photos.tar` and uploads
+path, and the id, size and MD5 checksum of every file, or its modification time when it has no checksum, the
+id, modification time and format of every export). A second run with nothing changed in the source prints `already-there photos.tar` and uploads
 nothing. When the folder changed since (a file added, removed, renamed or edited), the archive in the
 destination no longer matches: the item fails with `it exists in the destination with different content`,
 and nothing is overwritten. Rename or remove the old archive to make a new one. Any other file named
-`<name>.tar` in the destination folder fails the same way.
+`<name>.tar` in the destination folder fails the same way. Two `FILE_ID`s with the same Drive name give two
+files named `<name>.tar` in the destination folder (Drive allows it), and a later run finds each one again by
+its own digest.
 
 **Continuing an interrupted run.** An archive that was interrupted (Ctrl-C, a lost network) is continued by
 running the same command again, like a large file: the session is recorded in the destination account's
 `uploads/` directory (see [Running it again](#running-it-again)), and the next run sends only what Drive
-does not hold yet, without reading that part from the source again. Exports are not the same bytes twice,
+does not hold yet. The files that lie wholly in the part Drive holds are not read from the source again; the
+file the interruption fell in is read again from its start, so that it is checked whole. Exports are not the
+same bytes twice,
 so the exports of an archive whose session is recorded are kept next to the session records, in
 `uploads/archive-<digest>.exports` (private to you, like the records), and the next run uses them instead
 of exporting again. The file is deleted when the archive is complete, and with the stale session records
 after a week. An archive is continued only when it would be the same bytes; otherwise, and for an archive
 with a file that has no MD5 checksum, it starts over.
 
-**Checks.** Each file is checked against its MD5 checksum on Drive as it is read. A file that changes in the
-source while the archive is made (edited, resized, deleted) fails the archive with an error that names it,
-`'photos/a.txt' changed in the source while the archive was made; run the command again`, and no archive is
-created. Run the command again once the source is quiet. In a run that sends the whole archive, the MD5
-checksum Drive computes for it is compared with the bytes sent too.
+**Checks.** Each file is checked against its MD5 checksum on Drive as it is read, always from its first byte.
+A file that changes in the source while the archive is made (edited, resized, deleted) fails the archive
+with an error that names it, `'photos/a.txt' changed in the source while the archive was made; run the
+command again`, and no archive is created. Run the command again once the source is quiet. Only in a run
+that sends the whole archive is the MD5 checksum Drive computes for it compared with the bytes sent too; a
+continued run cannot, as it does not read the part Drive held already.
 
 **Dry run.** `--dry-run --archive` prints what a real run would (`create NAME.tar`, `already-there`,
 `skip`, conflicts) without exporting anything, so the size it shows leaves out the exports and says so:
