@@ -316,6 +316,9 @@ pub(crate) struct Behavior {
     /// Every media download and export waits for a permit of this semaphore before it is
     /// answered (and takes it), so that a test acts while the request is in flight.
     pub(crate) content_gate: Option<Arc<tokio::sync::Semaphore>>,
+    /// Every `files.get` of metadata waits for a permit of this semaphore before it is answered
+    /// (and takes it), like [`Behavior::content_gate`].
+    pub(crate) metadata_gate: Option<Arc<tokio::sync::Semaphore>>,
     /// The first queries naming one of these folders, as many as there are folders, are held
     /// until all of them have arrived.
     pub(crate) list_rendezvous: HashSet<String>,
@@ -776,6 +779,7 @@ async fn handle(
             return Ok(media(&state, id, request.headers()).await);
         }
         state.gets.lock().expect("gets lock").push(id.to_owned());
+        pass_metadata_gate(&state).await;
         return Ok(get(&state, id, &params));
     }
     if path == ABOUT_PATH {
@@ -1467,6 +1471,15 @@ async fn media(state: &State, id: &str, headers: &hyper::HeaderMap) -> FakeRespo
 /// Waits for a permit of [`Behavior::content_gate`], if there is one.
 async fn pass_gate(state: &State) {
     if let Some(gate) = &state.behavior.content_gate {
+        if let Ok(permit) = gate.acquire().await {
+            permit.forget();
+        }
+    }
+}
+
+/// Waits for a permit of [`Behavior::metadata_gate`], if there is one.
+async fn pass_metadata_gate(state: &State) {
+    if let Some(gate) = &state.behavior.metadata_gate {
         if let Ok(permit) = gate.acquire().await {
             permit.forget();
         }

@@ -535,11 +535,13 @@ async fn a_file_that_is_not_what_was_listed_fails_the_archive_and_nothing_is_cre
     assert!(dest.created().is_empty(), "no archive without that file");
 }
 
-/// A folder of two blobs of 300 000 bytes around a Doc whose exports differ every time.
+/// A folder of a small blob, then two blobs of 300 000 bytes around a Doc whose exports differ
+/// every time.
 fn large_tree() -> Vec<FakeFile> {
     let content = |c: char| std::iter::repeat_n(c, 300_000).collect::<String>();
     vec![
         FakeFile::folder("big", "big", "root"),
+        FakeFile::blob("first", "0.bin", "big", "first bytes"),
         FakeFile::blob("a", "a.bin", "big", &content('a')),
         FakeFile::native("doc", "notes", "big", DOCUMENT, "exported document").modified(FILE_TIME),
         FakeFile::blob("z", "z.bin", "big", &content('z')),
@@ -652,6 +654,7 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
     // The next run: the network is back.
     dest.stop_stalling();
     let media_before = source.media_ranges().len();
+    assert_eq!(source.media()[0], "first", "read by the first run");
     let chunks_before = dest.chunks().len();
     let second = migrate_with(
         &source,
@@ -682,6 +685,7 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
         unpacked,
         [
             (String::from("big/"), Vec::new()),
+            (String::from("big/0.bin"), b"first bytes".to_vec()),
             (String::from("big/a.bin"), vec![b'a'; 300_000]),
             (
                 String::from("big/notes.docx"),
@@ -692,14 +696,12 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
         "the export of the first run"
     );
     assert_eq!(source.exports().len(), 1, "not exported again");
-    // What the session held (the folder's header and the start of a.bin) is not read again.
-    let held_of_a = CHUNK_ALIGNMENT - 1024;
+    // The entries wholly in what the session held (the folder and 0.bin) are not read again;
+    // a.bin, which the session's offset falls in, is read again from its first byte to be
+    // hashed whole.
     assert_eq!(
         source.media_ranges()[media_before..],
-        [
-            (String::from("a"), Some(format!("bytes={held_of_a}-"))),
-            (String::from("z"), None),
-        ]
+        [(String::from("a"), None), (String::from("z"), None)]
     );
     assert_eq!(
         files_in(&uploads),
@@ -707,4 +709,79 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
         "record and cache deleted"
     );
     assert_eq!(source.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_wrong_file_that_an_interruption_fell_in_fails_the_next_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = UploadOptions {
+        chunk_size: CHUNK_ALIGNMENT,
+        multipart_threshold: 0,
+        session_dir: Some(dir.path().join("uploads")),
+        ..UploadOptions::default()
+    };
+    // Four chunks of the archive, nearly all of them b.bin, whose bytes are not the listed ones.
+    let wrong = FakeFile {
+        md5: Some(format!("{:x}", md5::compute("other bytes"))),
+        ..FakeFile::blob(
+            "b",
+            "b.bin",
+            "big",
+            &std::iter::repeat_n('b', 900_000).collect::<String>(),
+        )
+    };
+    let source = FakeDrive::start(
+        vec![FakeFile::folder("big", "big", "root"), wrong],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            chunks_stalled_from: Some(CHUNK_ALIGNMENT),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let first = migrate_with(
+        &source,
+        &dest,
+        settings(&["big"]),
+        &options,
+        dest.wait_for_stalled_chunks(1),
+    )
+    .await;
+    assert!(
+        first.summary().ends_with("; interrupted"),
+        "{}",
+        first.summary()
+    );
+
+    // The next run continues inside b.bin, and still hashes it whole.
+    dest.stop_stalling();
+    let media_before = source.media_ranges().len();
+    let second = migrate_with(
+        &source,
+        &dest,
+        settings(&["big"]),
+        &options,
+        std::future::pending(),
+    )
+    .await;
+
+    assert!(second.result.is_err());
+    let text = second.err.text();
+    assert!(
+        text.contains(
+            "Error: unable to migrate 'big.tar': the bytes read of 'big/b.bin' are not the ones \
+             the source lists"
+        ),
+        "{text}"
+    );
+    assert!(dest.created().is_empty(), "the archive is not completed");
+    assert_eq!(
+        source.media_ranges()[media_before..],
+        [(String::from("b"), None)],
+        "read again from its first byte"
+    );
 }

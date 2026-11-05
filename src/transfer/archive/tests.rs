@@ -4,6 +4,8 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io::{self, Read, Seek, SeekFrom},
+    sync::Arc,
+    time::Duration,
 };
 
 use bytes::Bytes;
@@ -650,4 +652,142 @@ async fn the_exports_cache_keeps_its_exports_privately_and_refuses_a_damaged_fil
 
     cache.remove().await;
     assert!(!cache.path.exists());
+}
+
+/// Where the content of the blob `index` of `layout` starts in the archive.
+fn blob_start(layout: &Layout, index: usize) -> u64 {
+    layout
+        .segments
+        .iter()
+        .find_map(|segment| match segment.part {
+            Part::Blob(blob) if blob == index => Some(segment.start),
+            _ => None,
+        })
+        .unwrap()
+}
+
+/// The entry failure of an error of [`ArchiveSource::read_at`].
+fn entry_failure(error: io::Error) -> EntryFailure {
+    match ArchiveError::of_upload(UploadError::Read(error)) {
+        ArchiveError::Entry(failure) => failure,
+        error => panic!("{error:?}"),
+    }
+}
+
+/// A blob of 3000 bytes whose listing (and metadata) gives the md5 of other bytes than Drive
+/// sends: the listed file and the one the fake serves.
+fn wrong_blob() -> (FakeFile, FakeFile) {
+    let listed = FakeFile::blob("one", "one.txt", "root", &content(3000, 1));
+    let served = FakeFile {
+        content: Some(content(3000, 2)),
+        ..listed.clone()
+    };
+    (listed, served)
+}
+
+#[tokio::test]
+async fn a_failed_md5_is_kept_when_the_read_is_dropped_while_it_is_told_apart() {
+    let (listed, served) = wrong_blob();
+    let layout = Layout::new(vec![folder("root"), blob_of("root/one.txt", &listed)]);
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let behavior = Behavior {
+        metadata_gate: Some(Arc::clone(&gate)),
+        ..Behavior::default()
+    };
+    let drive = FakeDrive::start(vec![served], behavior).await;
+    let hub = drive.hub();
+    let mut source = ArchiveSource::new(&hub, &layout);
+    let start = blob_start(&layout, 0);
+    let mut buf = vec![0; 1000];
+    for piece in 0..2 {
+        let read = source
+            .read_at(start + piece * 1000, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!(read, 1000);
+    }
+
+    // The last piece completes the md5, which is not the listed one; while the metadata is
+    // asked whether the file changed, the uploader drops the read.
+    let last = start + 2000;
+    {
+        let mut read = Box::pin(source.read_at(last, &mut buf));
+        let asked = async {
+            while drive.gets().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut read => panic!("the read should wait for the metadata: {result:?}"),
+            () = asked => {}
+        }
+    }
+    gate.add_permits(10);
+
+    // The piece sent again fails, and so does any other read of the blob.
+    for offset in [last, start + 500, start] {
+        let failure = entry_failure(source.read_at(offset, &mut buf).await.unwrap_err());
+        assert_eq!(failure.path, "root/one.txt");
+        assert!(
+            matches!(&failure.error, EntryError::Corrupt { expected, .. } if Some(expected) == listed.md5.as_ref()),
+            "{failure:?}"
+        );
+    }
+    assert_eq!(
+        drive.gets(),
+        ["one", "one"],
+        "told apart once it is answered"
+    );
+}
+
+#[tokio::test]
+async fn a_read_inside_a_blob_hashes_it_from_its_first_byte() {
+    // A good blob: the first read inside it reads its start first, in the same reply.
+    let (drive, layout, reference) = source_archive(three_blobs(), Behavior::default()).await;
+    let hub = drive.hub();
+    let mut source = ArchiveSource::new(&hub, &layout);
+    let offset = blob_start(&layout, 0) + 1000;
+    let mut archive = Vec::new();
+    let mut buf = vec![0; 4096];
+    loop {
+        let read = source
+            .read_at(offset + archive.len() as u64, &mut buf)
+            .await
+            .unwrap();
+        if read == 0 {
+            break;
+        }
+        archive.extend_from_slice(&buf[..read]);
+    }
+    let at = usize::try_from(offset).unwrap();
+    assert_eq!(archive, &reference[at..]);
+    assert_eq!(
+        drive.media_ranges(),
+        [
+            (String::from("one"), None),
+            (String::from("two"), None),
+            (String::from("three"), None),
+        ]
+    );
+
+    // A blob whose bytes are not the listed ones fails, though no read starts at its first byte.
+    let (listed, served) = wrong_blob();
+    let layout = Layout::new(vec![folder("root"), blob_of("root/one.txt", &listed)]);
+    let drive = FakeDrive::start(vec![served], Behavior::default()).await;
+    let hub = drive.hub();
+    let mut source = ArchiveSource::new(&hub, &layout);
+    let mut offset = blob_start(&layout, 0) + 1000;
+    let error = loop {
+        match source.read_at(offset, &mut buf).await {
+            Ok(0) => panic!("the archive was read whole"),
+            Ok(read) => offset += read as u64,
+            Err(error) => break error,
+        }
+    };
+    let failure = entry_failure(error);
+    assert_eq!(failure.path, "root/one.txt");
+    assert!(
+        matches!(failure.error, EntryError::Corrupt { .. }),
+        "{failure:?}"
+    );
 }

@@ -25,24 +25,27 @@
 //!   every blob).
 //!
 //! What a run checks:
-//! - Every blob that the run reads in order from its first byte is hashed, and at its last byte
-//!   the md5 is compared with the listed `md5Checksum`. The read that would return that last
-//!   byte fails instead when they differ, so the archive is never completed with it: the error
-//!   names the entry and tells whether the file changed in the source (its metadata shows
-//!   another content, as the relay asks) or the bytes read are not the listed ones. A changed
-//!   size, a deleted file and a failed read fail the same way. A blob without an md5 is
-//!   archived unchecked, as the relay copies one.
+//! - Every blob with an md5 is hashed from its first byte, and at its last byte the md5 is
+//!   compared with the listed `md5Checksum`. A read that starts past the bytes hashed so far
+//!   (the first read of a continued session, inside a blob) first reads the blob from there up
+//!   to its offset. The read that would return the last byte fails instead when the md5s
+//!   differ, and so does every later read of that blob, so the archive is never completed with
+//!   it: the error names the entry and tells whether the file changed in the source (its
+//!   metadata shows another content, as the relay asks) or the bytes read are not the listed
+//!   ones. A changed size, a deleted file and a failed read fail the same way. A blob without
+//!   an md5 is archived unchecked, as the relay copies one.
 //! - In a run that sends the whole archive, the uploader compares the md5 of the bytes it read
-//!   with Drive's md5 of the archive.
+//!   with Drive's md5 of the archive. Only such a run does.
 //! - A run that continues the session of an earlier run (the uploader's `record_in`, with
 //!   [`session_identity`]) does so only when the layout digest is the same: the same bytes in
 //!   memory (so the exports of the first run, see [`ExportsCache`]) and the same id, size and
-//!   md5 of every blob. The bytes the session holds are not read again
-//!   (`Upload::trust_continued_content`): the blobs in that part were checked by the run that
-//!   read them, the blobs read in this run are checked as above, and Drive's md5 of the whole
-//!   archive is not compared with anything, as nothing in this run read all of it. An archive
-//!   with a blob without md5 is never recorded: nothing would show that its content is the
-//!   one the session holds the start of.
+//!   md5 of every blob. The entries that lie wholly in the part the session holds are not read
+//!   again (`Upload::trust_continued_content`): each blob among them had its md5 compared by
+//!   the run that sent it, since a blob's last byte is returned only once its md5 matched. The
+//!   blob the session's offset falls in is read again from its first byte up to that offset,
+//!   to be hashed whole; the rest is read and checked as in any run. An archive with a blob
+//!   without md5 is never recorded: nothing would show that its content is the one the session
+//!   holds the start of.
 //!
 //! Exports are not the same bytes twice, so the exports of an archive whose session is recorded
 //! are kept in [`ExportsCache`] next to the session records, until the archive completes or the
@@ -459,6 +462,24 @@ struct Hashing {
     hashed: u64,
 }
 
+/// The bytes read at a time to hash the start of a blob that a read does not begin at.
+const CATCH_UP: usize = 256 * 1024;
+
+/// What is known of the md5 of a blob that has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Check {
+    /// Not compared yet.
+    Pending,
+    /// Its bytes have the listed md5.
+    Verified,
+    /// Its bytes have the md5 `actual`, not the listed one. `changed`: whether the metadata
+    /// shows another content, `None` until that is known.
+    Failed {
+        actual: String,
+        changed: Option<bool>,
+    },
+}
+
 /// An archive as the uploader reads it: the bytes of its [`Layout`] at any offset, with the
 /// blobs read from the source account through [`DriveSource`].
 pub(crate) struct ArchiveSource<'a> {
@@ -469,8 +490,8 @@ pub(crate) struct ArchiveSource<'a> {
     /// What the reader of each blob found out before it was dropped, for the next one.
     requested: Vec<Option<Requested>>,
     hashing: Option<Hashing>,
-    /// The blobs whose md5 was compared.
-    verified: Vec<bool>,
+    /// Per blob, its md5 check.
+    checks: Vec<Check>,
 }
 
 impl<'a> ArchiveSource<'a> {
@@ -483,7 +504,7 @@ impl<'a> ArchiveSource<'a> {
             open: None,
             requested: vec![None; layout.blobs.len()],
             hashing: None,
-            verified: vec![false; layout.blobs.len()],
+            checks: vec![Check::Pending; layout.blobs.len()],
         }
     }
 
@@ -508,8 +529,10 @@ impl<'a> ArchiveSource<'a> {
         }
     }
 
-    /// Reads the blob `index` at `offset` of its content, hashing what follows the bytes hashed
-    /// so far.
+    /// Reads the blob `index` at `offset` of its content. A blob with an md5 is hashed from its
+    /// first byte: a read past the bytes hashed so far (the first read of a continued session)
+    /// reads what lies between from the source first. Once its md5 failed, every read of the
+    /// blob fails.
     async fn read_blob(
         &mut self,
         index: usize,
@@ -522,32 +545,61 @@ impl<'a> ArchiveSource<'a> {
             path: laid.path.clone(),
             error,
         };
-        let reader = self
-            .reader(index)
-            .map_err(|error| failure(read_error(error)))?;
-        let read = reader.read_at(offset, buf).await.map_err(|error| {
-            failure(read_error(RelayError::of_upload(UploadError::Read(error))))
-        })?;
-        if read == 0 {
-            // The reader ends only past the size, which the offset is not.
-            return Err(failure(EntryError::Changed));
+        let Some(expected) = laid.blob.md5.as_deref() else {
+            // Unchecked, as the relay copies a file without md5.
+            return self.read_source(index, offset, buf).await.map_err(failure);
+        };
+        match &self.checks[index] {
+            Check::Pending => {}
+            Check::Verified => return self.read_source(index, offset, buf).await.map_err(failure),
+            Check::Failed { .. } => return Err(failure(self.mismatch(index, expected).await)),
         }
 
-        let Some(expected) = laid.blob.md5.as_deref() else {
-            return Ok(read);
-        };
-        if self.verified[index] {
-            return Ok(read);
-        }
-        let hashing = match &mut self.hashing {
-            Some(hashing) if hashing.blob == index => hashing,
-            _ if offset == 0 => self.hashing.insert(Hashing {
+        if self
+            .hashing
+            .as_ref()
+            .is_none_or(|hashing| hashing.blob != index)
+        {
+            self.hashing = Some(Hashing {
                 blob: index,
                 context: md5::Context::new(),
                 hashed: 0,
-            }),
-            // Not read from its first byte in this run (a continued session).
-            _ => return Ok(read),
+            });
+        }
+        let mut scratch = Vec::new();
+        while let Some(hashed) = self
+            .hashing
+            .as_ref()
+            .map(|hashing| hashing.hashed)
+            .filter(|&hashed| hashed < offset)
+        {
+            if scratch.is_empty() {
+                scratch = vec![0; CATCH_UP];
+            }
+            let len = usize::try_from(offset - hashed)
+                .map_or(scratch.len(), |left| left.min(scratch.len()));
+            let read = self
+                .read_source(index, hashed, &mut scratch[..len])
+                .await
+                .map_err(failure)?;
+            // Only once the read returned: a read dropped on the way loses nothing.
+            if let Some(hashing) = &mut self.hashing {
+                hashing.context.consume(&scratch[..read]);
+                hashing.hashed += read as u64;
+            }
+        }
+        let read = self
+            .read_source(index, offset, buf)
+            .await
+            .map_err(failure)?;
+
+        let Some(hashing) = self
+            .hashing
+            .as_mut()
+            .filter(|hashing| hashing.blob == index)
+        else {
+            // This call set the state for the blob, and nothing else ran since: never taken.
+            return Err(failure(EntryError::Changed));
         };
         let end = offset + read as u64;
         if offset <= hashing.hashed && hashing.hashed < end {
@@ -558,26 +610,70 @@ impl<'a> ArchiveSource<'a> {
         if hashing.hashed < laid.blob.size {
             return Ok(read);
         }
+        // The whole blob is hashed. Its outcome is kept before anything is awaited, so that a
+        // read dropped while a mismatch is told apart does not lose it.
         let Some(done) = self.hashing.take() else {
-            return Ok(read);
+            return Err(failure(EntryError::Changed));
         };
         let actual = done.context.compute();
         if parse_md5_digest(expected) == Some(actual) {
-            self.verified[index] = true;
+            self.checks[index] = Check::Verified;
             return Ok(read);
         }
-        let changed = match &self.open {
-            Some((_, reader)) => reader.changed_since_listing().await,
-            None => false,
+        self.checks[index] = Check::Failed {
+            actual: format!("{actual:x}"),
+            changed: None,
         };
-        Err(failure(if changed {
+        Err(failure(self.mismatch(index, expected).await))
+    }
+
+    /// Reads the blob `index` at `offset` from the source; never 0 bytes.
+    async fn read_source(
+        &mut self,
+        index: usize,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<usize, EntryError> {
+        let reader = self.reader(index).map_err(read_error)?;
+        let read = reader
+            .read_at(offset, buf)
+            .await
+            .map_err(|error| read_error(RelayError::of_upload(UploadError::Read(error))))?;
+        if read == 0 {
+            // The reader ends only past the size, which the offset is not.
+            return Err(EntryError::Changed);
+        }
+        Ok(read)
+    }
+
+    /// Why the blob `index`, whose md5 failed, is not what was listed: it changed in the source
+    /// (its metadata shows another content, as the relay asks), or the bytes read are not the
+    /// listed ones. Asked once; a question dropped on the way is asked again.
+    async fn mismatch(&mut self, index: usize, expected: &str) -> EntryError {
+        let (actual, known) = match &self.checks[index] {
+            Check::Failed { actual, changed } => (actual.clone(), *changed),
+            Check::Pending | Check::Verified => return EntryError::Changed,
+        };
+        let changed = if let Some(changed) = known {
+            changed
+        } else {
+            let changed = match self.reader(index) {
+                Ok(reader) => reader.changed_since_listing().await,
+                Err(_) => false,
+            };
+            if let Check::Failed { changed: slot, .. } = &mut self.checks[index] {
+                *slot = Some(changed);
+            }
+            changed
+        };
+        if changed {
             EntryError::Changed
         } else {
             EntryError::Corrupt {
                 expected: expected.to_ascii_lowercase(),
-                actual: format!("{actual:x}"),
+                actual,
             }
-        }))
+        }
     }
 
     /// The reader of the blob `index`: the open one, or a new one that takes over what the
