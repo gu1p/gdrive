@@ -12,10 +12,11 @@
 //!   the report on stdout; what was read, warnings and the summary on stderr
 //! ```
 //!
-//! Nothing is ever changed in Drive: every request is a read. A given id that does not exist, a
-//! folder that cannot be listed completely, a sharing list that cannot be read and a page of the
-//! audit log that cannot be read fail the command, because a report over part of the items or
-//! of the time range would tell wrongly that people are gone.
+//! Nothing is ever changed in Drive: every request is a read. A given id that does not exist or
+//! is in the trash, a folder that cannot be listed completely, a sharing list that cannot be read
+//! and a page of the audit log that cannot be read fail the command, because a report over part
+//! of the items or of the time range would tell wrongly that people are gone. The report is made
+//! whole before its first line is printed, so a failure leaves stdout empty.
 
 mod report;
 mod scan;
@@ -394,6 +395,13 @@ pub(crate) enum Error {
         id: String,
         source: Box<google_drive3::Error>,
     },
+    /// The `FILE_ID` `id`, named `name`, is in the trash; `by_folder`: because a folder above it
+    /// is.
+    Trashed {
+        id: String,
+        name: String,
+        by_folder: bool,
+    },
     /// A folder could not be listed; `path` is its path from the name of its `FILE_ID`.
     ListFolder {
         path: String,
@@ -430,6 +438,30 @@ impl Display for Error {
             }
             Error::Range(error) => error.fmt(f),
             Error::GetItem { id, .. } => write!(f, "unable to get '{}'", printable(id)),
+            Error::Trashed {
+                id,
+                name,
+                by_folder: false,
+            } => {
+                let id = printable(id);
+                write!(
+                    f,
+                    "'{}' ('{id}') is in the trash, whose items the report leaves out; restore it \
+                     with `gdrive files untrash {id}`, or leave it out",
+                    printable(name)
+                )
+            }
+            Error::Trashed {
+                id,
+                name,
+                by_folder: true,
+            } => write!(
+                f,
+                "'{}' ('{}') is in a folder that is in the trash, whose items the report leaves \
+                 out; restore that folder with `gdrive files untrash <FOLDER_ID>`, or leave it out",
+                printable(name),
+                printable(id)
+            ),
             Error::ListFolder { path, .. } => {
                 write!(f, "unable to list the folder '{}'", printable(path))
             }
@@ -467,9 +499,10 @@ impl error::Error for Error {
             Error::ReadLog(source) => Some(source),
             Error::Render(source) => Some(source),
             Error::WriteOutput(source) => Some(source),
-            Error::Range(_) | Error::IncompleteListing { .. } | Error::NotInSharedDrive { .. } => {
-                None
-            }
+            Error::Range(_)
+            | Error::Trashed { .. }
+            | Error::IncompleteListing { .. }
+            | Error::NotInSharedDrive { .. } => None,
         }
     }
 }

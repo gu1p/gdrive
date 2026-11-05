@@ -1574,6 +1574,48 @@ async fn a_tree_that_is_not_listed_completely_fails_before_the_audit_log() {
 }
 
 #[tokio::test]
+async fn a_given_item_in_the_trash_is_refused() {
+    let mut files = tree();
+    files.push(FakeFile::folder("bin", "bin", "root").trashed());
+    // Drive reports what is in a trashed folder as trashed, not explicitly.
+    files.push(FakeFile::blob("kept", "kept.txt", "bin", "k").in_trashed_folder());
+    let drive = FakeDrive::start(
+        files,
+        behavior(vec![record(
+            "2026-11-01T12:00:00Z",
+            Some("ana@example.com"),
+            vec![event("view", "gone"), event("view", "kept")],
+        )]),
+    )
+    .await;
+
+    for (ids, expected) in [
+        (
+            &["gone"][..],
+            "Error: 'gone.txt' ('gone') is in the trash, whose items the report leaves out; \
+             restore it with `gdrive files untrash gone`, or leave it out",
+        ),
+        (
+            &["old", "gone"],
+            "Error: 'gone.txt' ('gone') is in the trash, whose items the report leaves out; \
+             restore it with `gdrive files untrash gone`, or leave it out",
+        ),
+        (
+            &["kept"],
+            "Error: 'kept.txt' ('kept') is in a folder that is in the trash, whose items the \
+             report leaves out; restore that folder with `gdrive files untrash <FOLDER_ID>`, or \
+             leave it out",
+        ),
+    ] {
+        let ran = activity(&drive, settings(ids)).await;
+        assert_eq!(ran.error(), expected, "{ids:?}");
+        assert_eq!(ran.out.text(), "");
+    }
+    assert!(drive.audit_requests().is_empty());
+    assert!(drive.permission_requests().is_empty());
+}
+
+#[tokio::test]
 async fn hostile_names_and_addresses_are_escaped_in_every_output() {
     let mut files = tree();
     files.push(FakeFile::blob(

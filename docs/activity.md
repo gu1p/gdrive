@@ -55,7 +55,8 @@ gdrive files activity <FILE_ID>... [--account <ACCOUNT>] [--since <WHEN>] [--unt
 
 - `FILE_ID`: one or more ids of files or folders, also `root` (the top of My Drive) or the id of a shared
   drive. A folder counts with everything in it, at any depth, the folder itself included: opening the old
-  folder is using it. Items in the trash do not count. Several ids make one report.
+  folder is using it. Items in the trash do not count, and a `FILE_ID` in the trash (itself, or inside a
+  folder in the trash) is refused. Several ids make one report.
 - `--account ACCOUNT`: the account to read with, as `gdrive account list` prints it; the current account by
   default.
 - `--since WHEN` (default `30d`) and `--until WHEN` (default: now): the time range. `WHEN` is a duration back
@@ -167,9 +168,9 @@ On a terminal, a long scan prints a line such as `Read 120000 events so far, 410
 30 windows done)` every 15 seconds. The summary is for people; scripts should read the report.
 
 **Exit status:** 0 when the report was made, also when it is empty. 1 when it could not be made. A given id
-that does not exist, a folder that cannot be listed completely, a sharing list that cannot be read or a page
-of the audit log that cannot be read fail the command, rather than print a report over part of the items or
-of the time: such a report would tell wrongly that people are gone.
+that does not exist or is in the trash, a folder that cannot be listed completely, a sharing list that cannot
+be read or a page of the audit log that cannot be read fail the command, and nothing is printed on stdout:
+a report over part of the items or of the time would tell wrongly that people are gone.
 
 ## Scans: `--scan`
 

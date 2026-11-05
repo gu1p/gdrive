@@ -86,6 +86,8 @@ pub(crate) struct FakeFile {
     pub(crate) size: Option<u64>,
     pub(crate) md5: Option<String>,
     pub(crate) trashed: bool,
+    /// `explicitlyTrashed`, sent only when set: `Some(false)` for an item in a trashed folder.
+    pub(crate) explicitly_trashed: Option<bool>,
     pub(crate) drive_id: Option<String>,
     /// Target id and target MIME type of a shortcut.
     pub(crate) shortcut_target: Option<(String, String)>,
@@ -185,6 +187,16 @@ impl FakeFile {
         }
     }
 
+    /// In the trash because a folder above it is, as Drive reports such an item: `trashed`, not
+    /// `explicitlyTrashed`.
+    pub(crate) fn in_trashed_folder(self) -> Self {
+        Self {
+            trashed: true,
+            explicitly_trashed: Some(false),
+            ..self
+        }
+    }
+
     pub(crate) fn in_drive(self, drive_id: &str) -> Self {
         Self {
             drive_id: Some(drive_id.to_owned()),
@@ -220,6 +232,9 @@ impl FakeFile {
         file.insert("name".into(), json!(self.name));
         file.insert("mimeType".into(), json!(self.mime_type));
         file.insert("trashed".into(), json!(self.trashed));
+        if let Some(explicitly) = self.explicitly_trashed {
+            file.insert("explicitlyTrashed".into(), json!(explicitly));
+        }
         if with_parents {
             file.insert("parents".into(), json!(self.parents));
         }

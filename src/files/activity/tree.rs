@@ -2,7 +2,9 @@
 //! in the trash, listed by the walk ([`crate::transfer::walk`]) before the audit log is read.
 //! Every item gets its path, the names from the given item down. A listing that fails or is
 //! incomplete fails the command: a report over part of a tree would tell wrongly that the people
-//! who use the rest are gone.
+//! who use the rest are gone. A `FILE_ID` in the trash (itself or through a folder above it,
+//! which Drive reports the same way) is refused, as the items in the trash below a folder are
+//! left out.
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -17,7 +19,7 @@ use crate::{
 };
 
 /// What the report needs of a `FILE_ID`.
-const ROOT_FIELDS: &str = "id,name,mimeType,driveId,resourceKey";
+const ROOT_FIELDS: &str = "id,name,mimeType,driveId,resourceKey,trashed,explicitlyTrashed";
 
 /// A `FILE_ID`, as Drive resolved it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,6 +83,14 @@ pub(super) async fn resolve(
             name: file.name.clone().unwrap_or_default(),
             drive_id: file.drive_id.clone(),
         };
+        if file.trashed == Some(true) {
+            return Err(Error::Trashed {
+                id: id.clone(),
+                name: root.name,
+                // Drive reports an item in a trashed folder as trashed, not explicitly.
+                by_folder: file.explicitly_trashed == Some(false),
+            });
+        }
         if items.roots.iter().any(|known| known.id == root.id) {
             continue;
         }

@@ -110,8 +110,8 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   audit log's limit). The whole Drive log of the organization is read by default, which is complete;
   `--scan file` (each item) is faster for a few items, `--scan drive` (the items' shared drives) faster
   but blind to what happened before an item was moved into its shared drive. The items are always
-  filtered on this machine. A missing id, an incomplete listing or a page of the log that
-  cannot be read fails the command rather than print a partial report. Nothing in Drive is changed. Needs
+  filtered on this machine. A missing id, an id in the trash, an incomplete listing or a page of the log
+  that cannot be read fails the command rather than print a partial report. Nothing in Drive is changed. Needs
   a Workspace administrator with the Reports privilege, the Admin SDK API enabled in the Cloud project,
   and an account authorized with `--audit-log`. Takes `--jobs`, `--skip-header`, `--field-separator` and
   `--tsv`. See docs/activity.md.
