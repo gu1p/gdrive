@@ -17,6 +17,10 @@ console = { version = "0.16.4", default-features = false, features = ["std"] }
 error-trace = { version = "4.0.0", default-features = false }
 # Full jitter for the retry backoff; already in the tree through tempfile.
 fastrand = "2.1.0"
+# The lock that makes each update of tokens.json one step between gdrive processes (flock on
+# Unix, LockFileEx on Windows). std's File::lock needs Rust 1.89; fd-lock's own dependencies
+# (cfg-if, rustix, windows-sys) are already in the tree.
+fd-lock = "4.0.4"
 futures = "0.3.25"
 google-apis-common = { version = "8.0.0", default-features = false }
 google-drive3 = "7.0.0"

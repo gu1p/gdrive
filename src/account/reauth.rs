@@ -7,7 +7,10 @@ use std::{
 use crate::{
     account::add::{authorized_email, token_hub},
     app_config::{self, account_type::AccountType, AppConfig},
-    auth::{self, login, store::TokenFile},
+    auth::{
+        self, login,
+        store::{self, TokenFile},
+    },
     hub::Hub,
 };
 
@@ -143,17 +146,24 @@ async fn save_reauthorized(
     }
 
     // Google leaves out the refresh token when the grant still exists; keep the stored one then.
-    let previous = app_cfg.tokens_of_client(&secret.client_id).await;
-    let tokens = TokenFile::after_login(
-        previous.as_ref(),
-        authorization.scopes(),
-        authorization.token,
-    );
+    // The stored tokens are read and replaced under the lock of the file, in one step for the
+    // other gdrive processes: a refresh that is under way finishes first, and one that starts
+    // now sees the new tokens.
+    let saved = store::with_lock(app_cfg.tokens_path(), async |locked| {
+        let previous = app_cfg.tokens_of_client(&secret.client_id).await;
+        let tokens = TokenFile::after_login(
+            previous.as_ref(),
+            authorization.scopes(),
+            authorization.token,
+        );
+        tokens.save_locked(locked).await.map(|()| tokens)
+    })
+    .await;
+    let tokens = match saved {
+        Ok(saved) => saved.map_err(Error::SaveTokens)?,
+        Err(error) => return Err(Error::SaveTokens(error.into()).into()),
+    };
     auth::warn_if_no_refresh_token(&tokens, account_name);
-    tokens
-        .save(app_cfg.tokens_path())
-        .await
-        .map_err(Error::SaveTokens)?;
     Ok(())
 }
 

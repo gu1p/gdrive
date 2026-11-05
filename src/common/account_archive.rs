@@ -8,12 +8,15 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use crate::{app_config::account_type::STAGING_DIR_NAME, transfer::upload::session::UPLOADS_DIR};
+use crate::{
+    app_config::account_type::STAGING_DIR_NAME, auth::store::LOCK_FILE_NAME,
+    transfer::upload::session::UPLOADS_DIR,
+};
 
 /// Entries of an account directory that belong to this machine and are neither exported nor
 /// imported: the records of resumable upload sessions (`uploads/`, which hold session URLs and
-/// local paths) and gdrive's staging directory.
-const MACHINE_ENTRIES: [&str; 2] = [UPLOADS_DIR, STAGING_DIR_NAME];
+/// local paths), gdrive's staging directory and the lock file of `tokens.json`.
+const MACHINE_ENTRIES: [&str; 3] = [UPLOADS_DIR, STAGING_DIR_NAME, LOCK_FILE_NAME];
 
 /// Creates an archive of the given source directory, an account directory, without the entries
 /// that belong to this machine ([`MACHINE_ENTRIES`]).
@@ -189,7 +192,7 @@ pub(crate) fn get_account_name(archive_path: &Path) -> Result<String, errors::Ge
 mod tests {
     use std::{fs, path::Path};
 
-    use super::{create, get_account_name, unpack};
+    use super::{create, get_account_name, unpack, LOCK_FILE_NAME};
 
     /// The paths of the entries of the archive at `path`.
     fn entry_paths(path: &Path) -> Vec<String> {
@@ -201,12 +204,14 @@ mod tests {
             .collect()
     }
 
-    /// An account directory `work` under `root` with its tokens and a session record.
+    /// An account directory `work` under `root` with its tokens, their lock file and a session
+    /// record.
     fn account_with_session_record(root: &Path) -> std::path::PathBuf {
         let account = root.join("work");
         fs::create_dir_all(account.join("uploads")).unwrap();
         fs::write(account.join("secret.json"), "{}").unwrap();
         fs::write(account.join("tokens.json"), "[]").unwrap();
+        fs::write(account.join(LOCK_FILE_NAME), "").unwrap();
         fs::write(
             account.join("uploads/0123abcd.json"),
             r#"{"session_url": "https://upload.example/session"}"#,
@@ -229,7 +234,7 @@ mod tests {
         assert_eq!(
             paths,
             ["work", "work/secret.json", "work/tokens.json"],
-            "no uploads/ and no .staging"
+            "no uploads/, no .staging, no lock file"
         );
         assert_eq!(get_account_name(&archive).unwrap(), "work");
     }
@@ -264,6 +269,7 @@ mod tests {
         assert!(config.join("work/secret.json").is_file());
         assert!(!config.join("work/uploads").exists());
         assert!(!config.join("work/.staging").exists());
+        assert!(!config.join("work").join(LOCK_FILE_NAME).exists());
         assert!(!config.join(".staging").exists());
     }
 
