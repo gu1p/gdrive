@@ -1815,3 +1815,33 @@ fn the_walk_of_the_origin_asks_for_the_walk_fields_and_the_users() {
         )
     );
 }
+
+#[test]
+fn account_errors_name_the_account_and_the_commands_to_run() {
+    use crate::common::hub_helper::GetHubError;
+
+    let not_found = |account: &str| GetHubError::AccountNotFound(account.to_owned());
+    assert_eq!(
+        crate::error_message(&Error::CopyAccount {
+            account: String::from("new@example.com"),
+            source: not_found("new@example.com"),
+        }),
+        "Error: unable to use the account of the copy 'new@example.com': account \
+         'new@example.com' not found; run 'gdrive account list' to see the accounts, or 'gdrive \
+         account add' to add one"
+    );
+    assert_eq!(
+        crate::error_message(&Error::OriginAccount {
+            account: Some(String::from("old@example.com")),
+            source: not_found("old@example.com"),
+        }),
+        "Error: unable to use the origin account 'old@example.com': account 'old@example.com' \
+         not found; run 'gdrive account list' to see the accounts, or 'gdrive account add' to \
+         add one"
+    );
+    assert_eq!(
+        crate::error_message(&Error::SameAccount(String::from("old@example.com"))),
+        "Error: 'old@example.com' is both the origin and the account of the copy; --to must name \
+         the account the files were migrated to, see 'gdrive account list'"
+    );
+}
