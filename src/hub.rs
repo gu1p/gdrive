@@ -23,11 +23,20 @@ pub(crate) struct Hub {
     drive: DriveHub<Connector>,
     /// The Drive API base URL the hub was set up with (google-drive3 has no getter for it).
     drive_base_url: String,
+    /// The base URL of the Admin SDK Reports API, which google-drive3 does not know.
+    reports_base_url: String,
     retrier: Retrier,
 }
 
 /// google-drive3's default base URL.
 const DRIVE_BASE_URL: &str = "https://www.googleapis.com/drive/v3/";
+
+/// The base URL of the Admin SDK Reports API (the audit log of a Google Workspace organization).
+const REPORTS_BASE_URL: &str = "https://admin.googleapis.com/admin/reports/v1/";
+
+/// Where the Reports API is below a server's root URL, as for Google's own.
+#[cfg(test)]
+const REPORTS_PATH: &str = "admin/reports/v1/";
 
 impl Deref for Hub {
     type Target = DriveHub<Connector>;
@@ -63,6 +72,7 @@ impl Hub {
         Ok(Hub::from_drive_hub(
             google_drive3::DriveHub::new(http_client, auth),
             DRIVE_BASE_URL.to_owned(),
+            REPORTS_BASE_URL.to_owned(),
             RetryPolicy::default(),
         ))
     }
@@ -70,11 +80,13 @@ impl Hub {
     fn from_drive_hub(
         drive: DriveHub<Connector>,
         drive_base_url: String,
+        reports_base_url: String,
         policy: RetryPolicy,
     ) -> Hub {
         Hub {
             drive,
             drive_base_url,
+            reports_base_url,
             retrier: Retrier::new(policy, Throttle::new()),
         }
     }
@@ -84,6 +96,12 @@ impl Hub {
     /// headers. google-drive3 only has a setter for it.
     pub(crate) fn drive_base_url(&self) -> &str {
         &self.drive_base_url
+    }
+
+    /// The Admin SDK Reports API base URL, ending in `/`
+    /// (`https://admin.googleapis.com/admin/reports/v1/` unless a test changed it).
+    pub(crate) fn reports_base_url(&self) -> &str {
+        &self.reports_base_url
     }
 
     /// The retry policy and the throttle shared by every request of this hub.
@@ -115,14 +133,22 @@ impl Hub {
                 .build(connector_with(ProxyConnector::direct())?);
         let mut hub = google_drive3::DriveHub::new(http_client, google_apis_common::NoToken);
         hub.base_url(base_url.clone());
-        Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
+        let root = base_url.strip_suffix("drive/v3/").unwrap_or(&base_url);
+        let reports_base_url = format!("{root}{REPORTS_PATH}");
+        Ok(Hub::from_drive_hub(
+            hub,
+            base_url,
+            reports_base_url,
+            RetryPolicy::for_tests(),
+        ))
     }
 }
 
 #[cfg(test)]
 impl Hub {
     /// Hub that sends every request to the server at `root_url` (for example
-    /// `http://127.0.0.1:1234/`) with a dummy bearer token. Used with `common::mock_server`.
+    /// `http://127.0.0.1:1234/`) with a dummy bearer token, for any scope. Used with
+    /// `common::mock_server`. Requests to the Reports API go to `<root_url>admin/reports/v1/`.
     pub(crate) fn for_mock_server(root_url: &str) -> io::Result<Hub> {
         Self::for_mock_server_through(root_url, ProxyConnector::direct())
     }
@@ -141,6 +167,11 @@ impl Hub {
         let base_url = format!("{root_url}drive/v3/");
         hub.root_url(root_url.to_owned());
         hub.base_url(base_url.clone());
-        Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
+        Ok(Hub::from_drive_hub(
+            hub,
+            base_url,
+            format!("{root_url}{REPORTS_PATH}"),
+            RetryPolicy::for_tests(),
+        ))
     }
 }
