@@ -104,10 +104,13 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   resumable upload. Google Docs, Sheets, Slides and Drawings go in as docx, xlsx, pptx and png; shortcuts
   and Google types without an export are skipped and listed. Names are made portable to Windows, macOS
   and Linux, the order and the bytes do not depend on Drive's listing, and long and non-ASCII paths and
-  files of 8 GiB and more use pax headers. Each file is checked against its MD5 as it is read; a file that
-  changes during the run fails the archive. A second run finds the archive already there (by a digest in
-  its `appProperties`), fails on a changed folder instead of overwriting, and continues an interrupted
-  upload with the exports of the first run. Not with `--trash-source`. See docs/migrate.md.
+  files of 8 GiB and more use pax headers. Each file that has an MD5 on Drive is checked against it as it
+  is read, and Drive's MD5 of the whole tar against the bytes read; an export has no checksum on Drive and
+  is covered by the latter only, and a file without MD5 goes in unchecked. A file that changes during the
+  run fails the archive. Once checked, the archive is marked with a digest of what it was made from and
+  its MD5 (`appProperties`): a second run finds it already there, fails on a changed folder or a replaced
+  archive instead of overwriting, and continues an interrupted upload with the exports of the first run.
+  Not with `--trash-source`. See docs/migrate.md.
 
 Accounts and login:
 

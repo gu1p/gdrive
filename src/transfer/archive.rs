@@ -34,6 +34,8 @@
 //!   content, as the relay asks) or the bytes read are not the listed ones. A changed size, a
 //!   deleted file and a failed read fail the same way. A blob without an md5 is archived
 //!   unchecked, as the relay copies one.
+//! - An export has no checksum on Drive to compare with: the bytes exported are the bytes in
+//!   the archive, which only the next check covers.
 //! - The uploader compares the md5 of the bytes it read with Drive's md5 of the archive.
 //! - A run that continues the session of an earlier run (the uploader's `record_in`, with
 //!   [`session_identity`]) does so only when the layout digest is the same: the same bytes in
@@ -41,7 +43,7 @@
 //!   md5 of every blob. It sends only what the session does not hold yet, but first reads the
 //!   part the session holds again from the source, to hash it (the uploader's own catch-up:
 //!   the upload is not made with `Upload::trust_continued_content`): that part is downloaded a
-//!   second time and uploaded once, and both checks above cover the whole archive. Bytes that
+//!   second time and uploaded once, and the checks above cover the whole archive. Bytes that
 //!   an earlier run sent and that differ from the ones read now make Drive's md5 differ from
 //!   the md5 of the bytes read; so do bytes sent again within a run (a chunk sent again, a new
 //!   session after one expired). The session of an archive with a blob without md5 is never

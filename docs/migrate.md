@@ -298,16 +298,20 @@ export (Forms, Sites, My Maps, Apps Script, ...), and a Google file whose export
 Drive exports. A folder that could not be listed, or that Drive listed incompletely, fails the archive
 before anything is uploaded: an archive that silently misses files is worse than none.
 
-**Running it again.** Once an archive is uploaded and checked (see Checks below), it gets a mark: a
-property with a digest of what it was made from (every path; the id, size and MD5 checksum of every file, or
-its modification time when it has no checksum; the id, modification time and format of every export). A
-second run with nothing changed in the source prints `already-there photos.tar` and uploads nothing. When
-the folder changed since (a file added, removed, renamed or edited), the archive in the destination no
-longer matches: the item fails with `it exists in the destination with different content`, and nothing is
-overwritten. Rename or remove the old archive to make a new one. Any other file named `<name>.tar` in the
-destination folder fails the same way, and so does an archive without the mark: one that failed its check,
-or that could not be marked (that run says so). A folder with a file that has neither an MD5 checksum nor a
-modification time is never already there, since nothing tells that file from an edited one. Two `FILE_ID`s
+**Running it again.** Once an archive is uploaded and checked (see Checks below), it gets a mark: properties
+with a digest of what it was made from (every path; the id, size and MD5 checksum of every file, or its
+modification time when it has no checksum; the id, modification time and format of every export) and with
+the archive's own MD5 checksum at that point. A second run with nothing changed in the source prints
+`already-there photos.tar` and uploads nothing. When the folder changed since (a file added, removed,
+renamed or edited), the archive in the destination no longer matches: the item fails with `it exists in the
+destination with different content`, and nothing is overwritten. Rename or remove the old archive to make a
+new one. Any other file named `<name>.tar` in the destination folder fails the same way, and so do an
+archive without the mark (one that failed its check) and an archive whose content was replaced in the
+destination since it was marked (its MD5 checksum is no longer the marked one). When the marking itself
+fails, that run says so: it cannot tell whether the mark was written, and the next run finds the archive
+already there if it was, and different otherwise. A folder with a file that has neither an MD5 checksum nor
+a modification time, or with a Google file without a modification time, is never already there, since
+nothing tells that file from an edited one. Two `FILE_ID`s
 with the same Drive name give two files named `<name>.tar` in the destination folder (Drive allows it), and
 a later run finds each one again by its own digest.
 
@@ -323,9 +327,11 @@ the archive is complete, and with the stale session records after a week. An arc
 when it would be the same bytes; otherwise, and for an archive with a file that has no MD5 checksum, it
 starts over.
 
-**Checks.** Every archive that is completed, in one run or continued, is checked whole: each file against
-its MD5 checksum on Drive, from its first byte, as it is read, and the MD5 checksum Drive computes for the
-whole tar against the bytes read. A file that changes in the source while the archive is made (edited,
+**Checks.** Every archive that is completed, in one run or continued, is checked: each file that has an MD5
+checksum on Drive (practically every uploaded file) against it, from its first byte, as it is read, and the
+MD5 checksum Drive computes for the whole tar against the bytes read. A Google Doc, Sheet, Slide or Drawing
+has no checksum on Drive to compare its export with: it is covered by the comparison of the whole tar only
+(the bytes exported are the bytes in the archive). A file without an MD5 checksum is archived unchecked. A file that changes in the source while the archive is made (edited,
 resized, deleted) fails the archive with an error that names it, `'photos/a.txt' changed in the source while
 the archive was made; run the command again`, and no archive is created. Run the command again once the
 source is quiet. If Drive's checksum of the tar is not that of the bytes read (an earlier run sent other
