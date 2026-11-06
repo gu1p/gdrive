@@ -121,6 +121,11 @@ pub(crate) struct RemoteSource {
     /// permission), which the md5 does not, so with an md5 it would only cause needless starts
     /// from the beginning.
     pub(crate) version: Option<i64>,
+    /// For an archive of Drive files (`transfer/archive.rs`): the digest of its layout, every
+    /// byte it holds in memory and the id, size and md5 of every file it reads. Left out
+    /// otherwise, so that the records of relays keep their form.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) layout: Option<String>,
 }
 
 impl SourceIdentity {
@@ -143,6 +148,27 @@ impl SourceIdentity {
                 file_id: file_id.to_owned(),
                 md5: md5.map(str::to_ascii_lowercase),
                 version: if md5.is_some() { None } else { version },
+                layout: None,
+            }),
+        }
+    }
+
+    /// The identity of an archive of `size` bytes of the Drive files of `account` below the
+    /// file or folder `root_id`, with the digest of its `layout`. Its id is `archive:<root_id>`:
+    /// Drive ids have no `:`, so it is never the id of a relayed file.
+    #[must_use]
+    pub(crate) fn archive(account: &str, root_id: &str, size: u64, layout: &str) -> Self {
+        let file_id = format!("archive:{root_id}");
+        SourceIdentity {
+            path: PathBuf::from(format!("drive:{account}/{file_id}")),
+            size,
+            mtime: None,
+            remote: Some(RemoteSource {
+                account: account.to_owned(),
+                file_id,
+                md5: None,
+                version: None,
+                layout: Some(layout.to_owned()),
             }),
         }
     }
@@ -150,8 +176,10 @@ impl SourceIdentity {
     /// Why a session of this source can never be continued: nothing tells whether it changed.
     fn unverifiable(&self) -> Option<&'static str> {
         match &self.remote {
-            Some(remote) => (remote.md5.is_none() && remote.version.is_none())
-                .then_some("the Drive file has no md5 or version to tell whether it changed"),
+            Some(remote) => {
+                (remote.md5.is_none() && remote.version.is_none() && remote.layout.is_none())
+                    .then_some("the Drive file has no md5 or version to tell whether it changed")
+            }
             None => self
                 .mtime
                 .is_none()
@@ -378,41 +406,11 @@ impl RecordFile {
         }
     }
 
-    /// Writes `record` to a new temporary file of its own (created exclusively, so that it is
-    /// neither another writer's nor a planted link) and renames it over the record.
+    /// Writes `record` to a new temporary file of its own and renames it over the record
+    /// ([`write_private`]).
     async fn write(&self, record: &SessionRecord) -> io::Result<()> {
         let content = serde_json::to_vec_pretty(record).map_err(io::Error::other)?;
-        if let Some(dir) = self.path.parent() {
-            let mut builder = tokio::fs::DirBuilder::new();
-            builder.recursive(true);
-            #[cfg(unix)]
-            builder.mode(0o700);
-            builder.create(dir).await?;
-        }
-        let name = self
-            .path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let temp = self
-            .path
-            .with_file_name(format!("{name}.{:016x}.tmp", fastrand::u64(..)));
-        let mut options = tokio::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
-        let mut file = options.open(&temp).await?;
-        let written = async {
-            file.write_all(&content).await?;
-            file.flush().await?;
-            drop(file);
-            tokio::fs::rename(&temp, &self.path).await
-        }
-        .await;
-        if written.is_err() {
-            let _ = tokio::fs::remove_file(&temp).await;
-        }
-        written
+        write_private(&self.path, &content).await
     }
 
     /// Deletes the record if it is still the one this invocation owns.
@@ -431,17 +429,56 @@ impl RecordFile {
     }
 }
 
+/// Writes `content` to `path`, private to the user (0600, its directory 0700 if it is created):
+/// to a new temporary file of its own (created exclusively, so that it is neither another
+/// writer's nor a planted link) that is renamed over `path`.
+pub(crate) async fn write_private(path: &Path, content: &[u8]) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        let mut builder = tokio::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(dir).await?;
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!("{name}.{:016x}.tmp", fastrand::u64(..)));
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&temp).await?;
+    let written = async {
+        file.write_all(content).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&temp, path).await
+    }
+    .await;
+    if written.is_err() {
+        let _ = tokio::fs::remove_file(&temp).await;
+    }
+    written
+}
+
+/// The extension of the exports cache of an archive (`transfer/archive.rs`), which is kept next
+/// to the records and pruned with them.
+pub(crate) const EXPORTS_EXTENSION: &str = "exports";
+
 /// Deletes the records in `dir` that nothing wrote to for longer than the session lifetime:
-/// their sessions have expired.
+/// their sessions have expired. So do the exports caches of archives, which only serve such a
+/// session.
 pub(crate) async fn prune(dir: &Path) {
     let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
         return;
     };
     while let Ok(Some(entry)) = entries.next_entry().await {
         let path = entry.path();
-        let is_record = path
-            .extension()
-            .is_some_and(|extension| extension == "json" || extension == "tmp");
+        let is_record = path.extension().is_some_and(|extension| {
+            extension == "json" || extension == "tmp" || extension == EXPORTS_EXTENSION
+        });
         let stale = entry
             .metadata()
             .await
@@ -878,5 +915,75 @@ mod tests {
         assert!(!old.exists());
         assert!(fresh.exists());
         assert!(other.exists(), "only records are deleted");
+    }
+
+    #[tokio::test]
+    async fn stale_exports_caches_of_archives_are_pruned_with_the_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir
+            .path()
+            .join(format!("archive-old.{}", super::EXPORTS_EXTENSION));
+        let fresh = dir
+            .path()
+            .join(format!("archive-new.{}", super::EXPORTS_EXTENSION));
+        for path in [&old, &fresh] {
+            std::fs::write(path, b"cache").unwrap();
+        }
+        let long_ago = SystemTime::now() - Duration::from_secs(8 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        prune(dir.path()).await;
+
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn an_archive_is_continued_only_with_the_same_layout_and_never_as_a_relay() {
+        let archive = SourceIdentity::archive("a@example.com", "folder-1", 10, "digest-1");
+        assert_eq!(
+            archive.path,
+            std::path::Path::new("drive:a@example.com/archive:folder-1")
+        );
+        let record = SessionRecord::new(
+            String::from("url"),
+            archive.clone(),
+            target(),
+            256,
+            identity(),
+        );
+        assert_eq!(record.mismatch(&archive, &target()), None);
+        for other in [
+            SourceIdentity::archive("a@example.com", "folder-1", 10, "digest-2"),
+            SourceIdentity::archive("a@example.com", "folder-1", 11, "digest-1"),
+            SourceIdentity::archive("b@example.com", "folder-1", 10, "digest-1"),
+            remote(
+                "a@example.com",
+                "folder-1",
+                Some("0123456789abcdef0123456789abcdef"),
+                None,
+            ),
+        ] {
+            assert_eq!(
+                record.mismatch(&other, &target()),
+                Some("the file changed since"),
+                "{other:?}"
+            );
+        }
+        // The relay of a file never takes the record name of an archive.
+        let relay = remote("a@example.com", "folder-1", None, Some(1));
+        assert_ne!(
+            RecordFile::new(std::path::Path::new("/uploads"), &relay, &target()).path,
+            RecordFile::new(std::path::Path::new("/uploads"), &archive, &target()).path
+        );
+        let written = serde_json::to_value(&archive).unwrap();
+        assert_eq!(written["remote"]["layout"], "digest-1");
+        let relay = serde_json::to_value(&relay).unwrap();
+        assert!(relay["remote"].get("layout").is_none(), "{relay}");
     }
 }

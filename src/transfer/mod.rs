@@ -6,7 +6,10 @@
 //! - [`progress`]: the events a progress display receives from the scheduler.
 //! - [`upload`]: gdrive's own uploader, resumable sessions and multipart requests.
 //! - [`relay`]: the copy of a Drive file to another account, streamed through the uploader.
+//! - [`archive`]: a tar of Drive files of one account, streamed through the uploader into
+//!   another.
 
+pub(crate) mod archive;
 #[cfg(test)]
 pub(crate) mod fake_drive;
 pub(crate) mod progress;

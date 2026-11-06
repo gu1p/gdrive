@@ -119,6 +119,8 @@ pub(super) fn label(parent: Option<&str>, name: &str) -> String {
 pub(super) struct SourceFolder {
     pub(super) id: String,
     pub(super) name: String,
+    /// The time of an archive's directory entry.
+    pub(super) modified_time: Option<DateTime<Utc>>,
     pub(super) label: String,
     pub(super) children: Vec<SourceNode>,
     /// Drive reported an incomplete search for it: some children may be missing.
@@ -295,13 +297,7 @@ async fn walk(hub: &Hub, root: File, listing_jobs: usize, printer: &Printer) -> 
         }
     }
     let root_label = label(None, &root.name);
-    assemble(
-        FolderKey::ROOT,
-        root.id,
-        root.name,
-        root_label,
-        &mut folders,
-    )
+    assemble(FolderKey::ROOT, root, root_label, &mut folders)
 }
 
 /// The label of a folder of the walk below the root `root`.
@@ -311,12 +307,11 @@ fn label_of(root: &str, components: &[String]) -> String {
         .fold(label(None, root), |parent, name| label(Some(&parent), name))
 }
 
-/// The folder `key` with everything below it, from the folders of the walk. A folder the walk
-/// did not finish counts as listed incompletely.
+/// The folder `key` (the source `file`) with everything below it, from the folders of the walk.
+/// A folder the walk did not finish counts as listed incompletely.
 fn assemble(
     key: FolderKey,
-    id: String,
-    name: String,
+    file: SourceFile,
     label: String,
     folders: &mut HashMap<FolderKey, Building>,
 ) -> SourceFolder {
@@ -332,12 +327,13 @@ fn assemble(
             }
             Pending::Folder(file, Some(key)) => {
                 let child_label = self::label(Some(&label), &file.name);
-                SourceNode::Folder(assemble(key, file.id, file.name, child_label, folders))
+                SourceNode::Folder(assemble(key, file, child_label, folders))
             }
             Pending::Folder(file, None) => SourceNode::Folder(SourceFolder {
                 label: self::label(Some(&label), &file.name),
                 id: file.id,
                 name: file.name,
+                modified_time: file.modified_time,
                 children: Vec::new(),
                 incomplete: false,
                 error: Some(Error::Cycle),
@@ -345,8 +341,9 @@ fn assemble(
         })
         .collect();
     SourceFolder {
-        id,
-        name,
+        id: file.id,
+        name: file.name,
+        modified_time: file.modified_time,
         label,
         children,
         incomplete: incomplete && building.error.is_none(),

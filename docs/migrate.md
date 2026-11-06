@@ -246,6 +246,112 @@ What a dry run cannot tell, because it reads no content and writes nothing:
 - source files that change during the real run (see `--trash-source` above), and changes to the destination
   between the dry run and the real run.
 
+## One tar file per folder: `--archive`
+
+With `--archive`, each `FILE_ID` arrives in the destination as **one file**, `<name>.tar`, instead of as a
+copy of the tree: a plain tar archive (no compression) of the folder with everything in it, or of the one
+file. The archive is made while it is uploaded: the bytes stream from the source account through memory
+into a resumable upload of the destination account, and nothing is written to the local disk (apart from
+the exports cache described below).
+
+```sh
+gdrive files migrate <FOLDER_ID> --to new@example.com --archive --dry-run
+gdrive files migrate <FOLDER_ID> --to new@example.com --archive
+```
+
+```text
+Found 6 files in 4 folders with a total size of 16 MB
+skip photos/link: shortcuts have no content
+create photos.tar (16.1 MB)
+```
+
+The archive goes into `--into` (the top of My Drive by default) with the type `application/x-tar`. The
+other options keep their meaning: `--jobs` makes several archives at once (each `FILE_ID` is one), and
+`--continue-on-error`, `--chunk-size`, `--dry-run` and the progress flags work as without `--archive`; the
+progress shows each archive as one transfer. `--archive` cannot be combined with `--trash-source`, and an
+archive run never changes anything in the source account.
+
+**What is inside.** A directory entry for every folder, the top one and empty ones included, and a file
+entry for every file, all under `<name>/`. Entries come in the order of their names, each folder before
+what is in it, whatever order Drive lists them in. Every Drive name becomes one path component with the
+rules of a recursive download for Windows, macOS and Linux at once, wherever gdrive runs: `/`, `\`,
+control characters and `< > : " | ? *` become `_`, Windows device names and names ending in a dot or space
+get a `_`, and a name longer than 255 bytes is shortened with a tag of its file id. Two files of one name in
+a folder (also when they differ only in letter case) do not overwrite each other: one keeps the name, the
+others get `~` and 8 hex digits of their file id before the extension, `report~1a2b3c4d.pdf`. A name that
+cannot be used at all (`.`, `..`, an empty name) fails the archive, with the `gdrive files rename` command
+that fixes it. The
+archive is POSIX tar (pax): long and non-ASCII paths and files of 8 GiB and more extract with GNU tar,
+bsdtar (macOS, Windows) and other tar programs. Every entry has the file's modification time on Drive, mode
+644 (folders 755), and owner 0 with no user or group names; the same folder gives the same bytes on any
+machine.
+
+**Google Docs, Sheets, Slides and Drawings** are exported as by `files download --recursive --export`
+(its `default` profile): Docs as docx, Sheets as xlsx, Slides as pptx, Drawings as png. The entry gets the
+extension unless its name already ends with it (`Budget` becomes `Budget.xlsx`). The exports are made
+before the upload starts, since their sizes are part of the archive, and are held in memory until it ends.
+A Google file goes in as it is when it is exported, not as it was when the folder was listed: one edited in
+between goes in with its newer content, and the next run then finds the archive different from the source.
+
+**Left out**, each printed as `skip PATH: REASON` and counted as skipped: shortcuts, Google types without an
+export (Forms, Sites, My Maps, Apps Script, ...), and a Google file whose export is larger than the 10 MB
+Drive exports. A folder that could not be listed, or that Drive listed incompletely, fails the archive
+before anything is uploaded: an archive that silently misses files is worse than none.
+
+**Running it again.** Once an archive is uploaded and checked (see Checks below), it gets a mark: properties
+with a digest of what it was made from (every path; the id, size and MD5 checksum of every file, or its
+modification time when it has no checksum; the id, modification time and format of every export) and with
+the archive's own MD5 checksum at that point. A second run with nothing changed in the source prints
+`already-there photos.tar` and uploads nothing. When the folder changed since (a file added, removed,
+renamed or edited), the archive in the destination no longer matches: the item fails with `it exists in the
+destination with different content`, and nothing is overwritten. Rename or remove the old archive to make a
+new one. Any other file named `<name>.tar` in the destination folder fails the same way, and so do an
+archive without the mark (one that failed its check) and an archive whose content was replaced in the
+destination since it was marked (its MD5 checksum is no longer the marked one). When the marking itself
+fails, that run says so: it cannot tell whether the mark was written, and the next run finds the archive
+already there if it was, and different otherwise. A folder with a file that has neither an MD5 checksum nor
+a modification time, or with a Google file without a modification time, is never already there, since
+nothing tells that file from an edited one. Two `FILE_ID`s
+with the same Drive name give two files named `<name>.tar` in the destination folder (Drive allows it), and
+a later run finds each one again by its own digest.
+
+**Continuing an interrupted run.** An archive that was interrupted (Ctrl-C, a lost network) is continued by
+running the same command again, like a large file: the session is recorded in the destination account's
+`uploads/` directory (see [Running it again](#running-it-again)). The next run first reads the part that
+Drive holds already again from the source, from the start of the archive, to check it, and then continues
+the upload where Drive stopped: that part is downloaded a second time but uploaded only once, and only what
+Drive does not hold yet is sent. Exports are not the same bytes twice, so the exports of an archive whose
+session is recorded are kept next to the session records, in `uploads/archive-<digest>.exports` (private
+to you, like the records), and the next run uses them instead of exporting again. The file is deleted when
+the archive is complete, and with the stale session records after a week. An archive is continued only
+when it would be the same bytes; otherwise, and for an archive with a file that has no MD5 checksum, it
+starts over.
+
+**Checks.** Every archive that is completed, in one run or continued, is checked: each file that has an MD5
+checksum on Drive (practically every uploaded file) against it, from its first byte, as it is read, and the
+MD5 checksum Drive computes for the whole tar against the bytes read. A Google Doc, Sheet, Slide or Drawing
+has no checksum on Drive to compare its export with: it is covered by the comparison of the whole tar only
+(the bytes exported are the bytes in the archive). A file without an MD5 checksum is archived unchecked. A file that changes in the source while the archive is made (edited,
+resized, deleted) fails the archive with an error that names it, `'photos/a.txt' changed in the source while
+the archive was made; run the command again`, and no archive is created. Run the command again once the
+source is quiet. If Drive's checksum of the tar is not that of the bytes read (an earlier run sent other
+bytes than the source gives now, or bytes changed on the way), the item fails and the archive stays in the
+destination without its mark: delete it there and run the command again. The mark is written only after
+these checks.
+
+**Dry run.** `--dry-run --archive` prints what a real run would (`create NAME.tar`, `already-there`,
+`skip`, conflicts) without exporting anything, so the size it shows leaves out the exports and says so:
+
+```text
+create photos.tar (12 MB without the exports of 2 Google Workspace files)
+Dry run, nothing was changed. Summary: 1 archive to migrate (12 MB without the exports of 2 Google Workspace files), 0 already there, 1 skipped (unsupported), 0 failed, 0 cancelled
+```
+
+**Limits.** Drive takes at most 750 GB of uploads per account per day and 5 TB per file, so one archive is
+at most 5 TB, and a larger one needs several `FILE_ID`s (the subfolders). The archive's property is visible
+only to the OAuth client that created it: a second run with the destination account added with another
+client sees a file of the same name with other content.
+
 ## Options
 
 | Option | |
@@ -255,6 +361,7 @@ What a dry run cannot tell, because it reads no content and writes nothing:
 | `--into FOLDER_ID` | a folder of the destination account; the top of My Drive by default |
 | `--dry-run` | print what would be done, change nothing |
 | `--trash-source` | move migrated source files and folders to the source's trash |
+| `--archive` | each `FILE_ID` as one tar file, `<name>.tar` (see [One tar file per folder](#one-tar-file-per-folder---archive)) |
 | `--jobs N` | copy up to N files at once, 1 to 64 (default 4); folder listings and creations run besides, 2 at a time |
 | `--continue-on-error` | after a failed item, finish the others; the run still exits with 1 |
 | `--chunk-size MB`, `--multipart-threshold MB` | how large files are uploaded, as for `files upload` |
