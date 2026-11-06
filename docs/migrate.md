@@ -35,7 +35,8 @@ old@example.com
 ```
 
 `--from` and `--to` take these names. `--from` defaults to the current account (`gdrive account current`,
-changed with `gdrive account switch`). `--to` is required and must be another account.
+changed with `gdrive account switch`). `--to` is required and must be another account, except with
+[`--archive`](#one-tar-file-per-folder---archive).
 
 - Both accounts can use the same OAuth client. While the client's app is in **Testing**, add both Google
   accounts as test users ([Add test users](create_google_api_credentials.md#4-add-test-users)).
@@ -270,6 +271,19 @@ other options keep their meaning: `--jobs` makes several archives at once (each 
 `--continue-on-error`, `--chunk-size`, `--dry-run` and the progress flags work as without `--archive`; the
 progress shows each archive as one transfer. `--archive` cannot be combined with `--trash-source`, and an
 archive run never changes anything in the source account.
+
+**Inside one account.** With `--archive`, `--to` may name the source account itself: the folder becomes one
+tar file in the same Drive, next to it or in `--into`.
+
+```sh
+gdrive files migrate <FOLDER_ID> --to me@example.com --archive
+```
+
+The folder and its files are only read, and the tar file is the only thing written. It takes the folder's
+size of the account's storage a second time. The archive never goes into what it archives: an `--into`
+folder that is the folder itself or inside it is refused, and so is all of My Drive (`root`) unless `--into`
+names a folder outside it, on a shared drive. Without `--archive`, a migration inside one account is
+refused: `gdrive files copy` copies a file there without a transfer.
 
 **What is inside.** A directory entry for every folder, the top one and empty ones included, and a file
 entry for every file, all under `<name>/`. Entries come in the order of their names, each folder before

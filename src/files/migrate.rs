@@ -33,7 +33,9 @@
 //! goes, it is read again: a file whose size, md5 or modification time changed since the listing
 //! stays, and so does a folder that holds anything not in the trash (added during the run).
 //!
-//! `--archive` makes each `FILE_ID` one tar file in the destination instead (`archive.rs`).
+//! `--archive` makes each `FILE_ID` one tar file in the destination instead (`archive.rs`), also
+//! inside one account (`--to` the source account): nothing but gdrive puts a folder into one file
+//! there. A copy of the tree inside one account is refused: Drive copies on its side.
 
 mod archive;
 mod source;
@@ -133,12 +135,20 @@ pub(crate) struct Config {
 
 /// What a migration does, apart from the accounts.
 #[derive(Debug, Clone)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the flags of the command line and whether the accounts are one, orthogonal to \
+              each other"
+)]
 struct Settings {
     file_ids: Vec<String>,
     into: Option<String>,
     dry_run: bool,
     trash_source: bool,
     archive: bool,
+    /// The source and the destination are one account (only with `archive`): the top of My Drive
+    /// is then a folder the source may hold too.
+    same_account: bool,
     transfer: scheduler::Options,
 }
 
@@ -156,7 +166,8 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
             account: config.to.clone(),
             source,
         })?;
-    if source_account.account.name == dest_account.account.name {
+    let same_account = source_account.account.name == dest_account.account.name;
+    if same_account && !config.archive {
         return Err(Error::SameAccount(dest_account.account.name));
     }
 
@@ -166,12 +177,17 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
             account: Some(source_account.account.name.clone()),
             source: error,
         })?;
-    let dest = get_hub_for(&dest_account)
-        .await
-        .map_err(|error| Error::DestinationAccount {
-            account: dest_account.account.name.clone(),
-            source: error,
-        })?;
+    let dest = if same_account {
+        // One account, one hub: its token is renewed and stored in one place.
+        source.clone()
+    } else {
+        get_hub_for(&dest_account)
+            .await
+            .map_err(|error| Error::DestinationAccount {
+                account: dest_account.account.name.clone(),
+                source: error,
+            })?
+    };
 
     let options = UploadOptions {
         chunk_size: config.chunk_size.in_bytes(),
@@ -189,6 +205,7 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         dry_run: config.dry_run,
         trash_source: config.trash_source,
         archive: config.archive,
+        same_account,
         transfer: config.transfer,
     };
     let printer = Printer::stdio();
@@ -242,6 +259,8 @@ async fn run(
 ) -> Result<(), Error> {
     let into = match &settings.into {
         Some(id) => destination_folder(dest, id).await?,
+        // Inside one account the top of My Drive may be a folder to archive: its id tells.
+        None if settings.same_account => destination_folder(dest, MY_DRIVE).await?,
         None => MY_DRIVE.to_owned(),
     };
     let fields = if settings.archive {
@@ -1239,7 +1258,8 @@ impl Display for Error {
             Error::SameAccount(account) => write!(
                 f,
                 "'{account}' is both the source and the destination account; --to must name \
-                 another account, see 'gdrive account list'"
+                 another account, see 'gdrive account list' (inside one account only --archive \
+                 works)"
             ),
             Error::GetDestinationFolder { id, .. } => {
                 write!(f, "unable to get the destination folder '{id}'")

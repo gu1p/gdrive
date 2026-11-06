@@ -427,7 +427,7 @@ enum FileCommand {
         #[arg(required = true, value_name = "FILE_ID")]
         file_id: Vec<String>,
 
-        /// The account to migrate to, as `gdrive account list` prints it
+        /// The account to migrate to, as `gdrive account list` prints it: another account than the source, or with --archive the source account itself
         #[arg(long, value_name = "ACCOUNT")]
         to: String,
 

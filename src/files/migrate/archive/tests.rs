@@ -133,6 +133,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         dry_run: false,
         trash_source: false,
         archive: true,
+        same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
 }
@@ -1173,4 +1174,90 @@ async fn a_marked_archive_with_other_bytes_or_without_its_md5_is_a_conflict() {
         }
         assert!(dest.created().is_empty());
     }
+}
+
+/// `--to` the source account itself: one fake Drive is both sides.
+fn in_one_account(settings: Settings) -> Settings {
+    Settings {
+        same_account: true,
+        ..settings
+    }
+}
+
+#[tokio::test]
+async fn inside_one_account_a_folder_gets_its_tar_and_a_second_run_finds_it() {
+    let drive = FakeDrive::start(source_tree(), Behavior::default()).await;
+
+    let migrated = migrate(&drive, &drive, in_one_account(settings(&["photos"]))).await;
+
+    migrated.assert_ok();
+    let archive = the_archive(&drive);
+    assert_eq!(archive.name, "photos.tar");
+    // Next to the folder, at the top of My Drive.
+    assert_eq!(archive.parents, ["root"]);
+    assert_eq!(unpack(&archive.content), archived_tree());
+    assert!(mark(&drive, &archive).is_some());
+    // Nothing but the archive was written: its upload and its mark.
+    assert_eq!(
+        drive.writes(),
+        [
+            String::from("POST /upload/drive/v3/files"),
+            format!("PATCH /drive/v3/files/{}", archive.id)
+        ]
+    );
+
+    let again = migrate(&drive, &drive, in_one_account(settings(&["photos"]))).await;
+
+    again.assert_ok();
+    assert_eq!(again.out.lines()[1..], ["already-there photos.tar"]);
+    assert_eq!(drive.created().len(), 1, "nothing new");
+}
+
+#[tokio::test]
+async fn inside_one_account_an_archive_never_goes_into_what_it_archives() {
+    let refused = |id: &str| {
+        format!(
+            "Error: the destination folder '{id}' is one of the folders to migrate, or inside \
+             one; --into must name a folder outside them"
+        )
+    };
+
+    // Into the folder itself, or a folder in it.
+    let drive = FakeDrive::start(source_tree(), Behavior::default()).await;
+    for into in ["photos", "jan"] {
+        let migrated = migrate(
+            &drive,
+            &drive,
+            in_one_account(Settings {
+                into: Some(into.to_owned()),
+                ..settings(&["photos"])
+            }),
+        )
+        .await;
+        let error = migrated.result.expect_err("an archive inside its source");
+        assert_eq!(crate::error_message(&error), refused(into));
+    }
+    assert!(drive.created().is_empty());
+
+    // All of My Drive, without `--into`: the top of My Drive is `root` there and has an id of
+    // its own in the listing.
+    let mut files = source_tree();
+    for file in &mut files {
+        if file.parents == ["root"] {
+            file.parents = vec![String::from("drive0")];
+        }
+    }
+    files.push(FakeFile::folder("drive0", "My Drive", "root").with_parents(&[]));
+    let behavior = Behavior {
+        my_drive: Some(String::from("drive0")),
+        ..Behavior::default()
+    };
+    let drive = FakeDrive::start(files, behavior).await;
+    for id in ["root", "drive0"] {
+        let migrated = migrate(&drive, &drive, in_one_account(settings(&[id]))).await;
+        let error = migrated.result.expect_err("an archive inside its source");
+        assert_eq!(crate::error_message(&error), refused("drive0"));
+    }
+    assert!(drive.created().is_empty());
+    assert_eq!(drive.writes(), Vec::<String>::new());
 }

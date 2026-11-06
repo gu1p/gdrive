@@ -110,7 +110,8 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   run fails the archive. Once checked, the archive is marked with a digest of what it was made from and
   its MD5 (`appProperties`): a second run finds it already there, fails on a changed folder or a replaced
   archive instead of overwriting, and continues an interrupted upload with the exports of the first run.
-  Not with `--trash-source`. See docs/migrate.md.
+  `--to` may be the source account itself: the tar file is made inside one account, never inside the
+  folder it archives. Not with `--trash-source`. See docs/migrate.md.
 
 Accounts and login:
 

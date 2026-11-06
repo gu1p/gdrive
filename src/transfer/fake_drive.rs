@@ -332,6 +332,9 @@ pub(crate) struct Behavior {
     pub(crate) list_after_media: HashSet<String>,
     /// The email address `about.get` reports; `fake@example.com` without one.
     pub(crate) account_email: Option<String>,
+    /// The id of the top folder of My Drive, which a `files.get` of its alias `root` answers
+    /// with; `root` itself without one.
+    pub(crate) my_drive: Option<String>,
 }
 
 /// How long a request held by [`Rendezvous`] or [`Behavior::list_after_media`] waits at most.
@@ -1665,9 +1668,12 @@ fn list(state: &State, request: &ListRequest, q: &str) -> FakeResponse {
 }
 
 /// `files.get`: the stored file with the top-level fields of the `fields` mask (all without one).
+/// `root` is the top folder of My Drive, under its id ([`Behavior::my_drive`]).
 fn get(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
-    let Some(file) = state.file(id) else {
-        return error(StatusCode::NOT_FOUND, "File not found.");
+    let file = match state.file(id) {
+        Some(file) => file,
+        None if id == "root" => my_drive(state),
+        None => return error(StatusCode::NOT_FOUND, "File not found."),
     };
     let mut file = file.to_json(true);
     let fields = params
@@ -1678,6 +1684,17 @@ fn get(state: &State, id: &str, params: &[(String, String)]) -> FakeResponse {
         object.retain(|key, _| fields.contains(key));
     }
     json_response(StatusCode::OK, &file)
+}
+
+/// The top folder of My Drive: the stored file of its id, or a folder named `My Drive`.
+fn my_drive(state: &State) -> FakeFile {
+    let id = state.behavior.my_drive.as_deref().unwrap_or("root");
+    state.file(id).unwrap_or_else(|| FakeFile {
+        id: id.to_owned(),
+        name: String::from("My Drive"),
+        mime_type: MIME_TYPE_DRIVE_FOLDER.to_owned(),
+        ..FakeFile::default()
+    })
 }
 
 /// The top-level names of a fields mask: `a,b(c,d),e` gives `a`, `b`, `e`.

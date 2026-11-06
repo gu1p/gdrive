@@ -70,6 +70,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         dry_run: false,
         trash_source: false,
         archive: false,
+        same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
 }
@@ -1150,7 +1151,7 @@ fn account_errors_name_the_account_and_the_commands_to_run() {
     assert_eq!(
         crate::error_message(&Error::SameAccount(String::from("me@example.com"))),
         "Error: 'me@example.com' is both the source and the destination account; --to must name \
-         another account, see 'gdrive account list'"
+         another account, see 'gdrive account list' (inside one account only --archive works)"
     );
 }
 
