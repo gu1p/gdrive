@@ -133,6 +133,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         dry_run: false,
         trash_source: false,
         archive: true,
+        contents: false,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }

@@ -22,6 +22,10 @@
 //! name that is any migrated source item, fails that item, and an `--into` folder that is
 //! migrated, or inside a migrated folder, is refused before anything starts.
 //!
+//! `--contents` leaves out the folder of each `FILE_ID` that is one: what is in it goes straight
+//! into the destination folder, as the items of one folder (`FOLDER/*` to `DEST/*`). The given
+//! folder has no counterpart in the destination then, and never goes to the trash.
+//!
 //! `--dry-run` runs the same jobs without a write: folders that would be created are not
 //! listed (they would be empty), and only the destination folders that exist are read.
 //!
@@ -124,6 +128,8 @@ pub(crate) struct Config {
     pub(crate) trash_source: bool,
     /// Each `FILE_ID` as one tar file (`--archive`).
     pub(crate) archive: bool,
+    /// What is in each given folder goes straight into the destination folder (`--contents`).
+    pub(crate) contents: bool,
     pub(crate) chunk_size: ChunkSize,
     pub(crate) multipart_threshold: MultipartThreshold,
     pub(crate) print_chunk_errors: bool,
@@ -146,6 +152,8 @@ struct Settings {
     dry_run: bool,
     trash_source: bool,
     archive: bool,
+    /// A `FILE_ID` that is a folder is not migrated itself, only what is in it.
+    contents: bool,
     /// The source and the destination are one account (only with `archive`): the top of My Drive
     /// is then a folder the source may hold too.
     same_account: bool,
@@ -205,6 +213,7 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         dry_run: config.dry_run,
         trash_source: config.trash_source,
         archive: config.archive,
+        contents: config.contents,
         same_account,
         transfer: config.transfer,
     };
@@ -341,6 +350,9 @@ async fn run(
         roots
             .into_iter()
             .map(|(id, root)| match root {
+                Ok(SourceNode::Folder(folder)) if settings.contents => {
+                    migration.contents_job(folder, place.clone())
+                }
                 Ok(SourceNode::Folder(folder)) => migration.folder_job(folder, place.clone()),
                 Ok(SourceNode::File(item)) => migration.file_job(item, place.clone()),
                 Err(error) => Job::done(JobKind::Media, id.clone(), failed(id, error)),
@@ -744,6 +756,26 @@ impl FolderTrash {
 }
 
 impl Migration {
+    /// The job that releases what is in `folder` straight into `place` (`--contents`): the
+    /// folder itself gets no destination folder and stays in the source, also when everything
+    /// in it went to the trash.
+    fn contents_job(self: &Arc<Self>, mut folder: SourceFolder, place: Place) -> Job {
+        let label = folder.label.clone();
+        let subtree = subtree(&folder);
+        if let Some(error) = folder.error.take() {
+            return Job::done(JobKind::Metadata, label.clone(), failed(&label, error))
+                .with_subtree(subtree);
+        }
+        // In the destination its items have no folder of its name above them.
+        folder.label_from_inside();
+        let migration = Arc::clone(self);
+        Job::new(JobKind::Metadata, label, move |_| async move {
+            let output = JobOutput::from(Outcome::Transferred { bytes: 0 });
+            migration.release(folder.children, place, output)
+        })
+        .with_subtree(subtree)
+    }
+
     /// The job that finds or creates the destination folder of `folder` in `place`, and then
     /// releases its contents.
     fn folder_job(self: &Arc<Self>, mut folder: SourceFolder, place: Place) -> Job {
@@ -770,7 +802,7 @@ impl Migration {
             id,
             name,
             label,
-            mut children,
+            children,
             incomplete,
             modified_time: _,
             error: _,
@@ -820,6 +852,20 @@ impl Migration {
             trash: trash.clone(),
         };
 
+        let mut output = JobOutput::from(Outcome::Transferred { bytes: 0 });
+        if let Some(trash) = trash.filter(|trash| trash.remaining.load(Ordering::SeqCst) == 0) {
+            output = output.follow_up([self.trash_folder_job(trash)]);
+        }
+        self.release(children, place, output)
+    }
+
+    /// `output` followed by the jobs of `children`, the items of one source folder, in `place`.
+    fn release(
+        self: Arc<Self>,
+        mut children: Vec<SourceNode>,
+        place: Place,
+        output: JobOutput,
+    ) -> JobOutput {
         children.sort_by(|a, b| a.name().cmp(b.name()));
         let mut folders = Vec::new();
         let mut files = Vec::new();
@@ -830,10 +876,6 @@ impl Migration {
             }
         }
 
-        let mut output = JobOutput::from(Outcome::Transferred { bytes: 0 });
-        if let Some(trash) = trash.filter(|trash| trash.remaining.load(Ordering::SeqCst) == 0) {
-            output = output.follow_up([self.trash_folder_job(trash)]);
-        }
         // Two iterators: the subfolders are created while the files are migrated.
         let migration = Arc::clone(&self);
         let folder_place = place.clone();

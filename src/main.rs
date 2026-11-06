@@ -439,6 +439,10 @@ enum FileCommand {
         #[arg(long, value_name = "FOLDER_ID")]
         into: Option<String>,
 
+        /// Migrate what is in each given folder straight into the destination folder, without a folder of its name there: FOLDER/* goes to DEST/*, not to DEST/FOLDER/*. The given folder itself is not created in the destination, and stays in the source with --trash-source
+        #[arg(long, conflicts_with = "archive")]
+        contents: bool,
+
         /// Migrate up to N files at once (1 to 64)
         #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
         jobs: NonZeroUsize,
@@ -1189,6 +1193,7 @@ async fn handle_files_command(
             dry_run,
             trash_source,
             archive,
+            contents,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -1203,6 +1208,7 @@ async fn handle_files_command(
                 dry_run,
                 trash_source,
                 archive,
+                contents,
                 chunk_size,
                 multipart_threshold,
                 print_chunk_errors,
@@ -2152,6 +2158,7 @@ mod flag_tests {
             dry_run,
             trash_source,
             archive,
+            contents,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -2173,6 +2180,7 @@ mod flag_tests {
             "--continue-on-error",
             "--dry-run",
             "--trash-source",
+            "--contents",
             "--chunk-size",
             "1",
             "--multipart-threshold",
@@ -2190,7 +2198,7 @@ mod flag_tests {
         assert_eq!(from.as_deref(), Some("old@example.com"));
         assert_eq!(into.as_deref(), Some("folder"));
         assert_eq!(jobs.get(), 8);
-        assert!(continue_on_error && dry_run && trash_source && !archive);
+        assert!(continue_on_error && dry_run && trash_source && !archive && contents);
         assert_eq!(chunk_size.in_bytes(), 1 << 20);
         assert_eq!(multipart_threshold.in_bytes(), 0);
         assert!(print_chunk_errors && print_chunk_info);
@@ -2234,6 +2242,31 @@ mod flag_tests {
         ]);
         let Err(error) = error else {
             panic!("--archive --trash-source should be refused");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn migrate_takes_contents_but_never_with_archive() {
+        let FileCommand::Migrate { contents, .. } =
+            parse(&["files", "migrate", "id", "--to", "new@example.com"])
+        else {
+            panic!("expected migrate");
+        };
+        assert!(!contents);
+
+        let error = Cli::try_parse_from([
+            "gdrive",
+            "files",
+            "migrate",
+            "id",
+            "--to",
+            "new@example.com",
+            "--contents",
+            "--archive",
+        ]);
+        let Err(error) = error else {
+            panic!("--contents --archive should be refused");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }

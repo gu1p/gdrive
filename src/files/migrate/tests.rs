@@ -70,6 +70,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         dry_run: false,
         trash_source: false,
         archive: false,
+        contents: false,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
@@ -1713,4 +1714,173 @@ async fn the_relay_gets_the_resource_key_and_creation_time_of_each_source_file()
         .collect::<Vec<_>>();
     names.sort();
     assert_eq!(names, ["a.txt", "b.txt", "shared"]);
+}
+
+/// What [`source_tree`] becomes in the folder `Archive` with `--contents`: no `photos`.
+fn contents_tree() -> BTreeMap<String, String> {
+    migrated_tree()
+        .into_iter()
+        .filter_map(|(path, content)| {
+            let inside = path.strip_prefix("photos/")?;
+            (!inside.is_empty()).then(|| (format!("Archive/{inside}"), content))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn with_contents_what_is_in_a_folder_goes_straight_into_the_destination() {
+    let mut files = source_tree();
+    files.push(FakeFile::blob("notes", "notes.txt", "root", "n"));
+    let source = FakeDrive::start(files, Behavior::default()).await;
+    let target = FakeFile::folder("target", "Archive", "root");
+    let dest = FakeDrive::start(vec![target.clone()], Behavior::default()).await;
+    // A file given by its id is migrated as without the flag.
+    let contents = || Settings {
+        into: Some(String::from("target")),
+        contents: true,
+        ..settings(&["notes", "photos"])
+    };
+
+    let migrated = migrate(&source, &dest, contents()).await;
+
+    migrated.assert_ok();
+    let mut expected = contents_tree();
+    expected.insert(String::from("Archive/notes.txt"), String::from("n"));
+    let created = dest.created();
+    assert_eq!(
+        tree_below(&created, std::slice::from_ref(&target), &["root"]),
+        expected
+    );
+    assert!(created.iter().all(|file| file.name != "photos"));
+    // The lines name the items as they are placed in the destination folder.
+    let mut lines = vec![
+        "Found 5 files in 4 folders with a total size of 17 B",
+        "create 2024/",
+        "create 2024/jan/",
+        "create empty/",
+        "create a.txt (4 B)",
+        "create b.txt (2 B)",
+        "create 2024/d.txt (4 B)",
+        "create 2024/jan/f.txt (6 B)",
+        "create notes.txt (1 B)",
+    ];
+    lines.sort_unstable();
+    assert_eq!(migrated.sorted_out(), lines);
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 5 migrated (17 B), 0 already there, 0 skipped (unsupported), 0 failed, \
+         0 cancelled; 3 folders created, 0 reused"
+    );
+    assert_eq!(source.writes(), Vec::<String>::new());
+
+    let again = migrate(&source, &dest, contents()).await;
+
+    again.assert_ok();
+    assert_eq!(dest.created().len(), created.len(), "nothing twice");
+    assert_eq!(
+        again.summary(),
+        "Summary: 0 migrated (0 B), 5 already there, 0 skipped (unsupported), 0 failed, \
+         0 cancelled; 0 folders created, 3 reused"
+    );
+    let lines = again.sorted_out();
+    for line in ["reuse 2024/jan/", "already-there 2024/jan/f.txt"] {
+        assert!(lines.contains(&String::from(line)), "{lines:?}");
+    }
+}
+
+#[tokio::test]
+async fn with_contents_a_dry_run_shows_the_same_and_writes_nothing() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            contents: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    let lines = migrated.sorted_out();
+    for line in ["create 2024/", "create a.txt (4 B)"] {
+        assert!(lines.contains(&String::from(line)), "{lines:?}");
+    }
+    assert!(
+        lines.iter().all(|line| !line.contains("photos")),
+        "{lines:?}"
+    );
+    assert_eq!(dest.writes(), Vec::<String>::new());
+    assert_eq!(source.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn with_contents_the_given_folder_stays_in_the_source_when_its_items_go_to_the_trash() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let target = FakeFile::folder("target", "Archive", "root");
+    let dest = FakeDrive::start(vec![target.clone()], Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            into: Some(String::from("target")),
+            trash_source: true,
+            contents: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert_eq!(
+        tree_below(&dest.created(), &[target], &["root"]),
+        contents_tree()
+    );
+    // Everything in `photos`, and not `photos`.
+    assert_eq!(
+        trashed_ids(&source),
+        ["a", "b", "d", "empty", "f", "jan", "y2024"]
+    );
+    assert!(
+        migrated
+            .summary()
+            .ends_with("; 7 moved to the trash in the source"),
+        "{}",
+        migrated.summary()
+    );
+}
+
+#[tokio::test]
+async fn with_contents_a_folder_that_could_not_be_listed_fails_and_nothing_is_created() {
+    let behavior = Behavior {
+        unreadable: HashSet::from([String::from("photos")]),
+        ..Behavior::default()
+    };
+    let source = FakeDrive::start(source_tree(), behavior).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            contents: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    assert!(migrated.result.is_err());
+    assert!(
+        migrated
+            .err
+            .text()
+            .contains("Error: unable to migrate 'photos'"),
+        "{}",
+        migrated.err.text()
+    );
+    assert!(dest.created().is_empty());
 }

@@ -95,9 +95,10 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   copied onto itself. Interrupted large uploads continue on the next run. `--dry-run` only reads the
   destination; `--trash-source` moves migrated files, and folders whose whole content was migrated, to
   the source's trash, after checking each again: a file that changed or a folder that got new files
-  stays. Prints one line per item (`create`, `reuse`, `convert`,
-  `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the chunk and
-  progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
+  stays. With `--contents`, what is in each given folder goes straight into the destination folder
+  (`FOLDER/*` to `DEST/*`), without a folder of its name. Prints one line per item (`create`, `reuse`,
+  `convert`, `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the
+  chunk and progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
   docs/migrate.md.
 - **Migration as an archive.** `files migrate <FILE_ID>... --to <ACCOUNT> --archive` makes each `FILE_ID`
   one plain tar file, `<name>.tar`, in the destination, streamed from the source through memory into a

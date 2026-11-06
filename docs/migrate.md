@@ -47,7 +47,7 @@ changed with `gdrive account switch`). `--to` is required and must be another ac
 ## The command
 
 ```sh
-gdrive files migrate <FILE_ID>... --to <ACCOUNT> [--from <ACCOUNT>] [--into <FOLDER_ID>]
+gdrive files migrate <FILE_ID>... --to <ACCOUNT> [--from <ACCOUNT>] [--into <FOLDER_ID>] [--contents]
 ```
 
 - `FILE_ID`: one or more ids of files or folders in the source account. Find them with `gdrive files list`
@@ -56,6 +56,8 @@ gdrive files migrate <FILE_ID>... --to <ACCOUNT> [--from <ACCOUNT>] [--into <FOL
   in it. `root` is the top folder of My Drive: it is migrated as a folder named `My Drive`.
 - `--into <FOLDER_ID>`: a folder of the **destination** account to put everything in. Without it, the
   files and folders go to the top of the destination's My Drive. A folder of a shared drive works too.
+- `--contents`: migrate what is **in** each given folder, not the folder: `FOLDER/*` goes to `DEST/*`
+  instead of `DEST/FOLDER/*` (see [Only what is in a folder](#only-what-is-in-a-folder---contents)).
 
 ```sh
 # Two folders of the current account into the folder "From old" of new@example.com:
@@ -64,6 +66,31 @@ gdrive files migrate 1AbC... 1DeF... --to new@example.com --into 1XyZ...
 # From an account that is not the current one, 8 files at a time:
 gdrive files migrate 1AbC... --from old@example.com --to new@example.com --jobs 8
 ```
+
+## Only what is in a folder: `--contents`
+
+Without `--contents`, a folder arrives as a folder of its name in the destination: `photos` becomes
+`DEST/photos`, with everything in it. With `--contents`, the items of `photos` go straight into the
+destination folder, and no `photos` folder is made there:
+
+```sh
+gdrive files migrate <FOLDER_ID> --to new@example.com --into <DEST_FOLDER_ID> --contents --dry-run
+```
+
+```text
+Found 4 files in 4 folders with a total size of 16 B
+create 2024/
+create a.txt (4 B)
+create 2024/d.txt (4 B)
+```
+
+The lines name each item by its place in the destination folder, without the name of the given folder.
+Everything else works as without the flag: folders of the same name in the destination folder are reused,
+files that are already there are skipped, a second run continues the first. A `FILE_ID` that is a file is
+migrated as usual. With several folders, what is in all of them goes into the same destination folder; two
+subfolders of one name, one in each, are treated like two folders of one name in one source folder (see
+[Limitations](#limitations)). With `--trash-source`, the items of the given folder go to the trash and the
+folder itself stays. `--contents` cannot be combined with `--archive`.
 
 ## What happens
 
@@ -373,6 +400,7 @@ client sees a file of the same name with other content.
 | `--to ACCOUNT` | the destination account (required) |
 | `--from ACCOUNT` | the source account; the current account by default |
 | `--into FOLDER_ID` | a folder of the destination account; the top of My Drive by default |
+| `--contents` | what is in each given folder goes straight into the destination folder, without a folder of its name |
 | `--dry-run` | print what would be done, change nothing |
 | `--trash-source` | move migrated source files and folders to the source's trash |
 | `--archive` | each `FILE_ID` as one tar file, `<name>.tar` (see [One tar file per folder](#one-tar-file-per-folder---archive)) |

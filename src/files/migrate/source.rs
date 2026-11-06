@@ -130,6 +130,29 @@ pub(super) struct SourceFolder {
     pub(super) error: Option<Error>,
 }
 
+impl SourceFolder {
+    /// Labels everything in the folder by its path from the folder, without the folder's own
+    /// name: as its items are placed in the destination with `--contents`.
+    pub(super) fn label_from_inside(&mut self) {
+        let prefix = format!("{}/", self.label);
+        let mut pending = self.children.iter_mut().collect::<Vec<_>>();
+        while let Some(node) = pending.pop() {
+            let label = match node {
+                SourceNode::File(item) => &mut item.label,
+                SourceNode::Folder(SourceFolder {
+                    label, children, ..
+                }) => {
+                    pending.extend(children.iter_mut());
+                    label
+                }
+            };
+            if let Some(inside) = label.strip_prefix(&prefix) {
+                *label = inside.to_owned();
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(super) enum SourceNode {
     File(SourceItem),
