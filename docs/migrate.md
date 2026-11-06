@@ -278,8 +278,9 @@ rules of a recursive download for Windows, macOS and Linux at once, wherever gdr
 control characters and `< > : " | ? *` become `_`, Windows device names and names ending in a dot or space
 get a `_`, and a name longer than 255 bytes is shortened with a tag of its file id. Two files of one name in
 a folder (also when they differ only in letter case) do not overwrite each other: one keeps the name, the
-others get `~` and 8 hex digits of their file id before the extension, `report~1a2b3c4d.pdf`. A name that cannot be used at all
-(`.`, `..`, an empty name) fails the archive, with the `gdrive files rename` command that fixes it. The
+others get `~` and 8 hex digits of their file id before the extension, `report~1a2b3c4d.pdf`. A name that
+cannot be used at all (`.`, `..`, an empty name) fails the archive, with the `gdrive files rename` command
+that fixes it. The
 archive is POSIX tar (pax): long and non-ASCII paths and files of 8 GiB and more extract with GNU tar,
 bsdtar (macOS, Windows) and other tar programs. Every entry has the file's modification time on Drive, mode
 644 (folders 755), and owner 0 with no user or group names; the same folder gives the same bytes on any
@@ -297,34 +298,40 @@ export (Forms, Sites, My Maps, Apps Script, ...), and a Google file whose export
 Drive exports. A folder that could not be listed, or that Drive listed incompletely, fails the archive
 before anything is uploaded: an archive that silently misses files is worse than none.
 
-**Running it again.** The archive file carries a property with a digest of what it was made from (every
-path, and the id, size and MD5 checksum of every file, or its modification time when it has no checksum, the
-id, modification time and format of every export). A second run with nothing changed in the source prints `already-there photos.tar` and uploads
-nothing. When the folder changed since (a file added, removed, renamed or edited), the archive in the
-destination no longer matches: the item fails with `it exists in the destination with different content`,
-and nothing is overwritten. Rename or remove the old archive to make a new one. Any other file named
-`<name>.tar` in the destination folder fails the same way. Two `FILE_ID`s with the same Drive name give two
-files named `<name>.tar` in the destination folder (Drive allows it), and a later run finds each one again by
-its own digest.
+**Running it again.** Once an archive is uploaded and checked (see Checks below), it gets a mark: a
+property with a digest of what it was made from (every path; the id, size and MD5 checksum of every file, or
+its modification time when it has no checksum; the id, modification time and format of every export). A
+second run with nothing changed in the source prints `already-there photos.tar` and uploads nothing. When
+the folder changed since (a file added, removed, renamed or edited), the archive in the destination no
+longer matches: the item fails with `it exists in the destination with different content`, and nothing is
+overwritten. Rename or remove the old archive to make a new one. Any other file named `<name>.tar` in the
+destination folder fails the same way, and so does an archive without the mark: one that failed its check,
+or that could not be marked (that run says so). A folder with a file that has neither an MD5 checksum nor a
+modification time is never already there, since nothing tells that file from an edited one. Two `FILE_ID`s
+with the same Drive name give two files named `<name>.tar` in the destination folder (Drive allows it), and
+a later run finds each one again by its own digest.
 
 **Continuing an interrupted run.** An archive that was interrupted (Ctrl-C, a lost network) is continued by
 running the same command again, like a large file: the session is recorded in the destination account's
-`uploads/` directory (see [Running it again](#running-it-again)), and the next run sends only what Drive
-does not hold yet. The files that lie wholly in the part Drive holds are not read from the source again; the
-file the interruption fell in is read again from its start, so that it is checked whole. Exports are not the
-same bytes twice,
-so the exports of an archive whose session is recorded are kept next to the session records, in
-`uploads/archive-<digest>.exports` (private to you, like the records), and the next run uses them instead
-of exporting again. The file is deleted when the archive is complete, and with the stale session records
-after a week. An archive is continued only when it would be the same bytes; otherwise, and for an archive
-with a file that has no MD5 checksum, it starts over.
+`uploads/` directory (see [Running it again](#running-it-again)). The next run first reads the part that
+Drive holds already again from the source, from the start of the archive, to check it, and then continues
+the upload where Drive stopped: that part is downloaded a second time but uploaded only once, and only what
+Drive does not hold yet is sent. Exports are not the same bytes twice, so the exports of an archive whose
+session is recorded are kept next to the session records, in `uploads/archive-<digest>.exports` (private
+to you, like the records), and the next run uses them instead of exporting again. The file is deleted when
+the archive is complete, and with the stale session records after a week. An archive is continued only
+when it would be the same bytes; otherwise, and for an archive with a file that has no MD5 checksum, it
+starts over.
 
-**Checks.** Each file is checked against its MD5 checksum on Drive as it is read, always from its first byte.
-A file that changes in the source while the archive is made (edited, resized, deleted) fails the archive
-with an error that names it, `'photos/a.txt' changed in the source while the archive was made; run the
-command again`, and no archive is created. Run the command again once the source is quiet. Only in a run
-that sends the whole archive is the MD5 checksum Drive computes for it compared with the bytes sent too; a
-continued run cannot, as it does not read the part Drive held already.
+**Checks.** Every archive that is completed, in one run or continued, is checked whole: each file against
+its MD5 checksum on Drive, from its first byte, as it is read, and the MD5 checksum Drive computes for the
+whole tar against the bytes read. A file that changes in the source while the archive is made (edited,
+resized, deleted) fails the archive with an error that names it, `'photos/a.txt' changed in the source while
+the archive was made; run the command again`, and no archive is created. Run the command again once the
+source is quiet. If Drive's checksum of the tar is not that of the bytes read (an earlier run sent other
+bytes than the source gives now, or bytes changed on the way), the item fails and the archive stays in the
+destination without its mark: delete it there and run the command again. The mark is written only after
+these checks.
 
 **Dry run.** `--dry-run --archive` prints what a real run would (`create NAME.tar`, `already-there`,
 `skip`, conflicts) without exporting anything, so the size it shows leaves out the exports and says so:
