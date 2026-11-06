@@ -811,6 +811,7 @@ fn a_blob_without_md5_is_told_apart_by_its_modification_time_in_the_manifest() {
     };
     let (one, two) = ("2025-01-01T00:00:00Z", "2025-01-02T00:00:00Z");
     assert_ne!(digest(None, one), digest(None, two));
+    assert_eq!(digest(None, one), digest(None, one));
 
     // With an md5, the time is no part of it: the input is what it was.
     let md5 = "0123456789ABCDEF0123456789abcdef";
@@ -823,4 +824,27 @@ fn a_blob_without_md5_is_told_apart_by_its_modification_time_in_the_manifest() {
     context.update(&3_u64.to_be_bytes());
     field(&mut context, md5.to_ascii_lowercase().as_bytes());
     assert_eq!(digest(Some(md5), one), hex(context.finish().as_ref()));
+}
+
+#[test]
+fn a_blob_without_md5_or_modification_time_makes_its_manifest_unlike_any_other() {
+    let digest = |modified_time| {
+        let mut manifest = Manifest::new();
+        manifest.folder("root");
+        manifest.blob(
+            "root/a.bin",
+            &Blob {
+                id: String::from("a"),
+                size: 3,
+                md5: None,
+                resource_key: None,
+                modified_time,
+            },
+        );
+        manifest.finish()
+    };
+    // The same listing twice: nothing would tell an edited file from the archived one.
+    assert_ne!(digest(None), digest(None));
+    let time = Some("2025-01-01T00:00:00Z".parse().unwrap());
+    assert_eq!(digest(time), digest(time));
 }

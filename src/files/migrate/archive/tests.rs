@@ -1076,3 +1076,36 @@ async fn an_archive_that_cannot_be_marked_fails_and_is_reported_as_different_nex
     );
     assert_eq!(dest.created().len(), 1);
 }
+
+#[tokio::test]
+async fn an_archive_of_a_file_without_md5_or_modification_time_is_never_already_there() {
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("photos", "photos", "root"),
+            FakeFile {
+                md5: None,
+                ..FakeFile::blob("a", "a.txt", "photos", "aaaa")
+            },
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    assert!(mark(&dest, &the_archive(&dest)).is_some());
+
+    // The same listing again: the file may have been edited, nothing tells.
+    let again = migrate(&source, &dest, settings(&["photos"])).await;
+    assert!(again.result.is_err());
+    assert!(
+        again.err.text().contains(
+            "Error: unable to migrate 'photos.tar': it exists in the destination with different \
+             content"
+        ),
+        "{}",
+        again.err.text()
+    );
+    assert_eq!(dest.created().len(), 1);
+}

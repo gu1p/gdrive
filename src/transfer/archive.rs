@@ -391,7 +391,8 @@ fn digits(n: usize) -> usize {
 /// exporting anything): per entry, in the order of the archive, its path and kind; for a blob
 /// its id, size and md5 (and its `modifiedTime` when it has no md5); for an exported Workspace
 /// file its id, `modifiedTime` and export format. A destination file whose `appProperties`
-/// carry it is that archive.
+/// carry it is that archive. A manifest with a blob that has neither md5 nor `modifiedTime` is
+/// unlike any other.
 pub(crate) struct Manifest {
     context: ring::digest::Context,
 }
@@ -417,12 +418,18 @@ impl Manifest {
         let md5 = blob.md5.as_deref().unwrap_or_default().to_ascii_lowercase();
         field(&mut self.context, md5.as_bytes());
         if blob.md5.is_none() {
-            // Without md5, the modification time tells another content apart, as DriveSource
-            // compares it before reading again.
-            field(
-                &mut self.context,
-                rfc3339(blob.modified_time.as_ref()).as_bytes(),
-            );
+            if let Some(time) = &blob.modified_time {
+                // Without md5, the modification time tells another content apart, as
+                // DriveSource compares it before reading again.
+                field(&mut self.context, rfc3339(Some(time)).as_bytes());
+            } else {
+                // With neither, nothing tells this file from an edited one of the same size: the
+                // manifest is made unlike any other, so that its archive is never already there
+                // and its exports cache is never used again.
+                let fresh = [fastrand::u64(..), fastrand::u64(..)];
+                field(&mut self.context, &fresh[0].to_be_bytes());
+                field(&mut self.context, &fresh[1].to_be_bytes());
+            }
         }
     }
 
