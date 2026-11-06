@@ -304,6 +304,12 @@ pub(crate) struct Behavior {
     /// The chunk of the file with this name that starts at this offset fails with 503 once,
     /// committing nothing.
     pub(crate) chunk_unavailable: HashMap<String, u64>,
+    /// The first chunk that starts at this offset gets a 404, and so does every later request to
+    /// its session: the session expired.
+    pub(crate) expire_session_at: Option<u64>,
+    /// The chunks of the resumable session of this number (0 the first one started) are kept
+    /// with their first byte changed: Drive holds other bytes than were sent.
+    pub(crate) corrupt_session: Option<usize>,
     /// Chunks that start at or after this offset get no reply, like a transfer that hangs.
     /// [`FakeDrive::wait_for_stalled_chunks`] waits until that many have arrived, and after
     /// [`FakeDrive::stop_stalling`] the next chunks are answered.
@@ -476,6 +482,8 @@ struct State {
     stalled_chunks: watch::Sender<usize>,
     /// [`FakeDrive::stop_stalling`] was called.
     stalling_stopped: AtomicBool,
+    /// The session that [`Behavior::expire_session_at`] expired, once it did.
+    expired_session: Mutex<Option<usize>>,
 }
 
 pub(crate) struct FakeDrive {
@@ -529,6 +537,7 @@ impl FakeDrive {
             media_arrived: watch::channel(false).0,
             stalled_chunks: watch::channel(0).0,
             stalling_stopped: AtomicBool::new(false),
+            expired_session: Mutex::new(None),
         });
 
         let server_state = Arc::clone(&state);
@@ -1203,7 +1212,17 @@ async fn session_request(
         .unwrap_or_default()
         .to_owned();
     let committed = this.received.len() as u64;
-    let response = if let Some(done) = &this.done {
+    let expired = {
+        let mut expired = state.expired_session.lock().expect("expired lock");
+        let due = first.is_some_and(|(first, _)| state.behavior.expire_session_at == Some(first));
+        if due && expired.is_none() {
+            *expired = Some(session);
+        }
+        *expired == Some(session)
+    };
+    let response = if expired {
+        error(StatusCode::NOT_FOUND, "Upload session expired.")
+    } else if let Some(done) = &this.done {
         json_response(StatusCode::OK, done)
     } else if let Some((first, last)) = first {
         let fault = {
@@ -1222,7 +1241,11 @@ async fn session_request(
                 "Content-Range does not match the body",
             )
         } else {
+            let start = this.received.len();
             this.received.extend_from_slice(&body);
+            if state.behavior.corrupt_session == Some(session) && !body.is_empty() {
+                this.received[start] ^= 0xff;
+            }
             if this.received.len() as u64 == this.total {
                 let metadata = this.metadata.clone();
                 let content = this.received.clone();

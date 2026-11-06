@@ -592,9 +592,10 @@ impl Migration {
             Some(&report),
             size,
             media_type,
-        )
-        .trust_continued_content();
-        // Only resumable uploads have sessions to record.
+        );
+        // Only resumable uploads have sessions to record. A continued session is checked whole,
+        // as one run (no trust_continued_content): the part it holds is read again, see
+        // transfer/archive.rs.
         if let Some(dir) = &self.options.session_dir {
             if size > self.options.multipart_threshold {
                 let identity =

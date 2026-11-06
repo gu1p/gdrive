@@ -1253,7 +1253,6 @@ impl<'a> Upload<'a> {
                     .await
                     .map_err(UploadError::Read)?;
             }
-            source.prepare(offset).await.map_err(UploadError::Read)?;
             let request = Request::put(url)
                 .header(
                     "Content-Range",

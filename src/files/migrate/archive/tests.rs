@@ -560,6 +560,45 @@ fn files_in(dir: &Path) -> Vec<String> {
     names
 }
 
+/// Options of uploads in chunks of 256 KiB whose sessions are recorded in `uploads`.
+fn continuing(uploads: &Path) -> UploadOptions {
+    UploadOptions {
+        chunk_size: CHUNK_ALIGNMENT,
+        multipart_threshold: 0,
+        session_dir: Some(uploads.to_path_buf()),
+        ..UploadOptions::default()
+    }
+}
+
+/// A first run of `big` that `dest` interrupts: its second chunk never gets a reply (its
+/// behavior has `chunks_stalled_from` the second chunk), and the run is cancelled while it
+/// waits. The network is back afterwards.
+async fn interrupted(source: &FakeDrive, dest: &FakeDrive, options: &UploadOptions) {
+    let first = migrate_with(
+        source,
+        dest,
+        settings(&["big"]),
+        options,
+        dest.wait_for_stalled_chunks(1),
+    )
+    .await;
+    assert!(
+        first.summary().ends_with("; interrupted"),
+        "{}",
+        first.summary()
+    );
+    dest.stop_stalling();
+}
+
+/// The first bytes of the chunks the destination took, over all its sessions.
+fn accepted(dest: &FakeDrive) -> Vec<u64> {
+    dest.chunks()
+        .iter()
+        .filter(|chunk| matches!(chunk.status, 200 | 308))
+        .filter_map(|chunk| chunk.first)
+        .collect()
+}
+
 /// Checks what an interrupted run left in `uploads`, the session record of the archive and its
 /// exports; the manifest digest.
 fn left_by_the_first_run(uploads: &Path) -> String {
@@ -607,12 +646,7 @@ fn left_by_the_first_run(uploads: &Path) -> String {
 async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs_exports() {
     let dir = tempfile::tempdir().unwrap();
     let uploads = dir.path().join("uploads");
-    let options = UploadOptions {
-        chunk_size: CHUNK_ALIGNMENT,
-        multipart_threshold: 0,
-        session_dir: Some(uploads.clone()),
-        ..UploadOptions::default()
-    };
+    let options = continuing(&uploads);
     let source = FakeDrive::start(
         large_tree(),
         Behavior {
@@ -633,26 +667,12 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
     )
     .await;
 
-    let first = migrate_with(
-        &source,
-        &dest,
-        settings(&["big"]),
-        &options,
-        dest.wait_for_stalled_chunks(1),
-    )
-    .await;
-
-    assert!(
-        first.summary().ends_with("; interrupted"),
-        "{}",
-        first.summary()
-    );
+    interrupted(&source, &dest, &options).await;
     assert!(dest.created().is_empty());
     assert_eq!(source.exports().len(), 1);
     let manifest = left_by_the_first_run(&uploads);
 
-    // The next run: the network is back.
-    dest.stop_stalling();
+    // The next run.
     let media_before = source.media_ranges().len();
     assert_eq!(source.media()[0], "first", "read by the first run");
     let chunks_before = dest.chunks().len();
@@ -675,6 +695,11 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
         chunks,
         [None, Some(CHUNK_ALIGNMENT), Some(2 * CHUNK_ALIGNMENT)]
     );
+    assert_eq!(
+        accepted(&dest),
+        [0, CHUNK_ALIGNMENT, 2 * CHUNK_ALIGNMENT],
+        "over both runs, Drive took each byte of the archive once"
+    );
     let archive = the_archive(&dest);
     assert_eq!(archive.app_properties[PROPERTY], manifest);
     let unpacked = unpack(&archive.content)
@@ -696,12 +721,15 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
         "the export of the first run"
     );
     assert_eq!(source.exports().len(), 1, "not exported again");
-    // The entries wholly in what the session held (the folder and 0.bin) are not read again;
-    // a.bin, which the session's offset falls in, is read again from its first byte to be
-    // hashed whole.
+    // What the session held is read again from the source, from the first byte of the archive,
+    // to check the whole archive; it is not uploaded again.
     assert_eq!(
         source.media_ranges()[media_before..],
-        [(String::from("a"), None), (String::from("z"), None)]
+        [
+            (String::from("first"), None),
+            (String::from("a"), None),
+            (String::from("z"), None),
+        ]
     );
     assert_eq!(
         files_in(&uploads),
@@ -817,92 +845,83 @@ async fn a_doc_whose_export_is_too_large_is_one_skipped_item() {
 }
 
 #[tokio::test]
-async fn a_continued_run_reads_the_start_of_the_file_before_it_sends_a_chunk() {
-    let dir = tempfile::tempdir().unwrap();
-    let uploads = dir.path().join("uploads");
-    let options = UploadOptions {
-        chunk_size: CHUNK_ALIGNMENT,
-        multipart_threshold: 0,
-        session_dir: Some(uploads.clone()),
-        ..UploadOptions::default()
-    };
-    let files = || {
-        vec![
-            FakeFile::folder("big", "big", "root"),
-            FakeFile::blob(
-                "b",
-                "b.bin",
-                "big",
-                &std::iter::repeat_n('b', 900_000).collect::<String>(),
-            ),
-        ]
-    };
-    let source = FakeDrive::start(files(), Behavior::default()).await;
-    let dest = FakeDrive::start(
-        Vec::new(),
-        Behavior {
-            chunks_stalled_from: Some(CHUNK_ALIGNMENT),
-            ..Behavior::default()
-        },
-    )
-    .await;
-    let first = migrate_with(
-        &source,
-        &dest,
-        settings(&["big"]),
-        &options,
-        dest.wait_for_stalled_chunks(1),
-    )
-    .await;
-    assert!(
-        first.summary().ends_with("; interrupted"),
-        "{}",
-        first.summary()
-    );
+async fn a_continued_archive_whose_session_expires_is_sent_again_whole_and_checked() {
+    for corrupt in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let options = continuing(&dir.path().join("uploads"));
+        let content = std::iter::repeat_n('b', 900_000).collect::<String>();
+        let source = FakeDrive::start(
+            vec![
+                FakeFile::folder("big", "big", "root"),
+                FakeFile::blob("b", "b.bin", "big", &content),
+            ],
+            Behavior::default(),
+        )
+        .await;
+        // The first run stops after one chunk; in the next, the session expires at its first
+        // chunk, and the new session (the second one) keeps what it is sent, or other bytes.
+        let dest = FakeDrive::start(
+            Vec::new(),
+            Behavior {
+                chunks_stalled_from: Some(CHUNK_ALIGNMENT),
+                expire_session_at: Some(CHUNK_ALIGNMENT),
+                corrupt_session: corrupt.then_some(1),
+                ..Behavior::default()
+            },
+        )
+        .await;
+        interrupted(&source, &dest, &options).await;
 
-    // The next run continues inside b.bin, which cannot be read now: the start of b.bin is read
-    // before the continued chunk is sent, so that chunk is never sent.
-    dest.stop_stalling();
-    let unreadable = FakeDrive::start(
-        files(),
-        Behavior {
-            media_missing: std::collections::HashMap::from([(String::from("b"), Duration::ZERO)]),
-            ..Behavior::default()
-        },
-    )
-    .await;
-    let writes_before = dest.writes().len();
-    let second = migrate_with(
-        &unreadable,
-        &dest,
-        settings(&["big"]),
-        &options,
-        std::future::pending(),
-    )
-    .await;
+        let chunks_before = dest.chunks().len();
+        let second = migrate_with(
+            &source,
+            &dest,
+            settings(&["big"]),
+            &options,
+            std::future::pending(),
+        )
+        .await;
 
-    assert!(second.result.is_err());
-    let text = second.err.text();
-    assert!(
-        text.contains(
-            "Error: unable to migrate 'big.tar': unable to read 'big/b.bin' from the source; run \
-             the command again"
-        ),
-        "{text}"
-    );
-    // Every request that is not a GET, as it arrives: only the question where the session
-    // stands, an empty PUT; no chunk was sent.
-    assert_eq!(
-        dest.writes()[writes_before..],
-        ["PUT /upload-session/0"],
-        "{text}"
-    );
-    assert_eq!(dest.chunks().last().map(|chunk| chunk.first), Some(None));
-    assert_eq!(unreadable.media_ranges(), [(String::from("b"), None)]);
-    assert!(
-        files_in(&uploads)
+        let chunks = dest.chunks()[chunks_before..]
             .iter()
-            .any(|name| Path::new(name).extension().is_some_and(|ext| ext == "json")),
-        "the session is kept for the next run"
-    );
+            .map(|chunk| (chunk.first, chunk.status))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            chunks[..2],
+            [(None, 308), (Some(CHUNK_ALIGNMENT), 404)],
+            "continued, then expired"
+        );
+        let resent = chunks[2..]
+            .iter()
+            .map(|(first, _)| *first)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resent,
+            [
+                Some(0),
+                Some(CHUNK_ALIGNMENT),
+                Some(2 * CHUNK_ALIGNMENT),
+                Some(3 * CHUNK_ALIGNMENT)
+            ],
+            "the new session gets everything from byte 0"
+        );
+        let archive = the_archive(&dest);
+        if corrupt {
+            assert!(second.result.is_err());
+            let text = second.err.text();
+            assert!(
+                text.contains(&format!(
+                    "Error: unable to migrate 'big.tar': the archive in the destination (id {}) \
+                     is not what was sent",
+                    archive.id
+                )),
+                "{text}"
+            );
+        } else {
+            second.assert_ok();
+            let unpacked = unpack(&archive.content);
+            assert_eq!(unpacked.len(), 2);
+            assert_eq!(unpacked[1].3, content.as_bytes());
+        }
+    }
 }

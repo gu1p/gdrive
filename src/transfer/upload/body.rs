@@ -32,13 +32,6 @@ pub(crate) trait Source {
 
     /// The size of the source now.
     fn size(&mut self) -> impl Future<Output = io::Result<u64>>;
-
-    /// Called before a request that reads from `offset` is sent: a source that has work to do
-    /// before it can serve that offset does it here, with no request open. Nothing by default.
-    fn prepare(&mut self, offset: u64) -> impl Future<Output = io::Result<()>> {
-        let _ = offset;
-        std::future::ready(Ok(()))
-    }
 }
 
 /// A local file, read with tokio's file I/O.
