@@ -2372,11 +2372,17 @@ async fn ask_puts_each_conflict_to_the_user_and_a_no_is_no_failure() {
         questions,
         [
             "\nphotos/2024/d.txt is in the destination with other content:\n  source:      4 B\n  \
-             destination: 4 B\nReplace the destination's file? [y/N] ",
+             \x20            https://drive.google.com/file/d/d/view\n  destination: 4 B\n  \
+             \x20            https://drive.google.com/file/d/old-d/view\n\
+             Replace the destination's file? [y/N] ",
             "\nphotos/a.txt is in the destination with other content:\n  source:      4 B\n  \
-             destination: 1 B\nReplace the destination's file? [y/N] ",
+             \x20            https://drive.google.com/file/d/a/view\n  destination: 1 B\n  \
+             \x20            https://drive.google.com/file/d/old-a/view\n\
+             Replace the destination's file? [y/N] ",
             "\nphotos/b.txt is in the destination with other content:\n  source:      2 B\n  \
-             destination: 3 B\nReplace the destination's file? [y/N] ",
+             \x20            https://drive.google.com/file/d/b/view\n  destination: 3 B\n  \
+             \x20            https://drive.google.com/file/d/old-b/view\n\
+             Replace the destination's file? [y/N] ",
         ]
     );
     assert_eq!(dest.updates(), [(String::from("old-b"), b"bb".to_vec())]);

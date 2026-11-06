@@ -52,7 +52,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 
 use super::{
-    failed,
+    ask, failed,
     source::{label, SourceFolder, SourceItem, SourceNode},
     Error, Existing, Incoming, Match, Migration, Place, Settings, Settled, Smaller, Tally,
 };
@@ -343,6 +343,14 @@ impl Plan {
         u64::try_from(exports).unwrap_or(u64::MAX)
     }
 
+    /// Where a browser opens what the archive is made of: the folder, or the one file.
+    fn link(&self) -> String {
+        match self.entries.first().map(|entry| &entry.kind) {
+            Some(Kind::Folder) => ask::folder_link(&self.root_id),
+            _ => ask::file_link(&self.root_id),
+        }
+    }
+
     /// The size of the archive with every export empty: what the listing tells.
     fn planned_size(&self) -> u64 {
         let entries = self.entries.iter().map(|entry| entry.entry(None)).collect();
@@ -586,7 +594,11 @@ impl Migration {
         context: &JobContext,
     ) -> Result<Option<(Smaller, bool)>, Error> {
         let (name, label) = (&plan.name, &plan.label);
-        let least = Incoming::Archive(plan.least_size());
+        let link = plan.link();
+        let least = Incoming::Archive {
+            size: plan.least_size(),
+            link: &link,
+        };
         match self.settle(place, name, label, least, context).await? {
             Settled::Replace(old) => return Ok(Some((old, false))),
             Settled::Keep => return Ok(None),
@@ -594,7 +606,10 @@ impl Migration {
         }
         if plan.exports() > 0 {
             // Large enough exports make it larger than any file.
-            let most = Incoming::Archive(u64::MAX);
+            let most = Incoming::Archive {
+                size: u64::MAX,
+                link: &link,
+            };
             if let Settled::Replace(old) = self.settle(place, name, label, most, context).await? {
                 return Ok(Some((old, true)));
             }
@@ -712,7 +727,8 @@ impl Migration {
         let size = layout.size();
         let label = &plan.label;
         let smaller = if replacing {
-            let incoming = Incoming::Archive(size);
+            let link = plan.link();
+            let incoming = Incoming::Archive { size, link: &link };
             match self
                 .settle(place, &plan.name, label, incoming, context)
                 .await?

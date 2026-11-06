@@ -1502,7 +1502,10 @@ async fn ask_puts_a_changed_folders_archive_to_the_user() {
         questions[0],
         format!(
             "\nphotos.tar is in the destination with other content:\n  new archive: {now}\n  \
-             destination: {was}\nReplace the destination's file? [y/N] "
+             \x20            https://drive.google.com/drive/folders/photos\n  destination: {was}\n  \
+             \x20            https://drive.google.com/file/d/{}/view\n\
+             Replace the destination's file? [y/N] ",
+            first.id
         )
     );
     assert!(

@@ -283,7 +283,9 @@ gdrive files migrate <FOLDER_ID> --to new@example.com --into <DEST_FOLDER_ID> --
 ```text
 photos/report.xlsx is in the destination with other content:
   source:      1.2 MB, changed 2026-11-05 14:03 UTC by Maria Silva
+               https://drive.google.com/file/d/1AbC.../view
   destination: 1.1 MB, changed 2026-10-28 09:15 UTC by João Lima
+               https://drive.google.com/file/d/1DeF.../view
 Replace the destination's file? [y/N]
 ```
 
@@ -293,7 +295,8 @@ Replace the destination's file? [y/N]
 - Anything else, also just Enter, leaves the destination's file as it is: `keep-destination PATH`. That
   item is settled and is **not** a failure, so the run goes on and can end with exit status 0. With
   `--trash-source`, its source file stays where it is.
-- The times are UTC. `by NAME` is who changed the file last, when Drive tells.
+- The times are UTC. `by NAME` is who changed the file last, when Drive tells. The link under each file
+  opens it in a browser, to compare the two; for a new archive it opens the folder it is made of.
 - Questions come one at a time, and the lines of the other items wait until the answer. The other
   transfers go on in the background meanwhile. The progress display is off with `--ask`. A warning of a
   transfer in the background (a retry, `--print-chunk-info`) can still appear under a question, which goes

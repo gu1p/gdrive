@@ -646,8 +646,11 @@ enum Settled {
 /// The content of an item in conflict, which would go into the destination's file.
 enum Incoming<'a> {
     File(&'a SourceFile),
-    /// A new archive of that many bytes.
-    Archive(u64),
+    /// A new archive of that many bytes, of the source item that `link` opens.
+    Archive {
+        size: u64,
+        link: &'a str,
+    },
 }
 
 /// How a source file compares with the destination's files of its name.
@@ -1284,7 +1287,7 @@ impl Migration {
         }
         let size = match &incoming {
             Incoming::File(file) => file.content_size(),
-            Incoming::Archive(size) => Some(*size),
+            Incoming::Archive { size, .. } => Some(*size),
         };
         let (Some(size), Some(old)) = (size, place.existing.only_file(name)) else {
             return Ok(Settled::Conflict);
@@ -1352,13 +1355,15 @@ impl Migration {
                         size: Some(size),
                         modified: file.modified_time,
                         by: None,
+                        link: Some(ask::file_link(&file.id)),
                     },
                 };
                 ("source", shown)
             }
-            Incoming::Archive(size) => {
+            Incoming::Archive { size, link } => {
                 let shown = Side {
                     size: Some(size),
+                    link: Some(link.to_owned()),
                     ..Side::default()
                 };
                 ("new archive", shown)

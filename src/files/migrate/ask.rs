@@ -32,7 +32,7 @@ use crate::{
 
 /// What is read of a file for its question: fresh, not from a listing.
 pub(super) const FIELDS: &str =
-    "id,size,md5Checksum,modifiedTime,trashed,lastModifyingUser(displayName)";
+    "id,size,md5Checksum,modifiedTime,trashed,lastModifyingUser(displayName),webViewLink";
 
 /// Asks the user about a conflict.
 pub(super) trait Ask: Debug + Send + Sync {
@@ -47,6 +47,8 @@ pub(super) struct Side {
     pub(super) modified: Option<DateTime<Utc>>,
     /// Who changed it last, as Drive names them.
     pub(super) by: Option<String>,
+    /// Where to open it in a browser.
+    pub(super) link: Option<String>,
 }
 
 impl Side {
@@ -58,6 +60,10 @@ impl Side {
                 .last_modifying_user
                 .as_ref()
                 .and_then(|user| user.display_name.clone()),
+            link: file
+                .web_view_link
+                .clone()
+                .or_else(|| file.id.as_deref().map(file_link)),
         }
     }
 
@@ -77,18 +83,30 @@ impl Side {
     }
 }
 
+/// Where Drive opens the file `id` in a browser, when Drive did not say.
+pub(super) fn file_link(id: &str) -> String {
+    format!("https://drive.google.com/file/d/{id}/view")
+}
+
+/// Where Drive opens the folder `id` in a browser.
+pub(super) fn folder_link(id: &str) -> String {
+    format!("https://drive.google.com/drive/folders/{id}")
+}
+
 /// The question about the item `label`, whose content (`new`, called `what`: the source's file,
-/// the new archive) is other than that of the destination's file of its name (`old`).
+/// the new archive) is other than that of the destination's file of its name (`old`). Each
+/// side has its link below it, to open both in a browser.
 pub(super) fn question(label: &str, what: &str, new: &Side, old: &Side) -> String {
     let width = what.len().max("destination".len()) + 1;
-    format!(
-        "\n{label} is in the destination with other content:\n  {:<width$} {}\n  {:<width$} {}\n\
-         Replace the destination's file? [y/N] ",
-        format!("{what}:"),
-        new.describe(),
-        "destination:",
-        old.describe(),
-    )
+    let mut text = format!("\n{label} is in the destination with other content:\n");
+    for (what, side) in [(what, new), ("destination", old)] {
+        let _ = writeln!(text, "  {:<width$} {}", format!("{what}:"), side.describe());
+        if let Some(link) = &side.link {
+            let _ = writeln!(text, "  {:<width$} {}", "", local_name::printable(link));
+        }
+    }
+    text.push_str("Replace the destination's file? [y/N] ");
+    text
 }
 
 /// Whether `answer`, a line the user typed, is a yes. Anything else is a no, and so is no
@@ -206,11 +224,13 @@ mod tests {
             size: Some(1_200_000),
             modified: Some(Utc.with_ymd_and_hms(2026, 11, 5, 14, 3, 59).unwrap()),
             by: Some(String::from("Maria\u{1b}[31m")),
+            link: Some(String::from("https://drive.google.com/file/d/src/view")),
         };
         let destination = Side {
             size: Some(1_100_000),
             modified: Some(Utc.with_ymd_and_hms(2026, 10, 28, 9, 15, 0).unwrap()),
             by: None,
+            link: Some(file_link("dst")),
         };
 
         assert_eq!(
@@ -218,21 +238,25 @@ mod tests {
             format!(
                 "\nphotos/report.xlsx is in the destination with other content:\n  \
                  source:      {}, changed 2026-11-05 14:03 UTC by Maria\\u{{1b}}[31m\n  \
-                 destination: {}, changed 2026-10-28 09:15 UTC\n\
+                 \x20            https://drive.google.com/file/d/src/view\n  \
+                 destination: {}, changed 2026-10-28 09:15 UTC\n  \
+                 \x20            https://drive.google.com/file/d/dst/view\n\
                  Replace the destination's file? [y/N] ",
                 human_size(1_200_000),
                 human_size(1_100_000)
             )
         );
-        // An archive that is made now has a size only.
+        // An archive that is made now has a size and the folder it is made of.
         let archive = Side {
             size: Some(2048),
+            link: Some(folder_link("photos")),
             ..Side::default()
         };
         let asked = question("photos.tar", "new archive", &archive, &Side::default());
         assert!(
             asked.contains(&format!(
-                "  new archive: {}\n  destination: size unknown\n",
+                "  new archive: {}\n               https://drive.google.com/drive/folders/photos\n  \
+                 destination: size unknown\n",
                 human_size(2048)
             )),
             "{asked}"
