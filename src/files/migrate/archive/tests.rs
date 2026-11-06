@@ -134,6 +134,8 @@ fn settings(file_ids: &[&str]) -> Settings {
         trash_source: false,
         archive: true,
         contents: false,
+        replace_smaller: false,
+        ask: None,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
@@ -1261,4 +1263,307 @@ async fn inside_one_account_an_archive_never_goes_into_what_it_archives() {
     }
     assert!(drive.created().is_empty());
     assert_eq!(drive.writes(), Vec::<String>::new());
+}
+
+fn replacing(settings: Settings) -> Settings {
+    Settings {
+        replace_smaller: true,
+        ..settings
+    }
+}
+
+fn conflict_of_the_archive(migrated: &Migrated) -> bool {
+    migrated.result.is_err()
+        && migrated.err.text().contains(
+            "Error: unable to migrate 'photos.tar': it exists in the destination with different \
+             content",
+        )
+}
+
+#[tokio::test]
+async fn with_replace_smaller_the_archive_of_a_folder_that_grew_replaces_the_old_one() {
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    let first = the_archive(&dest);
+    let first_mark = mark(&dest, &first).unwrap();
+    let was = human_size(first.content.len() as u64);
+
+    // A file more in the folder.
+    let mut grown = source_tree();
+    grown.push(FakeFile::blob("new", "new.txt", "photos", "new file").modified(FILE_TIME));
+    let source = FakeDrive::start(grown, Behavior::default()).await;
+
+    // Without the flag it is the conflict it was.
+    let refused = migrate(&source, &dest, settings(&["photos"])).await;
+    assert!(conflict_of_the_archive(&refused), "{}", refused.err.text());
+    assert_eq!(dest.updates(), []);
+
+    let writes = dest.writes().len();
+    let dry = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            ..replacing(settings(&["photos"]))
+        },
+    )
+    .await;
+    dry.assert_ok();
+    // Without the exports it is not larger than the old one, which has them.
+    let lines = dry.out.lines();
+    let line = lines.last().unwrap();
+    assert!(line.starts_with("replace photos.tar ("), "{line}");
+    assert!(
+        line.ends_with(&format!(
+            " without the exports of 2 Google Workspace files, was {was}) if the exports make \
+             it larger"
+        )),
+        "{line}"
+    );
+    assert!(
+        dry.summary().ends_with("; 1 smaller file to replace"),
+        "{}",
+        dry.summary()
+    );
+    assert_eq!(dest.writes().len(), writes, "a dry run writes nothing");
+
+    let replaced = migrate(&source, &dest, replacing(settings(&["photos"]))).await;
+
+    replaced.assert_ok();
+    // The new archive is the new content of the same file.
+    let updates = dest.updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].0, first.id);
+    assert_eq!(dest.created().len(), 1, "no second file");
+    let mut expected = archived_tree();
+    expected.push(file("photos/new.txt", "new file"));
+    let mut unpacked = unpack(&updates[0].1);
+    expected.sort();
+    unpacked.sort();
+    assert_eq!(unpacked, expected);
+    let line = format!(
+        "replace photos.tar ({}, was {was})",
+        human_size(updates[0].1.len() as u64)
+    );
+    assert!(
+        replaced.out.lines().contains(&line),
+        "{}",
+        replaced.out.text()
+    );
+    assert!(
+        replaced.summary().ends_with("; 1 smaller file replaced"),
+        "{}",
+        replaced.summary()
+    );
+    // Marked anew, with the md5 of the new bytes.
+    let stored = dest.stored(&first.id).unwrap().app_properties;
+    assert_ne!(stored[PROPERTY], first_mark);
+    assert_eq!(
+        stored[PROPERTY_MD5],
+        format!("{:x}", md5::compute(&updates[0].1))
+    );
+
+    let again = migrate(&source, &dest, replacing(settings(&["photos"]))).await;
+
+    again.assert_ok();
+    assert_eq!(again.out.lines()[1..], ["already-there photos.tar"]);
+    assert_eq!(dest.updates().len(), 1);
+}
+
+/// `photos` with files that have content only: the size of its archive is known from the listing.
+fn plain_tree() -> Vec<FakeFile> {
+    source_tree()
+        .into_iter()
+        .filter(|file| !["doc", "drawing", "link", "form"].contains(&file.id.as_str()))
+        .collect()
+}
+
+#[tokio::test]
+async fn with_replace_smaller_only_a_larger_archive_replaces_and_a_dry_run_tells() {
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let source = FakeDrive::start(plain_tree(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    let first = the_archive(&dest);
+    let size = first.content.len() as u64;
+
+    // A file less in the folder: a smaller archive, which replaces nothing.
+    let shrunk = plain_tree()
+        .into_iter()
+        .filter(|file| file.id != "uni")
+        .collect();
+    let source = FakeDrive::start(shrunk, Behavior::default()).await;
+    for dry_run in [true, false] {
+        let migrated = migrate(
+            &source,
+            &dest,
+            Settings {
+                dry_run,
+                ..replacing(settings(&["photos"]))
+            },
+        )
+        .await;
+
+        assert!(
+            conflict_of_the_archive(&migrated),
+            "{}",
+            migrated.err.text()
+        );
+    }
+    assert_eq!(dest.updates(), []);
+    assert_eq!(
+        dest.stored(&first.id).unwrap().content,
+        Some(String::from_utf8_lossy(&first.content).into_owned())
+    );
+
+    // A file more: one header and one block of content more, which a dry run knows.
+    let mut grown = plain_tree();
+    grown.push(FakeFile::blob("new", "new.txt", "photos", "new file").modified(FILE_TIME));
+    let source = FakeDrive::start(grown, Behavior::default()).await;
+    let dry = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            ..replacing(settings(&["photos"]))
+        },
+    )
+    .await;
+
+    dry.assert_ok();
+    assert_eq!(
+        dry.out.lines()[1..],
+        [format!(
+            "replace photos.tar ({}, was {})",
+            human_size(size + 1024),
+            human_size(size)
+        )]
+    );
+    assert_eq!(dest.updates(), []);
+}
+
+/// Answers every question of `--ask` with `answer`, and counts them.
+#[derive(Debug)]
+struct Answering {
+    answer: bool,
+    questions: std::sync::Mutex<Vec<String>>,
+}
+
+impl crate::files::migrate::ask::Ask for Answering {
+    fn ask(&self, question: String) -> futures::future::BoxFuture<'_, bool> {
+        self.questions.lock().unwrap().push(question);
+        Box::pin(async move { self.answer })
+    }
+}
+
+#[tokio::test]
+async fn ask_puts_a_changed_folders_archive_to_the_user() {
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let source = FakeDrive::start(plain_tree(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    let first = the_archive(&dest);
+    let was = human_size(first.content.len() as u64);
+
+    // A file less in the folder, one header and one block of content: the new archive is the
+    // smaller one.
+    let shrunk = plain_tree()
+        .into_iter()
+        .filter(|file| file.id != "a")
+        .collect();
+    let source = FakeDrive::start(shrunk, Behavior::default()).await;
+    let asking = |answer| {
+        let user = Arc::new(Answering {
+            answer,
+            questions: std::sync::Mutex::new(Vec::new()),
+        });
+        let settings = Settings {
+            ask: Some(user.clone()),
+            ..settings(&["photos"])
+        };
+        (user, settings)
+    };
+
+    let (user, no) = asking(false);
+    let kept = migrate(&source, &dest, no).await;
+
+    kept.assert_ok();
+    assert_eq!(kept.out.lines()[1..], ["keep-destination photos.tar"]);
+    assert_eq!(dest.updates(), []);
+    let questions = user.questions.lock().unwrap().clone();
+    assert_eq!(questions.len(), 1);
+    let now = human_size(first.content.len() as u64 - 1024);
+    assert_eq!(
+        questions[0],
+        format!(
+            "\nphotos.tar is in the destination with other content:\n  new archive: {now}\n  \
+             destination: {was}\nReplace the destination's file? [y/N] "
+        )
+    );
+    assert!(
+        kept.summary().ends_with(
+            "0 already there, 0 skipped (unsupported), 0 failed, 0 cancelled; 0 files replaced, \
+             1 conflict left alone"
+        ),
+        "{}",
+        kept.summary()
+    );
+
+    let (_, yes) = asking(true);
+    let replaced = migrate(&source, &dest, yes).await;
+
+    replaced.assert_ok();
+    let updates = dest.updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].0, first.id);
+    assert_eq!(updates[0].1.len(), first.content.len() - 1024);
+    assert_eq!(
+        replaced.out.lines()[1..],
+        [format!("replace photos.tar ({now}, was {was})")]
+    );
+    // It is the archive of the folder as it is now.
+    let again = migrate(&source, &dest, settings(&["photos"])).await;
+    again.assert_ok();
+    assert_eq!(again.out.lines()[1..], ["already-there photos.tar"]);
+}
+
+#[tokio::test]
+async fn a_dry_run_of_an_archive_of_exports_only_promises_no_replace() {
+    // A Google Docs file by its id: without its export there is nothing to archive.
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::native("doc", "notes", "root", DOCUMENT, "exported document")
+                .modified(FILE_TIME),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![FakeFile::blob("old", "notes.tar", "root", "small")],
+        Behavior::default(),
+    )
+    .await;
+
+    let dry = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            ..replacing(settings(&["doc"]))
+        },
+    )
+    .await;
+
+    dry.assert_ok();
+    let lines = dry.out.lines();
+    let line = lines.last().unwrap();
+    assert!(
+        line.starts_with("replace notes.tar (") && line.ends_with(" if the exports make it larger"),
+        "{line}"
+    );
 }

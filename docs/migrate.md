@@ -225,7 +225,88 @@ A migration can always be run again with the same arguments:
   finish.
 
 A file that conflicts (same name, other content) keeps failing until you rename or remove one of the two
-files.
+files, let the larger one win with `--replace-smaller`, or decide each one yourself with `--ask`.
+
+## When a file grew in the source: `--replace-smaller`
+
+A destination file of the same name with other content is a conflict: the item fails and nothing is
+overwritten. With `--replace-smaller`, one case is settled without you: when the destination's file has
+**fewer bytes** than the source's, it gets the source's content. This fits folders where people mostly add
+to things, so that the larger file is the newer one.
+
+```sh
+gdrive files migrate <FOLDER_ID> --to new@example.com --into <DEST_FOLDER_ID> --replace-smaller --dry-run
+```
+
+```text
+replace photos/report.xlsx (1.2 MB, was 1.1 MB)
+```
+
+- The file is replaced **in place**: the same Drive file gets a new version, so its id, folder, sharing and
+  links stay. Drive keeps the earlier content as a previous version of the file for a limited time (30 days
+  for most files, see "Manage versions" in Drive).
+- Only a smaller file is replaced. A destination file of the same size or larger with other content is the
+  conflict it was.
+- Only when the destination folder has exactly one file of that name. With two or more, or when the file of
+  that name is a Google Docs, Sheets or Slides file, the item is the conflict it was. Google Workspace files
+  of the source are never replaced either: they are matched by name and type.
+- Right before it is replaced, the destination folder is listed again for that name. The file must still be
+  the only one of its name there, with the content that was listed. If it was changed, renamed, moved, put
+  in the trash, or got a namesake since, the item fails with `the file of this name in the destination
+  changed during the migration; it was not replaced`.
+- One run replaces a file once. When two source files of one name would replace the same destination file,
+  the first one does and the other one is a conflict. A file that another item of the run found its own
+  content in (`already-there`), or created, is not replaced either.
+- The new content is checked by MD5 like any migrated file, and the destination file is read once more
+  after the upload: it must hold what was sent. With `--trash-source`, the source file goes to the trash
+  only after that.
+- The summary ends with `; N smaller files replaced` (`to replace` in a dry run).
+- One thing gdrive cannot see: someone changing the destination file **while** it is being replaced. Drive
+  has no conditional update, so the replacement wins, and their content is the earlier version that Drive
+  keeps.
+
+With `--archive`, the same holds for the tar file: when the folder got more files since its archive was
+made, the new archive is larger and replaces the old one, as a new version of the same file, and gets its
+mark once it is checked. A new archive that is not larger than the file there is the conflict it was. A dry
+run knows the size of an archive without its exports only: for an archive with Google Workspace files it
+may print `replace photos.tar (...) if the exports make it larger`.
+
+## Deciding each conflict yourself: `--ask`
+
+With `--ask`, gdrive stops at each conflict that a replace can settle, shows both files as Drive has them at
+that moment, and asks:
+
+```sh
+gdrive files migrate <FOLDER_ID> --to new@example.com --into <DEST_FOLDER_ID> --ask
+```
+
+```text
+photos/report.xlsx is in the destination with other content:
+  source:      1.2 MB, changed 2026-11-05 14:03 UTC by Maria Silva
+  destination: 1.1 MB, changed 2026-10-28 09:15 UTC by João Lima
+Replace the destination's file? [y/N]
+```
+
+- `y` or `yes` replaces the destination's file with the source's, in place and with the same checks as
+  `--replace-smaller` (above), whichever of the two is larger. The line is `replace PATH (new size, was old
+  size)`.
+- Anything else, also just Enter, leaves the destination's file as it is: `keep-destination PATH`. That
+  item is settled and is **not** a failure, so the run goes on and can end with exit status 0. With
+  `--trash-source`, its source file stays where it is.
+- The times are UTC. `by NAME` is who changed the file last, when Drive tells.
+- Questions come one at a time, and the lines of the other items wait until the answer. The other
+  transfers go on in the background meanwhile. The progress display is off with `--ask`. A warning of a
+  transfer in the background (a retry, `--print-chunk-info`) can still appear under a question, which goes
+  on waiting for your answer.
+- Asked about are the conflicts that one file can settle: the destination folder has exactly one file of
+  that name, and it is not a Google Docs, Sheets or Slides file. The others are the failed items they were.
+- With `--replace-smaller` too, a smaller destination file is replaced without a question, and only the
+  rest is asked about.
+- `--ask` needs a terminal. Without one (a script, a pipe into the command) it refuses to start.
+- A dry run asks nothing. It prints `ask PATH (size, the destination's has size)` for each question a run
+  would ask, and the summary ends with `; N files to replace, M conflicts to ask about`.
+- With `--archive`, the question is about the tar file: `new archive: SIZE` against the file there.
+- Ctrl-C at a question stops the run like anywhere else.
 
 ## Moving instead of copying: `--trash-source`
 
@@ -346,7 +427,8 @@ the archive's own MD5 checksum at that point. A second run with nothing changed 
 `already-there photos.tar` and uploads nothing. When the folder changed since (a file added, removed,
 renamed or edited), the archive in the destination no longer matches: the item fails with `it exists in the
 destination with different content`, and nothing is overwritten. Rename or remove the old archive to make a
-new one. Any other file named `<name>.tar` in the destination folder fails the same way, and so do an
+new one, or use [`--replace-smaller`](#when-a-file-grew-in-the-source---replace-smaller) to replace it when
+the new archive is larger. Any other file named `<name>.tar` in the destination folder fails the same way, and so do an
 archive without the mark (one that failed its check) and an archive whose content was replaced in the
 destination since it was marked (its MD5 checksum is no longer the marked one). When the marking itself
 fails, that run says so: it cannot tell whether the mark was written, and the next run finds the archive
@@ -401,6 +483,8 @@ client sees a file of the same name with other content.
 | `--from ACCOUNT` | the source account; the current account by default |
 | `--into FOLDER_ID` | a folder of the destination account; the top of My Drive by default |
 | `--contents` | what is in each given folder goes straight into the destination folder, without a folder of its name |
+| `--replace-smaller` | a destination file of the same name with other content and fewer bytes gets the source's content, instead of a failed item |
+| `--ask` | show both files of such a conflict and ask whether to replace the destination's; needs a terminal |
 | `--dry-run` | print what would be done, change nothing |
 | `--trash-source` | move migrated source files and folders to the source's trash |
 | `--archive` | each `FILE_ID` as one tar file, `<name>.tar` (see [One tar file per folder](#one-tar-file-per-folder---archive)) |

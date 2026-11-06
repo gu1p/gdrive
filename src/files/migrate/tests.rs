@@ -71,6 +71,8 @@ fn settings(file_ids: &[&str]) -> Settings {
         trash_source: false,
         archive: false,
         contents: false,
+        replace_smaller: false,
+        ask: None,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
@@ -1883,4 +1885,706 @@ async fn with_contents_a_folder_that_could_not_be_listed_fails_and_nothing_is_cr
         migrated.err.text()
     );
     assert!(dest.created().is_empty());
+}
+
+/// [`migrate`] between any two hubs, with `options`.
+async fn migrate_hubs(
+    source: &crate::hub::Hub,
+    dest: &crate::hub::Hub,
+    settings: Settings,
+    options: &UploadOptions,
+) -> Migrated {
+    let output = output();
+    let run = run(
+        source,
+        dest,
+        &settings,
+        options,
+        &output.printer,
+        ProgressDisplay::reporting_to(Arc::new(NoProgress)),
+        future::pending(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the migration should end");
+    Migrated {
+        result,
+        out: output.out,
+        err: output.err,
+    }
+}
+
+/// `photos` in the destination with other content than [`source_tree`] under three names.
+fn smaller_and_larger_destination() -> Vec<FakeFile> {
+    vec![
+        FakeFile::folder("old-photos", "photos", "root"),
+        // Smaller than the source's `aaaa`.
+        FakeFile::blob("old-a", "a.txt", "old-photos", "a"),
+        // Larger than the source's `bb`.
+        FakeFile::blob("old-b", "b.txt", "old-photos", "bbb"),
+        FakeFile::folder("old-2024", "2024", "old-photos"),
+        // As large as the source's `dddd`.
+        FakeFile::blob("old-d", "d.txt", "old-2024", "DDDD"),
+    ]
+}
+
+fn replacing(file_ids: &[&str]) -> Settings {
+    continuing(Settings {
+        replace_smaller: true,
+        ..settings(file_ids)
+    })
+}
+
+fn conflict(label: &str) -> String {
+    format!(
+        "Error: unable to migrate '{label}': it exists in the destination with different content"
+    )
+}
+
+#[tokio::test]
+async fn replace_smaller_replaces_a_smaller_file_of_the_name_and_no_other() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    // The larger file and the one of the same size are conflicts, as without the flag.
+    assert!(migrated.result.is_err());
+    let errors = migrated.err.text();
+    for label in ["photos/b.txt", "photos/2024/d.txt"] {
+        assert!(errors.contains(&conflict(label)), "{errors}");
+    }
+    assert!(!errors.contains(&conflict("photos/a.txt")), "{errors}");
+    // The smaller one has the source's content now: the same file, where it was.
+    assert_eq!(dest.updates(), [(String::from("old-a"), b"aaaa".to_vec())]);
+    let replaced = dest.stored("old-a").unwrap();
+    assert_eq!(replaced.content.as_deref(), Some("aaaa"));
+    assert_eq!(replaced.parents, ["old-photos"]);
+    assert!(
+        dest.gets().contains(&String::from("old-a")),
+        "checked first"
+    );
+    let created = dest.created();
+    let mut names = created
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["empty", "f.txt", "jan"]);
+    assert!(migrated
+        .out
+        .lines()
+        .contains(&String::from("replace photos/a.txt (4 B, was 1 B)")));
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 2 migrated (10 B), 0 already there, 0 skipped (unsupported), 2 failed, \
+         0 cancelled; 2 folders created, 2 reused; 1 smaller file replaced"
+    );
+    assert_eq!(source.writes(), Vec::<String>::new());
+
+    let again = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    assert!(again
+        .out
+        .lines()
+        .contains(&String::from("already-there photos/a.txt")));
+    assert_eq!(dest.updates().len(), 1, "nothing is replaced twice");
+    assert!(
+        again.summary().ends_with("; 0 smaller files replaced"),
+        "{}",
+        again.summary()
+    );
+}
+
+#[tokio::test]
+async fn without_replace_smaller_a_smaller_file_is_a_conflict_and_a_dry_run_replaces_nothing() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+    assert!(migrated.err.text().contains(&conflict("photos/a.txt")));
+    assert!(!migrated.summary().contains("replace"));
+    assert_eq!(dest.updates(), []);
+
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    let dry = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            ..replacing(&["photos"])
+        },
+    )
+    .await;
+
+    assert!(dry
+        .out
+        .lines()
+        .contains(&String::from("replace photos/a.txt (4 B, was 1 B)")));
+    assert!(
+        dry.summary().ends_with("; 1 smaller file to replace"),
+        "{}",
+        dry.summary()
+    );
+    assert_eq!(dest.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn replace_smaller_picks_no_file_among_several_and_no_google_file() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            // Two of the name, both smaller.
+            FakeFile::blob("old-a1", "a.txt", "old-photos", "a"),
+            FakeFile::blob("old-a2", "a.txt", "old-photos", "aa"),
+            // A Google Docs file of the name.
+            FakeFile::document("old-b", "b.txt", "old-photos"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    let errors = migrated.err.text();
+    for label in ["photos/a.txt", "photos/b.txt"] {
+        assert!(errors.contains(&conflict(label)), "{errors}");
+    }
+    assert_eq!(dest.updates(), []);
+    assert!(dest
+        .created()
+        .iter()
+        .all(|file| file.name != "a.txt" && file.name != "b.txt"));
+}
+
+#[tokio::test]
+async fn two_source_files_of_one_name_replace_a_smaller_file_once() {
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("photos", "photos", "root"),
+            FakeFile::blob("s1", "same.txt", "photos", "first1"),
+            FakeFile::blob("s2", "same.txt", "photos", "second22"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old", "same.txt", "old-photos", "x"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    assert!(migrated.result.is_err());
+    let updates = dest.updates();
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0].0, "old");
+    assert!(migrated.err.text().contains(&conflict("photos/same.txt")));
+    assert!(dest.created().is_empty());
+    assert!(
+        migrated.summary().contains("1 migrated") && migrated.summary().contains("1 failed"),
+        "{}",
+        migrated.summary()
+    );
+}
+
+/// Whether a request lists the destination's files named `name` again.
+fn lists_again(
+    method: &hyper::Method,
+    path: &str,
+    params: &HashMap<String, String>,
+    name: &str,
+) -> bool {
+    *method == hyper::Method::GET
+        && path == "/drive/v3/files"
+        && params
+            .get("q")
+            .is_some_and(|q| q.contains(&format!("name = '{name}'")))
+}
+
+#[tokio::test]
+async fn a_destination_file_that_is_not_what_was_listed_is_not_replaced() {
+    let listed = |id: &str, content: &str| {
+        json!({
+            "id": id,
+            "name": "a.txt",
+            "mimeType": "text/plain",
+            "size": content.len().to_string(),
+            "md5Checksum": format!("{:x}", md5::compute(content)),
+        })
+    };
+    for now in [
+        // Other content than the listing had.
+        json!([listed("old-a", "zz")]),
+        // A second file of its name.
+        json!([listed("old-a", "a"), listed("other", "a")]),
+        // Renamed, moved or in the trash: not in the folder under its name.
+        json!([]),
+    ] {
+        let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+        let fake = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+        // The listing right before `a.txt` is replaced.
+        let dest = Interceptor::start(&fake, move |method, path, params| {
+            lists_again(method, path, params, "a.txt")
+                .then(|| json!({"kind": "drive#fileList", "files": now.clone()}))
+        })
+        .await;
+
+        let migrated = migrate_hubs(
+            &source.hub(),
+            &dest.hub(),
+            replacing(&["photos"]),
+            &UploadOptions::default(),
+        )
+        .await;
+
+        assert!(
+            migrated.err.text().contains(
+                "Error: unable to migrate 'photos/a.txt': the file of this name in the \
+                 destination changed during the migration; it was not replaced"
+            ),
+            "{}",
+            migrated.err.text()
+        );
+        assert_eq!(fake.updates(), []);
+        assert_eq!(fake.stored("old-a").unwrap().content.as_deref(), Some("a"));
+    }
+}
+
+#[tokio::test]
+async fn a_replace_that_the_destination_does_not_hold_fails_and_keeps_the_source() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let fake = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    // The file as it is once the upload returned: other content than was sent, as after a
+    // session that an earlier run completed and a change since.
+    let dest = Interceptor::start(&fake, |method, path, params| {
+        let confirm = *method == hyper::Method::GET
+            && path == "/drive/v3/files/old-a"
+            && params.get("fields").map(String::as_str) == Some(super::REPLACED_FIELDS);
+        confirm.then(|| json!({"id": "old-a", "size": "4", "md5Checksum": "0123456789abcdef"}))
+    })
+    .await;
+
+    let migrated = migrate_hubs(
+        &source.hub(),
+        &dest.hub(),
+        Settings {
+            trash_source: true,
+            ..replacing(&["photos"])
+        },
+        &UploadOptions::default(),
+    )
+    .await;
+
+    assert!(
+        migrated.err.text().contains(
+            "Error: unable to migrate 'photos/a.txt': the file in the destination does not hold \
+             the content that was sent to replace it; run the command again"
+        ),
+        "{}",
+        migrated.err.text()
+    );
+    assert!(!trashed_ids(&source).contains(&String::from("a")));
+}
+
+#[tokio::test]
+async fn a_file_that_one_item_found_its_content_in_is_not_replaced_by_another() {
+    // Two source files of one name: one is in the destination already, the other is larger.
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("photos", "photos", "root"),
+            FakeFile::blob("s1", "x.txt", "photos", "bbbb"),
+            FakeFile::blob("s2", "x.txt", "photos", "a"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old", "x.txt", "old-photos", "a"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            trash_source: true,
+            ..replacing(&["photos"])
+        },
+    )
+    .await;
+
+    // Whichever came first: the file is what `s2` is migrated to, or it has the content of
+    // `s1`. Never both, which would leave the content of `s2` nowhere but in the trash.
+    assert!(migrated.result.is_err());
+    assert!(migrated.err.text().contains(&conflict("photos/x.txt")));
+    let trashed = trashed_ids(&source);
+    if dest.updates().is_empty() {
+        assert_eq!(trashed, ["s2"]);
+        assert_eq!(dest.stored("old").unwrap().content.as_deref(), Some("a"));
+    } else {
+        assert_eq!(trashed, ["s1"]);
+        assert_eq!(dest.stored("old").unwrap().content.as_deref(), Some("bbbb"));
+    }
+}
+
+#[tokio::test]
+async fn a_requested_file_that_could_not_be_read_is_never_replaced() {
+    // Both accounts see `shared`, which the source cannot read now; `b` has its name.
+    let source = FakeDrive::start(
+        vec![FakeFile::blob("b", "x.txt", "root", "bbbb")],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![FakeFile::blob("shared", "x.txt", "root", "a")],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, replacing(&["shared", "b"])).await;
+
+    assert!(migrated.result.is_err());
+    assert_eq!(dest.updates(), []);
+    assert!(
+        migrated.err.text().contains(
+            "Error: unable to migrate 'x.txt': the file of this name in the destination is one \
+             of the source items that are migrated; nothing to do"
+        ),
+        "{}",
+        migrated.err.text()
+    );
+}
+
+#[tokio::test]
+async fn replace_smaller_sends_a_large_file_through_a_session_and_trashes_its_source() {
+    let content = "0123456789".repeat(60_000);
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("photos", "photos", "root"),
+            FakeFile::blob("big", "big.bin", "photos", &content),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old-big", "big.bin", "old-photos", "0123456789"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    // Everything through a resumable session, two chunks.
+    let options = UploadOptions {
+        chunk_size: 256 * 1024,
+        multipart_threshold: 0,
+        ..UploadOptions::default()
+    };
+
+    let migrated = migrate_hubs(
+        &source.hub(),
+        &dest.hub(),
+        Settings {
+            replace_smaller: true,
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+        &options,
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert_eq!(
+        dest.updates(),
+        [(String::from("old-big"), content.clone().into_bytes())]
+    );
+    assert!(dest.created().is_empty());
+    let sent = dest
+        .chunks()
+        .iter()
+        .filter(|chunk| chunk.first.is_some())
+        .count();
+    assert!(sent >= 2, "{:?}", dest.chunks());
+    // Replaced and checked by md5: the source file went, and its folder after it.
+    assert_eq!(trashed_ids(&source), ["big", "photos"]);
+}
+
+/// Answers the questions of `--ask` with `answer`, and keeps them.
+struct Scripted<F> {
+    answer: F,
+    questions: std::sync::Mutex<Vec<String>>,
+}
+
+impl<F> std::fmt::Debug for Scripted<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Scripted")
+    }
+}
+
+impl<F: Fn(&str) -> bool + Send + Sync> super::ask::Ask for Scripted<F> {
+    fn ask(&self, question: String) -> futures::future::BoxFuture<'_, bool> {
+        let answer = (self.answer)(&question);
+        self.questions.lock().unwrap().push(question);
+        Box::pin(async move { answer })
+    }
+}
+
+fn scripted<F: Fn(&str) -> bool + Send + Sync + 'static>(answer: F) -> Arc<Scripted<F>> {
+    Arc::new(Scripted {
+        answer,
+        questions: std::sync::Mutex::new(Vec::new()),
+    })
+}
+
+#[tokio::test]
+async fn ask_puts_each_conflict_to_the_user_and_a_no_is_no_failure() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    // Yes to `b.txt`, whose file in the destination is the larger one.
+    let user = scripted(|question| question.contains("photos/b.txt"));
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            ask: Some(user.clone()),
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    // Nothing failed: the two that got a no stay as they are.
+    migrated.assert_ok();
+    let mut questions = user.questions.lock().unwrap().clone();
+    questions.sort();
+    assert_eq!(
+        questions,
+        [
+            "\nphotos/2024/d.txt is in the destination with other content:\n  source:      4 B\n  \
+             destination: 4 B\nReplace the destination's file? [y/N] ",
+            "\nphotos/a.txt is in the destination with other content:\n  source:      4 B\n  \
+             destination: 1 B\nReplace the destination's file? [y/N] ",
+            "\nphotos/b.txt is in the destination with other content:\n  source:      2 B\n  \
+             destination: 3 B\nReplace the destination's file? [y/N] ",
+        ]
+    );
+    assert_eq!(dest.updates(), [(String::from("old-b"), b"bb".to_vec())]);
+    let lines = migrated.out.lines();
+    for line in [
+        "replace photos/b.txt (2 B, was 3 B)",
+        "keep-destination photos/a.txt",
+        "keep-destination photos/2024/d.txt",
+    ] {
+        assert!(lines.contains(&String::from(line)), "{lines:?}");
+    }
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 2 migrated (8 B), 0 already there, 0 skipped (unsupported), 0 failed, \
+         0 cancelled; 2 folders created, 2 reused; 1 file replaced, 2 conflicts left alone"
+    );
+    assert_eq!(source.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn ask_with_replace_smaller_asks_only_about_what_is_not_smaller() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    let user = scripted(|_| false);
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            ask: Some(user.clone()),
+            replace_smaller: true,
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert_eq!(dest.updates(), [(String::from("old-a"), b"aaaa".to_vec())]);
+    let questions = user.questions.lock().unwrap().clone();
+    assert_eq!(questions.len(), 2, "{questions:?}");
+    assert!(questions.iter().all(|question| !question.contains("a.txt")));
+    assert!(
+        migrated
+            .summary()
+            .contains("; 1 file replaced, 2 conflicts left alone"),
+        "{}",
+        migrated.summary()
+    );
+    // What was left as it is stays in the source, and so do its folders.
+    let trashed = trashed_ids(&source);
+    for kept in ["b", "d", "y2024", "photos"] {
+        assert!(!trashed.contains(&String::from(kept)), "{trashed:?}");
+    }
+    assert!(trashed.contains(&String::from("a")), "{trashed:?}");
+}
+
+#[tokio::test]
+async fn ask_in_a_dry_run_asks_nothing_and_tells_what_it_would_ask_about() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    let user = scripted(|_| true);
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        Settings {
+            ask: Some(user.clone()),
+            dry_run: true,
+            ..settings(&["photos"])
+        },
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert!(user.questions.lock().unwrap().is_empty());
+    let lines = migrated.out.lines();
+    for line in [
+        "ask photos/a.txt (4 B, the destination's has 1 B)",
+        "ask photos/b.txt (2 B, the destination's has 3 B)",
+        "ask photos/2024/d.txt (4 B, the destination's has 4 B)",
+    ] {
+        assert!(lines.contains(&String::from(line)), "{lines:?}");
+    }
+    assert!(
+        migrated
+            .summary()
+            .ends_with("; 0 files to replace, 3 conflicts to ask about"),
+        "{}",
+        migrated.summary()
+    );
+    assert_eq!(dest.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn ask_does_not_ask_about_what_no_single_file_can_settle() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old-a1", "a.txt", "old-photos", "a"),
+            FakeFile::blob("old-a2", "a.txt", "old-photos", "aa"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let user = scripted(|_| true);
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            ask: Some(user.clone()),
+            ..settings(&["photos"])
+        }),
+    )
+    .await;
+
+    assert!(migrated.err.text().contains(&conflict("photos/a.txt")));
+    assert!(user.questions.lock().unwrap().is_empty());
+    assert_eq!(dest.updates(), []);
+}
+
+#[tokio::test]
+async fn the_my_drive_of_one_account_goes_into_the_my_drive_of_another() {
+    // `root` is each account's name for its own top folder, whose id is another one.
+    let files = source_tree()
+        .into_iter()
+        .map(|file| {
+            if file.parents == ["root"] {
+                file.with_parents(&["source-top"])
+            } else {
+                file
+            }
+        })
+        .collect();
+    let behavior = Behavior {
+        my_drive: Some(String::from("source-top")),
+        ..Behavior::default()
+    };
+    let source = FakeDrive::start(files, behavior).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, replacing(&["root"])).await;
+
+    migrated.assert_ok();
+    let expected = migrated_tree()
+        .into_iter()
+        .map(|(path, content)| (format!("My Drive/{path}"), content))
+        .chain([(String::from("My Drive/"), String::new())])
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(created_tree(&dest), expected);
+}
+
+#[tokio::test]
+async fn a_file_that_one_item_created_is_not_replaced_by_another() {
+    // Two source folders of one name go into the same destination folder. Its listing is
+    // answered for one of them at once, and for the other one a second later: by then the
+    // first one has created its `x.txt` and trashed its source.
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("p1", "photos", "root"),
+            FakeFile::blob("s1", "x.txt", "p1", "first"),
+            FakeFile::folder("p2", "photos", "root"),
+            FakeFile::blob("s2", "x.txt", "p2", "second one"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let behavior = Behavior {
+        unavailable_first: HashMap::from([(String::from("old-photos"), 1)]),
+        unavailable_retry_after: Some(1),
+        ..Behavior::default()
+    };
+    let dest = FakeDrive::start(
+        vec![FakeFile::folder("old-photos", "photos", "root")],
+        behavior,
+    )
+    .await;
+    // Yes to every question: whichever folder comes second would replace the file of the first.
+    let user = scripted(|_| true);
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            ask: Some(user.clone()),
+            trash_source: true,
+            ..settings(&["p1", "p2"])
+        }),
+    )
+    .await;
+
+    assert_eq!(dest.updates(), [], "{}", migrated.err.text());
+    let created = dest.created();
+    assert_eq!(created.len(), 1, "{created:?}");
+    // The one whose content is in the destination went to the trash, and only that one.
+    let content = String::from_utf8_lossy(&created[0].content).into_owned();
+    let (migrated_file, other) = if content == "first" {
+        ("s1", "s2")
+    } else {
+        ("s2", "s1")
+    };
+    let trashed = trashed_ids(&source);
+    assert!(
+        trashed.contains(&String::from(migrated_file)),
+        "{trashed:?}"
+    );
+    assert!(!trashed.contains(&String::from(other)), "{trashed:?}");
+    assert!(migrated.err.text().contains(&conflict("photos/x.txt")));
 }

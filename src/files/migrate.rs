@@ -26,6 +26,23 @@
 //! into the destination folder, as the items of one folder (`FOLDER/*` to `DEST/*`). The given
 //! folder has no counterpart in the destination then, and never goes to the trash.
 //!
+//! `--replace-smaller` settles one kind of conflict: when the destination's only file of the
+//! item's name has other content and fewer bytes than the source's, the source's content goes up
+//! as a new version of that file (the same id, folder and sharing), after one more look at it. A
+//! file of the same size or larger, and one of several of that name, is a conflict as before.
+//! Three checks around a replace: the folder is listed again for the name right before it (the
+//! file must still be the only one, where and what it was); one run replaces a file once, and
+//! never one that another item of the run found its own content in or created (`dest_use`); and
+//! the file is
+//! read again once the upload returned, since a session completed by an earlier run answers with
+//! what the file was then. A writer that changes the file while it is replaced is not seen: Drive
+//! has no conditional update, and keeps what was replaced as an earlier version.
+//!
+//! `--ask` puts the conflicts that a replace can settle to the user (`ask.rs`): both files as
+//! Drive has them now, and a yes replaces the destination's the same way. A no leaves it, and
+//! the item is settled: no failure. With `--replace-smaller` too, only what that flag does not
+//! settle is asked about. A dry run asks nothing and tells what it would ask about.
+//!
 //! `--dry-run` runs the same jobs without a write: folders that would be created are not
 //! listed (they would be empty), and only the destination folders that exist are read.
 //!
@@ -42,12 +59,13 @@
 //! there. A copy of the tree inside one account is refused: Drive copies on its side.
 
 mod archive;
+mod ask;
 mod source;
 #[cfg(test)]
 mod tests;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{hash_map::Entry, HashMap, HashSet},
     error,
     fmt::{self, Display, Formatter, Write as _},
     future::Future,
@@ -61,6 +79,7 @@ use std::{
 use futures::stream;
 use google_drive3::api::{File, FileList};
 
+use ask::{Ask, Side};
 use source::{SourceFile, SourceFolder, SourceItem, SourceNode, Totals};
 
 use crate::{
@@ -72,11 +91,12 @@ use crate::{
         hub_helper::{get_hub_for, load_named_account, GetHubError},
         human_size::human_size,
         id_gen::NextError,
+        media_client::get_file,
         retry::retry_read,
     },
     files::{
         generate_ids::generate_ids,
-        list::ListQuery,
+        list::{quote, ListQuery},
         mkdir,
         update::{update_metadata, PatchFile},
     },
@@ -111,6 +131,9 @@ const LEFTOVER_FIELDS: &str = "nextPageToken,incompleteSearch,files(id)";
 /// What a source file is checked for right before it goes to the trash.
 const RECHECK_FIELDS: &str = "id,size,md5Checksum,modifiedTime";
 
+/// What a destination file is checked for right before it is replaced.
+const REPLACED_FIELDS: &str = "id,size,md5Checksum,trashed";
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "the flags of the command line, orthogonal to each other"
@@ -130,6 +153,10 @@ pub(crate) struct Config {
     pub(crate) archive: bool,
     /// What is in each given folder goes straight into the destination folder (`--contents`).
     pub(crate) contents: bool,
+    /// A smaller destination file of the same name is replaced (`--replace-smaller`).
+    pub(crate) replace_smaller: bool,
+    /// The user is asked about the conflicts that a replace can settle (`--ask`).
+    pub(crate) ask: bool,
     pub(crate) chunk_size: ChunkSize,
     pub(crate) multipart_threshold: MultipartThreshold,
     pub(crate) print_chunk_errors: bool,
@@ -154,6 +181,10 @@ struct Settings {
     archive: bool,
     /// A `FILE_ID` that is a folder is not migrated itself, only what is in it.
     contents: bool,
+    /// A destination file of an item's name with other content is replaced when it is smaller.
+    replace_smaller: bool,
+    /// Who is asked about the other conflicts that a replace can settle (`--ask`).
+    ask: Option<Arc<dyn Ask>>,
     /// The source and the destination are one account (only with `archive`): the top of My Drive
     /// is then a folder the source may hold too.
     same_account: bool,
@@ -161,6 +192,10 @@ struct Settings {
 }
 
 pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
+    // A dry run asks nothing.
+    if config.ask && !config.dry_run && !ask::Terminal::available() {
+        return Err(Error::AskWithoutTerminal);
+    }
     let source_account = match &config.from {
         Some(name) => load_named_account(name),
         None => AppConfig::load_current_account().map_err(GetHubError::LoadCurrentAccount),
@@ -207,6 +242,7 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         session_dir: Some(session_dir(&dest_account)),
         session_identity: session_identity(&dest_account).await,
     };
+    let printer = Printer::stdio();
     let settings = Settings {
         file_ids: config.file_ids,
         into: config.into,
@@ -214,11 +250,20 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         trash_source: config.trash_source,
         archive: config.archive,
         contents: config.contents,
+        replace_smaller: config.replace_smaller,
+        ask: config
+            .ask
+            .then(|| Arc::new(ask::Terminal::new(printer.clone())) as Arc<dyn Ask>),
         same_account,
         transfer: config.transfer,
     };
-    let printer = Printer::stdio();
-    let display = ProgressDisplay::recursive(config.progress, config.transfer.jobs);
+    // Bars that draw while a question waits for its answer would write over it.
+    let progress = if config.ask {
+        progress::Mode::Never
+    } else {
+        config.progress
+    };
+    let display = ProgressDisplay::recursive(progress, config.transfer.jobs);
     run(
         &source,
         &dest,
@@ -229,6 +274,25 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         scheduler::ctrl_c(),
     )
     .await
+}
+
+/// Every source id, for the destination folders and files that both accounts see: an `--into`
+/// among them is refused, and so is one reused, matched or replaced later. Trashing a source
+/// folder would trash what was put in it, and its listing would include the copies.
+fn source_ids(roots: &[(&String, Result<SourceNode, Error>)]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for (id, root) in roots {
+        match root {
+            Ok(root) => root.collect_ids(&mut ids),
+            // A requested id that could not be read is a source item all the same. Not `root`,
+            // which is each account's name for its own My Drive.
+            Err(_) if id.as_str() != MY_DRIVE => {
+                ids.insert((*id).clone());
+            }
+            Err(_) => {}
+        }
+    }
+    ids
 }
 
 /// Where the sessions of resumable uploads into `account` are recorded, as `files upload` records
@@ -292,15 +356,7 @@ async fn run(
         }
         roots.push((id, root));
     }
-    // Every source id, for the destination folders and files that both accounts see: an
-    // `--into` among them is refused, and so is one reused or matched later. Trashing a source
-    // folder would trash what was put in it, and its listing would include the copies.
-    let mut source_ids = HashSet::new();
-    for (_, root) in &roots {
-        if let Ok(root) = root {
-            root.collect_ids(&mut source_ids);
-        }
-    }
+    let source_ids = source_ids(&roots);
     if source_ids.contains(&into) {
         return Err(Error::IntoInsideSource(into));
     }
@@ -319,6 +375,9 @@ async fn run(
         options: options.clone(),
         dry_run: settings.dry_run,
         trash_source: settings.trash_source,
+        replace_smaller: settings.replace_smaller,
+        ask: settings.ask.clone(),
+        dest_use: Mutex::new(HashMap::new()),
         unsupported: Mutex::new(Vec::new()),
         tally: Tally::default(),
         ids: tokio::sync::Mutex::new(Vec::new()),
@@ -439,7 +498,7 @@ async fn finish(
 /// 1 skipped (unsupported), 0 failed, 0 cancelled; 3 folders created, 1 reused`.
 fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
     if settings.archive {
-        return archive::summary(report, tally, settings.dry_run);
+        return archive::summary(report, tally, settings);
     }
     let (migrated, converted, created, trashed) = if settings.dry_run {
         (
@@ -480,7 +539,10 @@ fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
         line,
         "), {} already there, {} skipped (unsupported), {} failed, {} cancelled; {} {created}, {} \
          reused",
-        files.unchanged,
+        // A conflict that was left as it is counts further on.
+        files
+            .unchanged
+            .saturating_sub(tally.left.load(Ordering::SeqCst)),
         files.skipped,
         files.failed,
         files.cancelled,
@@ -495,6 +557,7 @@ fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
         let folders = plural(report.folders.failed, "folder", "folders");
         let _ = write!(line, "; {folders} failed");
     }
+    line.push_str(&replaced(tally, settings));
     if settings.trash_source {
         let _ = write!(line, "; {} {trashed}", tally.trashed.load(Ordering::SeqCst));
         let kept = tally.kept.load(Ordering::SeqCst);
@@ -506,6 +569,30 @@ fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
         line.push_str("; interrupted");
     }
     line
+}
+
+/// The part of a summary about `--replace-smaller` and `--ask`, for example `; 2 smaller files
+/// replaced` or `; 1 file replaced, 2 conflicts left alone`; nothing without the flags.
+fn replaced(tally: &Tally, settings: &Settings) -> String {
+    let replaced = tally.replaced.load(Ordering::SeqCst);
+    if settings.ask.is_some() {
+        let files = plural(replaced, "file", "files");
+        let left = plural(tally.left.load(Ordering::SeqCst), "conflict", "conflicts");
+        return if settings.dry_run {
+            format!("; {files} to replace, {left} to ask about")
+        } else {
+            format!("; {files} replaced, {left} left alone")
+        };
+    }
+    if !settings.replace_smaller {
+        return String::new();
+    }
+    let files = plural(replaced, "smaller file", "smaller files");
+    if settings.dry_run {
+        format!("; {files} to replace")
+    } else {
+        format!("; {files} replaced")
+    }
 }
 
 /// The destination's files in one folder, by name.
@@ -526,6 +613,41 @@ struct DestFile {
     archive: Option<String>,
     /// The md5 the archive had when it was checked (`appProperties`), likewise.
     archive_md5: Option<String>,
+}
+
+/// A destination file that `--replace-smaller` or `--ask` replaces, as the listing of its
+/// folder has it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Smaller {
+    id: String,
+    size: u64,
+    md5: Option<String>,
+}
+
+/// What an item of a run does with a destination file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Use {
+    /// It found its content there: the file is what it is migrated to.
+    Relied,
+    /// It replaces the file's content, or is asking the user about that.
+    Replaced,
+}
+
+/// What becomes of a conflict.
+enum Settled {
+    /// The destination's file gets the item's content.
+    Replace(Smaller),
+    /// The destination's file stays: the user said so, or it is a dry run, which only tells.
+    Keep,
+    /// Nobody was asked: the conflict it was.
+    Conflict,
+}
+
+/// The content of an item in conflict, which would go into the destination's file.
+enum Incoming<'a> {
+    File(&'a SourceFile),
+    /// A new archive of that many bytes.
+    Archive(u64),
 }
 
 /// How a source file compares with the destination's files of its name.
@@ -578,6 +700,26 @@ impl Existing {
             .map(|file| file.id.as_str())
     }
 
+    /// The file named `name`, when it is the only one (folders aside) and a file with content
+    /// of a known size, no Google Workspace file or shortcut: what a source file of that name
+    /// can replace.
+    fn only_file(&self, name: &str) -> Option<Smaller> {
+        let mut files = self
+            .by_name
+            .get(name)?
+            .iter()
+            .filter(|file| file.mime_type != drive_file::MIME_TYPE_DRIVE_FOLDER);
+        let file = files.next().filter(|_| files.next().is_none())?;
+        if file.mime_type.starts_with(source::GOOGLE_APPS_PREFIX) {
+            return None;
+        }
+        Some(Smaller {
+            id: file.id.clone(),
+            size: u64::try_from(file.size?).ok()?,
+            md5: file.md5.clone(),
+        })
+    }
+
     /// How `source` compares with the files of its name; one of them that is a source item
     /// itself (in `source_ids`) is [`Match::Source`].
     fn file(&self, source: &SourceFile, source_ids: &HashSet<String>) -> Match {
@@ -594,23 +736,32 @@ impl Existing {
         if candidates.clone().any(|file| source_ids.contains(&file.id)) {
             return Match::Source;
         }
-        // A Workspace file's export is converted again: the copy has another size than the
-        // original, and neither has an md5. Its type is what can be compared.
-        let native = source.is_native();
-        let same = candidates.any(|file| {
-            if native {
-                file.mime_type == source.mime_type
-            } else {
-                file.size == source.size && file.md5 == source.md5
-            }
-        });
-        if same {
+        if self.same(source).next().is_some() {
             Match::Same {
-                verified: !native && source.md5.is_some(),
+                verified: !source.is_native() && source.md5.is_some(),
             }
         } else {
             Match::Different
         }
+    }
+
+    /// The files of `source`'s name that have its content. A Workspace file's export is
+    /// converted again: the copy has another size than the original, and neither has an md5.
+    /// Its type is what can be compared.
+    fn same<'a>(&'a self, source: &'a SourceFile) -> impl Iterator<Item = &'a DestFile> {
+        let native = source.is_native();
+        self.by_name
+            .get(&source.name)
+            .into_iter()
+            .flatten()
+            .filter(|file| file.mime_type != drive_file::MIME_TYPE_DRIVE_FOLDER)
+            .filter(move |file| {
+                if native {
+                    file.mime_type == source.mime_type
+                } else {
+                    file.size == source.size && file.md5 == source.md5
+                }
+            })
     }
 }
 
@@ -621,10 +772,16 @@ impl Existing {
 /// be taken for absent and created a second time.
 async fn list_existing(dest: &Hub, folder_id: &str, fields: &str) -> Result<Existing, Error> {
     let q = ListQuery::files_in_folder(folder_id.to_owned()).q();
+    list_files(dest, &q, fields).await
+}
+
+/// The destination's files that `q` names, with the `fields` mask `fields`; fails like
+/// [`list_existing`].
+async fn list_files(dest: &Hub, q: &str, fields: &str) -> Result<Existing, Error> {
     let mut files = Vec::new();
     let mut page_token = None;
     loop {
-        let list = list_page(dest, &q, LIST_PAGE_SIZE, fields, page_token.as_deref())
+        let list = list_page(dest, q, LIST_PAGE_SIZE, fields, page_token.as_deref())
             .await
             .map_err(Error::ListDestination)?;
         if list.incomplete_search == Some(true) {
@@ -700,6 +857,12 @@ struct Migration {
     options: UploadOptions,
     dry_run: bool,
     trash_source: bool,
+    replace_smaller: bool,
+    ask: Option<Arc<dyn Ask>>,
+    /// What the items of this run do with the destination files they found by name, when
+    /// replaces can happen: a file is replaced by one item at most, and never one that another
+    /// item found its content in.
+    dest_use: Mutex<HashMap<String, Use>>,
     /// `PATH: REASON` of every unsupported item, for the end of the output.
     unsupported: Mutex<Vec<String>>,
     tally: Tally,
@@ -722,6 +885,10 @@ struct Tally {
     trashed: AtomicU64,
     /// Source files and folders that stay although they were to go to the trash.
     kept: AtomicU64,
+    /// Destination files replaced (`--replace-smaller`, `--ask`).
+    replaced: AtomicU64,
+    /// Conflicts left alone (`--ask`): the user said so, or a dry run that would ask.
+    left: AtomicU64,
     /// Items left out of the archives (`--archive`): shortcuts, Workspace types without an
     /// export, exports over Drive's limit.
     skipped: AtomicU64,
@@ -916,24 +1083,52 @@ impl Migration {
         if place.existing.contains(&file.id) {
             return failed(&label, Error::SameItem { folder: false }).into();
         }
-        let (outcome, verified) = match place.existing.file(&file, &self.source_ids) {
-            Match::Different => return failed(&label, Error::Conflict).into(),
+        let matched = place.existing.file(&file, &self.source_ids);
+        // The file of its name that it replaces: a smaller one (`--replace-smaller`), or the
+        // one the user said to (`--ask`).
+        let mut smaller = None;
+        if matched == Match::Different {
+            let incoming = Incoming::File(&file);
+            match self
+                .settle(&place, &file.name, &label, incoming, context)
+                .await
+            {
+                Ok(Settled::Replace(old)) => smaller = Some(old),
+                Ok(Settled::Keep) => return Outcome::Unchanged.into(),
+                Ok(Settled::Conflict) => return failed(&label, Error::Conflict).into(),
+                Err(error) => return failed(&label, error).into(),
+            }
+        }
+        let (outcome, verified) = match matched {
             Match::Source => return failed(&label, Error::InsideSource { folder: false }).into(),
             Match::Same { verified } => {
+                // Another item of this run replaces the files that had its content.
+                let same = place.existing.same(&file).map(|file| file.id.as_str());
+                if !self.rely(same) {
+                    return failed(&label, Error::Conflict).into();
+                }
                 context.printer.out(format!("already-there {label}")).await;
                 (Outcome::Unchanged, verified)
             }
-            Match::None => {
-                let line = if file.is_native() {
-                    format!("convert {label}")
-                } else {
-                    format!("create {label} ({})", human_size(file.bytes()))
+            Match::None | Match::Different => {
+                let line = match &smaller {
+                    Some(old) => format!(
+                        "replace {label} ({}, was {})",
+                        human_size(file.bytes()),
+                        human_size(old.size)
+                    ),
+                    None if file.is_native() => format!("convert {label}"),
+                    None => format!("create {label} ({})", human_size(file.bytes())),
                 };
                 context.printer.out(line).await;
                 let bytes = if self.dry_run {
                     file.bytes()
                 } else {
-                    match self.relay(&file, &drive_file, &place, context).await {
+                    let replaced = smaller.as_ref();
+                    match self
+                        .relay(&file, &drive_file, &place, replaced, context)
+                        .await
+                    {
                         Ok(bytes) => bytes,
                         Err(error) => {
                             if let Some(reason) = error.unsupported() {
@@ -945,6 +1140,9 @@ impl Migration {
                 };
                 if file.is_native() {
                     self.tally.converted.fetch_add(1, Ordering::SeqCst);
+                }
+                if smaller.is_some() {
+                    self.tally.replaced.fetch_add(1, Ordering::SeqCst);
                 }
                 (Outcome::Transferred { bytes }, true)
             }
@@ -977,25 +1175,36 @@ impl Migration {
         output
     }
 
-    /// Relays `file` into the folder of `place`; the size of the new file.
+    /// Relays `file` into the folder of `place`, or as the new content of the destination file
+    /// `replaced`; the size of the new file.
     async fn relay(
         &self,
         file: &SourceFile,
         drive_file: &File,
         place: &Place,
+        replaced: Option<&Smaller>,
         context: &JobContext,
     ) -> Result<u64, Error> {
-        // A conversion takes no id.
-        let new_file_id = if file.is_native() {
-            None
+        let target = if let Some(old) = replaced {
+            self.still_listed(place, &file.name, old).await?;
+            UploadTarget {
+                name: Some(file.name.clone()),
+                existing_file_id: Some(old.id.clone()),
+                ..UploadTarget::default()
+            }
         } else {
-            Some(self.new_id().await?)
-        };
-        let target = UploadTarget {
-            parents: place.folder.iter().cloned().collect(),
-            name: Some(file.name.clone()),
-            new_file_id,
-            ..UploadTarget::default()
+            // A conversion takes no id.
+            let new_file_id = if file.is_native() {
+                None
+            } else {
+                Some(self.new_id().await?)
+            };
+            UploadTarget {
+                parents: place.folder.iter().cloned().collect(),
+                name: Some(file.name.clone()),
+                new_file_id,
+                ..UploadTarget::default()
+            }
         };
         // The relay tells the bytes Drive holds so far; progress takes what is new.
         let confirmed = ConfirmedTotal::new(context.progress.clone());
@@ -1010,10 +1219,191 @@ impl Migration {
         )
         .await
         .map_err(|error| Error::Relay(Box::new(error)))?;
+        match (replaced, created.id.as_deref()) {
+            (Some(old), _) => {
+                self.holds(&old.id, created.md5_checksum.as_deref()).await?;
+            }
+            // What the item was migrated to: no other item of the run replaces it. One that
+            // did meanwhile (it listed the folder later) has put other content there.
+            (None, Some(id)) if !self.rely(std::iter::once(id)) => return Err(Error::Conflict),
+            (None, _) => {}
+        }
         Ok(created
             .size
             .and_then(|size| u64::try_from(size).ok())
             .unwrap_or_else(|| confirmed.total()))
+    }
+
+    /// Whether replaces can happen in this run.
+    fn replaces(&self) -> bool {
+        self.replace_smaller || self.ask.is_some()
+    }
+
+    /// Notes that an item found its content in the destination files `ids`: it is already
+    /// there. `false` when another item of this run replaces every one of them, which makes
+    /// the listing that had them out of date.
+    fn rely<'a>(&self, ids: impl Iterator<Item = &'a str>) -> bool {
+        if !self.replaces() {
+            return true;
+        }
+        let mut uses = self.dest_use.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut any = false;
+        for id in ids {
+            any |= *uses.entry(id.to_owned()).or_insert(Use::Relied) == Use::Relied;
+        }
+        any
+    }
+
+    /// Whether this item is the one of the run that replaces the destination file `id`, or
+    /// asks about it: no other item does, and none found its own content in it.
+    fn claim(&self, id: &str) -> bool {
+        let mut uses = self.dest_use.lock().unwrap_or_else(PoisonError::into_inner);
+        match uses.entry(id.to_owned()) {
+            Entry::Vacant(entry) => {
+                entry.insert(Use::Replaced);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// What becomes of the conflict of the item `label`, named `name`: whether its content
+    /// replaces the file of that name in `place`. Only the folder's only file of that name
+    /// with content is replaced, by one item of a run: a smaller one (`--replace-smaller`), or
+    /// the one the user says to (`--ask`). A Workspace file replaces none.
+    async fn settle(
+        &self,
+        place: &Place,
+        name: &str,
+        label: &str,
+        incoming: Incoming<'_>,
+        context: &JobContext,
+    ) -> Result<Settled, Error> {
+        if !self.replaces() {
+            return Ok(Settled::Conflict);
+        }
+        let size = match &incoming {
+            Incoming::File(file) => file.content_size(),
+            Incoming::Archive(size) => Some(*size),
+        };
+        let (Some(size), Some(old)) = (size, place.existing.only_file(name)) else {
+            return Ok(Settled::Conflict);
+        };
+        let smaller = self.replace_smaller && old.size < size;
+        if !(smaller || self.ask.is_some()) || !self.claim(&old.id) {
+            return Ok(Settled::Conflict);
+        }
+        if smaller {
+            return Ok(Settled::Replace(old));
+        }
+
+        if self.dry_run {
+            let line = format!(
+                "ask {label} ({}, the destination's has {})",
+                human_size(size),
+                human_size(old.size)
+            );
+            context.printer.out(line).await;
+            self.tally.left.fetch_add(1, Ordering::SeqCst);
+            return Ok(Settled::Keep);
+        }
+        if self.asked(place, name, label, size, incoming, &old).await? {
+            return Ok(Settled::Replace(old));
+        }
+        // It stays what it is: no other item replaces it either, and one with its content
+        // finds it there.
+        self.dest_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(old.id.clone(), Use::Relied);
+        context
+            .printer
+            .out(format!("keep-destination {label}"))
+            .await;
+        self.tally.left.fetch_add(1, Ordering::SeqCst);
+        Ok(Settled::Keep)
+    }
+
+    /// Asks the user whether the item `label` replaces the destination file `old`, showing
+    /// both as Drive has them now.
+    async fn asked(
+        &self,
+        place: &Place,
+        name: &str,
+        label: &str,
+        size: u64,
+        incoming: Incoming<'_>,
+        old: &Smaller,
+    ) -> Result<bool, Error> {
+        let Some(ask) = &self.ask else {
+            return Ok(false);
+        };
+        self.still_listed(place, name, old).await?;
+        let now = get_file(&self.dest, &old.id, ask::FIELDS, None)
+            .await
+            .map_err(|error| Error::Replace(ReplaceError::Check(error)))?;
+        let (what, new) = match incoming {
+            Incoming::File(file) => {
+                let key = file.resource_key.as_deref();
+                let shown = match get_file(&self.source, &file.id, ask::FIELDS, key).await {
+                    Ok(now) => Side::of(&now),
+                    // The listing has less to tell, and is enough.
+                    Err(_) => Side {
+                        size: Some(size),
+                        modified: file.modified_time,
+                        by: None,
+                    },
+                };
+                ("source", shown)
+            }
+            Incoming::Archive(size) => {
+                let shown = Side {
+                    size: Some(size),
+                    ..Side::default()
+                };
+                ("new archive", shown)
+            }
+        };
+        let question = ask::question(label, what, &new, &Side::of(&now));
+        Ok(ask.ask(question).await)
+    }
+
+    /// Fails unless `old` is still the only file named `name` in the folder of `place`, with
+    /// the size and md5 that the listing of the folder had: asked right before it is replaced.
+    /// A file that was renamed, moved, put in the trash or changed since, or that got a
+    /// namesake, is not replaced.
+    async fn still_listed(&self, place: &Place, name: &str, old: &Smaller) -> Result<(), Error> {
+        let changed = || Error::Replace(ReplaceError::Changed);
+        let folder = place.folder.as_deref().ok_or_else(changed)?;
+        let q = format!(
+            "{} in parents and name = {} and trashed = false",
+            quote(folder),
+            quote(name)
+        );
+        let now = list_files(&self.dest, &q, DEST_FIELDS).await?;
+        if now.only_file(name).as_ref() == Some(old) {
+            Ok(())
+        } else {
+            Err(changed())
+        }
+    }
+
+    /// Fails unless the destination file `id` holds the content with the md5 `md5` now: asked
+    /// once the upload that replaced it returned. A session that an earlier run completed
+    /// answers with what the file was then, which need not be what it is.
+    async fn holds(&self, id: &str, md5: Option<&str>) -> Result<(), Error> {
+        let now = get_file(&self.dest, id, REPLACED_FIELDS, None)
+            .await
+            .map_err(|error| Error::Replace(ReplaceError::Check(error)))?;
+        let held = matches!(
+            (md5, now.md5_checksum.as_deref()),
+            (Some(sent), Some(held)) if archive::same_md5(sent, held)
+        );
+        if held && now.trashed != Some(true) {
+            Ok(())
+        } else {
+            Err(Error::Replace(ReplaceError::Unconfirmed))
+        }
     }
 
     /// A new id for a file or folder of the destination, from `files.generateIds`.
@@ -1184,6 +1574,44 @@ fn subtree(folder: &SourceFolder) -> Subtree {
     subtree
 }
 
+/// Why a destination file was not replaced (`--replace-smaller`, `--ask`).
+#[derive(Debug)]
+pub(crate) enum ReplaceError {
+    /// The file could not be read for the check before or after its replacement.
+    Check(Box<google_drive3::Error>),
+    /// It is no longer the folder's only file of its name with the content that was listed.
+    Changed,
+    /// After the upload, it does not hold the content that was sent.
+    Unconfirmed,
+}
+
+impl Display for ReplaceError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ReplaceError::Check(_) => {
+                "unable to check the file in the destination that it replaces"
+            }
+            ReplaceError::Changed => {
+                "the file of this name in the destination changed during the migration; it was \
+                 not replaced"
+            }
+            ReplaceError::Unconfirmed => {
+                "the file in the destination does not hold the content that was sent to replace \
+                 it; run the command again"
+            }
+        })
+    }
+}
+
+impl ReplaceError {
+    fn source(&self) -> Option<&(dyn error::Error + 'static)> {
+        match self {
+            ReplaceError::Check(source) => Some(source.as_ref()),
+            ReplaceError::Changed | ReplaceError::Unconfirmed => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum Error {
     /// The source account cannot be used; `account` is `None` for the current account.
@@ -1228,6 +1656,10 @@ pub(crate) enum Error {
     Cycle,
     /// The destination has a file of the same name with other content.
     Conflict,
+    /// A destination file was not replaced, or its replacement could not be confirmed.
+    Replace(ReplaceError),
+    /// `--ask` without a terminal to ask on.
+    AskWithoutTerminal,
     CreateFolder(Box<google_drive3::Error>),
     FolderMissingId,
     /// No id for a new file or folder of the destination.
@@ -1341,6 +1773,11 @@ impl Display for Error {
             Error::ListSource(_) => f.write_str("unable to list the folder in the source"),
             Error::Cycle => f.write_str("the folder is inside itself, it is not migrated"),
             Error::Conflict => f.write_str("it exists in the destination with different content"),
+            Error::Replace(error) => Display::fmt(error, f),
+            Error::AskWithoutTerminal => f.write_str(
+                "--ask needs a terminal: it asks on stderr and reads the answers from the \
+                 keyboard. In a script, use --replace-smaller or neither",
+            ),
             Error::CreateFolder(_) => f.write_str("unable to create the folder in the destination"),
             Error::FolderMissingId => {
                 f.write_str("the folder created in the destination has no id")
@@ -1396,6 +1833,7 @@ impl error::Error for Error {
             | Error::ArchiveMark { source, .. }
             | Error::ListDestination(source)
             | Error::Recheck(source) => Some(source.as_ref()),
+            Error::Replace(error) => error.source(),
             Error::ListSource(error) => Some(error.error.as_ref()),
             Error::Relay(error) => error::Error::source(error.as_ref()),
             Error::Archive(error) => error::Error::source(error.as_ref()),
@@ -1415,6 +1853,7 @@ impl error::Error for Error {
             | Error::NotAFolder(_)
             | Error::Cycle
             | Error::Conflict
+            | Error::AskWithoutTerminal
             | Error::FolderMissingId
             | Error::IncompleteListing
             | Error::ArchiveIncomplete(_)

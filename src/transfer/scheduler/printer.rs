@@ -31,8 +31,23 @@ pub(crate) struct Printer {
 
 #[derive(Debug)]
 enum Message {
-    Line { target: Target, text: String },
+    Line {
+        target: Target,
+        text: String,
+    },
     Flush(oneshot::Sender<()>),
+    /// Everything before is written, which `held` is told; nothing more is written until
+    /// `released` resolves or its sender is dropped.
+    Hold {
+        held: oneshot::Sender<()>,
+        released: oneshot::Receiver<()>,
+    },
+}
+
+/// Keeps a [`Printer`] from writing until it is dropped ([`Printer::hold`]).
+#[derive(Debug)]
+pub(crate) struct Hold {
+    _release: oneshot::Sender<()>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,34 +170,53 @@ impl Printer {
             let mut err = Output::new(err, Target::Stderr);
             let mut batch = Vec::with_capacity(Self::BATCH);
             while let Some(message) = messages.recv().await {
-                batch.push(message);
-                while batch.len() < Self::BATCH {
-                    match messages.try_recv() {
-                        Ok(message) => batch.push(message),
-                        Err(_) => break,
-                    }
-                }
-                // Above the progress bars, if any: they are taken off the terminal once per
-                // batch, not per line.
-                progress::suspend(|| {
-                    for message in batch.drain(..) {
-                        match message {
-                            Message::Line {
-                                target: Target::Stdout,
-                                text,
-                            } => out.line(&text, &state),
-                            Message::Line {
-                                target: Target::Stderr,
-                                text,
-                            } => err.line(&text, &state),
-                            Message::Flush(done) => {
-                                out.flush(&state);
-                                err.flush(&state);
-                                let _ = done.send(());
+                // A hold ends its batch: it is waited for once what came before is written.
+                let mut hold = None;
+                let mut next = Some(message);
+                while let Some(message) = next.take() {
+                    match message {
+                        Message::Hold { held, released } => hold = Some((held, released)),
+                        message => {
+                            batch.push(message);
+                            if batch.len() < Self::BATCH {
+                                next = messages.try_recv().ok();
                             }
                         }
                     }
-                });
+                }
+                // Above the progress bars, if any: they are taken off the terminal once per
+                // batch, not per line. A hold that came alone has nothing to write before it.
+                if !batch.is_empty() {
+                    progress::suspend(|| {
+                        for message in batch.drain(..) {
+                            match message {
+                                Message::Line {
+                                    target: Target::Stdout,
+                                    text,
+                                } => out.line(&text, &state),
+                                Message::Line {
+                                    target: Target::Stderr,
+                                    text,
+                                } => err.line(&text, &state),
+                                Message::Flush(done) => {
+                                    out.flush(&state);
+                                    err.flush(&state);
+                                    let _ = done.send(());
+                                }
+                                // Never in a batch.
+                                Message::Hold { .. } => {}
+                            }
+                        }
+                    });
+                }
+                if let Some((held, released)) = hold {
+                    out.flush(&state);
+                    err.flush(&state);
+                    // Until the holder lets go; one that went away holds nothing.
+                    if held.send(()).is_ok() {
+                        let _ = released.await;
+                    }
+                }
             }
         });
         Printer { sender, state }
@@ -220,6 +254,24 @@ impl Printer {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
+    }
+
+    /// Waits until every line sent before is written, and keeps the lines sent from then on
+    /// from being written until the returned guard is dropped: for a question to the user,
+    /// which nothing may follow on the terminal before its answer. The lines wait in order, and
+    /// their senders with them once [`Self::CAPACITY`] of them wait.
+    pub(crate) async fn hold(&self) -> Hold {
+        let (held, holding) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        if self
+            .sender
+            .send(Message::Hold { held, released })
+            .await
+            .is_ok()
+        {
+            let _ = holding.await;
+        }
+        Hold { _release: release }
     }
 
     async fn send(&self, target: Target, text: String) {
