@@ -9,6 +9,7 @@ use std::{
 };
 
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
 
 use super::{
     decode, encode, field, header, hex, pax_record, ArchiveError, ArchiveSource, Blob,
@@ -847,4 +848,29 @@ fn a_blob_without_md5_or_modification_time_makes_its_manifest_unlike_any_other()
     assert_ne!(digest(None), digest(None));
     let time = Some("2025-01-01T00:00:00Z".parse().unwrap());
     assert_eq!(digest(time), digest(time));
+}
+
+#[test]
+fn a_workspace_file_without_modification_time_makes_its_manifest_unlike_any_other() {
+    let digest = |modified_time: Option<DateTime<Utc>>| {
+        let mut manifest = Manifest::new();
+        manifest.folder("root");
+        manifest.export("root/notes.docx", "doc", modified_time.as_ref(), "docx");
+        manifest.finish()
+    };
+    // The same listing twice: nothing would tell an edited document from the exported one.
+    assert_ne!(digest(None), digest(None));
+    let time = Some("2025-01-01T00:00:00Z".parse().unwrap());
+    assert_eq!(digest(time), digest(time));
+    // With a time, the input is what it was.
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"gdrive archive manifest 1\n");
+    context.update(b"d");
+    field(&mut context, b"root");
+    context.update(b"e");
+    field(&mut context, b"root/notes.docx");
+    field(&mut context, b"doc");
+    field(&mut context, b"2025-01-01T00:00:00.000Z");
+    field(&mut context, b"docx");
+    assert_eq!(digest(time), hex(context.finish().as_ref()));
 }

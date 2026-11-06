@@ -391,8 +391,8 @@ fn digits(n: usize) -> usize {
 /// exporting anything): per entry, in the order of the archive, its path and kind; for a blob
 /// its id, size and md5 (and its `modifiedTime` when it has no md5); for an exported Workspace
 /// file its id, `modifiedTime` and export format. A destination file whose `appProperties`
-/// carry it is that archive. A manifest with a blob that has neither md5 nor `modifiedTime` is
-/// unlike any other.
+/// carry it is that archive. A manifest with a blob that has neither md5 nor `modifiedTime`, or
+/// with a Workspace file without `modifiedTime`, is unlike any other.
 pub(crate) struct Manifest {
     context: ring::digest::Context,
 }
@@ -423,12 +423,8 @@ impl Manifest {
                 // DriveSource compares it before reading again.
                 field(&mut self.context, rfc3339(Some(time)).as_bytes());
             } else {
-                // With neither, nothing tells this file from an edited one of the same size: the
-                // manifest is made unlike any other, so that its archive is never already there
-                // and its exports cache is never used again.
-                let fresh = [fastrand::u64(..), fastrand::u64(..)];
-                field(&mut self.context, &fresh[0].to_be_bytes());
-                field(&mut self.context, &fresh[1].to_be_bytes());
+                // With neither, nothing tells this file from an edited one of the same size.
+                self.unlike_any_other();
             }
         }
     }
@@ -444,8 +440,22 @@ impl Manifest {
         self.context.update(b"e");
         field(&mut self.context, path.as_bytes());
         field(&mut self.context, id.as_bytes());
-        field(&mut self.context, rfc3339(modified_time).as_bytes());
+        if let Some(time) = modified_time {
+            field(&mut self.context, rfc3339(Some(time)).as_bytes());
+        } else {
+            // Without it, nothing tells this file from an edited one.
+            self.unlike_any_other();
+        }
         field(&mut self.context, format.as_bytes());
+    }
+
+    /// For a file that nothing tells from an edited one: makes the manifest unlike any other
+    /// (16 fresh random bytes), so that its archive is never already there and its exports cache
+    /// is never used again.
+    fn unlike_any_other(&mut self) {
+        let fresh = [fastrand::u64(..), fastrand::u64(..)];
+        field(&mut self.context, &fresh[0].to_be_bytes());
+        field(&mut self.context, &fresh[1].to_be_bytes());
     }
 
     /// The digest, in hex.
