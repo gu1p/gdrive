@@ -99,8 +99,9 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   (`FOLDER/*` to `DEST/*`), without a folder of its name. With `--replace-smaller`, a destination file of
   the same name with other content and fewer bytes gets the source's content as a new version of that
   file, instead of a failed item (also the tar file of `--archive`); a file of the same size or larger is
-  never replaced. Prints one line per item (`create`, `reuse`,
-  `convert`, `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the
+  never replaced. With `--ask`, gdrive shows both files of such a conflict (size, last change and by whom)
+  and asks on the terminal whether to replace the destination's; a no leaves it and is no failure. Prints one line per item (`create`, `reuse`,
+  `convert`, `replace`, `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the
   chunk and progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
   docs/migrate.md.
 - **Migration as an archive.** `files migrate <FILE_ID>... --to <ACCOUNT> --archive` makes each `FILE_ID`

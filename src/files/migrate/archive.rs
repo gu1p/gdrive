@@ -54,7 +54,7 @@ use chrono::{DateTime, Utc};
 use super::{
     failed,
     source::{label, SourceFolder, SourceItem, SourceNode},
-    Error, Existing, Match, Migration, Place, Settings, Tally,
+    Error, Existing, Incoming, Match, Migration, Place, Settings, Settled, Smaller, Tally,
 };
 use crate::{
     common::{
@@ -348,6 +348,18 @@ impl Plan {
         let entries = self.entries.iter().map(|entry| entry.entry(None)).collect();
         Layout::new(entries).size()
     }
+
+    /// The size of the archive without its exports: what it has at least, since an export
+    /// over Drive's limit is left out.
+    fn least_size(&self) -> u64 {
+        let entries = self
+            .entries
+            .iter()
+            .filter(|entry| !matches!(entry.kind, Kind::Export(_)))
+            .map(|entry| entry.entry(None))
+            .collect();
+        Layout::new(entries).size()
+    }
 }
 
 impl Planned {
@@ -383,6 +395,16 @@ fn unusable(name: &str, id: &str, source: local_name::InvalidName) -> Error {
     Error::ArchiveName(UnusableName::new(name, id, source))
 }
 
+/// How the making of an archive ended.
+enum Made {
+    /// Uploaded and marked: its size.
+    Archive(u64),
+    /// Nothing was left to archive.
+    Nothing,
+    /// The file of its name in the destination stays (`--ask`).
+    Kept,
+}
+
 impl Existing {
     /// How the archive `name` with the manifest digest `manifest` compares with the
     /// destination's files of that name; one of them that is a source item itself (in
@@ -401,24 +423,37 @@ impl Existing {
         if candidates.clone().any(|file| source_ids.contains(&file.id)) {
             return Match::Source;
         }
-        // The mark of this manifest, on the bytes it was checked with.
-        let same = candidates.any(|file| {
-            file.archive.as_deref() == Some(manifest)
-                && matches!(
-                    (file.archive_md5.as_deref(), file.md5.as_deref()),
-                    (Some(marked), Some(listed)) if same_md5(marked, listed)
-                )
-        });
-        if same {
+        if self.archives(name, manifest).next().is_some() {
             Match::Same { verified: true }
         } else {
             Match::Different
         }
     }
+
+    /// The files named `name` that are the archive of `manifest`: with its mark, on the bytes
+    /// it was checked with.
+    fn archives<'a>(
+        &'a self,
+        name: &str,
+        manifest: &'a str,
+    ) -> impl Iterator<Item = &'a super::DestFile> {
+        self.by_name
+            .get(name)
+            .into_iter()
+            .flatten()
+            .filter(|file| file.mime_type != drive_file::MIME_TYPE_DRIVE_FOLDER)
+            .filter(move |file| {
+                file.archive.as_deref() == Some(manifest)
+                    && matches!(
+                        (file.archive_md5.as_deref(), file.md5.as_deref()),
+                        (Some(marked), Some(listed)) if same_md5(marked, listed)
+                    )
+            })
+    }
 }
 
 /// Whether two md5s in hex are the same, whatever the case of their digits.
-fn same_md5(one: &str, other: &str) -> bool {
+pub(super) fn same_md5(one: &str, other: &str) -> bool {
     matches!(
         (parse_md5_digest(one), parse_md5_digest(other)),
         (Some(one), Some(other)) if one == other
@@ -461,36 +496,36 @@ impl Migration {
             }
         }
         let label = &plan.label;
-        // Whether a file of its name with other content is there, to replace if it is smaller.
+        // Whether a file of its name with other content is there, which it may replace.
         let replacing = match place
             .existing
             .archive(&plan.name, &plan.manifest, &self.source_ids)
         {
             Match::None => false,
             Match::Same { .. } => {
+                // Another archive of this run replaces the file that is this one.
+                let same = place.existing.archives(&plan.name, &plan.manifest);
+                if !self.rely(same.map(|file| file.id.as_str())) {
+                    return failed(label, Error::Conflict).into();
+                }
                 context.printer.out(format!("already-there {label}")).await;
                 return Outcome::Unchanged.into();
             }
-            Match::Different if self.replace_smaller => true,
+            Match::Different if self.replaces() => true,
             Match::Different => return failed(label, Error::Conflict).into(),
             Match::Source => return failed(label, Error::InsideSource { folder: false }).into(),
         };
-        // A dry run knows the size without the exports, which only a real run makes: at least
-        // that many bytes. With exports it cannot tell whether a file that is not smaller than
-        // that will be replaced, and says so.
-        let mut unsure = false;
-        let smaller = if replacing && self.dry_run {
-            let mut old = self.smaller(&place.existing, &plan.name, planned);
-            if old.is_none() && plan.exports() > 0 {
-                old = self.smaller(&place.existing, &plan.name, u64::MAX);
-                unsure = true;
-            }
-            match old {
-                Some(old) => Some(old),
-                None => return failed(label, Error::Conflict).into(),
+        // What a dry run tells of the file it would replace, and whether that hangs on the
+        // exports, which only a real run makes.
+        let (smaller, unsure) = if replacing && self.dry_run {
+            match self.dry_replace(&plan, &place, context).await {
+                Ok(Some(told)) => (Some(told.0), told.1),
+                // It told what it would ask about.
+                Ok(None) => return Outcome::Unchanged.into(),
+                Err(error) => return failed(label, error).into(),
             }
         } else {
-            None
+            (None, false)
         };
         for (label, reason) in &plan.skipped {
             self.left_out(label, reason, context).await;
@@ -525,14 +560,42 @@ impl Migration {
         }
 
         match self.make_archive(&plan, &place, replacing, context).await {
-            Ok(Some(bytes)) => Outcome::Transferred { bytes }.into(),
+            Ok(Made::Archive(bytes)) => Outcome::Transferred { bytes }.into(),
             // A FILE_ID that is a Workspace file whose export is too large.
-            Ok(None) => Outcome::Skipped {
+            Ok(Made::Nothing) => Outcome::Skipped {
                 reason: SkipReason::NotExportable,
             }
             .into(),
+            Ok(Made::Kept) => Outcome::Unchanged.into(),
             Err(error) => failed(label, error).into(),
         }
+    }
+
+    /// The file that the archive of `plan` replaces, as far as a dry run can tell, and whether
+    /// that hangs on its exports; `None` once it printed what it would ask about. A dry run
+    /// knows the size without the exports: the archive has at least the bytes of everything
+    /// else, and replaces a file smaller than that for sure.
+    async fn dry_replace(
+        &self,
+        plan: &Plan,
+        place: &Place,
+        context: &JobContext,
+    ) -> Result<Option<(Smaller, bool)>, Error> {
+        let (name, label) = (&plan.name, &plan.label);
+        let least = Incoming::Archive(plan.least_size());
+        match self.settle(place, name, label, least, context).await? {
+            Settled::Replace(old) => return Ok(Some((old, false))),
+            Settled::Keep => return Ok(None),
+            Settled::Conflict => {}
+        }
+        if plan.exports() > 0 {
+            // Large enough exports make it larger than any file.
+            let most = Incoming::Archive(u64::MAX);
+            if let Settled::Replace(old) = self.settle(place, name, label, most, context).await? {
+                return Ok(Some((old, true)));
+            }
+        }
+        Err(Error::Conflict)
     }
 
     /// Prints that the item `label` is not in its archive, and why, and counts it.
@@ -616,16 +679,16 @@ impl Migration {
         (entries, exported, left_out)
     }
 
-    /// Exports, lays out and uploads the archive of `plan`; its size, or `None` when nothing is
-    /// left to archive. `replacing`: a file of its name with other content is there, and the
-    /// archive replaces it if it is smaller, and is a conflict otherwise.
+    /// Exports, lays out and uploads the archive of `plan`. `replacing`: a file of its name
+    /// with other content is there, and the archive replaces it if it is smaller or the user
+    /// says so, and is a conflict otherwise.
     async fn make_archive(
         &self,
         plan: &Plan,
         place: &Place,
         replacing: bool,
         context: &JobContext,
-    ) -> Result<Option<u64>, Error> {
+    ) -> Result<Made, Error> {
         let cache = self
             .options
             .session_dir
@@ -637,7 +700,7 @@ impl Migration {
         if entries.is_empty() {
             // A FILE_ID that is a Workspace file whose export is too large: the job's outcome
             // counts it.
-            return Ok(None);
+            return Ok(Made::Nothing);
         }
         self.tally.skipped.fetch_add(left_out, Ordering::SeqCst);
 
@@ -645,11 +708,18 @@ impl Migration {
         let size = layout.size();
         let label = &plan.label;
         let smaller = if replacing {
-            let old = self
-                .smaller(&place.existing, &plan.name, size)
-                .ok_or(Error::Conflict)?;
-            self.still_listed(&old).await?;
-            Some(old)
+            let incoming = Incoming::Archive(size);
+            match self
+                .settle(place, &plan.name, label, incoming, context)
+                .await?
+            {
+                Settled::Replace(old) => {
+                    self.still_listed(place, &plan.name, &old).await?;
+                    Some(old)
+                }
+                Settled::Keep => return Ok(Made::Kept),
+                Settled::Conflict => return Err(Error::Conflict),
+            }
         } else {
             None
         };
@@ -708,11 +778,22 @@ impl Migration {
         if let Some(cache) = &cache {
             cache.remove().await;
         }
-        // Checked: the archive gets its mark, with the md5 it was checked with (without one, the
-        // mark never matches).
         let id = file.id.unwrap_or_default();
+        let md5 = file.md5_checksum.as_deref();
+        if smaller.is_some() {
+            self.holds(&id, md5).await?;
+            self.tally.replaced.fetch_add(1, Ordering::SeqCst);
+        }
+        self.mark(plan, id, md5).await?;
+        self.tally.converted.fetch_add(exported, Ordering::SeqCst);
+        Ok(Made::Archive(size))
+    }
+
+    /// Marks the destination file `id` as the archive of `plan`, once it is checked: with the
+    /// md5 it was checked with (without one, the mark never matches).
+    async fn mark(&self, plan: &Plan, id: String, md5: Option<&str>) -> Result<(), Error> {
         let mut mark = PatchFile::new(id.clone()).with_app_property(PROPERTY, &plan.manifest);
-        if let Some(md5) = &file.md5_checksum {
+        if let Some(md5) = md5 {
             mark = mark.with_app_property(PROPERTY_MD5, md5);
         }
         update_metadata(&self.dest, mark)
@@ -722,11 +803,7 @@ impl Migration {
                 id,
                 source: Box::new(source),
             })?;
-        self.tally.converted.fetch_add(exported, Ordering::SeqCst);
-        if smaller.is_some() {
-            self.tally.replaced.fetch_add(1, Ordering::SeqCst);
-        }
-        Ok(Some(size))
+        Ok(())
     }
 
     /// Prints `skip LABEL: REASON` and keeps the line for the end of the output.
@@ -773,7 +850,10 @@ pub(super) fn summary(report: &Report, tally: &Tally, settings: &Settings) -> St
     let _ = write!(
         line,
         "), {} already there, {} skipped (unsupported), {} failed, {} cancelled",
-        files.unchanged,
+        // A conflict that was left as it is counts further on.
+        files
+            .unchanged
+            .saturating_sub(tally.left.load(Ordering::SeqCst)),
         files.skipped + tally.skipped.load(Ordering::SeqCst),
         files.failed,
         files.cancelled,

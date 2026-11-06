@@ -447,6 +447,10 @@ enum FileCommand {
         #[arg(long)]
         replace_smaller: bool,
 
+        /// When the destination has one file of the same name with other content, show both files (size, last change) and ask whether the source's replaces it, instead of failing the item; a no leaves it. Needs a terminal, and turns the progress display off. With --replace-smaller, only the conflicts which that flag does not settle are asked about
+        #[arg(long)]
+        ask: bool,
+
         /// Migrate up to N files at once (1 to 64)
         #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
         jobs: NonZeroUsize,
@@ -1199,6 +1203,7 @@ async fn handle_files_command(
             archive,
             contents,
             replace_smaller,
+            ask,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -1215,6 +1220,7 @@ async fn handle_files_command(
                 archive,
                 contents,
                 replace_smaller,
+                ask,
                 chunk_size,
                 multipart_threshold,
                 print_chunk_errors,
@@ -2166,6 +2172,7 @@ mod flag_tests {
             archive,
             contents,
             replace_smaller,
+            ask,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -2189,6 +2196,7 @@ mod flag_tests {
             "--trash-source",
             "--contents",
             "--replace-smaller",
+            "--ask",
             "--chunk-size",
             "1",
             "--multipart-threshold",
@@ -2207,7 +2215,7 @@ mod flag_tests {
         assert_eq!(into.as_deref(), Some("folder"));
         assert_eq!(jobs.get(), 8);
         assert!(continue_on_error && dry_run && trash_source && !archive && contents);
-        assert!(replace_smaller);
+        assert!(replace_smaller && ask);
         assert_eq!(chunk_size.in_bytes(), 1 << 20);
         assert_eq!(multipart_threshold.in_bytes(), 0);
         assert!(print_chunk_errors && print_chunk_info);

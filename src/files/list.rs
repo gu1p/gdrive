@@ -351,7 +351,7 @@ fn mentions_trashed(query: &str) -> bool {
 
 /// Quotes a value as a string literal of the Drive query language: `'` and `\` are escaped
 /// with a backslash.
-fn quote(value: &str) -> String {
+pub(crate) fn quote(value: &str) -> String {
     let mut quoted = String::with_capacity(value.len() + 2);
     quoted.push('\'');
     for c in value.chars() {

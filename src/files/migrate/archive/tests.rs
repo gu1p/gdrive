@@ -135,6 +135,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         archive: true,
         contents: false,
         replace_smaller: false,
+        ask: None,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
@@ -1443,4 +1444,90 @@ async fn with_replace_smaller_only_a_larger_archive_replaces_and_a_dry_run_tells
         )]
     );
     assert_eq!(dest.updates(), []);
+}
+
+/// Answers every question of `--ask` with `answer`, and counts them.
+#[derive(Debug)]
+struct Answering {
+    answer: bool,
+    questions: std::sync::Mutex<Vec<String>>,
+}
+
+impl crate::files::migrate::ask::Ask for Answering {
+    fn ask(&self, question: String) -> futures::future::BoxFuture<'_, bool> {
+        self.questions.lock().unwrap().push(question);
+        Box::pin(async move { self.answer })
+    }
+}
+
+#[tokio::test]
+async fn ask_puts_a_changed_folders_archive_to_the_user() {
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let source = FakeDrive::start(plain_tree(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    let first = the_archive(&dest);
+    let was = human_size(first.content.len() as u64);
+
+    // A file less in the folder, one header and one block of content: the new archive is the
+    // smaller one.
+    let shrunk = plain_tree()
+        .into_iter()
+        .filter(|file| file.id != "a")
+        .collect();
+    let source = FakeDrive::start(shrunk, Behavior::default()).await;
+    let asking = |answer| {
+        let user = Arc::new(Answering {
+            answer,
+            questions: std::sync::Mutex::new(Vec::new()),
+        });
+        let settings = Settings {
+            ask: Some(user.clone()),
+            ..settings(&["photos"])
+        };
+        (user, settings)
+    };
+
+    let (user, no) = asking(false);
+    let kept = migrate(&source, &dest, no).await;
+
+    kept.assert_ok();
+    assert_eq!(kept.out.lines()[1..], ["keep-destination photos.tar"]);
+    assert_eq!(dest.updates(), []);
+    let questions = user.questions.lock().unwrap().clone();
+    assert_eq!(questions.len(), 1);
+    let now = human_size(first.content.len() as u64 - 1024);
+    assert_eq!(
+        questions[0],
+        format!(
+            "\nphotos.tar is in the destination with other content:\n  new archive: {now}\n  \
+             destination: {was}\nReplace the destination's file? [y/N] "
+        )
+    );
+    assert!(
+        kept.summary().ends_with(
+            "0 already there, 0 skipped (unsupported), 0 failed, 0 cancelled; 0 files replaced, \
+             1 conflict left alone"
+        ),
+        "{}",
+        kept.summary()
+    );
+
+    let (_, yes) = asking(true);
+    let replaced = migrate(&source, &dest, yes).await;
+
+    replaced.assert_ok();
+    let updates = dest.updates();
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].0, first.id);
+    assert_eq!(updates[0].1.len(), first.content.len() - 1024);
+    assert_eq!(
+        replaced.out.lines()[1..],
+        [format!("replace photos.tar ({now}, was {was})")]
+    );
+    // It is the archive of the folder as it is now.
+    let again = migrate(&source, &dest, settings(&["photos"])).await;
+    again.assert_ok();
+    assert_eq!(again.out.lines()[1..], ["already-there photos.tar"]);
 }
