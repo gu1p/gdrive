@@ -9,7 +9,14 @@
 //!        the destination's files named <name>.tar: the same manifest is already-there,
 //!        another file of that name a conflict
 //!        -> exports (or the exports cache of an interrupted run), the layout, the upload
+//!        -> once the upload returned, checked: the mark, appProperties gdriveArchive=<manifest>
 //! ```
+//!
+//! The mark means "verified": the archive is created without it, and gets it (one metadata
+//! update) only once the uploader compared Drive's md5 of the whole tar with the bytes read and
+//! every file was checked against its md5 (`transfer/archive.rs`). An archive that failed a
+//! check, or whose update failed, stays in the destination unmarked, and a later run takes it
+//! for a file of that name with other content: a conflict, never already-there.
 //!
 //! Names: every Drive name becomes one path component through `local_name` with the rules of
 //! every platform at once ([`local_name::unique_portable_names`]), so the archive extracts on
@@ -43,7 +50,10 @@ use crate::{
         human_size::human_size,
         local_name::{self, NameEntry, UnusableName},
     },
-    files::export::{export_file_name, ExportFormats},
+    files::{
+        export::{export_file_name, ExportFormats},
+        update::{update_metadata, PatchFile},
+    },
     transfer::{
         archive::{
             self, ArchiveError, ArchiveSource, Blob, CachedExport, Content, Entry, ExportsCache,
@@ -56,7 +66,8 @@ use crate::{
     },
 };
 
-/// The `appProperties` key of an archive, whose value is its manifest digest.
+/// The `appProperties` key of an archive, whose value is its manifest digest: the mark of an
+/// archive that was checked whole.
 pub(super) const PROPERTY: &str = "gdriveArchive";
 
 /// What the destination folder's listing returns of each file in an archive run: the
@@ -578,7 +589,6 @@ impl Migration {
             parents: place.folder.iter().cloned().collect(),
             name: Some(plan.name.clone()),
             mime: Some(media_type.clone()),
-            app_properties: BTreeMap::from([(PROPERTY.to_owned(), plan.manifest.clone())]),
             ..UploadTarget::default()
         };
         // The uploader tells the bytes Drive holds so far; progress takes what is new.
@@ -610,12 +620,22 @@ impl Migration {
         }
         let mut source = ArchiveSource::new(&self.source, &layout);
         // Boxed, as the relay's: the upload's state is large.
-        Box::pin(upload.run(&mut source))
+        let file = Box::pin(upload.run(&mut source))
             .await
             .map_err(|error| Error::Archive(Box::new(ArchiveError::of_upload(error))))?;
         if let Some(cache) = &cache {
             cache.remove().await;
         }
+        // Checked: the archive gets its mark.
+        let id = file.id.unwrap_or_default();
+        let mark = PatchFile::new(id.clone()).with_app_property(PROPERTY, &plan.manifest);
+        update_metadata(&self.dest, mark)
+            .await
+            .map_err(|source| Error::ArchiveMark {
+                name: plan.label.clone(),
+                id,
+                source: Box::new(source),
+            })?;
         self.tally.converted.fetch_add(exported, Ordering::SeqCst);
         Ok(Some(size))
     }

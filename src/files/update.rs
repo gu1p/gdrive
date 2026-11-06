@@ -263,6 +263,16 @@ impl PatchFile {
         };
         self
     }
+
+    /// Sets the `appProperties` key `key` to `value`; the file's other keys stay.
+    #[must_use]
+    pub(crate) fn with_app_property(mut self, key: &str, value: &str) -> Self {
+        self.file
+            .app_properties
+            .get_or_insert_with(Default::default)
+            .insert(key.to_owned(), value.to_owned());
+        self
+    }
 }
 
 #[cfg(test)]

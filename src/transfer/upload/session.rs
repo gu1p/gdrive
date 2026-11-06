@@ -28,7 +28,6 @@
 //! names.
 
 use std::{
-    collections::BTreeMap,
     fmt::{self, Debug, Formatter, Write},
     io,
     path::{Path, PathBuf},
@@ -235,10 +234,6 @@ pub(crate) struct RecordTarget {
     /// The `createdTime` the new file is given, like `modified_time`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) created_time: Option<String>,
-    /// The `appProperties` the new file is created with. Left out when there are none, like
-    /// `modified_time`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub(crate) app_properties: BTreeMap<String, String>,
 }
 
 impl RecordTarget {
@@ -542,7 +537,6 @@ mod tests {
             marker: None,
             modified_time: None,
             created_time: None,
-            app_properties: std::collections::BTreeMap::new(),
         }
     }
 
@@ -947,33 +941,6 @@ mod tests {
 
         assert!(!old.exists());
         assert!(fresh.exists());
-    }
-
-    #[test]
-    fn app_properties_name_and_pin_the_record_and_are_left_out_without_them() {
-        let with = |value: &str| RecordTarget {
-            app_properties: [(String::from("gdriveArchive"), value.to_owned())].into(),
-            ..target()
-        };
-        let dir = std::path::Path::new("/uploads");
-        let name = |target: &RecordTarget| RecordFile::new(dir, &source(), target).path.clone();
-        assert_ne!(name(&with("one")), name(&target()));
-        assert_ne!(name(&with("one")), name(&with("two")));
-
-        let record =
-            SessionRecord::new(String::from("url"), source(), with("one"), 256, identity());
-        assert_eq!(record.mismatch(&source(), &with("one")), None);
-        assert!(record.mismatch(&source(), &with("two")).is_some());
-        assert!(record.mismatch(&source(), &target()).is_some());
-
-        let written = serde_json::to_value(&record).unwrap();
-        assert_eq!(written["target"]["app_properties"]["gdriveArchive"], "one");
-        let plain = SessionRecord::new(String::from("url"), source(), target(), 256, identity());
-        let written = serde_json::to_value(&plain).unwrap();
-        assert!(
-            written["target"].get("app_properties").is_none(),
-            "{written}"
-        );
     }
 
     #[test]

@@ -619,6 +619,12 @@ impl FakeDrive {
         self.state.patches.lock().expect("patches lock").clone()
     }
 
+    /// The stored file `id` as it is now: as the test started the fake, or as a create made it,
+    /// with the metadata updates applied.
+    pub(crate) fn stored(&self, id: &str) -> Option<FakeFile> {
+        self.state.file(id)
+    }
+
     /// The file ids of `files.delete` requests.
     pub(crate) fn deletes(&self) -> Vec<String> {
         self.state.deletes.lock().expect("deletes lock").clone()
@@ -1100,6 +1106,19 @@ async fn patch(state: &State, id: &str, request: hyper::Request<Incoming>) -> Fa
     }
     if let Some(name) = metadata["name"].as_str() {
         name.clone_into(&mut file.name);
+    }
+    // As Drive: the keys sent are set, a null removes its key, the others stay.
+    if let Some(properties) = metadata["appProperties"].as_object() {
+        for (key, value) in properties {
+            match value.as_str() {
+                Some(value) => {
+                    file.app_properties.insert(key.clone(), value.to_owned());
+                }
+                None => {
+                    file.app_properties.remove(key);
+                }
+            }
+        }
     }
     let mut reply = file.to_json(true);
     drop(files);

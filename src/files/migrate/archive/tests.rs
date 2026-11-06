@@ -6,6 +6,8 @@ use std::{
     time::Duration,
 };
 
+use serde_json::json;
+
 use super::PROPERTY;
 use crate::{
     common::{human_size::human_size, local_name},
@@ -202,6 +204,14 @@ async fn migrate(source: &FakeDrive, dest: &FakeDrive, settings: Settings) -> Mi
     .await
 }
 
+/// The mark of `archive` in the destination now: its manifest digest, once it was checked.
+fn mark(dest: &FakeDrive, archive: &Created) -> Option<String> {
+    dest.stored(&archive.id)?
+        .app_properties
+        .get(PROPERTY)
+        .cloned()
+}
+
 /// The one file the run created in the destination.
 fn the_archive(dest: &FakeDrive) -> Created {
     let created = dest.created();
@@ -221,9 +231,14 @@ async fn a_folder_arrives_as_one_tar_that_unpacks_to_the_tree() {
     assert_eq!(archive.name, "photos.tar");
     assert_eq!(archive.mime_type, MEDIA_TYPE);
     assert_eq!(archive.parents, ["root"]);
-    let manifest = &archive.app_properties[PROPERTY];
+    // Created without its mark, which it gets once it is checked.
+    assert!(archive.app_properties.is_empty(), "{archive:?}");
+    let manifest = mark(&dest, &archive).unwrap();
     assert_eq!(manifest.len(), 64, "{manifest}");
-    assert_eq!(archive.app_properties.len(), 1);
+    let patches = dest.patches();
+    assert_eq!(patches.len(), 1, "{patches:?}");
+    assert_eq!(patches[0].0, archive.id);
+    assert_eq!(patches[0].1["appProperties"], json!({ PROPERTY: manifest }));
     assert_eq!(unpack(&archive.content), archived_tree());
 
     // The source is only read; the Doc and the Drawing were exported in the default formats.
@@ -287,7 +302,8 @@ async fn the_bytes_do_not_depend_on_the_order_drive_lists_things_in() {
             .await
             .assert_ok();
         let archive = the_archive(&dest);
-        archives.insert((archive.content, archive.app_properties[PROPERTY].clone()));
+        let manifest = mark(&dest, &archive).unwrap();
+        archives.insert((archive.content, manifest));
     }
     assert_eq!(archives.len(), 1);
 }
@@ -634,11 +650,13 @@ fn left_by_the_first_run(uploads: &Path) -> String {
     assert_eq!(record["source"]["remote"]["account"], "old@example.com");
     assert_eq!(record["source"]["remote"]["file_id"], "archive:big");
     assert_eq!(record["target"]["mime"], MEDIA_TYPE);
-    let manifest = record["target"]["app_properties"][PROPERTY]
-        .as_str()
+    assert!(record["target"].get("app_properties").is_none(), "{record}");
+    let manifest = cache
+        .strip_prefix("archive-")
+        .and_then(|name| name.strip_suffix(".exports"))
         .unwrap()
         .to_owned();
-    assert_eq!(*cache, format!("archive-{manifest}.exports"));
+    assert_eq!(manifest.len(), 64, "{manifest}");
     manifest
 }
 
@@ -701,7 +719,11 @@ async fn an_interrupted_archive_is_continued_by_the_next_run_with_the_first_runs
         "over both runs, Drive took each byte of the archive once"
     );
     let archive = the_archive(&dest);
-    assert_eq!(archive.app_properties[PROPERTY], manifest);
+    assert_eq!(
+        mark(&dest, &archive),
+        Some(manifest),
+        "marked once it was checked"
+    );
     let unpacked = unpack(&archive.content)
         .into_iter()
         .map(|(path, _, _, content)| (path, content))
@@ -917,11 +939,140 @@ async fn a_continued_archive_whose_session_expires_is_sent_again_whole_and_check
                 )),
                 "{text}"
             );
+            assert_eq!(mark(&dest, &archive), None, "never marked");
         } else {
             second.assert_ok();
             let unpacked = unpack(&archive.content);
             assert_eq!(unpacked.len(), 2);
             assert_eq!(unpacked[1].3, content.as_bytes());
+            assert!(mark(&dest, &archive).is_some(), "marked once checked");
         }
     }
+}
+
+#[tokio::test]
+async fn a_wrong_prefix_sent_before_an_interruption_fails_the_next_run_and_is_never_marked() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = continuing(&dir.path().join("uploads"));
+    let good = std::iter::repeat_n('b', 900_000).collect::<String>();
+    let listed = FakeFile::blob("b", "b.bin", "big", &good);
+    // In the first run only, Drive sends other bytes for the start of b.bin (the listed size and
+    // md5 stay): the first run uploads them and is interrupted before the end of b.bin.
+    let wrong_start = format!("{}{}", "x".repeat(100_000), &good[100_000..]);
+    let first_source = FakeDrive::start(
+        vec![
+            FakeFile::folder("big", "big", "root"),
+            FakeFile {
+                content: Some(wrong_start),
+                ..listed.clone()
+            },
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            chunks_stalled_from: Some(CHUNK_ALIGNMENT),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    interrupted(&first_source, &dest, &options).await;
+
+    // The next run reads the right bytes: they are not what Drive holds.
+    let source = FakeDrive::start(
+        vec![FakeFile::folder("big", "big", "root"), listed],
+        Behavior::default(),
+    )
+    .await;
+    let second = migrate_with(
+        &source,
+        &dest,
+        settings(&["big"]),
+        &options,
+        std::future::pending(),
+    )
+    .await;
+
+    assert!(second.result.is_err());
+    let archive = the_archive(&dest);
+    let text = second.err.text();
+    assert!(
+        text.contains(&format!(
+            "Error: unable to migrate 'big.tar': the archive in the destination (id {}) is not \
+             what was sent",
+            archive.id
+        )),
+        "{text}"
+    );
+    assert!(text.contains("it is left there unmarked"), "{text}");
+    assert_eq!(mark(&dest, &archive), None, "never marked");
+
+    // A third run takes it for a file of that name with other content.
+    let third = migrate_with(
+        &source,
+        &dest,
+        settings(&["big"]),
+        &options,
+        std::future::pending(),
+    )
+    .await;
+    assert!(third.result.is_err());
+    assert!(
+        third.err.text().contains(
+            "Error: unable to migrate 'big.tar': it exists in the destination with different \
+             content"
+        ),
+        "{}",
+        third.err.text()
+    );
+    assert_eq!(dest.created().len(), 1);
+    assert_eq!(first_source.writes(), Vec::<String>::new());
+    assert_eq!(source.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn an_archive_that_cannot_be_marked_fails_and_is_reported_as_different_next_time() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    // The archive gets the first generated id.
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            patch_rejected: HashSet::from([String::from("gen-0")]),
+            ..Behavior::default()
+        },
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, settings(&["photos"])).await;
+
+    assert!(migrated.result.is_err());
+    let archive = the_archive(&dest);
+    assert_eq!(archive.id, "gen-0");
+    let text = migrated.err.text();
+    assert!(
+        text.contains(
+            "Error: unable to migrate 'photos.tar': the archive 'photos.tar' is complete and \
+             checked in the destination (id gen-0), but it could not be marked as made from this \
+             source, so a later run will report it as a file of that name with other content; \
+             nothing was deleted"
+        ),
+        "{text}"
+    );
+    assert_eq!(unpack(&archive.content), archived_tree());
+    assert_eq!(mark(&dest, &archive), None);
+    assert_eq!(dest.deletes(), Vec::<String>::new());
+
+    let again = migrate(&source, &dest, settings(&["photos"])).await;
+    assert!(again.result.is_err());
+    assert!(
+        again.err.text().contains(
+            "Error: unable to migrate 'photos.tar': it exists in the destination with different \
+             content"
+        ),
+        "{}",
+        again.err.text()
+    );
+    assert_eq!(dest.created().len(), 1);
 }

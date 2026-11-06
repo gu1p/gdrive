@@ -1188,6 +1188,13 @@ pub(crate) enum Error {
         source: Box<RelayError>,
     },
     Archive(Box<crate::transfer::archive::ArchiveError>),
+    /// The archive `name` (the file `id`) is in the destination and checked, but could not get
+    /// its mark.
+    ArchiveMark {
+        name: String,
+        id: String,
+        source: Box<google_drive3::Error>,
+    },
     /// The item is in the destination, but could not be moved to the trash in the source.
     Trash(Box<google_drive3::Error>),
     /// An item of the migration failed; `label` is its path, starting with the name of its
@@ -1291,6 +1298,12 @@ impl Display for Error {
             ),
             Error::Export { label, .. } => write!(f, "unable to export '{label}'"),
             Error::Archive(error) => error.fmt(f),
+            Error::ArchiveMark { name, id, .. } => write!(
+                f,
+                "the archive '{name}' is complete and checked in the destination (id {id}), but \
+                 it could not be marked as made from this source, so a later run will report it \
+                 as a file of that name with other content; nothing was deleted"
+            ),
             Error::Trash(_) => f.write_str(
                 "it is in the destination, but it could not be moved to the trash in the source",
             ),
@@ -1315,6 +1328,7 @@ impl error::Error for Error {
             | Error::GetSource { source, .. }
             | Error::CreateFolder(source)
             | Error::Trash(source)
+            | Error::ArchiveMark { source, .. }
             | Error::ListDestination(source)
             | Error::Recheck(source) => Some(source.as_ref()),
             Error::ListSource(error) => Some(error.error.as_ref()),

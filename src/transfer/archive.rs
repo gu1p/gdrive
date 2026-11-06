@@ -855,8 +855,8 @@ impl Display for ArchiveError {
             } => write!(
                 f,
                 "the archive in the destination (id {file_id}) is not what was sent: its md5 is \
-                 {remote}, the bytes sent have {local}; delete it in the destination and run the \
-                 command again"
+                 {remote}, the bytes read have {local}; it is left there unmarked, delete it in \
+                 the destination and run the command again"
             ),
             ArchiveError::Upload(_) => f.write_str("unable to upload the archive"),
         }

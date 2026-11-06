@@ -730,51 +730,6 @@ async fn a_conversion_asks_for_the_google_type_and_sends_the_source_type() {
     }
 }
 
-#[tokio::test]
-async fn app_properties_are_sent_in_the_request_that_creates_the_file() {
-    let properties = || {
-        [(String::from("gdriveArchive"), String::from("digest"))]
-            .into_iter()
-            .collect::<std::collections::BTreeMap<_, _>>()
-    };
-    // A resumable upload, and a multipart one: the start of the session and the one request.
-    for (size, options) in [(SIZE, options()), (1000, UploadOptions::default())] {
-        let fixture = fixture(size);
-        let mock = MockDrive::start(Faults::default()).await;
-        let target = UploadTarget {
-            app_properties: properties(),
-            ..target()
-        };
-
-        upload(&mock, &fixture, &target, &options).await.unwrap();
-
-        let state = mock.state();
-        let uploads = state.uploads();
-        assert_eq!(uploads.len(), 1, "{}", state.log_text());
-        let file = state.files.values().next().unwrap();
-        assert_eq!(
-            file.metadata["appProperties"],
-            json!({"gdriveArchive": "digest"}),
-            "{size} bytes"
-        );
-    }
-
-    // With the marker of a conversion, both.
-    let fixture = fixture(1000);
-    let mock = MockDrive::start(Faults::default()).await;
-    let target = UploadTarget {
-        app_properties: properties(),
-        ..conversion()
-    };
-    upload(&mock, &fixture, &target, &UploadOptions::default())
-        .await
-        .unwrap();
-    let state = mock.state();
-    let properties = &state.files.values().next().unwrap().metadata["appProperties"];
-    assert_eq!(properties["gdriveArchive"], "digest");
-    assert_eq!(properties[super::UPLOAD_MARKER].as_str().unwrap().len(), 32);
-}
-
 /// Changes the file at `path` once the server confirmed the first chunk.
 fn after_first_chunk(path: PathBuf, change: fn(&std::fs::File)) -> impl Fn(u64) + Send + Sync {
     move |offset| {
