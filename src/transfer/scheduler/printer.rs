@@ -185,28 +185,30 @@ impl Printer {
                     }
                 }
                 // Above the progress bars, if any: they are taken off the terminal once per
-                // batch, not per line.
-                progress::suspend(|| {
-                    for message in batch.drain(..) {
-                        match message {
-                            Message::Line {
-                                target: Target::Stdout,
-                                text,
-                            } => out.line(&text, &state),
-                            Message::Line {
-                                target: Target::Stderr,
-                                text,
-                            } => err.line(&text, &state),
-                            Message::Flush(done) => {
-                                out.flush(&state);
-                                err.flush(&state);
-                                let _ = done.send(());
+                // batch, not per line. A hold that came alone has nothing to write before it.
+                if !batch.is_empty() {
+                    progress::suspend(|| {
+                        for message in batch.drain(..) {
+                            match message {
+                                Message::Line {
+                                    target: Target::Stdout,
+                                    text,
+                                } => out.line(&text, &state),
+                                Message::Line {
+                                    target: Target::Stderr,
+                                    text,
+                                } => err.line(&text, &state),
+                                Message::Flush(done) => {
+                                    out.flush(&state);
+                                    err.flush(&state);
+                                    let _ = done.send(());
+                                }
+                                // Never in a batch.
+                                Message::Hold { .. } => {}
                             }
-                            // Never in a batch.
-                            Message::Hold { .. } => {}
                         }
-                    }
-                });
+                    });
+                }
                 if let Some((held, released)) = hold {
                     out.flush(&state);
                     err.flush(&state);

@@ -618,7 +618,7 @@ struct Smaller {
 enum Use {
     /// It found its content there: the file is what it is migrated to.
     Relied,
-    /// It replaces the file's content, or asked the user about that.
+    /// It replaces the file's content, or is asking the user about that.
     Replaced,
 }
 
@@ -1293,6 +1293,12 @@ impl Migration {
         if self.asked(place, name, label, size, incoming, &old).await? {
             return Ok(Settled::Replace(old));
         }
+        // It stays what it is: no other item replaces it either, and one with its content
+        // finds it there.
+        self.dest_use
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(old.id.clone(), Use::Relied);
         context
             .printer
             .out(format!("keep-destination {label}"))
