@@ -256,7 +256,7 @@ replace photos/report.xlsx (1.2 MB, was 1.1 MB)
   changed during the migration; it was not replaced`.
 - One run replaces a file once. When two source files of one name would replace the same destination file,
   the first one does and the other one is a conflict. A file that another item of the run found its own
-  content in (`already-there`) is not replaced either.
+  content in (`already-there`), or created, is not replaced either.
 - The new content is checked by MD5 like any migrated file, and the destination file is read once more
   after the upload: it must hold what was sent. With `--trash-source`, the source file goes to the trash
   only after that.
@@ -294,8 +294,10 @@ Replace the destination's file? [y/N]
   item is settled and is **not** a failure, so the run goes on and can end with exit status 0. With
   `--trash-source`, its source file stays where it is.
 - The times are UTC. `by NAME` is who changed the file last, when Drive tells.
-- Questions come one at a time, and nothing else is printed between a question and its answer. The other
-  transfers go on in the background meanwhile. The progress display is off with `--ask`.
+- Questions come one at a time, and the lines of the other items wait until the answer. The other
+  transfers go on in the background meanwhile. The progress display is off with `--ask`. A warning of a
+  transfer in the background (a retry, `--print-chunk-info`) can still appear under a question, which goes
+  on waiting for your answer.
 - Asked about are the conflicts that one file can settle: the destination folder has exactly one file of
   that name, and it is not a Google Docs, Sheets or Slides file. The others are the failed items they were.
 - With `--replace-smaller` too, a smaller destination file is replaced without a question, and only the

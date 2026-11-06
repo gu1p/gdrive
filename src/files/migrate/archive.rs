@@ -350,14 +350,18 @@ impl Plan {
     }
 
     /// The size of the archive without its exports: what it has at least, since an export
-    /// over Drive's limit is left out.
+    /// over Drive's limit is left out. Nothing at all when it is exports only: no archive is
+    /// made of nothing.
     fn least_size(&self) -> u64 {
         let entries = self
             .entries
             .iter()
             .filter(|entry| !matches!(entry.kind, Kind::Export(_)))
             .map(|entry| entry.entry(None))
-            .collect();
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return 0;
+        }
         Layout::new(entries).size()
     }
 }
@@ -713,10 +717,7 @@ impl Migration {
                 .settle(place, &plan.name, label, incoming, context)
                 .await?
             {
-                Settled::Replace(old) => {
-                    self.still_listed(place, &plan.name, &old).await?;
-                    Some(old)
-                }
+                Settled::Replace(old) => Some(old),
                 Settled::Keep => return Ok(Made::Kept),
                 Settled::Conflict => return Err(Error::Conflict),
             }
@@ -771,6 +772,10 @@ impl Migration {
             }
         }
         let mut source = ArchiveSource::new(&self.source, &layout);
+        // Right before the upload: what came before may have waited for a question's answer.
+        if let Some(old) = &smaller {
+            self.still_listed(place, &plan.name, old).await?;
+        }
         // Boxed, as the relay's: the upload's state is large.
         let file = Box::pin(upload.run(&mut source))
             .await
@@ -783,6 +788,9 @@ impl Migration {
         if smaller.is_some() {
             self.holds(&id, md5).await?;
             self.tally.replaced.fetch_add(1, Ordering::SeqCst);
+        } else if !self.rely(std::iter::once(id.as_str())) {
+            // Another archive of the run, which listed the folder later, replaced this one.
+            return Err(Error::Conflict);
         }
         self.mark(plan, id, md5).await?;
         self.tally.converted.fetch_add(exported, Ordering::SeqCst);

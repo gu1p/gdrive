@@ -1531,3 +1531,39 @@ async fn ask_puts_a_changed_folders_archive_to_the_user() {
     again.assert_ok();
     assert_eq!(again.out.lines()[1..], ["already-there photos.tar"]);
 }
+
+#[tokio::test]
+async fn a_dry_run_of_an_archive_of_exports_only_promises_no_replace() {
+    // A Google Docs file by its id: without its export there is nothing to archive.
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::native("doc", "notes", "root", DOCUMENT, "exported document")
+                .modified(FILE_TIME),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![FakeFile::blob("old", "notes.tar", "root", "small")],
+        Behavior::default(),
+    )
+    .await;
+
+    let dry = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            ..replacing(settings(&["doc"]))
+        },
+    )
+    .await;
+
+    dry.assert_ok();
+    let lines = dry.out.lines();
+    let line = lines.last().unwrap();
+    assert!(
+        line.starts_with("replace notes.tar (") && line.ends_with(" if the exports make it larger"),
+        "{line}"
+    );
+}

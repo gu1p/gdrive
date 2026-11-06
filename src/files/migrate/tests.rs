@@ -2499,3 +2499,92 @@ async fn ask_does_not_ask_about_what_no_single_file_can_settle() {
     assert!(user.questions.lock().unwrap().is_empty());
     assert_eq!(dest.updates(), []);
 }
+
+#[tokio::test]
+async fn the_my_drive_of_one_account_goes_into_the_my_drive_of_another() {
+    // `root` is each account's name for its own top folder, whose id is another one.
+    let files = source_tree()
+        .into_iter()
+        .map(|file| {
+            if file.parents == ["root"] {
+                file.with_parents(&["source-top"])
+            } else {
+                file
+            }
+        })
+        .collect();
+    let behavior = Behavior {
+        my_drive: Some(String::from("source-top")),
+        ..Behavior::default()
+    };
+    let source = FakeDrive::start(files, behavior).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, replacing(&["root"])).await;
+
+    migrated.assert_ok();
+    let expected = migrated_tree()
+        .into_iter()
+        .map(|(path, content)| (format!("My Drive/{path}"), content))
+        .chain([(String::from("My Drive/"), String::new())])
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(created_tree(&dest), expected);
+}
+
+#[tokio::test]
+async fn a_file_that_one_item_created_is_not_replaced_by_another() {
+    // Two source folders of one name go into the same destination folder. Its listing is
+    // answered for one of them at once, and for the other one a second later: by then the
+    // first one has created its `x.txt` and trashed its source.
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("p1", "photos", "root"),
+            FakeFile::blob("s1", "x.txt", "p1", "first"),
+            FakeFile::folder("p2", "photos", "root"),
+            FakeFile::blob("s2", "x.txt", "p2", "second one"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let behavior = Behavior {
+        unavailable_first: HashMap::from([(String::from("old-photos"), 1)]),
+        unavailable_retry_after: Some(1),
+        ..Behavior::default()
+    };
+    let dest = FakeDrive::start(
+        vec![FakeFile::folder("old-photos", "photos", "root")],
+        behavior,
+    )
+    .await;
+    // Yes to every question: whichever folder comes second would replace the file of the first.
+    let user = scripted(|_| true);
+
+    let migrated = migrate(
+        &source,
+        &dest,
+        continuing(Settings {
+            ask: Some(user.clone()),
+            trash_source: true,
+            ..settings(&["p1", "p2"])
+        }),
+    )
+    .await;
+
+    assert_eq!(dest.updates(), [], "{}", migrated.err.text());
+    let created = dest.created();
+    assert_eq!(created.len(), 1, "{created:?}");
+    // The one whose content is in the destination went to the trash, and only that one.
+    let content = String::from_utf8_lossy(&created[0].content).into_owned();
+    let (migrated_file, other) = if content == "first" {
+        ("s1", "s2")
+    } else {
+        ("s2", "s1")
+    };
+    let trashed = trashed_ids(&source);
+    assert!(
+        trashed.contains(&String::from(migrated_file)),
+        "{trashed:?}"
+    );
+    assert!(!trashed.contains(&String::from(other)), "{trashed:?}");
+    assert!(migrated.err.text().contains(&conflict("photos/x.txt")));
+}

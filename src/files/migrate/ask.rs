@@ -10,7 +10,9 @@
 //! The answers are read on a thread of their own: a read of the keyboard cannot be cancelled,
 //! and a thread of the runtime that waits in one would keep the process from ending after
 //! Ctrl-C. That thread ends with the process. A question whose job went away (the run stopped)
-//! is abandoned: its hold is released, and its answer goes nowhere.
+//! is abandoned: its hold is released, and its answer goes nowhere. Ctrl-C releases the hold of
+//! the open question by itself, so that the run can print and stop even when lines wait behind
+//! it.
 
 use std::{
     fmt::{Debug, Write as _},
@@ -130,12 +132,21 @@ impl Ask for Terminal {
             let Some(keyboard) = keyboard.as_ref() else {
                 return false;
             };
-            // What was printed so far is on the terminal, and nothing follows the question.
-            let _hold = self.printer.hold().await;
-            keyboard
-                .answer(question)
-                .await
-                .is_some_and(|answer| is_yes(&answer))
+            let answer = {
+                // What was printed so far is on the terminal, and nothing follows the question.
+                let _hold = self.printer.hold().await;
+                tokio::select! {
+                    answer = keyboard.answer(question) => Some(answer),
+                    _ = tokio::signal::ctrl_c() => None,
+                }
+            };
+            match answer {
+                Some(answer) => answer.is_some_and(|answer| is_yes(&answer)),
+                // Ctrl-C: the output is free again for what the run prints while it stops,
+                // which a full queue behind the question would keep it from. The question has
+                // no answer, and the run drops this job.
+                None => std::future::pending().await,
+            }
         })
     }
 }

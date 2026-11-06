@@ -32,7 +32,8 @@
 //! file of the same size or larger, and one of several of that name, is a conflict as before.
 //! Three checks around a replace: the folder is listed again for the name right before it (the
 //! file must still be the only one, where and what it was); one run replaces a file once, and
-//! never one that another item of the run found its own content in (`dest_use`); and the file is
+//! never one that another item of the run found its own content in or created (`dest_use`); and
+//! the file is
 //! read again once the upload returned, since a session completed by an earlier run answers with
 //! what the file was then. A writer that changes the file while it is replaced is not seen: Drive
 //! has no conditional update, and keeps what was replaced as an earlier version.
@@ -275,6 +276,25 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
     .await
 }
 
+/// Every source id, for the destination folders and files that both accounts see: an `--into`
+/// among them is refused, and so is one reused, matched or replaced later. Trashing a source
+/// folder would trash what was put in it, and its listing would include the copies.
+fn source_ids(roots: &[(&String, Result<SourceNode, Error>)]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for (id, root) in roots {
+        match root {
+            Ok(root) => root.collect_ids(&mut ids),
+            // A requested id that could not be read is a source item all the same. Not `root`,
+            // which is each account's name for its own My Drive.
+            Err(_) if id.as_str() != MY_DRIVE => {
+                ids.insert((*id).clone());
+            }
+            Err(_) => {}
+        }
+    }
+    ids
+}
+
 /// Where the sessions of resumable uploads into `account` are recorded, as `files upload` records
 /// those of the current account (`uploads/` of the account directory).
 fn session_dir(account: &AppConfig) -> PathBuf {
@@ -336,16 +356,7 @@ async fn run(
         }
         roots.push((id, root));
     }
-    // Every source id, for the destination folders and files that both accounts see: an
-    // `--into` among them is refused, and so is one reused or matched later. Trashing a source
-    // folder would trash what was put in it, and its listing would include the copies.
-    // A requested id that could not be read is a source item all the same.
-    let mut source_ids = settings.file_ids.iter().cloned().collect::<HashSet<_>>();
-    for (_, root) in &roots {
-        if let Ok(root) = root {
-            root.collect_ids(&mut source_ids);
-        }
-    }
+    let source_ids = source_ids(&roots);
     if source_ids.contains(&into) {
         return Err(Error::IntoInsideSource(into));
     }
@@ -1208,8 +1219,14 @@ impl Migration {
         )
         .await
         .map_err(|error| Error::Relay(Box::new(error)))?;
-        if let Some(old) = replaced {
-            self.holds(&old.id, created.md5_checksum.as_deref()).await?;
+        match (replaced, created.id.as_deref()) {
+            (Some(old), _) => {
+                self.holds(&old.id, created.md5_checksum.as_deref()).await?;
+            }
+            // What the item was migrated to: no other item of the run replaces it. One that
+            // did meanwhile (it listed the folder later) has put other content there.
+            (None, Some(id)) if !self.rely(std::iter::once(id)) => return Err(Error::Conflict),
+            (None, _) => {}
         }
         Ok(created
             .size
