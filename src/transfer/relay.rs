@@ -285,13 +285,16 @@ impl Error for RelayError {
     }
 }
 
-/// Relays `source_file` from the account of `source` to a NEW file of the account of `dest`.
+/// Relays `source_file` from the account of `source` to a NEW file of the account of `dest`, or,
+/// for a blob with `target.existing_file_id`, as the new content of that file of `dest` (a new
+/// version of it; its folders and type stay).
 /// `source_file` comes from a listing with at least `id, name, mimeType`; `size`,
 /// `md5Checksum`, `modifiedTime`, `createdTime`, `version` are used when present and fetched
 /// with files.get when a blob lacks `size` or `md5Checksum`. The new file goes to
 /// `target.parents`, is named `target.name` (the source's name when None) and gets the source's
-/// type: `target.mime`, `target.convert_to` and `target.existing_file_id` are ignored;
-/// `target.new_file_id` (pre-generated) is honoured for blobs. The source's `modifiedTime` (and
+/// type: `target.mime` and `target.convert_to` are ignored, and so is
+/// `target.existing_file_id` for a Workspace file; `target.new_file_id` (pre-generated) is
+/// honoured for blobs. The source's `modifiedTime` (and
 /// `createdTime`) are set on the new file. Blobs stream in pieces straight into the resumable
 /// (or multipart, under `opts.multipart_threshold`) upload: nothing is written to disk and
 /// memory is a few MiB per call. A Workspace file is exported (docx/xlsx/pptx/... for its type)
@@ -348,6 +351,7 @@ pub(crate) async fn relay_file(
         parents: &target.parents,
         name,
         new_file_id: target.new_file_id.as_deref(),
+        existing_file_id: target.existing_file_id.as_deref(),
         times: FileTimes {
             modified: file.modified_time,
             created: file.created_time,
@@ -397,6 +401,8 @@ struct Relay<'a> {
     /// The name of the copy.
     name: Option<String>,
     new_file_id: Option<&'a str>,
+    /// The file of the destination that gets the content of a blob, instead of a new file.
+    existing_file_id: Option<&'a str>,
     times: FileTimes,
     opts: &'a UploadOptions,
     progress: Option<&'a (dyn Fn(u64) + Send + Sync)>,
@@ -411,8 +417,12 @@ impl Relay<'_> {
             mime: Some(mime),
             // Drive takes no id for a conversion; the uploader leaves it out then.
             new_file_id: self.new_file_id.map(str::to_owned),
+            // A conversion never replaces a file.
+            existing_file_id: self
+                .existing_file_id
+                .filter(|_| convert_to.is_none())
+                .map(str::to_owned),
             convert_to,
-            ..UploadTarget::default()
         }
     }
 

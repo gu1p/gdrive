@@ -22,6 +22,14 @@
 //! content for a later run: a conflict, never already-there. An update whose reply failed may
 //! or may not have written the mark.
 //!
+//! `--replace-smaller`: a file of the archive's name that is no archive of this manifest is
+//! replaced when it is the only one and smaller than the new archive, whose size is known once
+//! its exports are made (a dry run compares with the size without them, and with exports says
+//! `replace ... if the exports make it larger` for a file that is not smaller than that). The new
+//! archive goes up
+//! as a new version of that file, which keeps its old mark until the new one is checked: with
+//! other bytes than it was marked with, it is no archive of any manifest in between.
+//!
 //! Names: every Drive name becomes one path component through `local_name` with the rules of
 //! every platform at once ([`local_name::unique_portable_names`]), so the archive extracts on
 //! Windows, macOS and Linux and its bytes do not depend on where gdrive runs; siblings whose
@@ -46,7 +54,7 @@ use chrono::{DateTime, Utc};
 use super::{
     failed,
     source::{label, SourceFolder, SourceItem, SourceNode},
-    Error, Existing, Match, Migration, Place, Tally,
+    Error, Existing, Match, Migration, Place, Settings, Tally,
 };
 use crate::{
     common::{
@@ -453,25 +461,49 @@ impl Migration {
             }
         }
         let label = &plan.label;
-        match place
+        // Whether a file of its name with other content is there, to replace if it is smaller.
+        let replacing = match place
             .existing
             .archive(&plan.name, &plan.manifest, &self.source_ids)
         {
-            Match::None => {}
+            Match::None => false,
             Match::Same { .. } => {
                 context.printer.out(format!("already-there {label}")).await;
                 return Outcome::Unchanged.into();
             }
+            Match::Different if self.replace_smaller => true,
             Match::Different => return failed(label, Error::Conflict).into(),
             Match::Source => return failed(label, Error::InsideSource { folder: false }).into(),
-        }
+        };
+        // A dry run knows the size without the exports, which only a real run makes: at least
+        // that many bytes. With exports it cannot tell whether a file that is not smaller than
+        // that will be replaced, and says so.
+        let mut unsure = false;
+        let smaller = if replacing && self.dry_run {
+            let mut old = self.smaller(&place.existing, &plan.name, planned);
+            if old.is_none() && plan.exports() > 0 {
+                old = self.smaller(&place.existing, &plan.name, u64::MAX);
+                unsure = true;
+            }
+            match old {
+                Some(old) => Some(old),
+                None => return failed(label, Error::Conflict).into(),
+            }
+        } else {
+            None
+        };
         for (label, reason) in &plan.skipped {
             self.left_out(label, reason, context).await;
         }
 
         if self.dry_run {
             let exports = plan.exports();
-            let mut line = format!("create {label} ({}", human_size(planned));
+            let verb = if smaller.is_some() {
+                "replace"
+            } else {
+                "create"
+            };
+            let mut line = format!("{verb} {label} ({}", human_size(planned));
             if exports > 0 {
                 let _ = write!(
                     line,
@@ -479,13 +511,20 @@ impl Migration {
                     plural(exports, "Google Workspace file", "Google Workspace files")
                 );
             }
+            if let Some(old) = &smaller {
+                let _ = write!(line, ", was {}", human_size(old.size));
+                self.tally.replaced.fetch_add(1, Ordering::SeqCst);
+            }
             line.push(')');
+            if unsure {
+                line.push_str(" if the exports make it larger");
+            }
             context.printer.out(line).await;
             self.tally.converted.fetch_add(exports, Ordering::SeqCst);
             return Outcome::Transferred { bytes: planned }.into();
         }
 
-        match self.make_archive(&plan, &place, context).await {
+        match self.make_archive(&plan, &place, replacing, context).await {
             Ok(Some(bytes)) => Outcome::Transferred { bytes }.into(),
             // A FILE_ID that is a Workspace file whose export is too large.
             Ok(None) => Outcome::Skipped {
@@ -578,11 +617,13 @@ impl Migration {
     }
 
     /// Exports, lays out and uploads the archive of `plan`; its size, or `None` when nothing is
-    /// left to archive.
+    /// left to archive. `replacing`: a file of its name with other content is there, and the
+    /// archive replaces it if it is smaller, and is a conflict otherwise.
     async fn make_archive(
         &self,
         plan: &Plan,
         place: &Place,
+        replacing: bool,
         context: &JobContext,
     ) -> Result<Option<u64>, Error> {
         let cache = self
@@ -603,10 +644,24 @@ impl Migration {
         let layout = Layout::new(entries);
         let size = layout.size();
         let label = &plan.label;
-        context
-            .printer
-            .out(format!("create {label} ({})", human_size(size)))
-            .await;
+        let smaller = if replacing {
+            let old = self
+                .smaller(&place.existing, &plan.name, size)
+                .ok_or(Error::Conflict)?;
+            self.still_listed(&old).await?;
+            Some(old)
+        } else {
+            None
+        };
+        let line = match &smaller {
+            Some(old) => format!(
+                "replace {label} ({}, was {})",
+                human_size(size),
+                human_size(old.size)
+            ),
+            None => format!("create {label} ({})", human_size(size)),
+        };
+        context.printer.out(line).await;
         let media_type = archive::MEDIA_TYPE
             .parse::<mime::Mime>()
             .unwrap_or(mime::APPLICATION_OCTET_STREAM);
@@ -614,6 +669,8 @@ impl Migration {
             parents: place.folder.iter().cloned().collect(),
             name: Some(plan.name.clone()),
             mime: Some(media_type.clone()),
+            // A new version of the smaller file, which keeps its id and folder.
+            existing_file_id: smaller.as_ref().map(|old| old.id.clone()),
             ..UploadTarget::default()
         };
         // The uploader tells the bytes Drive holds so far; progress takes what is new.
@@ -666,6 +723,9 @@ impl Migration {
                 source: Box::new(source),
             })?;
         self.tally.converted.fetch_add(exported, Ordering::SeqCst);
+        if smaller.is_some() {
+            self.tally.replaced.fetch_add(1, Ordering::SeqCst);
+        }
         Ok(Some(size))
     }
 
@@ -687,7 +747,8 @@ impl Migration {
 /// The last line on stderr of an archive run, for example `Summary: 2 archives migrated
 /// (3.4 MB, 1 Google Workspace file exported), 0 already there, 1 skipped (unsupported), 0
 /// failed, 0 cancelled`. A dry run's size leaves out the exports, and says so.
-pub(super) fn summary(report: &Report, tally: &Tally, dry_run: bool) -> String {
+pub(super) fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
+    let dry_run = settings.dry_run;
     let files = &report.files;
     let mut line = String::new();
     if dry_run {
@@ -717,6 +778,7 @@ pub(super) fn summary(report: &Report, tally: &Tally, dry_run: bool) -> String {
         files.failed,
         files.cancelled,
     );
+    line.push_str(&super::replaced(tally, settings));
     if report.interrupted {
         line.push_str("; interrupted");
     }

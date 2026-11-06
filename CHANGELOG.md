@@ -96,7 +96,10 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   destination; `--trash-source` moves migrated files, and folders whose whole content was migrated, to
   the source's trash, after checking each again: a file that changed or a folder that got new files
   stays. With `--contents`, what is in each given folder goes straight into the destination folder
-  (`FOLDER/*` to `DEST/*`), without a folder of its name. Prints one line per item (`create`, `reuse`,
+  (`FOLDER/*` to `DEST/*`), without a folder of its name. With `--replace-smaller`, a destination file of
+  the same name with other content and fewer bytes gets the source's content as a new version of that
+  file, instead of a failed item (also the tar file of `--archive`); a file of the same size or larger is
+  never replaced. Prints one line per item (`create`, `reuse`,
   `convert`, `already-there`, `skip`, `trash`) and a summary; takes `--jobs`, `--continue-on-error`, the
   chunk and progress flags of `files upload`. Sharing, comments and revisions are not migrated. See
   docs/migrate.md.

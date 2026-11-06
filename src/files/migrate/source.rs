@@ -26,7 +26,7 @@ const ROOT_FIELDS: &str =
     "id,name,mimeType,size,md5Checksum,modifiedTime,createdTime,driveId,resourceKey,trashed";
 
 /// The prefix of the Google Workspace MIME types.
-const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
+pub(super) const GOOGLE_APPS_PREFIX: &str = "application/vnd.google-apps.";
 
 /// What a migration knows about a source file (not a folder).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -1543,7 +1543,6 @@ async fn a_small_blob_goes_up_in_one_multipart_request_with_the_sources_type_and
         // Ignored: the copy has the source's type.
         mime: Some(mime::TEXT_PLAIN),
         convert_to: Some(mime::TEXT_PLAIN),
-        existing_file_id: Some(String::from("ignored")),
         ..target()
     };
     let reported = Mutex::new(Vec::new());

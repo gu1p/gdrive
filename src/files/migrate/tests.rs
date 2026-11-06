@@ -71,6 +71,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         trash_source: false,
         archive: false,
         contents: false,
+        replace_smaller: false,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }
@@ -1883,4 +1884,298 @@ async fn with_contents_a_folder_that_could_not_be_listed_fails_and_nothing_is_cr
         migrated.err.text()
     );
     assert!(dest.created().is_empty());
+}
+
+/// [`migrate`] between any two hubs, with `options`.
+async fn migrate_hubs(
+    source: &crate::hub::Hub,
+    dest: &crate::hub::Hub,
+    settings: Settings,
+    options: &UploadOptions,
+) -> Migrated {
+    let output = output();
+    let run = run(
+        source,
+        dest,
+        &settings,
+        options,
+        &output.printer,
+        ProgressDisplay::reporting_to(Arc::new(NoProgress)),
+        future::pending(),
+    );
+    let result = tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("the migration should end");
+    Migrated {
+        result,
+        out: output.out,
+        err: output.err,
+    }
+}
+
+/// `photos` in the destination with other content than [`source_tree`] under three names.
+fn smaller_and_larger_destination() -> Vec<FakeFile> {
+    vec![
+        FakeFile::folder("old-photos", "photos", "root"),
+        // Smaller than the source's `aaaa`.
+        FakeFile::blob("old-a", "a.txt", "old-photos", "a"),
+        // Larger than the source's `bb`.
+        FakeFile::blob("old-b", "b.txt", "old-photos", "bbb"),
+        FakeFile::folder("old-2024", "2024", "old-photos"),
+        // As large as the source's `dddd`.
+        FakeFile::blob("old-d", "d.txt", "old-2024", "DDDD"),
+    ]
+}
+
+fn replacing(file_ids: &[&str]) -> Settings {
+    continuing(Settings {
+        replace_smaller: true,
+        ..settings(file_ids)
+    })
+}
+
+fn conflict(label: &str) -> String {
+    format!(
+        "Error: unable to migrate '{label}': it exists in the destination with different content"
+    )
+}
+
+#[tokio::test]
+async fn replace_smaller_replaces_a_smaller_file_of_the_name_and_no_other() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    // The larger file and the one of the same size are conflicts, as without the flag.
+    assert!(migrated.result.is_err());
+    let errors = migrated.err.text();
+    for label in ["photos/b.txt", "photos/2024/d.txt"] {
+        assert!(errors.contains(&conflict(label)), "{errors}");
+    }
+    assert!(!errors.contains(&conflict("photos/a.txt")), "{errors}");
+    // The smaller one has the source's content now: the same file, where it was.
+    assert_eq!(dest.updates(), [(String::from("old-a"), b"aaaa".to_vec())]);
+    let replaced = dest.stored("old-a").unwrap();
+    assert_eq!(replaced.content.as_deref(), Some("aaaa"));
+    assert_eq!(replaced.parents, ["old-photos"]);
+    assert!(
+        dest.gets().contains(&String::from("old-a")),
+        "checked first"
+    );
+    let created = dest.created();
+    let mut names = created
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect::<Vec<_>>();
+    names.sort_unstable();
+    assert_eq!(names, ["empty", "f.txt", "jan"]);
+    assert!(migrated
+        .out
+        .lines()
+        .contains(&String::from("replace photos/a.txt (4 B, was 1 B)")));
+    assert_eq!(
+        migrated.summary(),
+        "Summary: 2 migrated (10 B), 0 already there, 0 skipped (unsupported), 2 failed, \
+         0 cancelled; 2 folders created, 2 reused; 1 smaller file replaced"
+    );
+    assert_eq!(source.writes(), Vec::<String>::new());
+
+    let again = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    assert!(again
+        .out
+        .lines()
+        .contains(&String::from("already-there photos/a.txt")));
+    assert_eq!(dest.updates().len(), 1, "nothing is replaced twice");
+    assert!(
+        again.summary().ends_with("; 0 smaller files replaced"),
+        "{}",
+        again.summary()
+    );
+}
+
+#[tokio::test]
+async fn without_replace_smaller_a_smaller_file_is_a_conflict_and_a_dry_run_replaces_nothing() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+
+    let migrated = migrate(&source, &dest, continuing(settings(&["photos"]))).await;
+
+    assert!(migrated.err.text().contains(&conflict("photos/a.txt")));
+    assert!(!migrated.summary().contains("replace"));
+    assert_eq!(dest.updates(), []);
+
+    let dest = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    let dry = migrate(
+        &source,
+        &dest,
+        Settings {
+            dry_run: true,
+            ..replacing(&["photos"])
+        },
+    )
+    .await;
+
+    assert!(dry
+        .out
+        .lines()
+        .contains(&String::from("replace photos/a.txt (4 B, was 1 B)")));
+    assert!(
+        dry.summary().ends_with("; 1 smaller file to replace"),
+        "{}",
+        dry.summary()
+    );
+    assert_eq!(dest.writes(), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn replace_smaller_picks_no_file_among_several_and_no_google_file() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            // Two of the name, both smaller.
+            FakeFile::blob("old-a1", "a.txt", "old-photos", "a"),
+            FakeFile::blob("old-a2", "a.txt", "old-photos", "aa"),
+            // A Google Docs file of the name.
+            FakeFile::document("old-b", "b.txt", "old-photos"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    let errors = migrated.err.text();
+    for label in ["photos/a.txt", "photos/b.txt"] {
+        assert!(errors.contains(&conflict(label)), "{errors}");
+    }
+    assert_eq!(dest.updates(), []);
+    assert!(dest
+        .created()
+        .iter()
+        .all(|file| file.name != "a.txt" && file.name != "b.txt"));
+}
+
+#[tokio::test]
+async fn two_source_files_of_one_name_replace_a_smaller_file_once() {
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("photos", "photos", "root"),
+            FakeFile::blob("s1", "same.txt", "photos", "first1"),
+            FakeFile::blob("s2", "same.txt", "photos", "second22"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old", "same.txt", "old-photos", "x"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+
+    let migrated = migrate(&source, &dest, replacing(&["photos"])).await;
+
+    assert!(migrated.result.is_err());
+    let updates = dest.updates();
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    assert_eq!(updates[0].0, "old");
+    assert!(migrated.err.text().contains(&conflict("photos/same.txt")));
+    assert!(dest.created().is_empty());
+    assert!(
+        migrated.summary().contains("1 migrated") && migrated.summary().contains("1 failed"),
+        "{}",
+        migrated.summary()
+    );
+}
+
+#[tokio::test]
+async fn a_destination_file_that_changed_since_its_listing_is_not_replaced() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let fake = FakeDrive::start(smaller_and_larger_destination(), Behavior::default()).await;
+    // The check right before `a.txt` is replaced finds other content than the listing had.
+    let dest = Interceptor::start(&fake, |method, path, params| {
+        let recheck = *method == hyper::Method::GET
+            && path == "/drive/v3/files/old-a"
+            && params.get("fields").map(String::as_str) == Some(super::REPLACED_FIELDS);
+        recheck.then(|| json!({"id": "old-a", "size": "2", "md5Checksum": "0123456789abcdef"}))
+    })
+    .await;
+
+    let migrated = migrate_hubs(
+        &source.hub(),
+        &dest.hub(),
+        replacing(&["photos"]),
+        &UploadOptions::default(),
+    )
+    .await;
+
+    assert!(
+        migrated.err.text().contains(
+            "Error: unable to migrate 'photos/a.txt': the file of this name in the destination \
+             changed during the migration; it was not replaced"
+        ),
+        "{}",
+        migrated.err.text()
+    );
+    assert_eq!(fake.updates(), []);
+    assert_eq!(fake.stored("old-a").unwrap().content.as_deref(), Some("a"));
+}
+
+#[tokio::test]
+async fn replace_smaller_sends_a_large_file_through_a_session_and_trashes_its_source() {
+    let content = "0123456789".repeat(60_000);
+    let source = FakeDrive::start(
+        vec![
+            FakeFile::folder("photos", "photos", "root"),
+            FakeFile::blob("big", "big.bin", "photos", &content),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    let dest = FakeDrive::start(
+        vec![
+            FakeFile::folder("old-photos", "photos", "root"),
+            FakeFile::blob("old-big", "big.bin", "old-photos", "0123456789"),
+        ],
+        Behavior::default(),
+    )
+    .await;
+    // Everything through a resumable session, two chunks.
+    let options = UploadOptions {
+        chunk_size: 256 * 1024,
+        multipart_threshold: 0,
+        ..UploadOptions::default()
+    };
+
+    let migrated = migrate_hubs(
+        &source.hub(),
+        &dest.hub(),
+        Settings {
+            replace_smaller: true,
+            trash_source: true,
+            ..settings(&["photos"])
+        },
+        &options,
+    )
+    .await;
+
+    migrated.assert_ok();
+    assert_eq!(
+        dest.updates(),
+        [(String::from("old-big"), content.clone().into_bytes())]
+    );
+    assert!(dest.created().is_empty());
+    let sent = dest
+        .chunks()
+        .iter()
+        .filter(|chunk| chunk.first.is_some())
+        .count();
+    assert!(sent >= 2, "{:?}", dest.chunks());
+    // Replaced and checked by md5: the source file went, and its folder after it.
+    assert_eq!(trashed_ids(&source), ["big", "photos"]);
 }
