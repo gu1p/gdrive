@@ -9,14 +9,18 @@
 //!        the destination's files named <name>.tar: the same manifest is already-there,
 //!        another file of that name a conflict
 //!        -> exports (or the exports cache of an interrupted run), the layout, the upload
-//!        -> once the upload returned, checked: the mark, appProperties gdriveArchive=<manifest>
+//!        -> once the upload returned, checked: the mark, appProperties
+//!           gdriveArchive=<manifest> gdriveArchiveMd5=<md5 of the archive>
 //! ```
 //!
 //! The mark means "verified": the archive is created without it, and gets it (one metadata
 //! update) only once the uploader compared Drive's md5 of the whole tar with the bytes read and
-//! every file was checked against its md5 (`transfer/archive.rs`). An archive that failed a
-//! check, or whose update failed, stays in the destination unmarked, and a later run takes it
-//! for a file of that name with other content: a conflict, never already-there.
+//! every file with an md5 was checked against it (`transfer/archive.rs`). It holds the
+//! manifest digest and the md5 of the archive then, and is already-there only on a file whose
+//! listed md5 is still that one. An archive without it (one that failed a check), or with other
+//! bytes than it was marked with (its content replaced since), is a file of that name with other
+//! content for a later run: a conflict, never already-there. An update whose reply failed may
+//! or may not have written the mark.
 //!
 //! Names: every Drive name becomes one path component through `local_name` with the rules of
 //! every platform at once ([`local_name::unique_portable_names`]), so the archive extracts on
@@ -49,6 +53,7 @@ use crate::{
         drive_file::{self, DocType, FileExtension},
         human_size::human_size,
         local_name::{self, NameEntry, UnusableName},
+        parse_md5_digest,
     },
     files::{
         export::{export_file_name, ExportFormats},
@@ -67,8 +72,12 @@ use crate::{
 };
 
 /// The `appProperties` key of an archive, whose value is its manifest digest: the mark of an
-/// archive that was checked whole.
+/// archive that was checked.
 pub(super) const PROPERTY: &str = "gdriveArchive";
+
+/// The `appProperties` key of the md5 an archive had when it was checked, which binds the mark
+/// to those bytes: an archive whose content was replaced since has another md5.
+pub(super) const PROPERTY_MD5: &str = "gdriveArchiveMd5";
 
 /// What the destination folder's listing returns of each file in an archive run: the
 /// archive's property too.
@@ -384,12 +393,28 @@ impl Existing {
         if candidates.clone().any(|file| source_ids.contains(&file.id)) {
             return Match::Source;
         }
-        if candidates.any(|file| file.archive.as_deref() == Some(manifest)) {
+        // The mark of this manifest, on the bytes it was checked with.
+        let same = candidates.any(|file| {
+            file.archive.as_deref() == Some(manifest)
+                && matches!(
+                    (file.archive_md5.as_deref(), file.md5.as_deref()),
+                    (Some(marked), Some(listed)) if same_md5(marked, listed)
+                )
+        });
+        if same {
             Match::Same { verified: true }
         } else {
             Match::Different
         }
     }
+}
+
+/// Whether two md5s in hex are the same, whatever the case of their digits.
+fn same_md5(one: &str, other: &str) -> bool {
+    matches!(
+        (parse_md5_digest(one), parse_md5_digest(other)),
+        (Some(one), Some(other)) if one == other
+    )
 }
 
 impl Migration {
@@ -626,9 +651,13 @@ impl Migration {
         if let Some(cache) = &cache {
             cache.remove().await;
         }
-        // Checked: the archive gets its mark.
+        // Checked: the archive gets its mark, with the md5 it was checked with (without one, the
+        // mark never matches).
         let id = file.id.unwrap_or_default();
-        let mark = PatchFile::new(id.clone()).with_app_property(PROPERTY, &plan.manifest);
+        let mut mark = PatchFile::new(id.clone()).with_app_property(PROPERTY, &plan.manifest);
+        if let Some(md5) = &file.md5_checksum {
+            mark = mark.with_app_property(PROPERTY_MD5, md5);
+        }
         update_metadata(&self.dest, mark)
             .await
             .map_err(|source| Error::ArchiveMark {

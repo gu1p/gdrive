@@ -8,7 +8,7 @@ use std::{
 
 use serde_json::json;
 
-use super::PROPERTY;
+use super::{PROPERTY, PROPERTY_MD5};
 use crate::{
     common::{human_size::human_size, local_name},
     files::migrate::{run, Error, Settings},
@@ -238,7 +238,12 @@ async fn a_folder_arrives_as_one_tar_that_unpacks_to_the_tree() {
     let patches = dest.patches();
     assert_eq!(patches.len(), 1, "{patches:?}");
     assert_eq!(patches[0].0, archive.id);
-    assert_eq!(patches[0].1["appProperties"], json!({ PROPERTY: manifest }));
+    // The manifest, and the md5 of the bytes it was checked with.
+    let md5 = format!("{:x}", md5::compute(&archive.content));
+    let marked = json!({ PROPERTY: manifest, PROPERTY_MD5: md5 });
+    assert_eq!(patches[0].1["appProperties"], marked);
+    let stored = dest.stored(&archive.id).unwrap().app_properties;
+    assert_eq!(json!(stored), marked);
     assert_eq!(unpack(&archive.content), archived_tree());
 
     // The source is only read; the Doc and the Drawing were exported in the default formats.
@@ -1054,9 +1059,9 @@ async fn an_archive_that_cannot_be_marked_fails_and_is_reported_as_different_nex
     assert!(
         text.contains(
             "Error: unable to migrate 'photos.tar': the archive 'photos.tar' is complete and \
-             checked in the destination (id gen-0), but it could not be marked as made from this \
-             source, so a later run will report it as a file of that name with other content; \
-             nothing was deleted"
+             checked in the destination (id gen-0), but marking it could not be confirmed: a \
+             later run reports it as already there if the mark was written, and otherwise as a \
+             file of that name with other content; nothing was deleted"
         ),
         "{text}"
     );
@@ -1108,4 +1113,64 @@ async fn an_archive_of_a_file_without_md5_or_modification_time_is_never_already_
         again.err.text()
     );
     assert_eq!(dest.created().len(), 1);
+}
+
+#[tokio::test]
+async fn a_marked_archive_with_other_bytes_or_without_its_md5_is_a_conflict() {
+    let source = FakeDrive::start(source_tree(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    migrate(&source, &dest, settings(&["photos"]))
+        .await
+        .assert_ok();
+    let archive = the_archive(&dest);
+    let manifest = mark(&dest, &archive).unwrap();
+    let md5 = format!("{:x}", md5::compute(&archive.content));
+
+    // A destination photos.tar with `content` and the properties `marked`.
+    let with = |content: &str, marked: &[(&str, &str)]| FakeFile {
+        app_properties: marked
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
+        ..FakeFile::blob("old", "photos.tar", "root", content)
+    };
+    let same_bytes_md5 = format!("{:X}", md5::compute("same bytes"));
+    for (existing, already_there) in [
+        // Its content was replaced, its properties kept (a new version uploaded over it).
+        (
+            with(
+                "other bytes",
+                &[(PROPERTY, &manifest), (PROPERTY_MD5, &md5)],
+            ),
+            false,
+        ),
+        // The manifest without the md5 it was checked with.
+        (with("other bytes", &[(PROPERTY, &manifest)]), false),
+        // Both, and the listed md5 is the marked one (in other case).
+        (
+            with(
+                "same bytes",
+                &[(PROPERTY, &manifest), (PROPERTY_MD5, &same_bytes_md5)],
+            ),
+            true,
+        ),
+    ] {
+        let dest = FakeDrive::start(vec![existing], Behavior::default()).await;
+        let again = migrate(&source, &dest, settings(&["photos"])).await;
+        if already_there {
+            again.assert_ok();
+            assert_eq!(again.out.lines()[1..], ["already-there photos.tar"]);
+        } else {
+            assert!(again.result.is_err());
+            assert!(
+                again.err.text().contains(
+                    "Error: unable to migrate 'photos.tar': it exists in the destination with \
+                     different content"
+                ),
+                "{}",
+                again.err.text()
+            );
+        }
+        assert!(dest.created().is_empty());
+    }
 }

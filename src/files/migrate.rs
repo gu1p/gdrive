@@ -493,6 +493,8 @@ struct DestFile {
     md5: Option<String>,
     /// The manifest digest of an archive (`appProperties`), listed in archive runs only.
     archive: Option<String>,
+    /// The md5 the archive had when it was checked (`appProperties`), likewise.
+    archive_md5: Option<String>,
 }
 
 /// How a source file compares with the destination's files of its name.
@@ -518,14 +520,14 @@ impl Existing {
                 continue;
             };
             ids.insert(id.clone());
+            let mut properties = file.app_properties.unwrap_or_default();
             by_name.entry(name).or_default().push(DestFile {
                 id,
                 mime_type: file.mime_type.unwrap_or_default(),
                 size: file.size,
                 md5: file.md5_checksum,
-                archive: file
-                    .app_properties
-                    .and_then(|mut properties| properties.remove(archive::PROPERTY)),
+                archive: properties.remove(archive::PROPERTY),
+                archive_md5: properties.remove(archive::PROPERTY_MD5),
             });
         }
         Existing { by_name, ids }
@@ -1188,8 +1190,8 @@ pub(crate) enum Error {
         source: Box<RelayError>,
     },
     Archive(Box<crate::transfer::archive::ArchiveError>),
-    /// The archive `name` (the file `id`) is in the destination and checked, but could not get
-    /// its mark.
+    /// The archive `name` (the file `id`) is in the destination and checked, but its mark could
+    /// not be confirmed (the update failed, or its reply was lost after it applied).
     ArchiveMark {
         name: String,
         id: String,
@@ -1301,8 +1303,9 @@ impl Display for Error {
             Error::ArchiveMark { name, id, .. } => write!(
                 f,
                 "the archive '{name}' is complete and checked in the destination (id {id}), but \
-                 it could not be marked as made from this source, so a later run will report it \
-                 as a file of that name with other content; nothing was deleted"
+                 marking it could not be confirmed: a later run reports it as already there if \
+                 the mark was written, and otherwise as a file of that name with other content; \
+                 nothing was deleted"
             ),
             Error::Trash(_) => f.write_str(
                 "it is in the destination, but it could not be moved to the trash in the source",
