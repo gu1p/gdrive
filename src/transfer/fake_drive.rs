@@ -298,6 +298,9 @@ pub(crate) struct Behavior {
     /// Media downloads of these file ids fail with 404, after the given time instead of
     /// `media_delay`.
     pub(crate) media_missing: HashMap<String, Duration>,
+    /// The media downloads after the first this many are refused for good, as Drive does when
+    /// a file was read too often.
+    pub(crate) media_refused_after: Option<usize>,
     /// Media downloads of these file ids send half of the content and then nothing more, like
     /// a transfer that is still running.
     pub(crate) media_stalled: HashSet<String>,
@@ -1438,6 +1441,17 @@ fn about(state: &State) -> FakeResponse {
     json_response(StatusCode::OK, &json!({"user": {"emailAddress": email}}))
 }
 
+/// What Drive answers for a file that was read too often.
+fn download_quota_exceeded() -> FakeResponse {
+    let message = "The download quota for this file has been exceeded.";
+    let body = json!({"error": {
+        "code": 403,
+        "message": message,
+        "errors": [{"domain": "global", "reason": "downloadQuotaExceeded", "message": message}],
+    }});
+    json_response(StatusCode::FORBIDDEN, &body)
+}
+
 /// `files.get?alt=media`: the content of a blob, from the first byte of its `Range`
 /// (`bytes=<first>-`) unless an `If-Range` is not the content's `ETag`.
 async fn media(state: &State, id: &str, headers: &hyper::HeaderMap) -> FakeResponse {
@@ -1466,6 +1480,13 @@ async fn media(state: &State, id: &str, headers: &hyper::HeaderMap) -> FakeRespo
     pass_gate(state).await;
 
     let behavior = &state.behavior;
+    let requested = state.media.lock().expect("media lock").len();
+    if behavior
+        .media_refused_after
+        .is_some_and(|allowed| requested > allowed)
+    {
+        return download_quota_exceeded();
+    }
     if let Some(delay) = behavior.media_missing.get(id) {
         tokio::time::sleep(*delay).await;
         return error(StatusCode::NOT_FOUND, "File not found.");

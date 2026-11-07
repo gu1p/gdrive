@@ -9,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use super::{folder_name, mark, run, Error, PROPERTY};
+use super::{folder_name, largest_held, mark, run, Error, MEMORY, PROPERTY};
 use crate::transfer::{
     fake_drive::{Behavior, Created, FakeDrive, FakeFile},
     progress::{NoProgress, ProgressDisplay},
@@ -63,6 +63,20 @@ async fn unzip_with(
     options: &UploadOptions,
     cancel: impl Future<Output = ()> + Send,
 ) -> Ran {
+    unzip_holding(MEMORY, drive, id, into, continue_on_error, options, cancel).await
+}
+
+/// [`unzip_with`], with `memory` for the entries that go up. Without any, each goes up as it is
+/// read.
+async fn unzip_holding(
+    memory: u64,
+    drive: &FakeDrive,
+    id: &str,
+    into: Option<&str>,
+    continue_on_error: bool,
+    options: &UploadOptions,
+    cancel: impl Future<Output = ()> + Send,
+) -> Ran {
     let output = output();
     let hub = drive.hub();
     let run = Box::pin(run(
@@ -71,6 +85,7 @@ async fn unzip_with(
         into,
         Options::new(NonZeroUsize::new(4).unwrap(), continue_on_error),
         options,
+        memory,
         &output.printer,
         ProgressDisplay::reporting_to(Arc::new(NoProgress)),
         cancel,
@@ -406,24 +421,35 @@ async fn damaged_content_never_becomes_a_file() {
         multipart_threshold: 1000,
         ..UploadOptions::default()
     };
-    for written in [
-        // One request.
-        Written::deflated("bad.bin", b"small"),
-        // Several chunks, the last of which never goes up.
-        Written::deflated("bad.bin", &content),
-        Written::stored("bad.bin", &content),
-    ] {
-        let zip = zip_of(&[Written {
-            crc32: Some(1),
-            ..written
-        }]);
-        let drive = drive_with(&zip, vec![], Behavior::default()).await;
+    for memory in [MEMORY, 0] {
+        for written in [
+            // One request.
+            Written::deflated("bad.bin", b"small"),
+            // Several chunks, the last of which never goes up.
+            Written::deflated("bad.bin", &content),
+            Written::stored("bad.bin", &content),
+        ] {
+            let zip = zip_of(&[Written {
+                crc32: Some(1),
+                ..written
+            }]);
+            let drive = drive_with(&zip, vec![], Behavior::default()).await;
 
-        let ran = unzip_with(&drive, "zip", None, false, &options, std::future::pending()).await;
+            let ran = unzip_holding(
+                memory,
+                &drive,
+                "zip",
+                None,
+                false,
+                &options,
+                std::future::pending(),
+            )
+            .await;
 
-        assert!(matches!(ran.result, Err(Error::Incomplete(_))));
-        assert!(ran.err.text().contains("CRC-32"), "{}", ran.err.text());
-        assert_eq!(names(&drive), ["photos"]);
+            assert!(matches!(ran.result, Err(Error::Incomplete(_))));
+            assert!(ran.err.text().contains("CRC-32"), "{}", ran.err.text());
+            assert_eq!(names(&drive), ["photos"]);
+        }
     }
 }
 
@@ -472,9 +498,18 @@ async fn a_large_entry_goes_up_in_chunks_and_a_failed_chunk_downloads_nothing_ag
         multipart_threshold: 1000,
         ..UploadOptions::default()
     };
-    let unzipped = async |behavior| {
+    let unzipped = async |memory, behavior| {
         let drive = drive_with(&zip, vec![], behavior).await;
-        let ran = unzip_with(&drive, "zip", None, false, &options, std::future::pending()).await;
+        let ran = unzip_holding(
+            memory,
+            &drive,
+            "zip",
+            None,
+            false,
+            &options,
+            std::future::pending(),
+        )
+        .await;
         ran.assert_ok();
         assert_eq!(named(&drive, "big.bin").content, deflated);
         assert_eq!(named(&drive, "plain.bin").content, stored);
@@ -484,15 +519,147 @@ async fn a_large_entry_goes_up_in_chunks_and_a_failed_chunk_downloads_nothing_ag
         (drive.media().len(), drive.chunks().len())
     };
 
-    let (downloads, chunks) = unzipped(Behavior::default()).await;
-    let (downloads_on_retry, chunks_on_retry) = unzipped(Behavior {
-        chunk_unavailable: HashMap::from([(String::from("big.bin"), CHUNK_ALIGNMENT)]),
-        ..Behavior::default()
-    })
+    for memory in [MEMORY, 0] {
+        let (downloads, chunks) = unzipped(memory, Behavior::default()).await;
+        let (downloads_on_retry, chunks_on_retry) = unzipped(
+            memory,
+            Behavior {
+                chunk_unavailable: HashMap::from([(String::from("big.bin"), CHUNK_ALIGNMENT)]),
+                ..Behavior::default()
+            },
+        )
+        .await;
+
+        assert!(chunks_on_retry > chunks, "{chunks_on_retry} {chunks}");
+        assert_eq!(downloads_on_retry, downloads);
+    }
+}
+
+/// `count` small files, written against the order of their names: a run that takes them by name
+/// jumps back and forth through the zip file.
+fn many(count: usize) -> Vec<Written> {
+    (0..count)
+        .rev()
+        .map(|number| {
+            let name = format!("{}/{number:03}.bin", number % 3);
+            Written::deflated(&name, &noise(2000, number as u64 + 1))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_zip_file_is_requested_as_often_however_many_files_it_holds() {
+    let options = UploadOptions::default();
+    for memory in [MEMORY, 0] {
+        let mut requests = Vec::new();
+        for count in [10, 100] {
+            let written = many(count);
+            let drive = drive_with(&zip_of(&written), vec![], Behavior::default()).await;
+
+            unzip_holding(
+                memory,
+                &drive,
+                "zip",
+                None,
+                false,
+                &options,
+                std::future::pending(),
+            )
+            .await
+            .assert_ok();
+
+            for file in &written {
+                let name = String::from_utf8(file.name.clone()).unwrap();
+                let name = name.rsplit('/').next().unwrap();
+                assert_eq!(named(&drive, name).content, file.content);
+            }
+            requests.push(drive.media().len());
+        }
+        assert_eq!(requests[0], requests[1], "memory {memory}");
+    }
+}
+
+#[tokio::test]
+async fn what_is_there_already_is_read_through_rather_than_requested_again() {
+    // Further apart than a reply is read on its own.
+    let written = vec![
+        Written::stored("a.bin", b"a"),
+        Written::stored("there.bin", &noise(5_000_000, 23)),
+        Written::stored("z.bin", b"z"),
+    ];
+    let zip = zip_of(&written);
+    let requests = async |others| {
+        let drive = drive_with(&zip, others, Behavior::default()).await;
+        unzip(&drive).await.assert_ok();
+        assert_eq!(named(&drive, "z.bin").content, b"z");
+        drive.media().len()
+    };
+
+    let all = requests(vec![]).await;
+    let some = requests(vec![
+        FakeFile::folder("top", "photos", "home"),
+        extracted("old", &written[1], "top"),
+    ])
     .await;
 
-    assert!(chunks_on_retry > chunks, "{chunks_on_retry} {chunks}");
-    assert_eq!(downloads_on_retry, downloads);
+    assert_eq!(some, all);
+}
+
+#[tokio::test]
+async fn a_refusal_of_drive_ends_the_reading_and_is_not_asked_again() {
+    let zip = zip_of(&many(30));
+    let good = drive_with(&zip, vec![], Behavior::default()).await;
+    going_on(&good).await.assert_ok();
+    let all = good.media().len();
+
+    // The directory can be read, the first file cannot.
+    let behavior = Behavior {
+        media_refused_after: Some(all - 1),
+        ..Behavior::default()
+    };
+    let drive = drive_with(&zip, vec![], behavior).await;
+    let ran = going_on(&drive).await;
+
+    assert!(matches!(ran.result, Err(Error::Incomplete(_))));
+    assert_eq!(drive.media().len(), all);
+    let err = ran.err.text();
+    assert!(err.contains("download quota"), "{err}");
+    assert!(err.contains("run the command again later"), "{err}");
+    assert_eq!(err.matches("download quota").count(), 1, "{err}");
+    let summary = ran.summary();
+    assert!(summary.contains(", 1 failed, 29 cancelled"), "{summary}");
+}
+
+#[tokio::test]
+async fn a_folder_that_cannot_be_made_leaves_the_files_of_the_others() {
+    let written = many(9);
+    let behavior = Behavior {
+        upload_rejected: HashSet::from([String::from("1")]),
+        ..Behavior::default()
+    };
+    let drive = drive_with(&zip_of(&written), vec![], behavior).await;
+
+    let ran = going_on(&drive).await;
+
+    assert!(
+        matches!(ran.result, Err(Error::Incomplete(_))),
+        "{:?}",
+        ran.result
+    );
+    let names = names(&drive);
+    assert!(names.contains(&String::from("000.bin")), "{names:?}");
+    assert!(names.contains(&String::from("002.bin")), "{names:?}");
+    assert!(!names.contains(&String::from("001.bin")), "{names:?}");
+}
+
+#[test]
+fn what_goes_up_from_memory_stays_within_the_memory() {
+    const MIB: u64 = 1024 * 1024;
+    assert_eq!(largest_held(MEMORY, 1), 256 * MIB);
+    assert_eq!(largest_held(MEMORY, 4), 256 * MIB);
+    assert_eq!(largest_held(MEMORY, 16), 64 * MIB);
+    assert_eq!(largest_held(MEMORY, 64), 16 * MIB);
+    assert_eq!(largest_held(0, 4), 0);
 }
 
 #[tokio::test]

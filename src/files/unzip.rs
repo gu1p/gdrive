@@ -1,7 +1,10 @@
 //! `files unzip`: a zip file on Drive extracted into a folder on Drive, in the same account.
 //!
-//! Nothing goes through the disk: the list of entries is read from the end of the zip file, and
-//! each entry goes up as it is inflated ([`crate::transfer::zip`]). The zip file is only read.
+//! Nothing goes through the disk: the list of entries is read from the end of the zip file, then
+//! all folders are made, then the entries are read in the order of the zip file, from one reply
+//! ([`reader`], which says why), and inflated ([`crate::transfer::zip`]). An entry that fits in
+//! memory is read at once and goes up beside the others. A larger one goes up as it is read, and
+//! the entries after it wait for that. The zip file is only read.
 //!
 //! A new file carries the CRC-32 of its entry in `appProperties`. That is what tells a later run
 //! that the file is already there: Drive's md5 cannot be compared with anything in a zip. A file
@@ -10,6 +13,7 @@
 //! trusted as it is: the file on Drive is not read, so one that was edited since to the same size
 //! still counts as there. It stays as it is, a run never overwrites anything.
 
+mod reader;
 #[cfg(test)]
 mod tests;
 
@@ -18,14 +22,18 @@ use std::{
     error,
     fmt::{self, Display, Formatter, Write as _},
     future::Future,
+    io::{self, Cursor},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex, PoisonError,
     },
 };
 
-use futures::stream;
+use futures::{stream, Stream, StreamExt};
 use google_drive3::api::File;
+use tokio::sync::watch;
+
+use self::reader::{Turn, Turns, ZipReader};
 
 use super::{
     generate_ids::generate_ids,
@@ -50,7 +58,7 @@ use crate::{
             self, plural, Job, JobContext, JobKind, JobOutput, Outcome, Printer, Report, Scheduler,
             Subtree,
         },
-        upload::{FileTimes, Upload, UploadError, UploadOptions, UploadTarget},
+        upload::{FileTimes, ReaderSource, Upload, UploadError, UploadOptions, UploadTarget},
         zip::{self, Entry, EntrySource, ZipError},
     },
 };
@@ -69,6 +77,15 @@ const MY_DRIVE: &str = "root";
 const PROPERTY: &str = "gdriveZipCrc32";
 /// Its value on a file that Drive holds with other bytes than were sent: no CRC-32 is like it.
 const NOT_THE_CONTENT: &str = "not-the-content";
+/// The most memory the entries that go up at the same time hold.
+const MEMORY: u64 = 1 << 30;
+
+/// The largest entry that is read into memory before it goes up, for `jobs` transfers at once
+/// that hold at most `memory` together. Not all of it for one entry: one that large would hold up
+/// the others while it is read, for little gain.
+fn largest_held(memory: u64, jobs: usize) -> u64 {
+    (memory / jobs.max(1) as u64).min(memory / 4)
+}
 
 pub(crate) struct Config {
     pub(crate) file_id: String,
@@ -96,6 +113,7 @@ pub(crate) async fn unzip(config: Config) -> Result<(), Error> {
         config.into.as_deref(),
         config.transfer,
         &UploadOptions::default(),
+        MEMORY,
         &Printer::stdio(),
         display,
         scheduler::ctrl_c(),
@@ -113,6 +131,7 @@ async fn run(
     into: Option<&str>,
     transfer: scheduler::Options,
     options: &UploadOptions,
+    memory: u64,
     printer: &Printer,
     progress: ProgressDisplay,
     cancel: impl Future<Output = ()> + Send,
@@ -130,6 +149,7 @@ async fn run(
         .filter(|_| drive_file::is_binary(&zip_file))
         .ok_or_else(|| Error::NotAFile(zip_name.clone()))?;
 
+    let (reader, requests) = ZipReader::new(size);
     let unzip = Arc::new(Unzip {
         hub: hub.clone(),
         id: file_id.to_owned(),
@@ -140,15 +160,19 @@ async fn run(
         ids: tokio::sync::Mutex::new(Vec::new()),
         folders_created: AtomicU64::new(0),
         folders_reused: AtomicU64::new(0),
+        reader,
+        turns: Turns::new(),
+        largest_held: largest_held(memory, transfer.jobs.get()),
+        found: Mutex::new(Vec::new()),
+        folders_left: watch::channel(0).0,
     });
-    let mut reader = unzip.reader().map_err(Error::Open)?;
-    let entries = zip::read_directory(&mut reader, size)
+    let mut source = unzip.source().map_err(Error::Open)?;
+    let entries = zip::read_directory(&mut source, size)
         .await
         .map_err(|source| Error::Zip {
             name: zip_name.clone(),
             source,
         })?;
-    drop(reader);
 
     let tree = Dir::of(folder_name(&zip_name), entries);
     let subtree = tree.subtree();
@@ -185,11 +209,12 @@ async fn run(
         files: subtree.files,
         bytes: subtree.bytes,
     });
-    let jobs = unzip.jobs_of(tree, &Arc::new(place));
-    let report = Scheduler::new(transfer, printer.clone())
-        .with_progress(progress.sink())
-        .run(stream::iter(jobs), cancel)
-        .await;
+    unzip.folders_left.send_replace(subtree.folders);
+    let scheduler = Scheduler::new(transfer, printer.clone()).with_progress(progress.sink());
+    let report = tokio::select! {
+        report = scheduler.run(unzip.jobs(tree, place), cancel) => report,
+        never = reader::serve(source, requests) => match never {},
+    };
     progress.finish();
 
     printer
@@ -197,6 +222,14 @@ async fn run(
             "Folder: https://drive.google.com/drive/folders/{folder}"
         ))
         .await;
+    if unzip.reader.broken() {
+        printer
+            .err(
+                "Warning: Drive stopped serving the zip file, so the files after this one were \
+                 not tried; run the command again later, it goes on from here",
+            )
+            .await;
+    }
     printer.err(unzip.summary(&report)).await;
     printer.flush().await.map_err(Error::WriteOutput)?;
     report.check().map_err(Error::Incomplete)
@@ -300,6 +333,14 @@ fn is_extracted_from(file: &File, entry: &Entry) -> bool {
             .is_some_and(|value| *value == mark(entry.crc32))
 }
 
+/// A file to extract, once all folders are entered.
+struct Found {
+    entry: Entry,
+    /// The label of its folder.
+    folder: String,
+    place: Arc<Place>,
+}
+
 /// A folder of the zip file, with everything below it.
 #[derive(Debug, Default)]
 struct Dir {
@@ -367,11 +408,21 @@ struct Unzip {
     ids: tokio::sync::Mutex<Vec<String>>,
     folders_created: AtomicU64,
     folders_reused: AtomicU64,
+    /// The one reader of the zip file.
+    reader: ZipReader,
+    /// Whose turn it is to read.
+    turns: Turns,
+    /// The largest entry that goes up from memory.
+    largest_held: u64,
+    /// The files of the folders entered so far.
+    found: Mutex<Vec<Found>>,
+    /// The folders not entered yet, of those that will be.
+    folders_left: watch::Sender<u64>,
 }
 
 impl Unzip {
-    /// A reader of the zip file.
-    fn reader(&self) -> Result<DriveSource<'_>, MediaError> {
+    /// The content of the zip file.
+    fn source(&self) -> Result<DriveSource<'_>, MediaError> {
         DriveSource::new(
             &self.hub,
             &self.zip_file,
@@ -425,23 +476,64 @@ impl Unzip {
         })
     }
 
-    /// The jobs of what `dir` holds, which goes to `place`.
+    /// The jobs of `tree`, which goes to `place`: the folders, then the files.
+    fn jobs(self: &Arc<Self>, tree: Dir, place: Place) -> impl Stream<Item = Job> + Send {
+        let folders = stream::iter(self.jobs_of(tree, &Arc::new(place)));
+        let unzip = Arc::clone(self);
+        let files = stream::once(async move {
+            unzip.all_folders_entered().await;
+            unzip.file_jobs()
+        })
+        .flat_map(stream::iter);
+        folders.chain(files)
+    }
+
+    /// The jobs of the folders in `dir`, which goes to `place`. Its files wait for
+    /// [`Self::file_jobs`].
     fn jobs_of(self: &Arc<Self>, dir: Dir, place: &Arc<Place>) -> Vec<Job> {
         let Dir {
             label, dirs, files, ..
         } = dir;
-        let mut jobs = Vec::with_capacity(files.len() + dirs.len());
-        for entry in files.into_values() {
-            jobs.push(self.file_job(entry, &label, place));
-        }
-        for dir in dirs.into_values() {
-            jobs.push(self.folder_job(dir, Arc::clone(place)));
-        }
-        jobs
+        self.found
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(files.into_values().map(|entry| Found {
+                entry,
+                folder: label.clone(),
+                place: Arc::clone(place),
+            }));
+        dirs.into_values()
+            .map(|dir| self.folder_job(dir, Arc::clone(place)))
+            .collect()
+    }
+
+    /// `count` folders were entered, or never will be.
+    fn folders_done(&self, count: u64) {
+        self.folders_left
+            .send_modify(|left| *left = left.saturating_sub(count));
+    }
+
+    async fn all_folders_entered(&self) {
+        let mut left = self.folders_left.subscribe();
+        // It cannot fail: the sender is `self`.
+        let _ = left.wait_for(|left| *left == 0).await;
+    }
+
+    /// The jobs of all files found, in the order of the zip file: what starts first reads first.
+    fn file_jobs(self: &Arc<Self>) -> Vec<Job> {
+        let mut found =
+            std::mem::take(&mut *self.found.lock().unwrap_or_else(PoisonError::into_inner));
+        found.sort_by_key(|file| file.entry.offset);
+        let mut places = 0..;
+        found
+            .into_iter()
+            .map(|file| self.file_job(file, &mut places))
+            .collect()
     }
 
     fn folder_job(self: &Arc<Self>, dir: Dir, parent: Arc<Place>) -> Job {
         let subtree = dir.subtree();
+        let below = subtree.folders;
         let unzip = Arc::clone(self);
         Job::new(
             JobKind::Metadata,
@@ -451,26 +543,58 @@ impl Unzip {
                     .enter(&dir.name, &dir.label, &parent, &context.printer)
                     .await;
                 match entered {
-                    Ok(place) => JobOutput::from(Outcome::Transferred { bytes: 0 })
-                        .follow_up(unzip.jobs_of(dir, &Arc::new(place))),
-                    Err(error) => failed(&dir.label, error).into(),
+                    Ok(place) => {
+                        let jobs = unzip.jobs_of(dir, &Arc::new(place));
+                        unzip.folders_done(1);
+                        JobOutput::from(Outcome::Transferred { bytes: 0 }).follow_up(jobs)
+                    }
+                    Err(error) => {
+                        unzip.folders_done(1 + below);
+                        failed(&dir.label, error).into()
+                    }
                 }
             },
         )
         .with_subtree(subtree)
     }
 
-    fn file_job(self: &Arc<Self>, entry: Entry, folder: &str, place: &Arc<Place>) -> Job {
+    /// The job of `file`, with the next of `places` if it has to read the zip file.
+    fn file_job(self: &Arc<Self>, file: Found, places: &mut impl Iterator<Item = u64>) -> Job {
+        let Found {
+            entry,
+            folder,
+            place,
+        } = file;
         let label = format!("{folder}/{}", printable(entry.name()));
         let size = entry.size;
         if let Some(error) = entry.unreadable() {
             let outcome = failed(&label, Error::Entry(error));
             return Job::done(JobKind::Media, label, outcome).with_size(size);
         }
+        let (occupied, extracted) = {
+            let mut there = place.existing.files(entry.name()).peekable();
+            (
+                there.peek().is_some(),
+                there.any(|other| is_extracted_from(other, &entry)),
+            )
+        };
+        if occupied && !extracted {
+            let outcome = failed(&label, Error::Conflict);
+            return Job::done(JobKind::Media, label, outcome).with_size(size);
+        }
+        if occupied {
+            return Job::new(JobKind::Media, label.clone(), move |context| async move {
+                context.printer.out(format!("already-there {label}")).await;
+                Outcome::Unchanged.into()
+            })
+            .with_size(size);
+        }
+        let Some(turn) = places.next() else {
+            return Job::done(JobKind::Media, label, Outcome::Cancelled).with_size(size);
+        };
         let unzip = Arc::clone(self);
-        let place = Arc::clone(place);
         Job::new(JobKind::Media, label.clone(), move |context| async move {
-            unzip.extract(&entry, &label, &place, &context).await
+            unzip.extract(&entry, &label, turn, &place, &context).await
         })
         .with_size(size)
     }
@@ -479,33 +603,42 @@ impl Unzip {
         &self,
         entry: &Entry,
         label: &str,
+        place_to_read: u64,
         place: &Place,
         context: &JobContext,
     ) -> JobOutput {
-        let mut there = place.existing.files(entry.name()).peekable();
-        if there.peek().is_some() {
-            if there.any(|file| is_extracted_from(file, entry)) {
-                context.printer.out(format!("already-there {label}")).await;
-                return Outcome::Unchanged.into();
-            }
-            return failed(label, Error::Conflict).into();
+        let turn = self.turns.take(place_to_read).await;
+        if self.reader.broken() {
+            return Outcome::Cancelled.into();
         }
         context
             .printer
             .out(format!("create {label} ({})", human_size(entry.size)))
             .await;
-        match self.upload(entry, place, context).await {
+        match self.upload(entry, turn, place, context).await {
             Ok(()) => Outcome::Transferred { bytes: entry.size }.into(),
             Err(error) => failed(label, error).into(),
         }
     }
 
+    /// Reads `entry` and sends it up. The turn is passed on once it needs the zip file no more.
     async fn upload(
         &self,
         entry: &Entry,
+        turn: Turn<'_>,
         place: &Place,
         context: &JobContext,
     ) -> Result<(), Error> {
+        let held = if entry.size <= self.largest_held {
+            let inflated = EntrySource::new(self.reader.clone(), entry, 0)
+                .all()
+                .await
+                .map_err(Error::Read)?;
+            drop(turn);
+            Some(inflated)
+        } else {
+            None
+        };
         // `.gdoc` and the like are guessed as Google types, which only a conversion can create.
         let media_type = mime_guess::from_path(entry.name())
             .first()
@@ -534,15 +667,19 @@ impl Unzip {
             created: None,
         })
         .with_property(PROPERTY, mark(entry.crc32));
-        // The most an upload goes back: one request's bytes.
-        let window = self
-            .options
-            .chunk_len()
-            .max(self.options.multipart_threshold);
-        let reader = self.reader().map_err(Error::Open)?;
-        let mut source = EntrySource::new(reader, entry, window);
         // Boxed: the upload's state is large, and many of these futures wait at once.
-        let result = Box::pin(upload.run(&mut source)).await;
+        let result = if let Some(inflated) = held {
+            let mut source = ReaderSource::new(Cursor::new(inflated));
+            Box::pin(upload.run(&mut source)).await
+        } else {
+            // The most an upload goes back: one request's bytes.
+            let window = self
+                .options
+                .chunk_len()
+                .max(self.options.multipart_threshold);
+            let mut source = EntrySource::new(self.reader.clone(), entry, window);
+            Box::pin(upload.run(&mut source)).await
+        };
         if let Err(UploadError::Md5Mismatch { file_id, .. }) = &result {
             self.take_back_mark(file_id, context).await;
         }
@@ -616,6 +753,7 @@ pub(crate) enum Error {
         source: ZipError,
     },
     Entry(ZipError),
+    Read(io::Error),
     GetFolder {
         id: String,
         source: Box<google_drive3::Error>,
@@ -649,6 +787,7 @@ impl Display for Error {
             Error::Open(_) => f.write_str("unable to read the zip file"),
             Error::Zip { name, .. } => write!(f, "unable to read '{}'", printable(name)),
             Error::Entry(source) => Display::fmt(source, f),
+            Error::Read(_) => f.write_str("unable to read the file in the zip file"),
             Error::GetFolder { id, .. } => write!(f, "unable to get the folder '{id}'"),
             Error::NotAFolder(id) => {
                 write!(f, "'{id}' is not a folder; --into takes a folder id")
@@ -685,6 +824,7 @@ impl error::Error for Error {
             Error::Open(source) => Some(source),
             Error::Zip { source, .. } => Some(source),
             Error::Entry(source) => source.source(),
+            Error::Read(source) => Some(source),
             Error::Upload(source) => Some(source),
             Error::Item { source, .. } => Some(source),
             Error::Incomplete(source) => Some(source),

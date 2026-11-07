@@ -119,8 +119,9 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   `--to` may be the source account itself: the tar file is made inside one account, never inside the
   folder it archives. Not with `--trash-source`. See docs/migrate.md.
 - **Extract a zip file on Drive.** `files unzip FILE_ID [--from ACCOUNT] [--into FOLDER_ID]` unpacks a zip file into a new
-  folder next to it, or in `--into`, without downloading it to disk and without touching it. A run after a
-  failure uploads only what is missing. Stored and deflated files, ZIP64 included. See docs/basic_usage.md.
+  folder next to it, or in `--into`, without downloading it to disk and without touching it. It reads the zip
+  file once from front to back, as Drive refuses a file that is requested too often. A run after a failure
+  uploads only what is missing. Stored and deflated files, ZIP64 included. See docs/basic_usage.md.
 - **An archive in parts.** `files migrate --archive --max-part-size SIZE` (`3GB`, `2MB`) makes each
   `FILE_ID` several tar files of at most SIZE, `<name>.part00001.tar` and so on, each one a tar of whole
   files that extracts alone, and `<name>.parts.json`, which lists what each one holds. A failure costs only
@@ -199,7 +200,7 @@ Platforms and releases:
 
 - **Transfers within one account no longer stand still for minutes.** Downloads and uploads of one account
   share an HTTP/2 connection, and downloads waiting for their upload used up its window, so the replies to
-  the uploads could not arrive until Drive dropped the connection. `files unzip` hit this on every few files.
+  the uploads could not arrive until Drive dropped the connection.
 - Drive names are no longer joined into local paths unchecked: a name with `/` broke a recursive
   download, and `../x` or an absolute name wrote outside `--destination` (see Local names above).
 - Temporary download files no longer collide: `a.pdf` and `a.docx` shared `a.incomplete`, a Drive file

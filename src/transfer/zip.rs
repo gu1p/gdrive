@@ -124,7 +124,7 @@ pub(crate) struct Entry {
     method: u16,
     compressed: u64,
     /// Where its local header is.
-    offset: u64,
+    pub(crate) offset: u64,
 }
 
 impl Entry {
@@ -490,6 +490,20 @@ impl<S: Source> EntrySource<S> {
                 capacity: length(window.saturating_add(STEP as u64).min(entry.size)),
             },
         }
+    }
+
+    /// All of the content in one piece, checked.
+    pub(crate) async fn all(mut self) -> io::Result<Vec<u8>> {
+        let mut content = vec![0; length(self.size)];
+        let mut at = 0;
+        while at < content.len() {
+            let read = self.read_at(at as u64, &mut content[at..]).await?;
+            if read == 0 {
+                return Err(ZipError::Malformed("it ends too early").into());
+            }
+            at += read;
+        }
+        Ok(content)
     }
 
     fn start_over(&mut self) {

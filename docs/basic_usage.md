@@ -282,9 +282,13 @@ gdrive files unzip <FILE_ID> --into <FOLDER_ID>    # into a new folder in that f
 gdrive files unzip <FILE_ID> --from <ACCOUNT>      # with another account than the current one
 ```
 
-- The new folder has the name of the zip file without `.zip`. Nothing is downloaded to disk: each file
-  goes up as it is unpacked, and the zip file itself is only read. One account does all of it: it must
-  see both the zip file and the folder.
+- The new folder has the name of the zip file without `.zip`. Nothing is downloaded to disk, and the zip file
+  itself is only read. One account does all of it: it must see both the zip file and the folder.
+- All folders are made first. Then the zip file is read once from front to back, because Drive refuses a file
+  that is requested too often (`The download quota for this file has been exceeded`). If that happens anyway,
+  the run stops reading and says so; run it again later, it goes on from there.
+- A file of up to 256 MB (less with a high `--jobs`, 1 GB in memory at most) is read into memory and goes up
+  beside the others. A larger one goes up as it is read, and the files after it wait for that.
 - Run it again after a failure. The folder is reused, the files it already extracted stay
   (`already-there`), and the rest goes up. A file that was interrupted starts over.
 - A file of the same name that this command did not extract from that entry is left alone, and that entry
@@ -297,7 +301,7 @@ gdrive files unzip <FILE_ID> --from <ACCOUNT>      # with another account than t
   files split over several files: the command says so.
 - File names are UTF-8 when the zip file says so or when they can be, otherwise code page 850, which is what
   older Windows wrote in the Americas and Western Europe. A file gets the modification time in the zip file: exact when the zip file has
-  it in UTC, otherwise its local time taken as UTC. Each large file holds up to one chunk (32 MB) in memory.
+  it in UTC, otherwise its local time taken as UTC.
 
 ## Sync a folder
 
