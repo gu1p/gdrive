@@ -66,8 +66,9 @@ url = "2.5"
 yup-oauth2 = { version = "12.1.2", default-features = false, features = ["service-account", "ring"] }
 
 [dev-dependencies]
-# The mock Google upload server in tests/ needs hyper's server side.
-hyper = { version = "1.5.2", features = ["server", "http1"] }
+# The mock Google upload server in tests/ needs hyper's server side; the test of the HTTP/2 windows
+# its HTTP/2.
+hyper = { version = "1.5.2", features = ["server", "http1", "http2"] }
 # Paused clock for the retry and throttle tests.
 tokio = { version = "1.23.0", features = ["test-util"] }
 

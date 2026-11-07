@@ -13,6 +13,19 @@ use crate::{
 /// The connector of every HTTP client: rustls over a direct or proxied connection.
 pub(crate) type Connector = HttpsConnector<ProxyConnector>;
 
+/// How much of a reply one HTTP/2 stream may hold unread: hyper's default, stated here because
+/// [`CONNECTION_WINDOW`] follows from it.
+const STREAM_WINDOW: u32 = 2 * 1024 * 1024;
+
+/// How much of all replies one HTTP/2 connection may hold unread.
+///
+/// Downloads and uploads of one account share a connection. A download is not read while the
+/// upload it feeds waits for its reply, and what it holds unread counts here. With hyper's default
+/// of 5 MiB three such downloads use all of it, so Drive cannot send the replies the uploads wait
+/// for, and everything stands still until Drive drops the connection minutes later. This has room
+/// for a full [`STREAM_WINDOW`] of each of the 64 transfers of `--jobs`, and for the replies.
+const CONNECTION_WINDOW: u32 = 144 * 1024 * 1024;
+
 /// The Drive API client of a command: google-drive3's hub, and the retry policy and throttle
 /// that every request made through it shares.
 ///
@@ -54,11 +67,18 @@ fn connector_with(proxy: ProxyConnector) -> io::Result<Connector> {
     Ok(connector)
 }
 
+/// The settings of the HTTP client of a [`Hub`].
+fn client_builder() -> hyper_util::client::legacy::Builder {
+    let mut builder = Client::builder(hyper_util::rt::TokioExecutor::new());
+    builder
+        .http2_initial_stream_window_size(STREAM_WINDOW)
+        .http2_initial_connection_window_size(CONNECTION_WINDOW);
+    builder
+}
+
 impl Hub {
     pub(crate) fn new(auth: impl GetToken + 'static) -> io::Result<Hub> {
-        let http_client =
-            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
-                .build(create_connector()?);
+        let http_client = client_builder().build(create_connector()?);
 
         Ok(Hub::from_drive_hub(
             google_drive3::DriveHub::new(http_client, auth),
@@ -142,5 +162,70 @@ impl Hub {
         hub.root_url(root_url.to_owned());
         hub.base_url(base_url.clone());
         Ok(Hub::from_drive_hub(hub, base_url, RetryPolicy::for_tests()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{convert::Infallible, time::Duration};
+
+    use bytes::Bytes;
+    use http_body_util::{BodyExt, Full};
+    use hyper::{
+        body::Incoming, server::conn::http2, service::service_fn, Method, Request, Response, Uri,
+    };
+    use hyper_util::{
+        client::legacy::connect::HttpConnector,
+        rt::{TokioExecutor, TokioIo},
+    };
+    use tokio::net::TcpListener;
+
+    use super::client_builder;
+    use crate::transfer::scheduler::Options;
+
+    #[tokio::test]
+    async fn a_reply_gets_through_while_every_transfer_holds_unread_content() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: Uri = format!("http://{}/", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        // More than a stream holds: a download nobody reads fills its window and stops there.
+        let content = Bytes::from(vec![0; 4 * 1024 * 1024]);
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = service_fn(move |request: Request<Incoming>| {
+                let body = if request.method() == Method::GET {
+                    content.clone()
+                } else {
+                    Bytes::from_static(b"{}")
+                };
+                async move { Ok::<_, Infallible>(Response::new(Full::new(body))) }
+            });
+            let _ = http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
+        });
+        let client = client_builder()
+            .http2_only(true)
+            .build::<_, Full<Bytes>>(HttpConnector::new());
+
+        let mut downloads = Vec::new();
+        for _ in 0..Options::MAX_JOBS {
+            downloads.push(client.get(url.clone()).await.unwrap());
+        }
+        // Time to use up a window that is too small. Slower than that, this test would pass
+        // without showing anything, but it never fails because of it.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let reply = async {
+            let request = Request::post(url).body(Full::default()).unwrap();
+            let response = client.request(request).await.unwrap();
+            response.into_body().collect().await.unwrap().to_bytes()
+        };
+        let reply = tokio::time::timeout(Duration::from_secs(20), reply)
+            .await
+            .expect("the unread downloads held back the reply");
+        assert_eq!(reply, "{}");
+        drop(downloads);
     }
 }

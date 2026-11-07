@@ -197,6 +197,9 @@ Platforms and releases:
 
 ### Fixed
 
+- **Transfers within one account no longer stand still for minutes.** Downloads and uploads of one account
+  share an HTTP/2 connection, and downloads waiting for their upload used up its window, so the replies to
+  the uploads could not arrive until Drive dropped the connection. `files unzip` hit this on every few files.
 - Drive names are no longer joined into local paths unchecked: a name with `/` broke a recursive
   download, and `../x` or an absolute name wrote outside `--destination` (see Local names above).
 - Temporary download files no longer collide: `a.pdf` and `a.docx` shared `a.incomplete`, a Drive file
