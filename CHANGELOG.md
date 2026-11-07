@@ -118,6 +118,9 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   archive instead of overwriting, and continues an interrupted upload with the exports of the first run.
   `--to` may be the source account itself: the tar file is made inside one account, never inside the
   folder it archives. Not with `--trash-source`. See docs/migrate.md.
+- **Extract a zip file on Drive.** `files unzip FILE_ID [--into FOLDER_ID]` unpacks a zip file into a new
+  folder next to it, or in `--into`, without downloading it to disk and without touching it. A run after a
+  failure uploads only what is missing. Stored and deflated files, ZIP64 included. See docs/basic_usage.md.
 - **An archive in parts.** `files migrate --archive --max-part-size SIZE` (`3GB`, `2MB`) makes each
   `FILE_ID` several tar files of at most SIZE, `<name>.part00001.tar` and so on, each one a tar of whole
   files that extracts alone, and `<name>.parts.json`, which lists what each one holds. A failure costs only

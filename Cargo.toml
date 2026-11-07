@@ -14,9 +14,14 @@ clap = { version = "4.5.41", features = ["derive"] }
 clap_complete = "4.5.67"
 # The terminal that the progress bars draw on (indicatif's own, already in the tree through it).
 console = { version = "0.16.4", default-features = false, features = ["std"] }
+# The CRC-32 of the entries of a zip file (`files unzip`), already a dependency of flate2.
+crc32fast = "1.4.0"
 error-trace = { version = "4.0.0", default-features = false }
 # Full jitter for the retry backoff; already in the tree through tempfile.
 fastrand = "2.1.0"
+# Inflates the entries of a zip file (`files unzip`) as they stream by. Pure Rust: miniz_oxide, no C
+# library.
+flate2 = { version = "1.1.0", default-features = false, features = ["rust_backend"] }
 futures = "0.3.25"
 google-apis-common = { version = "8.0.0", default-features = false }
 google-drive3 = "7.0.0"

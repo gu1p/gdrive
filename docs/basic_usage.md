@@ -274,6 +274,30 @@ gdrive files upload --recursive ~/photos               # a local folder and ever
 - `--recursive` uploads 4 files at a time (`--jobs`); every Drive folder is created before anything goes
   into it. See [Recursive transfers](#recursive-transfers).
 
+## Extract a zip file on Drive
+
+```sh
+gdrive files unzip <FILE_ID>                       # into a new folder next to the zip file
+gdrive files unzip <FILE_ID> --into <FOLDER_ID>    # into a new folder in that folder
+```
+
+- The new folder has the name of the zip file without `.zip`. Nothing is downloaded to disk: each file
+  goes up as it is unpacked, and the zip file itself is only read. Both sides are the current account;
+  `gdrive account switch` picks another.
+- Run it again after a failure. The folder is reused, the files it already extracted stay
+  (`already-there`), and the rest goes up. A file that was interrupted starts over.
+- A file of the same name that this command did not extract from that entry is left alone, and that entry
+  fails. Nothing is ever overwritten. A later run knows its files by name, size and a mark with the CRC-32
+  of the entry, and does not read them: one that was edited since to the same size counts as there.
+- `--continue-on-error` goes on with the others, `--jobs N` sets how many go up at once. Of several entries
+  with one path, the last counts.
+- Stored and deflated files can be read, which is nearly every zip file, up to any size (ZIP64). Not
+  encrypted files, other compression methods such as Deflate64 (which Windows may use above 2 GB) and zip
+  files split over several files: the command says so.
+- File names are UTF-8 when the zip file says so or when they can be, otherwise code page 850, which is what
+  older Windows wrote in the Americas and Western Europe. A file gets the modification time in the zip file: exact when the zip file has
+  it in UTC, otherwise its local time taken as UTC. Each large file holds up to one chunk (32 MB) in memory.
+
 ## Sync a folder
 
 `files sync` makes one folder like the other, one way, like `rsync`: it transfers only new and changed

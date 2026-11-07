@@ -82,6 +82,8 @@ pub(crate) struct FakeFile {
     pub(crate) resource_key: Option<String>,
     /// What a media download of a blob, or an export of a Workspace document, returns.
     pub(crate) content: Option<String>,
+    /// What a media download returns instead of `content`, for bytes that are no text.
+    pub(crate) binary: Option<Vec<u8>>,
     /// `modifiedTime`, RFC 3339.
     pub(crate) modified_time: Option<String>,
     /// `createdTime`, RFC 3339.
@@ -116,6 +118,19 @@ impl FakeFile {
     }
 
     /// A Google Docs document: no size, no md5.
+    pub(crate) fn binary(id: &str, name: &str, parent: &str, content: &[u8]) -> Self {
+        Self {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            mime_type: "application/zip".to_owned(),
+            parents: vec![parent.to_owned()],
+            size: Some(content.len() as u64),
+            md5: Some(format!("{:x}", md5::compute(content))),
+            binary: Some(content.to_vec()),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn document(id: &str, name: &str, parent: &str) -> Self {
         Self {
             id: id.to_owned(),
@@ -1460,7 +1475,10 @@ async fn media(state: &State, id: &str, headers: &hyper::HeaderMap) -> FakeRespo
         .files()
         .iter()
         .find(|file| file.id == id)
-        .and_then(|file| file.content.clone());
+        .and_then(|file| {
+            let text = file.content.clone().map(String::into_bytes);
+            file.binary.clone().or(text)
+        });
     let Some(content) = content else {
         return error(StatusCode::NOT_FOUND, "File not found.");
     };

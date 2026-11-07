@@ -806,7 +806,7 @@ async fn list_files(dest: &Hub, q: &str, fields: &str) -> Result<Existing, Error
 }
 
 /// One page of the files `q` names (in any drive), with the `fields` mask `fields`.
-async fn list_page(
+pub(super) async fn list_page(
     hub: &Hub,
     q: &str,
     page_size: i32,

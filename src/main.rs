@@ -626,6 +626,30 @@ enum FileCommand {
         progress: ProgressArgs,
     },
 
+    /// Extract a zip file on Drive into a new folder on Drive, without downloading it
+    ///
+    /// The folder has the name of the zip file without `.zip`, next to it or in the folder --into names. The current account does all of it, and the zip file stays as it is. Stored and deflated files can be read, as in nearly all zip files; ZIP64 too, a zip split over several files or an encrypted one not. Run it again after a failure: what is there stays, the rest goes up. A file that was interrupted starts over.
+    Unzip {
+        /// Id of the zip file
+        #[arg(value_name = "FILE_ID")]
+        file_id: String,
+
+        /// Id of the folder to create the new folder in [default: the folder of the zip file]
+        #[arg(long, value_name = "FOLDER_ID")]
+        into: Option<String>,
+
+        /// Extract up to N files at once (1 to 64)
+        #[arg(long, value_name = "N", default_value_t = Options::DEFAULT_JOBS, value_parser = parse_jobs)]
+        jobs: NonZeroUsize,
+
+        /// When a file or folder fails, go on with the others instead of stopping. The command still exits with an error
+        #[arg(long)]
+        continue_on_error: bool,
+
+        #[command(flatten)]
+        progress: ProgressArgs,
+    },
+
     /// Export google document to file
     Export {
         /// File id
@@ -1255,6 +1279,22 @@ async fn handle_files_command(
                 multipart_threshold,
                 print_chunk_errors,
                 print_chunk_info,
+                transfer: Options::new(jobs, continue_on_error),
+                progress: progress.mode(),
+            })
+            .await?;
+        }
+
+        FileCommand::Unzip {
+            file_id,
+            into,
+            jobs,
+            continue_on_error,
+            progress,
+        } => {
+            files::unzip(files::unzip::Config {
+                file_id,
+                into,
                 transfer: Options::new(jobs, continue_on_error),
                 progress: progress.mode(),
             })
@@ -2293,6 +2333,46 @@ mod flag_tests {
             panic!("--archive --trash-source should be refused");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn unzip_takes_a_file_id_and_the_flags_of_a_transfer() {
+        let FileCommand::Unzip {
+            file_id,
+            into,
+            jobs,
+            continue_on_error,
+            ..
+        } = parse(&["files", "unzip", "a"])
+        else {
+            panic!("expected unzip");
+        };
+        assert_eq!(file_id, "a");
+        assert_eq!(into, None);
+        assert_eq!(jobs.get(), 4);
+        assert!(!continue_on_error);
+
+        let FileCommand::Unzip {
+            into,
+            jobs,
+            continue_on_error,
+            ..
+        } = parse(&[
+            "files",
+            "unzip",
+            "a",
+            "--into",
+            "b",
+            "--jobs",
+            "2",
+            "--continue-on-error",
+        ])
+        else {
+            panic!("expected unzip");
+        };
+        assert_eq!(into.as_deref(), Some("b"));
+        assert_eq!(jobs.get(), 2);
+        assert!(continue_on_error);
     }
 
     #[test]

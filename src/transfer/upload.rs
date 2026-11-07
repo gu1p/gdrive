@@ -638,6 +638,8 @@ pub(crate) struct Upload<'a> {
     file_id: Option<String>,
     /// The marker of a conversion (`appProperties`), which has no pre-generated id.
     marker: Option<String>,
+    /// An `appProperties` entry of a new file ([`Upload::with_property`]).
+    property: Option<(&'static str, String)>,
     /// The md5 of the content read so far, unless md5 verification is off.
     hasher: Option<Md5Progress>,
     /// The most bytes the server held so far: only bytes past it are progress.
@@ -693,6 +695,7 @@ impl<'a> Upload<'a> {
             media_type,
             file_id,
             marker,
+            property: None,
             hasher: options.verify_md5.then(Md5Progress::new),
             high_water: 0,
             reported: None,
@@ -708,6 +711,14 @@ impl<'a> Upload<'a> {
     #[must_use]
     pub(crate) fn with_times(mut self, times: FileTimes) -> Self {
         self.times = times;
+        self
+    }
+
+    /// A new file gets this `appProperties` entry, as part of its creation: no file of the
+    /// upload is ever without it.
+    #[must_use]
+    pub(crate) fn with_property(mut self, key: &'static str, value: String) -> Self {
+        self.property = Some((key, value));
         self
     }
 
@@ -991,11 +1002,15 @@ impl<'a> Upload<'a> {
             if !self.target.parents.is_empty() {
                 metadata.insert("parents".into(), self.target.parents.clone().into());
             }
+            let mut properties = serde_json::Map::new();
             if let Some(marker) = &self.marker {
-                metadata.insert(
-                    "appProperties".into(),
-                    serde_json::json!({ UPLOAD_MARKER: marker }),
-                );
+                properties.insert(UPLOAD_MARKER.into(), marker.as_str().into());
+            }
+            if let Some((key, value)) = &self.property {
+                properties.insert((*key).into(), value.as_str().into());
+            }
+            if !properties.is_empty() {
+                metadata.insert("appProperties".into(), properties.into());
             }
         }
         serde_json::Value::Object(metadata).to_string()

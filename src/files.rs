@@ -13,6 +13,7 @@ pub(crate) mod mv;
 pub(crate) mod rename;
 pub(crate) mod sync;
 pub(crate) mod trash;
+pub(crate) mod unzip;
 pub(crate) mod update;
 pub(crate) mod upload;
 
@@ -30,6 +31,7 @@ pub(crate) use mv::mv;
 pub(crate) use rename::rename;
 pub(crate) use sync::sync;
 pub(crate) use trash::trash;
+pub(crate) use unzip::unzip;
 pub(crate) use update::update;
 pub(crate) use upload::upload;
 

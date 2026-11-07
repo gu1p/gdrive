@@ -137,6 +137,8 @@ Run `gdrive <command> --help` for the options, for example `gdrive files list --
   [Migrate files to another account](docs/migrate.md). With `--archive`, each folder arrives as one tar
   file, made on the fly, or with `--max-part-size` as several, so that a run after a failure uploads only
   what no part holds yet.
+- Extract a zip file on Drive into a folder on Drive, without downloading it to disk:
+  [`gdrive files unzip`](docs/basic_usage.md#extract-a-zip-file-on-drive).
 
 - Service accounts and Application Default Credentials, for CI and servers:
   [Service accounts](docs/service_accounts.md).

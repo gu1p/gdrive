@@ -8,6 +8,7 @@
 //! - [`relay`]: the copy of a Drive file to another account, streamed through the uploader.
 //! - [`archive`]: a tar of Drive files of one account, streamed through the uploader into
 //!   another.
+//! - [`zip`]: a zip file on Drive read where it is, entry by entry.
 
 pub(crate) mod archive;
 #[cfg(test)]
@@ -17,3 +18,4 @@ pub(crate) mod relay;
 pub(crate) mod scheduler;
 pub(crate) mod upload;
 pub(crate) mod walk;
+pub(crate) mod zip;

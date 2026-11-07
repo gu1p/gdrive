@@ -764,7 +764,7 @@ impl Stream {
 /// An archive (`archive.rs`) reads many files, one reply open at a time: it drops the reader
 /// of a file when it moves on, and a later reader of that file takes over what the earlier one
 /// found out ([`Requested`]).
-pub(super) struct DriveSource<'a> {
+pub(crate) struct DriveSource<'a> {
     media: MediaSource<'a>,
     /// The source's content as its metadata describes it, compared before every new reply.
     identity: Identity<'a>,
@@ -793,7 +793,7 @@ pub(super) struct Requested {
 impl<'a> DriveSource<'a> {
     /// The content of `file`, `size` bytes, with its id and resource key; warnings name the
     /// transfer `label`.
-    pub(super) fn new(
+    pub(crate) fn new(
         hub: &'a Hub,
         file: &google_drive3::api::File,
         (id, resource_key): (&str, Option<&str>),
