@@ -516,8 +516,8 @@ photos.part00002.tar (7.7 GB, larger than the maximum: a file is never split)`.
 **What tracks the upload.** `<name>.parts.json`, next to the parts, lists each part with the path of everything
 in it, so it also tells which part holds a file. A part counts only when the file of its name is in the
 destination with the mark of exactly those entries, on the bytes that were checked. A part that was deleted,
-replaced or never finished proves nothing, and what it held goes up again. Editing the list can only cause more
-uploads, never fewer. Marks are visible only to the OAuth client that wrote them: a run with the destination
+replaced or never finished proves nothing, and what it held goes up again. The list is gdrive's own: read it, but
+do not edit it. Marks are visible only to the OAuth client that wrote them: a run with the destination
 account added with another client finds no part it can count on.
 
 **Running it again** uploads only what no part holds, whatever SIZE the earlier runs used:

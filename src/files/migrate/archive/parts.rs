@@ -24,13 +24,15 @@
 //! What a part holds counts only when the destination proves it: the index names the part, and
 //! the file of that name has the mark of exactly those entries (the digest of their digests) on
 //! the bytes it was checked with, as for a whole archive ([`Existing::archives`]). A part that
-//! was deleted, replaced or never finished proves nothing, and what it held goes up again. So an
-//! edit of the index can only cause more uploads, never fewer.
+//! was deleted, replaced or never finished proves nothing, and what it held goes up again. The
+//! index itself is gdrive's own: the marks prove the digests in it, not its paths or its order.
 //!
 //! The order of the writes: the index names a part before it goes up, the mark comes once it is
 //! checked. A run that dies at any point leaves a part that the next run recognizes, or one that
 //! counts for nothing. An unfinished part gets its session continued: the next run makes the same
 //! part (the same entries, and the same exports through [`ExportsCache`]) under the same number.
+//! The cache is the archive's, with exports by the digest of their entry, so that a file added
+//! elsewhere in the source since does not cost the part its session.
 //!
 //! Nothing in the destination is overwritten but the run's own index: a part's number skips the
 //! names that files have. That is why this mode takes neither `--replace-smaller` nor
@@ -38,8 +40,8 @@
 //! parts, as they do with whole archives, and each finds its own by the marks.
 //!
 //! The parts of one `FILE_ID` go up one after the other. With `--continue-on-error`, a part or an
-//! export that fails is printed and the walk goes on, so that one unreadable file does not hold up
-//! everything after it; what failed is tried again by the next run.
+//! export that fails is printed at once and the walk goes on, so that one unreadable file does not
+//! hold up everything after it; what failed is tried again by the next run.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -54,7 +56,7 @@ use serde::{Deserialize, Serialize};
 use super::{failed, label, Kind, Migration, Place, Plan, Planned, Sending};
 use crate::{
     common::{drive_file, human_size::human_size},
-    files::migrate::{Error, PartsIndexError},
+    files::migrate::{Error, PartsError},
     transfer::{
         archive::{self, CachedExport, Entry, ExportsCache, Layout},
         relay::{self, RelayError, EXPORT_LIMIT},
@@ -152,20 +154,19 @@ struct Parts<'a> {
     /// The number of the last part named.
     number: u64,
     cache: Option<ExportsCache>,
-    /// What an interrupted run kept of the exports, by file id.
+    /// What an interrupted run kept of the exports, by the digest of their entry.
     kept: BTreeMap<String, CachedExport>,
-    /// The exports of the part being made and of the entry after it, by file id.
+    /// The exports of the part being made and of the entry after it, by the digest of their
+    /// entry.
     exports: BTreeMap<String, CachedExport>,
-    /// Parts already there.
-    there: u64,
     /// Parts this run made.
     made: u64,
     /// Exports over Drive's limit, left out.
     left_out: u64,
     /// The bytes of the parts this run made.
     bytes: u64,
-    /// The last failure of a run that continues on errors: the job's own.
-    failure: Option<Error>,
+    /// Failures of a run that continues on errors, all of them printed.
+    failures: u64,
 }
 
 impl Migration {
@@ -232,7 +233,10 @@ impl<'a> Parts<'a> {
             .session_dir
             .as_deref()
             .filter(|_| plan.exports() > 0 && !migration.dry_run)
-            .map(|dir| ExportsCache::new(dir, &plan.manifest));
+            .map(|dir| {
+                let key = archive::part_digest(std::iter::once(plan.root_id.as_str()));
+                ExportsCache::new(dir, &key)
+            });
         let kept = match &cache {
             Some(cache) => cache.load().await.unwrap_or_default(),
             None => BTreeMap::new(),
@@ -258,26 +262,30 @@ impl<'a> Parts<'a> {
             cache,
             kept,
             exports: BTreeMap::new(),
-            there,
             made: 0,
             left_out: 0,
             bytes: 0,
-            failure: None,
+            failures: 0,
         })
     }
 
     /// Makes the parts, and tells how the job ended.
     async fn make(mut self) -> Outcome {
         let stopped = self.walk().await;
-        let failure = stopped.err().or_else(|| self.failure.take());
+        let tally = &self.migration.tally;
         // A FILE_ID that is a Workspace file whose export is too large is the job's own skip.
-        let alone = self.left_out > 0 && self.made == 0 && self.there == 0;
+        let alone = self.plan.entries.len() == 1 && self.left_out == 1;
         if !alone {
-            let tally = &self.migration.tally;
             tally.skipped.fetch_add(self.left_out, Ordering::SeqCst);
         }
-        if let Some(error) = failure {
+        if let Err(error) = stopped {
             return Outcome::failed(error);
+        }
+        if self.failures > 0 {
+            // The job's own failure is one of them.
+            tally.more_failures.fetch_sub(1, Ordering::SeqCst);
+            let error = Error::Parts(PartsError::Failed(self.failures));
+            return failed(&parts_label(&self.plan.stem), error);
         }
         if let Some(cache) = &self.cache {
             cache.remove().await;
@@ -310,7 +318,7 @@ impl<'a> Parts<'a> {
             if held.get(&planned.path) == Some(&digest) {
                 continue;
             }
-            let entry = match self.entry(planned).await {
+            let entry = match self.entry(planned, &digest).await {
                 Ok(Some(entry)) => entry,
                 // Over Drive's limit, and left out.
                 Ok(None) => continue,
@@ -323,7 +331,7 @@ impl<'a> Parts<'a> {
             if part.overflows(size, self.max) {
                 let full = mem::take(&mut part);
                 self.finish(full).await?;
-                self.exports.retain(|id, _| planned.is_export_of(id));
+                self.exports.retain(|key, _| *key == digest);
             }
             part.size += size;
             part.exports += u64::from(matches!(planned.kind, Kind::Export(_)));
@@ -339,23 +347,23 @@ impl<'a> Parts<'a> {
         Ok(())
     }
 
-    /// The entry of `planned` with its export, unless that is over Drive's limit. A dry run makes
-    /// no exports: they count as empty.
-    async fn entry(&mut self, planned: &Planned) -> Result<Option<Entry>, Error> {
+    /// The entry of `planned`, whose digest is `digest`, with its export, unless that is over
+    /// Drive's limit. A dry run makes no exports: they count as empty.
+    async fn entry(&mut self, planned: &Planned, digest: &str) -> Result<Option<Entry>, Error> {
         let Kind::Export(export) = &planned.kind else {
             return Ok(Some(planned.entry(None)));
         };
         if self.migration.dry_run {
             return Ok(Some(planned.entry(None)));
         }
-        let made = match self.kept.remove(&export.id) {
+        let made = match self.kept.remove(digest) {
             Some(made) => made,
             None => self.migration.export_of(&planned.label, export).await?,
         };
         match &made {
             CachedExport::Content(bytes) => {
                 let entry = planned.entry(Some(bytes.clone()));
-                self.exports.insert(export.id.clone(), made);
+                self.exports.insert(digest.to_owned(), made);
                 Ok(Some(entry))
             }
             CachedExport::TooLarge => {
@@ -382,7 +390,7 @@ impl<'a> Parts<'a> {
     }
 
     /// What `error` of `label` means for the walk: its end, unless the run goes on after
-    /// failures. The job ends with one failure, so an earlier one is printed now.
+    /// failures. Then it is told and counted now: a Ctrl-C ends the job without its end.
     async fn fail(&mut self, label: &str, error: Error) -> Result<(), Error> {
         let error = Error::Item {
             label: label.to_owned(),
@@ -391,12 +399,13 @@ impl<'a> Parts<'a> {
         if !self.migration.continue_on_error {
             return Err(error);
         }
-        if let Some(earlier) = self.failure.replace(error) {
-            let message = crate::failure_message(&earlier);
-            self.context.printer.err(message).await;
-            let tally = &self.migration.tally;
-            tally.more_failures.fetch_add(1, Ordering::SeqCst);
-        }
+        self.context
+            .printer
+            .err(crate::failure_message(&error))
+            .await;
+        self.failures += 1;
+        let tally = &self.migration.tally;
+        tally.more_failures.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 
@@ -495,7 +504,7 @@ impl<'a> Parts<'a> {
     /// Writes the index to the destination.
     async fn save_index(&mut self) -> Result<(), Error> {
         let write_error = |source: Box<dyn std::error::Error + Send + Sync>| {
-            Error::PartsIndex(PartsIndexError::Access {
+            Error::Parts(PartsError::Access {
                 doing: "write",
                 name: label(None, &self.index_name),
                 source,
@@ -556,14 +565,14 @@ async fn read_index(
         let content = relay::read_file(&migration.dest, &file.id, &shown)
             .await
             .map_err(|error| {
-                Error::PartsIndex(PartsIndexError::Access {
+                Error::Parts(PartsError::Access {
                     doing: "read",
                     name: shown.clone(),
                     source: Box::new(error),
                 })
             })?;
         let index = serde_json::from_slice::<Index>(&content)
-            .map_err(|_| Error::PartsIndex(PartsIndexError::Other(shown.clone())))?;
+            .map_err(|_| Error::Parts(PartsError::Other(shown.clone())))?;
         if index.source == plan.root_id {
             return Ok((Some(file.id.clone()), index));
         }

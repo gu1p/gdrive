@@ -176,6 +176,25 @@ async fn a_folder_arrives_in_parts_that_each_unpack_alone() {
 }
 
 #[tokio::test]
+async fn a_later_part_extracts_alone_into_an_empty_folder() {
+    let source = FakeDrive::start(photos(), Behavior::default()).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    migrate(&source, &dest, in_parts(&["photos"]))
+        .await
+        .assert_ok();
+    let last = part(&dest, "photos.part00003.tar");
+    let dir = tempfile::tempdir().unwrap();
+
+    tar::Archive::new(last.content.as_slice())
+        .unpack(dir.path())
+        .unwrap();
+
+    let extracted = std::fs::read(dir.path().join("photos").join("e.bin")).unwrap();
+    assert_eq!(extracted, thousand('e').as_bytes());
+    assert_eq!(files_in(&dir.path().join("photos")), ["e.bin"]);
+}
+
+#[tokio::test]
 async fn a_second_run_finds_every_part_there_and_sends_nothing_whatever_the_maximum() {
     let source = FakeDrive::start(photos(), Behavior::default()).await;
     let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
@@ -344,6 +363,69 @@ async fn every_part_that_fails_is_told_and_counted() {
         );
     }
     assert!(first.summary().contains(", 2 failed,"), "{text}");
+}
+
+#[tokio::test]
+async fn a_failure_is_told_and_counted_even_when_a_ctrl_c_follows() {
+    let behavior = Behavior {
+        media_missing: HashMap::from([(String::from("c"), Duration::ZERO)]),
+        media_stalled: HashSet::from([String::from("e")]),
+        ..Behavior::default()
+    };
+    let failing = FakeDrive::start(photos(), behavior).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+
+    let first = migrate_with(
+        &failing,
+        &dest,
+        going_on(in_parts(&["photos"])),
+        &UploadOptions::default(),
+        tokio::time::sleep(Duration::from_millis(500)),
+    )
+    .await;
+
+    assert!(first.result.is_err());
+    let text = first.err.text();
+    assert!(
+        text.contains("Error: unable to migrate 'photos.part00002.tar'"),
+        "{text}"
+    );
+    assert!(
+        first
+            .summary()
+            .contains(", 1 failed, 1 cancelled; interrupted"),
+        "{}",
+        first.summary()
+    );
+}
+
+#[tokio::test]
+async fn a_skip_counts_also_when_the_part_fails() {
+    let mut files = photos();
+    files
+        .push(FakeFile::native("doc", "notes", "photos", DOCUMENT, "too much").modified(FILE_TIME));
+    let behavior = Behavior {
+        export_too_large: HashSet::from([String::from("doc")]),
+        media_missing: HashMap::from([(String::from("a"), Duration::ZERO)]),
+        ..Behavior::default()
+    };
+    let failing = FakeDrive::start(files, behavior).await;
+    let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    let settings = Settings {
+        max_part_size: Some(1_000_000),
+        ..settings(&["photos"])
+    };
+
+    let first = migrate(&failing, &dest, settings).await;
+
+    assert!(first.result.is_err());
+    assert!(
+        first
+            .summary()
+            .contains(", 1 skipped (unsupported), 1 failed"),
+        "{}",
+        first.summary()
+    );
 }
 
 #[tokio::test]
@@ -551,7 +633,7 @@ fn index_of_stored(dest: &FakeDrive) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn an_edited_index_can_only_cause_more_uploads() {
+async fn a_part_that_does_not_hold_what_the_index_says_proves_nothing() {
     let source = FakeDrive::start(photos(), Behavior::default()).await;
     let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
     migrate(&source, &dest, in_parts(&["photos"]))
@@ -889,6 +971,75 @@ async fn an_interrupted_part_is_continued_with_its_exports_and_the_parts_before_
         source.media_ranges()[media_before..],
         [(String::from("z"), None)]
     );
+    assert_eq!(
+        files_in(&uploads),
+        Vec::<String>::new(),
+        "nothing left behind"
+    );
+}
+
+#[tokio::test]
+async fn a_file_added_elsewhere_does_not_cost_an_interrupted_part_its_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let uploads = dir.path().join("uploads");
+    let options = continuing(&uploads);
+    let source_behavior = || Behavior {
+        exports_vary: true,
+        account_email: Some(String::from("old@example.com")),
+        ..Behavior::default()
+    };
+    let source = FakeDrive::start(big(), source_behavior()).await;
+    let dest = FakeDrive::start(
+        Vec::new(),
+        Behavior {
+            chunks_stalled_from: Some(CHUNK_ALIGNMENT),
+            account_email: Some(String::from("new@example.com")),
+            ..Behavior::default()
+        },
+    )
+    .await;
+    let settings = || Settings {
+        max_part_size: Some(400_000),
+        ..settings(&["big"])
+    };
+    let first = migrate_with(
+        &source,
+        &dest,
+        settings(),
+        &options,
+        dest.wait_for_stalled_chunks(1),
+    )
+    .await;
+    assert!(first.summary().ends_with("; interrupted"));
+    dest.stop_stalling();
+    let chunks_before = dest.chunks().len();
+
+    // A file that sorts after that part, too large to fit in it.
+    let mut files = big();
+    let added = std::iter::repeat_n('a', 100_000).collect::<String>();
+    files.push(FakeFile::blob("zz", "zz.bin", "big", &added));
+    let later = FakeDrive::start(files, source_behavior()).await;
+
+    let second = migrate_with(&later, &dest, settings(), &options, std::future::pending()).await;
+
+    second.assert_ok();
+    assert_eq!(
+        later.exports(),
+        Vec::<(String, String)>::new(),
+        "the first run's export"
+    );
+    let firsts = dest.chunks()[chunks_before..]
+        .iter()
+        .map(|chunk| chunk.first)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        firsts[..3],
+        [Some(0), None, Some(CHUNK_ALIGNMENT)],
+        "{firsts:?}"
+    );
+    let continued = part(&dest, "big.part00002.tar");
+    assert_eq!(paths(&continued), ["big/notes.docx", "big/z.bin"]);
+    assert_eq!(paths(&part(&dest, "big.part00003.tar")), ["big/zz.bin"]);
     assert_eq!(
         files_in(&uploads),
         Vec::<String>::new(),

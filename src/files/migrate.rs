@@ -1639,30 +1639,37 @@ impl ReplaceError {
     }
 }
 
-/// Why the list of what the parts of an archive hold cannot be used (`--max-part-size`).
+/// What went wrong with the parts of an archive (`--max-part-size`).
 #[derive(Debug)]
-pub(crate) enum PartsIndexError {
-    /// It could not be read or written.
+pub(crate) enum PartsError {
+    /// The list of what they hold could not be read or written.
     Access {
         doing: &'static str,
         name: String,
         source: Box<dyn error::Error + Send + Sync>,
     },
-    /// A file of its name in the destination is no such list.
+    /// A file of the name of that list in the destination is no such list.
     Other(String),
+    /// That many parts failed, each told when it did.
+    Failed(u64),
 }
 
-impl Display for PartsIndexError {
+impl Display for PartsError {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            PartsIndexError::Access { doing, name, .. } => write!(
+            PartsError::Access { doing, name, .. } => write!(
                 f,
                 "unable to {doing} '{name}', which lists what the parts of the archive hold"
             ),
-            PartsIndexError::Other(name) => write!(
+            PartsError::Other(name) => write!(
                 f,
                 "'{name}' is in the destination and is no list of the parts of an archive; rename \
                  or remove it"
+            ),
+            PartsError::Failed(count) => write!(
+                f,
+                "{} failed; run the command again",
+                plural(*count, "part", "parts")
             ),
         }
     }
@@ -1746,7 +1753,7 @@ pub(crate) enum Error {
         id: String,
         source: Box<google_drive3::Error>,
     },
-    PartsIndex(PartsIndexError),
+    Parts(PartsError),
     /// The item is in the destination, but could not be moved to the trash in the source.
     Trash(Box<google_drive3::Error>),
     /// An item of the migration failed; `label` is its path, starting with the name of its
@@ -1863,7 +1870,7 @@ impl Display for Error {
                  the mark was written, and otherwise as a file of that name with other content; \
                  nothing was deleted"
             ),
-            Error::PartsIndex(error) => error.fmt(f),
+            Error::Parts(error) => error.fmt(f),
             Error::Trash(_) => f.write_str(
                 "it is in the destination, but it could not be moved to the trash in the source",
             ),
@@ -1899,7 +1906,7 @@ impl error::Error for Error {
                 Some(source.as_ref())
             }
             Error::Export { source, .. } => Some(source.as_ref()),
-            Error::PartsIndex(PartsIndexError::Access { source, .. }) => Some(source.as_ref()),
+            Error::Parts(PartsError::Access { source, .. }) => Some(source.as_ref()),
             Error::ArchiveName(source) => Some(source),
             Error::Incomplete(source) => Some(source),
             Error::GenerateId(source) => Some(source),
@@ -1916,7 +1923,7 @@ impl error::Error for Error {
             | Error::FolderMissingId
             | Error::IncompleteListing
             | Error::ArchiveIncomplete(_)
-            | Error::PartsIndex(PartsIndexError::Other(_))
+            | Error::Parts(PartsError::Other(_) | PartsError::Failed(_))
             | Error::NoSize(_) => None,
         }
     }

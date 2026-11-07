@@ -394,11 +394,6 @@ impl Planned {
         manifest.finish()
     }
 
-    /// Whether it is the export of the Workspace file `id`.
-    fn is_export_of(&self, id: &str) -> bool {
-        matches!(&self.kind, Kind::Export(export) if export.id == id)
-    }
-
     /// The entry, with `export` as the content of an export (none: empty).
     fn entry(&self, export: Option<Bytes>) -> Entry {
         Entry {
