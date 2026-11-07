@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use super::{
     decode, encode, field, header, hex, pax_record, ArchiveError, ArchiveSource, Blob,
     CachedExport, Content, Entry, EntryError, EntryFailure, ExportsCache, Layout, Manifest, Part,
-    END_OF_ARCHIVE,
+    END_OF_ARCHIVE, END_SIZE,
 };
 use crate::transfer::{
     fake_drive::{Behavior, FakeDrive, FakeFile},
@@ -873,4 +873,37 @@ fn a_workspace_file_without_modification_time_makes_its_manifest_unlike_any_othe
     field(&mut context, b"2025-01-01T00:00:00.000Z");
     field(&mut context, b"docx");
     assert_eq!(digest(time), hex(context.finish().as_ref()));
+}
+
+#[test]
+fn the_size_of_an_archive_is_the_sizes_of_its_entries_and_its_end() {
+    let blob = |id: &str, size: u64| Blob {
+        id: id.to_owned(),
+        size,
+        md5: None,
+        resource_key: None,
+        modified_time: None,
+    };
+    let entry = |path: String, content: Content| Entry {
+        path,
+        mtime: MTIME,
+        content,
+    };
+    let entries = vec![
+        folder("top"),
+        // A pax header for the path that is too long, for the one that is not ASCII, and for the
+        // size that does not fit its field.
+        entry("top/l".repeat(40), Content::Blob(blob("long", 1))),
+        entry(
+            "top/\u{e9}.txt".to_owned(),
+            Content::Blob(blob("name", 512)),
+        ),
+        entry("top/big".to_owned(), Content::Blob(blob("big", 9 << 30))),
+        entry("top/doc".to_owned(), Content::Bytes(Bytes::from("export"))),
+        entry("top/empty".to_owned(), Content::Blob(blob("empty", 0))),
+    ];
+
+    let sizes = entries.iter().map(Entry::archived_size).sum::<u64>();
+
+    assert_eq!(Layout::new(entries).size(), sizes + END_SIZE);
 }

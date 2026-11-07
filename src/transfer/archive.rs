@@ -93,6 +93,9 @@ const MAX_OCTAL_SIZE: u64 = 0o77_777_777_777;
 /// What ends an archive: two blocks of zeros.
 const END_OF_ARCHIVE: [u8; 1024] = [0; 1024];
 
+/// The bytes of an archive after its last entry.
+pub(crate) const END_SIZE: u64 = END_OF_ARCHIVE.len() as u64;
+
 /// The bytes of the ustar name field.
 const USTAR_NAME_LEN: usize = 100;
 
@@ -108,6 +111,25 @@ pub(crate) struct Entry {
     /// The modification time, in seconds since the Unix epoch.
     pub(crate) mtime: u64,
     pub(crate) content: Content,
+}
+
+impl Entry {
+    /// The size of its content.
+    fn content_size(&self) -> u64 {
+        match &self.content {
+            Content::Folder => 0,
+            Content::Bytes(bytes) => bytes.len() as u64,
+            Content::Blob(blob) => blob.size,
+        }
+    }
+
+    /// The bytes it takes in an archive: its header, its content and the padding after it.
+    #[must_use]
+    pub(crate) fn archived_size(&self) -> u64 {
+        let size = self.content_size();
+        let is_folder = matches!(self.content, Content::Folder);
+        header(&self.path, is_folder, size, self.mtime).len() as u64 + size + padding(size) as u64
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,11 +188,7 @@ impl Layout {
         let mut builder = Builder::default();
         for entry in entries {
             let is_folder = matches!(entry.content, Content::Folder);
-            let size = match &entry.content {
-                Content::Folder => 0,
-                Content::Bytes(bytes) => bytes.len() as u64,
-                Content::Blob(blob) => blob.size,
-            };
+            let size = entry.content_size();
             builder.memory(&header(&entry.path, is_folder, size, entry.mtime));
             match entry.content {
                 Content::Folder => {}
@@ -465,6 +483,18 @@ impl Manifest {
     pub(crate) fn finish(self) -> String {
         hex(self.context.finish().as_ref())
     }
+}
+
+/// The digest of a part of an archive from the [`Manifest`] digests of its entries, each made
+/// of that entry alone, in the order of the part: the mark of the file that holds them.
+#[must_use]
+pub(crate) fn part_digest<'a>(entries: impl Iterator<Item = &'a str>) -> String {
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    context.update(b"gdrive archive part 1\n");
+    for entry in entries {
+        field(&mut context, entry.as_bytes());
+    }
+    hex(context.finish().as_ref())
 }
 
 /// `time` in RFC 3339 with milliseconds; empty without one.

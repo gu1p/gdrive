@@ -38,7 +38,11 @@
 //!
 //! A root with a folder that could not be listed, or was listed incompletely, fails before
 //! anything is uploaded: an archive that silently misses files is worse than none.
+//!
+//! `--max-part-size` makes several tar files of each `FILE_ID`, each with its own mark, and a list
+//! of what each one holds: see [`parts`].
 
+mod parts;
 #[cfg(test)]
 mod tests;
 
@@ -50,6 +54,7 @@ use std::{
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use google_drive3::api::File;
 
 use super::{
     ask, failed,
@@ -95,6 +100,8 @@ pub(super) const DEST_FIELDS: &str =
 /// What the archive of one `FILE_ID` is made of, from the listing alone.
 pub(super) struct Plan {
     root_id: String,
+    /// The Drive name.
+    stem: String,
     /// `<Drive name>.tar`.
     name: String,
     /// The name as output shows it.
@@ -180,6 +187,7 @@ impl Plan {
         let name = format!("{}.tar", root.name());
         let mut plan = Plan {
             root_id: String::new(),
+            stem: root.name().to_owned(),
             label: label(None, &name),
             name,
             entries: Vec::new(),
@@ -319,16 +327,7 @@ impl Plan {
     fn manifest(&self) -> String {
         let mut manifest = Manifest::new();
         for entry in &self.entries {
-            match &entry.kind {
-                Kind::Folder => manifest.folder(&entry.path),
-                Kind::Blob(blob) => manifest.blob(&entry.path, blob),
-                Kind::Export(export) => manifest.export(
-                    &entry.path,
-                    &export.id,
-                    export.modified_time.as_ref(),
-                    &export.format.to_string(),
-                ),
-            }
+            entry.add_to(&mut manifest);
         }
         manifest.finish()
     }
@@ -375,6 +374,31 @@ impl Plan {
 }
 
 impl Planned {
+    fn add_to(&self, manifest: &mut Manifest) {
+        match &self.kind {
+            Kind::Folder => manifest.folder(&self.path),
+            Kind::Blob(blob) => manifest.blob(&self.path, blob),
+            Kind::Export(export) => manifest.export(
+                &self.path,
+                &export.id,
+                export.modified_time.as_ref(),
+                &export.format.to_string(),
+            ),
+        }
+    }
+
+    /// What tells this entry from an edited one: the digest of a manifest of it alone.
+    fn digest(&self) -> String {
+        let mut manifest = Manifest::new();
+        self.add_to(&mut manifest);
+        manifest.finish()
+    }
+
+    /// Whether it is the export of the Workspace file `id`.
+    fn is_export_of(&self, id: &str) -> bool {
+        matches!(&self.kind, Kind::Export(export) if export.id == id)
+    }
+
     /// The entry, with `export` as the content of an export (none: empty).
     fn entry(&self, export: Option<Bytes>) -> Entry {
         Entry {
@@ -415,6 +439,22 @@ enum Made {
     Nothing,
     /// The file of its name in the destination stays (`--ask`).
     Kept,
+}
+
+/// A tar file on its way to the destination.
+struct Sending<'a> {
+    /// The source file or folder it is made of.
+    root_id: &'a str,
+    name: &'a str,
+    /// The name as output shows it.
+    label: &'a str,
+    layout: &'a Layout,
+    /// Where its exports are kept while its session is recorded.
+    cache: Option<&'a ExportsCache>,
+    /// The exports to keep there: none when the cache has them already.
+    exports: Option<&'a BTreeMap<String, CachedExport>>,
+    /// The file of its name whose new version it is.
+    replaced: Option<&'a Smaller>,
 }
 
 impl Existing {
@@ -476,7 +516,11 @@ impl Migration {
     /// The job that makes the archive of `root` in the folder of `place`, and the size of the
     /// archive as the listing tells it (without the exports).
     pub(super) fn archive_job(self: &Arc<Self>, root: SourceNode, place: Place) -> (Job, u64) {
-        let label = label(None, &format!("{}.tar", root.name()));
+        let label = if self.max_part_size.is_some() {
+            parts::parts_label(root.name())
+        } else {
+            label(None, &format!("{}.tar", root.name()))
+        };
         match Plan::new(root) {
             Err(error) => (
                 Job::done(JobKind::Media, label.clone(), failed(&label, error)),
@@ -506,6 +550,9 @@ impl Migration {
             if let Some((label, reason)) = plan.skipped.first() {
                 return self.unsupported(label, reason, context).await;
             }
+        }
+        if let Some(max) = self.max_part_size {
+            return self.archive_in_parts(plan, max, place, context).await;
         }
         let label = &plan.label;
         // Whether a file of its name with other content is there, which it may replace.
@@ -644,25 +691,26 @@ impl Migration {
                 made.clone()
             } else {
                 fresh = true;
-                let reading = format!("export of '{}'", entry.label);
-                let format = export.format.get_export_mime();
-                let resource_key = export.resource_key.as_deref();
-                match relay::read_export(&self.source, &export.id, resource_key, format, &reading)
-                    .await
-                {
-                    Ok(bytes) => CachedExport::Content(bytes),
-                    Err(RelayError::ExportTooLarge { .. }) => CachedExport::TooLarge,
-                    Err(error) => {
-                        return Err(Error::Export {
-                            label: entry.label.clone(),
-                            source: Box::new(error),
-                        })
-                    }
-                }
+                self.export_of(&entry.label, export).await?
             };
             exports.insert(export.id.clone(), made);
         }
         Ok((exports, fresh))
+    }
+
+    /// The export of the Workspace file `label`, made now.
+    async fn export_of(&self, label: &str, export: &Export) -> Result<CachedExport, Error> {
+        let reading = format!("export of '{label}'");
+        let format = export.format.get_export_mime();
+        let resource_key = export.resource_key.as_deref();
+        match relay::read_export(&self.source, &export.id, resource_key, format, &reading).await {
+            Ok(bytes) => Ok(CachedExport::Content(bytes)),
+            Err(RelayError::ExportTooLarge { .. }) => Ok(CachedExport::TooLarge),
+            Err(error) => Err(Error::Export {
+                label: label.to_owned(),
+                source: Box::new(error),
+            }),
+        }
     }
 
     /// The entries of `plan` with its `exports`, how many of them are exports, and how many
@@ -749,15 +797,56 @@ impl Migration {
             None => format!("create {label} ({})", human_size(size)),
         };
         context.printer.out(line).await;
+        let sending = Sending {
+            root_id: &plan.root_id,
+            name: &plan.name,
+            label,
+            layout: &layout,
+            cache: cache.as_ref(),
+            exports: fresh.then_some(&exports),
+            replaced: smaller.as_ref(),
+        };
+        let file = self.send(sending, place, context).await?;
+        let id = file.id.unwrap_or_default();
+        let md5 = file.md5_checksum.as_deref();
+        if smaller.is_some() {
+            self.holds(&id, md5).await?;
+            self.tally.replaced.fetch_add(1, Ordering::SeqCst);
+        } else if !self.rely(std::iter::once(id.as_str())) {
+            // Another archive of the run, which listed the folder later, replaced this one.
+            return Err(Error::Conflict);
+        }
+        self.mark(&plan.manifest, label, id, md5).await?;
+        self.tally.converted.fetch_add(exported, Ordering::SeqCst);
+        Ok(Made::Archive(size))
+    }
+
+    /// Uploads a tar file into the folder of `place`, and checks it on the way.
+    async fn send(
+        &self,
+        sending: Sending<'_>,
+        place: &Place,
+        context: &JobContext,
+    ) -> Result<File, Error> {
+        let Sending {
+            root_id,
+            name,
+            label,
+            layout,
+            cache,
+            exports,
+            replaced,
+        } = sending;
+        let size = layout.size();
         let media_type = archive::MEDIA_TYPE
             .parse::<mime::Mime>()
             .unwrap_or(mime::APPLICATION_OCTET_STREAM);
         let target = UploadTarget {
             parents: place.folder.iter().cloned().collect(),
-            name: Some(plan.name.clone()),
+            name: Some(name.to_owned()),
             mime: Some(media_type.clone()),
             // A new version of the smaller file, which keeps its id and folder.
-            existing_file_id: smaller.as_ref().map(|old| old.id.clone()),
+            existing_file_id: replaced.map(|old| old.id.clone()),
             ..UploadTarget::default()
         };
         // The uploader tells the bytes Drive holds so far; progress takes what is new.
@@ -778,52 +867,48 @@ impl Migration {
         if let Some(dir) = &self.options.session_dir {
             if size > self.options.multipart_threshold {
                 let identity =
-                    archive::session_identity(&self.source, &plan.root_id, &layout, label).await;
+                    archive::session_identity(&self.source, root_id, layout, label).await;
                 if let Some(identity) = identity {
-                    if let (Some(cache), true) = (&cache, fresh) {
-                        cache.save(&exports).await;
+                    if let (Some(cache), Some(exports)) = (cache, exports) {
+                        cache.save(exports).await;
                     }
                     upload.record_in(dir, identity);
                 }
             }
         }
-        let mut source = ArchiveSource::new(&self.source, &layout);
+        let mut source = ArchiveSource::new(&self.source, layout);
         // Right before the upload: what came before may have waited for a question's answer.
-        if let Some(old) = &smaller {
-            self.still_listed(place, &plan.name, old).await?;
+        if let Some(old) = replaced {
+            self.still_listed(place, name, old).await?;
         }
         // Boxed, as the relay's: the upload's state is large.
         let file = Box::pin(upload.run(&mut source))
             .await
             .map_err(|error| Error::Archive(Box::new(ArchiveError::of_upload(error))))?;
-        if let Some(cache) = &cache {
+        if let Some(cache) = cache {
             cache.remove().await;
         }
-        let id = file.id.unwrap_or_default();
-        let md5 = file.md5_checksum.as_deref();
-        if smaller.is_some() {
-            self.holds(&id, md5).await?;
-            self.tally.replaced.fetch_add(1, Ordering::SeqCst);
-        } else if !self.rely(std::iter::once(id.as_str())) {
-            // Another archive of the run, which listed the folder later, replaced this one.
-            return Err(Error::Conflict);
-        }
-        self.mark(plan, id, md5).await?;
-        self.tally.converted.fetch_add(exported, Ordering::SeqCst);
-        Ok(Made::Archive(size))
+        Ok(file)
     }
 
-    /// Marks the destination file `id` as the archive of `plan`, once it is checked: with the
-    /// md5 it was checked with (without one, the mark never matches).
-    async fn mark(&self, plan: &Plan, id: String, md5: Option<&str>) -> Result<(), Error> {
-        let mut mark = PatchFile::new(id.clone()).with_app_property(PROPERTY, &plan.manifest);
+    /// Marks the destination file `id`, shown as `label`, as the archive with the digest
+    /// `manifest`, once it is checked: with the md5 it was checked with (without one, the mark
+    /// never matches).
+    async fn mark(
+        &self,
+        manifest: &str,
+        label: &str,
+        id: String,
+        md5: Option<&str>,
+    ) -> Result<(), Error> {
+        let mut mark = PatchFile::new(id.clone()).with_app_property(PROPERTY, manifest);
         if let Some(md5) = md5 {
             mark = mark.with_app_property(PROPERTY_MD5, md5);
         }
         update_metadata(&self.dest, mark)
             .await
             .map_err(|source| Error::ArchiveMark {
-                name: plan.label.clone(),
+                name: label.to_owned(),
                 id,
                 source: Box::new(source),
             })?;
@@ -851,16 +936,33 @@ impl Migration {
 pub(super) fn summary(report: &Report, tally: &Tally, settings: &Settings) -> String {
     let dry_run = settings.dry_run;
     let files = &report.files;
+    // A conflict that was left as it is counts further on.
+    let unchanged = files
+        .unchanged
+        .saturating_sub(tally.left.load(Ordering::SeqCst));
+    let (made, bytes, there) = if settings.max_part_size.is_some() {
+        let count = |counter: &std::sync::atomic::AtomicU64| counter.load(Ordering::SeqCst);
+        (
+            plural(count(&tally.parts_made), "archive part", "archive parts"),
+            count(&tally.parts_bytes),
+            count(&tally.parts_there),
+        )
+    } else {
+        (
+            plural(files.transferred, "archive", "archives"),
+            files.bytes,
+            unchanged,
+        )
+    };
     let mut line = String::new();
     if dry_run {
         line.push_str("Dry run, nothing was changed. ");
     }
     let _ = write!(
         line,
-        "Summary: {} {} ({}",
-        plural(files.transferred, "archive", "archives"),
+        "Summary: {made} {} ({}",
         if dry_run { "to migrate" } else { "migrated" },
-        human_size(files.bytes)
+        human_size(bytes)
     );
     let exports = tally.converted.load(Ordering::SeqCst);
     if exports > 0 {
@@ -873,13 +975,9 @@ pub(super) fn summary(report: &Report, tally: &Tally, settings: &Settings) -> St
     }
     let _ = write!(
         line,
-        "), {} already there, {} skipped (unsupported), {} failed, {} cancelled",
-        // A conflict that was left as it is counts further on.
-        files
-            .unchanged
-            .saturating_sub(tally.left.load(Ordering::SeqCst)),
+        "), {there} already there, {} skipped (unsupported), {} failed, {} cancelled",
         files.skipped + tally.skipped.load(Ordering::SeqCst),
-        files.failed,
+        files.failed + tally.more_failures.load(Ordering::SeqCst),
         files.cancelled,
     );
     line.push_str(&super::replaced(tally, settings));

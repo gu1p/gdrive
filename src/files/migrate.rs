@@ -157,6 +157,8 @@ pub(crate) struct Config {
     pub(crate) replace_smaller: bool,
     /// The user is asked about the conflicts that a replace can settle (`--ask`).
     pub(crate) ask: bool,
+    /// Each archive in tar files of at most that many bytes (`--max-part-size`).
+    pub(crate) max_part_size: Option<u64>,
     pub(crate) chunk_size: ChunkSize,
     pub(crate) multipart_threshold: MultipartThreshold,
     pub(crate) print_chunk_errors: bool,
@@ -185,6 +187,8 @@ struct Settings {
     replace_smaller: bool,
     /// Who is asked about the other conflicts that a replace can settle (`--ask`).
     ask: Option<Arc<dyn Ask>>,
+    /// Each archive in tar files of at most that many bytes.
+    max_part_size: Option<u64>,
     /// The source and the destination are one account (only with `archive`): the top of My Drive
     /// is then a folder the source may hold too.
     same_account: bool,
@@ -254,6 +258,7 @@ pub(crate) async fn migrate(config: Config) -> Result<(), Error> {
         ask: config
             .ask
             .then(|| Arc::new(ask::Terminal::new(printer.clone())) as Arc<dyn Ask>),
+        max_part_size: config.max_part_size,
         same_account,
         transfer: config.transfer,
     };
@@ -377,6 +382,8 @@ async fn run(
         trash_source: settings.trash_source,
         replace_smaller: settings.replace_smaller,
         ask: settings.ask.clone(),
+        max_part_size: settings.max_part_size,
+        continue_on_error: settings.transfer.continue_on_error,
         dest_use: Mutex::new(HashMap::new()),
         unsupported: Mutex::new(Vec::new()),
         tally: Tally::default(),
@@ -854,6 +861,10 @@ impl Leftover {
 }
 
 /// What the jobs of a migration share.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the flags of the command line, orthogonal to each other"
+)]
 struct Migration {
     source: Hub,
     dest: Hub,
@@ -862,6 +873,10 @@ struct Migration {
     trash_source: bool,
     replace_smaller: bool,
     ask: Option<Arc<dyn Ask>>,
+    /// Each archive in tar files of at most that many bytes.
+    max_part_size: Option<u64>,
+    /// A part of an archive that fails does not stop the parts after it.
+    continue_on_error: bool,
     /// What the items of this run do with the destination files they found by name, when
     /// replaces can happen: a file is replaced by one item at most, and never one that another
     /// item found its content in.
@@ -895,6 +910,13 @@ struct Tally {
     /// Items left out of the archives (`--archive`): shortcuts, Workspace types without an
     /// export, exports over Drive's limit.
     skipped: AtomicU64,
+    /// Parts of archives made (`--max-part-size`), and their bytes.
+    parts_made: AtomicU64,
+    parts_bytes: AtomicU64,
+    /// Parts of archives that were there.
+    parts_there: AtomicU64,
+    /// Failures of parts beyond the one each job ends with.
+    more_failures: AtomicU64,
 }
 
 /// Where the items of a source folder go.
@@ -1617,6 +1639,35 @@ impl ReplaceError {
     }
 }
 
+/// Why the list of what the parts of an archive hold cannot be used (`--max-part-size`).
+#[derive(Debug)]
+pub(crate) enum PartsIndexError {
+    /// It could not be read or written.
+    Access {
+        doing: &'static str,
+        name: String,
+        source: Box<dyn error::Error + Send + Sync>,
+    },
+    /// A file of its name in the destination is no such list.
+    Other(String),
+}
+
+impl Display for PartsIndexError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            PartsIndexError::Access { doing, name, .. } => write!(
+                f,
+                "unable to {doing} '{name}', which lists what the parts of the archive hold"
+            ),
+            PartsIndexError::Other(name) => write!(
+                f,
+                "'{name}' is in the destination and is no list of the parts of an archive; rename \
+                 or remove it"
+            ),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum Error {
     /// The source account cannot be used; `account` is `None` for the current account.
@@ -1695,6 +1746,7 @@ pub(crate) enum Error {
         id: String,
         source: Box<google_drive3::Error>,
     },
+    PartsIndex(PartsIndexError),
     /// The item is in the destination, but could not be moved to the trash in the source.
     Trash(Box<google_drive3::Error>),
     /// An item of the migration failed; `label` is its path, starting with the name of its
@@ -1811,6 +1863,7 @@ impl Display for Error {
                  the mark was written, and otherwise as a file of that name with other content; \
                  nothing was deleted"
             ),
+            Error::PartsIndex(error) => error.fmt(f),
             Error::Trash(_) => f.write_str(
                 "it is in the destination, but it could not be moved to the trash in the source",
             ),
@@ -1846,6 +1899,7 @@ impl error::Error for Error {
                 Some(source.as_ref())
             }
             Error::Export { source, .. } => Some(source.as_ref()),
+            Error::PartsIndex(PartsIndexError::Access { source, .. }) => Some(source.as_ref()),
             Error::ArchiveName(source) => Some(source),
             Error::Incomplete(source) => Some(source),
             Error::GenerateId(source) => Some(source),
@@ -1862,6 +1916,7 @@ impl error::Error for Error {
             | Error::FolderMissingId
             | Error::IncompleteListing
             | Error::ArchiveIncomplete(_)
+            | Error::PartsIndex(PartsIndexError::Other(_))
             | Error::NoSize(_) => None,
         }
     }

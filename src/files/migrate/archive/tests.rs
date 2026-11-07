@@ -2,7 +2,12 @@
 //! unpacked with the `tar` crate.
 
 use std::{
-    collections::HashSet, future::Future, io::Read, num::NonZeroUsize, path::Path, sync::Arc,
+    collections::{BTreeMap, HashSet},
+    future::Future,
+    io::Read,
+    num::NonZeroUsize,
+    path::Path,
+    sync::Arc,
     time::Duration,
 };
 
@@ -24,6 +29,8 @@ use crate::{
         upload::{UploadOptions, CHUNK_ALIGNMENT},
     },
 };
+
+mod parts;
 
 const DOCUMENT: &str = "application/vnd.google-apps.document";
 const DRAWING: &str = "application/vnd.google-apps.drawing";
@@ -136,6 +143,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         contents: false,
         replace_smaller: false,
         ask: None,
+        max_part_size: None,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }

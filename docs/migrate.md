@@ -478,6 +478,82 @@ at most 5 TB, and a larger one needs several `FILE_ID`s (the subfolders). The ar
 only to the OAuth client that created it: a second run with the destination account added with another
 client sees a file of the same name with other content.
 
+## An archive in parts: `--max-part-size`
+
+With `--max-part-size SIZE`, an archive arrives as several tar files of at most SIZE instead of one. A failure
+then costs only the part it fell in, and running the command again uploads only the files that no part holds
+yet.
+
+```sh
+gdrive files migrate <FOLDER_ID> --to new@example.com --archive --max-part-size 3GB --dry-run
+gdrive files migrate <FOLDER_ID> --to new@example.com --archive --max-part-size 3GB
+```
+
+```text
+Found 5000 files in 40 folders with a total size of 8.2 GB
+create photos.parts.json
+create photos.part00001.tar (3 GB)
+create photos.part00002.tar (3 GB)
+create photos.part00003.tar (2.2 GB)
+Summary: 3 archive parts migrated (8.2 GB), 0 already there, 0 skipped (unsupported), 0 failed, 0 cancelled
+```
+
+SIZE is a whole number with `B`, `KB`, `MB`, `GB` or `TB`, in powers of 1000 as gdrive prints sizes: `3GB` is
+3 000 000 000 bytes, and `2MB` is 2 000 000. Everything else in [`--archive`](#one-tar-file-per-folder---archive)
+holds for each part: what goes in, the checks, the mark and the continued upload of an interrupted part. The
+parts of one `FILE_ID` go up one after the other, and `--jobs` makes several `FILE_ID`s at once.
+
+**Each part is a tar of its own**, of whole files. It extracts alone, with the folders of its files, and all of
+them extract into the tree:
+
+```sh
+for part in photos.part*.tar; do tar -xf "$part"; done
+```
+
+A file is never split: one larger than SIZE is alone in a part of its size, and its line says so, `create
+photos.part00002.tar (7.7 GB, larger than the maximum: a file is never split)`.
+
+**What tracks the upload.** `<name>.parts.json`, next to the parts, lists each part with the path of everything
+in it, so it also tells which part holds a file. A part counts only when the file of its name is in the
+destination with the mark of exactly those entries, on the bytes that were checked. A part that was deleted,
+replaced or never finished proves nothing, and what it held goes up again. Editing the list can only cause more
+uploads, never fewer. Marks are visible only to the OAuth client that wrote them: a run with the destination
+account added with another client finds no part it can count on.
+
+**Running it again** uploads only what no part holds, whatever SIZE the earlier runs used:
+
+```text
+already-there photos.part00001.tar
+create photos.part00002.tar (3 GB)
+create photos.part00003.tar (2.2 GB)
+```
+
+An interrupted part continues where Drive stopped, when the same files make it up: its session is recorded as
+for a whole archive. A file is told by its path and its content as Drive lists it (id, size and MD5 checksum;
+for a Google file, its id, modification time and format). So:
+
+- A file added to the source later goes into a new part, and so does a file that was edited, also when it was
+  edited back to what an older part holds. The old part stays. Extracted in the order of their names, the parts
+  give the newest content.
+- A file removed from the source stays in its part.
+- A renamed or moved file goes into a new part under its new path. Its old path stays in the old part.
+
+**Failures.** A part that fails stops the archive, as any failed item stops the run, and the parts before it
+stay. With `--continue-on-error`, the next parts are made all the same, so that one unreadable file does not hold
+up everything after it. The run still exits with 1, and the next run tries what failed again, including the other
+files of that part, in a new part. A part left in the destination without its mark (its check failed, or the marking did) counts
+for nothing: gdrive warns about it, sends what it was to hold in a new part, and never deletes it. You can delete
+it.
+
+**Names.** Nothing in the destination is overwritten but the run's own list. A new part takes a number above every
+part that counts, whose name no file of the folder has, so the order of the names is the order of the uploads. A
+file named `<name>.parts.json` that is not such a list fails the archive,
+before anything is uploaded: rename or remove it. With no conflicts to settle, `--max-part-size` cannot be
+combined with `--replace-smaller` or `--ask`. A `<name>.tar` made without it is left alone and does not count.
+
+**Dry run.** `--dry-run` reads the list and prints what a real run would do, with the sizes of the parts as the
+listing tells them. Exports are not made, so they count as empty, and a real run may cut the parts differently.
+
 ## Options
 
 | Option | |
@@ -491,6 +567,7 @@ client sees a file of the same name with other content.
 | `--dry-run` | print what would be done, change nothing |
 | `--trash-source` | move migrated source files and folders to the source's trash |
 | `--archive` | each `FILE_ID` as one tar file, `<name>.tar` (see [One tar file per folder](#one-tar-file-per-folder---archive)) |
+| `--max-part-size SIZE` | with `--archive`, each `FILE_ID` as tar files of at most SIZE, such as `3GB` or `2MB`, and a list of what each holds; a later run uploads only what no part holds (see [An archive in parts](#an-archive-in-parts---max-part-size)) |
 | `--jobs N` | copy up to N files at once, 1 to 64 (default 4); folder listings and creations run besides, 2 at a time |
 | `--continue-on-error` | after a failed item, finish the others; the run still exits with 1 |
 | `--chunk-size MB`, `--multipart-threshold MB` | how large files are uploaded, as for `files upload` |

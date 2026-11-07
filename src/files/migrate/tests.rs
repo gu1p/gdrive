@@ -73,6 +73,7 @@ fn settings(file_ids: &[&str]) -> Settings {
         contents: false,
         replace_smaller: false,
         ask: None,
+        max_part_size: None,
         same_account: false,
         transfer: Options::new(NonZeroUsize::new(4).unwrap(), false),
     }

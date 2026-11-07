@@ -471,6 +471,10 @@ enum FileCommand {
         #[arg(long, conflicts_with = "trash_source")]
         archive: bool,
 
+        /// With --archive: each archive as several tar files of at most SIZE, for example 3GB or 2MB (B, KB, MB, GB, TB, in powers of 1000): NAME.part00001.tar, NAME.part00002.tar and so on, each a tar of its own, and NAME.parts.json, which lists what each one holds. A file is never split: one larger than SIZE is alone in a part of its size. Running the command again uploads only what no part holds yet. See docs/migrate.md
+        #[arg(long, value_name = "SIZE", requires = "archive", conflicts_with_all = ["replace_smaller", "ask"], value_parser = parse_part_size)]
+        max_part_size: Option<u64>,
+
         /// Set chunk size in MB, must be a power of two.
         #[arg(long, value_name = "1|2|4|8|16|32|64|128|256|512|1024|4096|8192", default_value_t = ChunkSize::default())]
         chunk_size: ChunkSize,
@@ -799,6 +803,30 @@ fn parse_export_format(value: &str) -> Result<FileExtension, String> {
             png"
         )
     })
+}
+
+/// A size such as `3GB` or `2MB`, in the powers of 1000 that gdrive prints sizes in.
+fn parse_part_size(value: &str) -> Result<u64, String> {
+    const UNITS: [(&str, u64); 5] = [
+        ("KB", 1_000),
+        ("MB", 1_000_000),
+        ("GB", 1_000_000_000),
+        ("TB", 1_000_000_000_000),
+        ("B", 1),
+    ];
+    let wrong = || "must be a size such as 3GB or 2MB (B, KB, MB, GB, TB)".to_owned();
+    let upper = value.trim().to_ascii_uppercase();
+    let (digits, unit) = UNITS
+        .iter()
+        .find_map(|(unit, bytes)| Some((upper.strip_suffix(unit)?, *bytes)))
+        .ok_or_else(wrong)?;
+    digits
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .and_then(|count| count.checked_mul(unit))
+        .filter(|size| *size > 0)
+        .ok_or_else(wrong)
 }
 
 fn parse_jobs(value: &str) -> Result<NonZeroUsize, String> {
@@ -1204,6 +1232,7 @@ async fn handle_files_command(
             contents,
             replace_smaller,
             ask,
+            max_part_size,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -1221,6 +1250,7 @@ async fn handle_files_command(
                 contents,
                 replace_smaller,
                 ask,
+                max_part_size,
                 chunk_size,
                 multipart_threshold,
                 print_chunk_errors,
@@ -1878,7 +1908,7 @@ mod flag_tests {
 
     use clap::Parser;
 
-    use super::{Cli, Command, FileCommand};
+    use super::{parse_part_size, Cli, Command, FileCommand};
     use crate::common::drive_file::{DocType, FileExtension};
 
     fn words(text: &str) -> HashSet<&str> {
@@ -2173,6 +2203,7 @@ mod flag_tests {
             contents,
             replace_smaller,
             ask,
+            max_part_size,
             chunk_size,
             multipart_threshold,
             print_chunk_errors,
@@ -2216,6 +2247,7 @@ mod flag_tests {
         assert_eq!(jobs.get(), 8);
         assert!(continue_on_error && dry_run && trash_source && !archive && contents);
         assert!(replace_smaller && ask);
+        assert_eq!(max_part_size, None);
         assert_eq!(chunk_size.in_bytes(), 1 << 20);
         assert_eq!(multipart_threshold.in_bytes(), 0);
         assert!(print_chunk_errors && print_chunk_info);
@@ -2261,6 +2293,62 @@ mod flag_tests {
             panic!("--archive --trash-source should be refused");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn migrate_takes_a_maximum_part_size_with_archive_only() {
+        let args = |rest: &[&'static str]| {
+            let mut args = vec!["gdrive", "files", "migrate", "a", "--to", "new@example.com"];
+            args.extend_from_slice(rest);
+            args
+        };
+        let FileCommand::Migrate { max_part_size, .. } =
+            parse(&args(&["--archive", "--max-part-size", "3GB"])[1..])
+        else {
+            panic!("expected migrate");
+        };
+        assert_eq!(max_part_size, Some(3_000_000_000));
+
+        for refused in [
+            &["--max-part-size", "3GB"][..],
+            &["--archive", "--max-part-size", "3GB", "--replace-smaller"],
+            &["--archive", "--max-part-size", "3GB", "--ask"],
+            &["--archive", "--max-part-size", "3"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args(refused)).is_err(),
+                "{refused:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_size_has_a_count_and_a_unit() {
+        for (text, bytes) in [
+            ("3GB", 3_000_000_000),
+            ("2MB", 2_000_000),
+            ("2mb", 2_000_000),
+            ("2 MB", 2_000_000),
+            ("1500KB", 1_500_000),
+            ("1TB", 1_000_000_000_000),
+            ("4096B", 4096),
+        ] {
+            assert_eq!(parse_part_size(text), Ok(bytes), "{text}");
+        }
+        for text in [
+            "",
+            "3",
+            "GB",
+            "0GB",
+            "-1GB",
+            "1.5GB",
+            "3XB",
+            "3G",
+            "3GiB",
+            "99999999999TB",
+        ] {
+            assert!(parse_part_size(text).is_err(), "{text}");
+        }
     }
 
     #[test]

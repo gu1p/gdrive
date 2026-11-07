@@ -118,6 +118,13 @@ from 3.9.1 work without changes, and every 3.9.1 command and flag is still there
   archive instead of overwriting, and continues an interrupted upload with the exports of the first run.
   `--to` may be the source account itself: the tar file is made inside one account, never inside the
   folder it archives. Not with `--trash-source`. See docs/migrate.md.
+- **An archive in parts.** `files migrate --archive --max-part-size SIZE` (`3GB`, `2MB`) makes each
+  `FILE_ID` several tar files of at most SIZE, `<name>.part00001.tar` and so on, each one a tar of whole
+  files that extracts alone, and `<name>.parts.json`, which lists what each one holds. A failure costs only
+  the part it fell in. A later run uploads only what no part holds, also files added or edited since, and a
+  part counts only when the destination holds it with its mark. A file larger than SIZE is alone in a part
+  of its size. With `--continue-on-error`, the parts after a failed one are made all the same. Not with
+  `--replace-smaller` or `--ask`. See docs/migrate.md.
 
 Accounts and login:
 

@@ -634,6 +634,63 @@ pub(crate) async fn read_export(
     }
 }
 
+/// The whole content of the file `id`, read into memory: for a small file that gdrive wrote.
+/// One that breaks off is requested again from the start, within the hub's retry policy.
+pub(crate) async fn read_file(hub: &Hub, id: &str, label: &str) -> Result<Bytes, RelayError> {
+    let client = MediaClient::new(hub);
+    let url = client
+        .drive_url(
+            &["files", id],
+            &[("alt", "media"), ("supportsAllDrives", "true")],
+        )
+        .map_err(RelayError::Source)?;
+    let mut retry = hub.retrier().state();
+    loop {
+        let response = client
+            .send_with_retry(&mut retry, label, || {
+                Request::get(url.as_str()).body(google_apis_common::to_body::<String>(None))
+            })
+            .await
+            .map_err(RelayError::Source)?;
+        if response.status() != StatusCode::OK {
+            return Err(RelayError::Source(MediaError::Status {
+                status: response.status(),
+                message: None,
+                stop: None,
+            }));
+        }
+        let mut content = Vec::new();
+        let mut body = response.into_body();
+        let error = loop {
+            match body.frame().await {
+                None => return Ok(Bytes::from(content)),
+                Some(Ok(frame)) => {
+                    if let Ok(data) = frame.into_data() {
+                        content.extend_from_slice(&data);
+                    }
+                }
+                Some(Err(error)) => break error,
+            }
+        };
+        match retry.next(classify_body_error(&error)) {
+            Decision::Retry { after, reason } => {
+                eprintln!(
+                    "Warning: {label}: interrupted after {} bytes ({reason}), reading again in {} \
+                     (attempt {} of {})",
+                    content.len(),
+                    DisplayDuration(after),
+                    retry.failures() + 1,
+                    retry.policy().max_attempts,
+                );
+                tokio::time::sleep(after).await;
+            }
+            Decision::Stop { reason } => {
+                return Err(RelayError::Source(MediaError::Resume { reason }));
+            }
+        }
+    }
+}
+
 /// Why reading the source failed, carried through the uploader as the `io::Error` of a read.
 #[derive(Debug)]
 enum SourceFailure {
