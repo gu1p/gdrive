@@ -374,13 +374,19 @@ async fn a_failure_is_told_and_counted_even_when_a_ctrl_c_follows() {
     };
     let failing = FakeDrive::start(photos(), behavior).await;
     let dest = FakeDrive::start(Vec::new(), Behavior::default()).await;
+    // The Ctrl-C comes while the part after the failed one is on its way.
+    let ctrl_c = async {
+        while !failing.media().contains(&String::from("e")) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
 
     let first = migrate_with(
         &failing,
         &dest,
         going_on(in_parts(&["photos"])),
         &UploadOptions::default(),
-        tokio::time::sleep(Duration::from_millis(500)),
+        ctrl_c,
     )
     .await;
 
