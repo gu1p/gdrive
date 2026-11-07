@@ -279,11 +279,12 @@ gdrive files upload --recursive ~/photos               # a local folder and ever
 ```sh
 gdrive files unzip <FILE_ID>                       # into a new folder next to the zip file
 gdrive files unzip <FILE_ID> --into <FOLDER_ID>    # into a new folder in that folder
+gdrive files unzip <FILE_ID> --from <ACCOUNT>      # with another account than the current one
 ```
 
 - The new folder has the name of the zip file without `.zip`. Nothing is downloaded to disk: each file
-  goes up as it is unpacked, and the zip file itself is only read. Both sides are the current account;
-  `gdrive account switch` picks another.
+  goes up as it is unpacked, and the zip file itself is only read. One account does all of it: it must
+  see both the zip file and the folder.
 - Run it again after a failure. The folder is reused, the files it already extracted stay
   (`already-there`), and the rest goes up. A file that was interrupted starts over.
 - A file of the same name that this command did not extract from that entry is left alone, and that entry

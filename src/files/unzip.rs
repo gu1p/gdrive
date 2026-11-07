@@ -37,7 +37,7 @@ use super::{
 use crate::{
     common::{
         drive_file,
-        hub_helper::{get_hub, GetHubError},
+        hub_helper::{get_hub, get_hub_for, load_named_account, GetHubError},
         human_size::human_size,
         local_name::printable,
         media_client::{get_file, MediaError},
@@ -72,6 +72,8 @@ const NOT_THE_CONTENT: &str = "not-the-content";
 
 pub(crate) struct Config {
     pub(crate) file_id: String,
+    /// The account that does all of it; `None`: the current account.
+    pub(crate) from: Option<String>,
     /// The folder to extract into; `None`: the folder of the zip file.
     pub(crate) into: Option<String>,
     pub(crate) transfer: scheduler::Options,
@@ -79,7 +81,14 @@ pub(crate) struct Config {
 }
 
 pub(crate) async fn unzip(config: Config) -> Result<(), Error> {
-    let hub = get_hub().await.map_err(Error::Hub)?;
+    let hub = match &config.from {
+        Some(name) => {
+            let account = load_named_account(name).map_err(Error::Hub)?;
+            get_hub_for(&account).await
+        }
+        None => get_hub().await,
+    }
+    .map_err(Error::Hub)?;
     let display = ProgressDisplay::recursive(config.progress, config.transfer.jobs);
     Box::pin(run(
         &hub,

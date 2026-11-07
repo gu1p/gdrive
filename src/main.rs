@@ -628,11 +628,15 @@ enum FileCommand {
 
     /// Extract a zip file on Drive into a new folder on Drive, without downloading it
     ///
-    /// The folder has the name of the zip file without `.zip`, next to it or in the folder --into names. The current account does all of it, and the zip file stays as it is. Stored and deflated files can be read, as in nearly all zip files; ZIP64 too, a zip split over several files or an encrypted one not. Run it again after a failure: what is there stays, the rest goes up. A file that was interrupted starts over.
+    /// The folder has the name of the zip file without `.zip`, next to it or in the folder --into names. The zip file stays as it is. Stored and deflated files can be read, as in nearly all zip files; ZIP64 too, a zip split over several files or an encrypted one not. Run it again after a failure: what is there stays, the rest goes up. A file that was interrupted starts over.
     Unzip {
         /// Id of the zip file
         #[arg(value_name = "FILE_ID")]
         file_id: String,
+
+        /// The account that has the zip file and gets the new folder, as `gdrive account list` prints it [default: the current account]
+        #[arg(long, value_name = "ACCOUNT")]
+        from: Option<String>,
 
         /// Id of the folder to create the new folder in [default: the folder of the zip file]
         #[arg(long, value_name = "FOLDER_ID")]
@@ -1287,6 +1291,7 @@ async fn handle_files_command(
 
         FileCommand::Unzip {
             file_id,
+            from,
             into,
             jobs,
             continue_on_error,
@@ -1294,6 +1299,7 @@ async fn handle_files_command(
         } => {
             files::unzip(files::unzip::Config {
                 file_id,
+                from,
                 into,
                 transfer: Options::new(jobs, continue_on_error),
                 progress: progress.mode(),
@@ -2339,6 +2345,7 @@ mod flag_tests {
     fn unzip_takes_a_file_id_and_the_flags_of_a_transfer() {
         let FileCommand::Unzip {
             file_id,
+            from,
             into,
             jobs,
             continue_on_error,
@@ -2348,11 +2355,13 @@ mod flag_tests {
             panic!("expected unzip");
         };
         assert_eq!(file_id, "a");
+        assert_eq!(from, None);
         assert_eq!(into, None);
         assert_eq!(jobs.get(), 4);
         assert!(!continue_on_error);
 
         let FileCommand::Unzip {
+            from,
             into,
             jobs,
             continue_on_error,
@@ -2361,6 +2370,8 @@ mod flag_tests {
             "files",
             "unzip",
             "a",
+            "--from",
+            "x@example.com",
             "--into",
             "b",
             "--jobs",
@@ -2370,6 +2381,7 @@ mod flag_tests {
         else {
             panic!("expected unzip");
         };
+        assert_eq!(from.as_deref(), Some("x@example.com"));
         assert_eq!(into.as_deref(), Some("b"));
         assert_eq!(jobs.get(), 2);
         assert!(continue_on_error);
