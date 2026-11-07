@@ -628,6 +628,15 @@ async fn a_refusal_of_drive_ends_the_reading_and_is_not_asked_again() {
     assert_eq!(err.matches("download quota").count(), 1, "{err}");
     let summary = ran.summary();
     assert!(summary.contains(", 1 failed, 29 cancelled"), "{summary}");
+
+    // Stopped at the failure, the files it never took count as cancelled all the same.
+    let behavior = Behavior {
+        media_refused_after: Some(all - 1),
+        ..Behavior::default()
+    };
+    let drive = drive_with(&zip, vec![], behavior).await;
+    let summary = unzip(&drive).await.summary();
+    assert!(summary.contains(", 1 failed, 29 cancelled"), "{summary}");
 }
 
 #[tokio::test]

@@ -211,11 +211,16 @@ async fn run(
     });
     unzip.folders_left.send_replace(subtree.folders);
     let scheduler = Scheduler::new(transfer, printer.clone()).with_progress(progress.sink());
-    let report = tokio::select! {
+    let mut report = tokio::select! {
         report = scheduler.run(unzip.jobs(tree, place), cancel) => report,
         never = reader::serve(source, requests) => match never {},
     };
     progress.finish();
+    // A run that stopped never took the files after those it took: they are cancelled too.
+    let files = &report.files;
+    let counted =
+        files.transferred + files.unchanged + files.skipped + files.failed + files.cancelled;
+    report.files.cancelled += subtree.files.saturating_sub(counted);
 
     printer
         .out(format!(
